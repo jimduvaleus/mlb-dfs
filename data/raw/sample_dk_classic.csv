@@ -1,0 +1,9 @@
+ID,Name,Roster Position,Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame,"Name + ID",Tier,Player and position,Starter?,PPR
+10001,Shohei Ohtani,P/DH,P,10000,"LAD @ SD 03/20/2026 09:40PM ET",LAD,18.5,"Shohei Ohtani (10001)",,
+10002,Freddie Freeman,1B,1B,9000,"LAD @ SD 03/20/2026 09:40PM ET",LAD,12.3,"Freddie Freeman (10002)",,
+10003,Mookie Betts,2B/OF,2B,9500,"LAD @ SD 03/20/2026 09:40PM ET",LAD,15.1,"Mookie Betts (10003)",,
+10004,Manny Machado,3B,3B,8500,"LAD @ SD 03/20/2026 09:40PM ET",SD,11.8,"Manny Machado (10004)",,
+10005,Fernando Tatis Jr.,OF,OF,8800,"LAD @ SD 03/20/2026 09:40PM ET",SD,13.2,"Fernando Tatis Jr. (10005)",,
+10006,Yu Darvish,P,P,8000,"LAD @ SD 03/20/2026 09:40PM ET",SD,16.0,"Yu Darvish (10006)",,
+10007,Invalid Player,P,INVALID_POS,6000,"LAD @ SD 03/20/2026 09:40PM ET",SD,0.0,"Invalid Player (10007)",,
+10008,Missing Salary,,C,,,"LAD @ SD 03/20/2026 09:40PM ET",LAD,0.0,"Missing Salary (10008)",,
