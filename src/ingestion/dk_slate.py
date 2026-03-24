@@ -10,6 +10,7 @@ class Player:
     salary: float
     team: str
     roster_position: str
+    game: str = ""
 
 
 class DraftKingsSlateIngestor:
@@ -28,6 +29,7 @@ class DraftKingsSlateIngestor:
             "Roster Position": "roster_position",
             "Salary": "salary",
             "TeamAbbrev": "team",
+            "Game Info": "game_info",
             "Name + ID": "name_plus_id" # Keep this for potential future use or validation
         }, inplace=True)
 
@@ -43,7 +45,18 @@ class DraftKingsSlateIngestor:
             # For now, we'll just raise an error as per the design to validate
             raise ValueError("Unexpected position strings found in CSV.")
 
-        return df[['player_id', 'name', 'position', 'roster_position', 'salary', 'team']]
+        # Extract game ID from "Game Info" column (e.g. "LAD @ SD 03/20/2026 ..." -> "LAD@SD")
+        if 'game_info' in df.columns:
+            def _extract_game(info: str) -> str:
+                tokens = str(info).split()
+                if len(tokens) >= 3 and tokens[1] == '@':
+                    return f"{tokens[0]}@{tokens[2]}"
+                return ""
+            df['game'] = df['game_info'].apply(_extract_game)
+        else:
+            df['game'] = ""
+
+        return df[['player_id', 'name', 'position', 'roster_position', 'salary', 'team', 'game']]
 
     def get_players(self) -> List[Player]:
         players = []
@@ -54,7 +67,8 @@ class DraftKingsSlateIngestor:
                 position=row['position'],
                 salary=row['salary'],
                 team=row['team'],
-                roster_position=row['roster_position']
+                roster_position=row['roster_position'],
+                game=row['game'],
             ))
         return players
 
