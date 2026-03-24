@@ -3,33 +3,48 @@ import pandas as pd
 from typing import List, Dict, Any, Optional
 from src.models.copula import EmpiricalCopula
 from src.models.marginals import GaussianMarginal
+from src.models.batter_model import BatterPCAModel, BatterMixtureMarginal
 from src.simulation.results import SimulationResults
 
 class SimulationEngine:
     """
     Core simulation engine for MLB DFS.
-    
+
     Generates joint player performances by sampling from an empirical copula
-    and applying inverse CDF (Gaussian marginals) to each player's projection.
+    and applying inverse CDFs to each player's projection.
+
+    When a BatterPCAModel and score_grid are supplied, batter slots (1-9) use
+    the mixture-distribution marginal (Phase 4).  Pitcher slots (10) always use
+    a Gaussian marginal.  Omitting the PCA model falls back to Gaussian for all
+    players, preserving backward compatibility with Phases 1-3.
     """
-    
-    def __init__(self, copula: EmpiricalCopula, players_df: pd.DataFrame):
+
+    def __init__(
+        self,
+        copula: EmpiricalCopula,
+        players_df: pd.DataFrame,
+        batter_pca_model: Optional[BatterPCAModel] = None,
+        score_grid: Optional[np.ndarray] = None,
+    ):
         """
-        Initialize the engine with a copula model and a slate of players.
-        
         Args:
             copula (EmpiricalCopula): Initialized copula model.
-            players_df (pd.DataFrame): DataFrame containing players and their projections.
-                                        Expected columns:
-                                        - player_id: Unique identifier for the player.
-                                        - team: Player's team abbreviation.
-                                        - opponent: Opponent's team abbreviation.
-                                        - slot: Projected batting slot (1-9) or pitcher slot (10).
-                                        - mean: Projected mean DraftKings points.
-                                        - std_dev: Projected standard deviation of points.
+            players_df (pd.DataFrame): Players with columns:
+                player_id, team, opponent, slot, mean, std_dev.
+            batter_pca_model (BatterPCAModel | None): Fitted PCA model for
+                mapping (mu, sigma) projections → mixture parameters.
+                When None, Gaussian marginals are used for all slots.
+            score_grid (np.ndarray | None): Sorted array of unique historical
+                batter DK scores used for mixture PPF discretisation.
+                Required when batter_pca_model is provided.
         """
+        if batter_pca_model is not None and score_grid is None:
+            raise ValueError("score_grid is required when batter_pca_model is provided.")
+
         self.copula = copula
         self.players_df = players_df.copy().reset_index(drop=True)
+        self.batter_pca_model = batter_pca_model
+        self.score_grid = score_grid
         self._validate_input()
         
     def _validate_input(self):
@@ -85,8 +100,16 @@ class SimulationEngine:
                 # Slot is 1-indexed, so we subtract 1 for 0-based NumPy indexing.
                 q = sampled_quantiles[:, slot - 1]
                 
-                # Apply the Gaussian Inverse CDF to the quantiles
-                marginal = GaussianMarginal(player['mean'], player['std_dev'])
+                # Choose marginal: mixture for batters (slot 1-9) when a PCA
+                # model is available, Gaussian otherwise and for pitchers.
+                is_batter = (1 <= slot <= 9)
+                if is_batter and self.batter_pca_model is not None:
+                    w, lam, mu, sigma = self.batter_pca_model.project(
+                        float(player['mean']), float(player['std_dev'])
+                    )
+                    marginal = BatterMixtureMarginal(w, lam, mu, sigma, self.score_grid)
+                else:
+                    marginal = GaussianMarginal(player['mean'], player['std_dev'])
                 simulated_points = marginal.ppf(q)
                 
                 # DFS points are typically non-negative
