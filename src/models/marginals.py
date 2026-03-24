@@ -9,14 +9,16 @@ class GaussianMarginal:
         self.mu = mu
         self.sigma = sigma
 
-    def ppf(self, q: float) -> float:
+    def ppf(self, q: np.ndarray) -> np.ndarray:
         """
         Percent point function (inverse of CDF) at q.
         Args:
-            q (float): Lower tail probability.
+            q (np.ndarray): Lower tail probabilities.
         Returns:
-            float: The value at which the cumulative distribution function is equal to q.
+            np.ndarray: The values at which the cumulative distribution function is equal to q.
         """
-        if not (0 <= q <= 1):
+        if np.any((q < 0) | (q > 1)):
             raise ValueError("Quantile (q) must be between 0 and 1 inclusive.")
-        return norm.ppf(q, loc=self.mu, scale=self.sigma)
+        # Clip quantiles to avoid infinity at 0 and 1
+        q_clipped = np.clip(q, 0.0001, 0.9999)
+        return norm.ppf(q_clipped, loc=self.mu, scale=self.sigma)

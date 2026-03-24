@@ -1,0 +1,43 @@
+Missing: Slot assignment logic
+Neither file contains any code that assigns slot (batting order position 1–9) to batters or assigns slot 10 to the opposing pitcher. This is the most important piece for copula correctness. You'll need a processing step that:
+
+Joins batting game logs with the batting order for that game to get each batter's slot
+Identifies the starting pitcher for each team in each game
+For each (game_id, team_id) observation, assigns that team's opponent's starting pitcher to slot 10
+
+Until this exists, the copula construction pipeline is incomplete regardless of how correct build_copula.py is.
+
+Bug: IP conversion assumes Chadwick outputs fractional notation, but it likely outputs outs
+The comment in the code even flags this uncertainty:
+python# IP (Innings Pitched - Note: Chadwick might output this as outs or 12.1 style)
+Chadwick's cwevent and cwgame tools typically output innings pitched as a count of outs recorded, not as the 12.1 fractional string notation. If Chadwick gives you 37 (meaning 37 outs = 12.1 IP), your convert_ip function will just cast it to float(37) and you'll be feeding 37.0 innings into calculate_pitcher_points, which will wildly inflate pitcher scores. You should verify what Chadwick actually outputs for a known game and handle accordingly. The fix if it's outs:
+pythondf['IP_dec'] = df['IP_outs'] / 3.0
+
+Bug: process_batting_stats uses apply row-wise, which is slow and unnecessary
+This is a performance issue rather than a correctness issue, but with the volume of Retrosheet data (millions of rows across many seasons) it matters. The scoring calculation should be vectorized:
+pythondf['dk_points'] = (
+    df['1B'] * 3 +
+    df['D'] * 5 +
+    df['T'] * 8 +
+    df['HR'] * 10 +
+    df['RBI'] * 3.5 +
+    df['R'] * 3.2 +
+    df['BB'] * 3 +
+    df['HBP'] * 3 +
+    df['SB'] * 6
+)
+The same applies to process_pitching_stats. Row-wise apply with a function call per row is 10–50x slower than vectorized column arithmetic on a DataFrame this size.
+
+Moderate: No handling for relief pitchers
+The copula's slot 10 should be the starting pitcher only. If your pitching data includes all pitchers who appeared in a game, you need to filter to starters before assigning slot 10. Otherwise a game where the starter got knocked out in the second inning might have a reliever's stats in slot 10, which captures a completely different performance distribution and corrupts the dependence structure. Add an explicit is_starter filter based on batting order appearance or innings threshold before the slot assignment step.
+
+Minor: HBP vs HB column name inconsistency
+In process_batting_stats the hit-by-pitch column is called HBP, but in process_pitching_stats it's called HB. Make sure these match whatever Chadwick actually outputs and are consistent across your pipeline — a silent column-not-found will produce zeros rather than an error if you're not careful.
+
+Summary of priority actions:
+
+Build the slot assignment step — this is the missing piece that determines copula correctness
+Verify Chadwick's IP output format and fix the conversion accordingly
+Add a starter filter before assigning slot 10
+Vectorize the scoring calculations
+Standardize HBP/HB naming

@@ -1,0 +1,121 @@
+MLB Classic
+In salary cap contests, participants will create a lineup by selecting players listed in the Player Pool. Each player listed has an assigned salary and a valid lineup must not exceed the salary cap of $50,000.
+
+Contest results will be determined by the total points accumulated by each individual lineup entry (scoring rules summarized below).
+
+Participation in each contest must be made only as specified in the Terms of Use. Failure to comply with these Terms of Use will result in disqualification and, if applicable, prize forfeiture.
+
+Scoring
+Hitters
+
+Single
+
++3 Pts
+
+Double
+
++5 Pts
+
+Triple
+
++8 Pts
+
+Home Run
+
++10 Pts
+
+Run Batted In
+
++2 Pts
+
+Run
+
++2 Pts
+
+Base on Balls
+
++2 Pts
+
+Hit By Pitch
+
++2 Pts
+
+Stolen Base
+
++5 Pts
+
+Pitchers
+
+Inning Pitched
+
++2.25 Pts (+0.75 Pts / Out)
+
+Strikeout
+
++2 Pts
+
+Win
+
++4 Pts
+
+Earned Run Allowed
+
+-2 Pts
+
+Hit Against
+
+-0.6 Pts
+
+Base on Balls Against
+
+-0.6 Pts
+
+Hit Batsman
+
+-0.6 Pts
+
+Complete Game
+
++2.5 Pts
+
+Complete Game Shutout
+
++2.5 Pts
+
+No Hitter
+
++5 Pts
+
+Scoring Notes
+Hitting statistics for Pitchers will not be counted, and Pitching statistics for Hitters will not be counted.
+Lineup Requirements
+Lineups will consist of 10 players and must include players scheduled to play in at least 2 different MLB games. Lineups must have no more than 5 hitters from any one team. The 10 roster positions are:
+
+2
+
+P
+
+1
+
+C
+
+1
+
+1B
+
+1
+
+2B
+
+1
+
+3B
+
+1
+
+SS
+
+3
+
+OF
+

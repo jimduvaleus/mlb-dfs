@@ -1,6 +1,12 @@
 import pandas as pd
 import numpy as np
-from src.utils.scoring import calculate_batter_points, calculate_pitcher_points
+from src.utils.scoring import (
+    BATTER_SINGLE, BATTER_DOUBLE, BATTER_TRIPLE, BATTER_HOME_RUN,
+    BATTER_RBI, BATTER_RUN, BATTER_WALK, BATTER_HBP, BATTER_SB,
+    PITCHER_WIN, PITCHER_ER, PITCHER_SO, PITCHER_IP,
+    PITCHER_H, PITCHER_BB, PITCHER_HB, PITCHER_CG, PITCHER_CGS, PITCHER_NH,
+)
+
 
 class RetrosheetParser:
     """
@@ -11,10 +17,8 @@ class RetrosheetParser:
     def process_batting_stats(df: pd.DataFrame) -> pd.DataFrame:
         """
         Process batting statistics and calculate DraftKings points.
-        
+
         Expected columns in df:
-        - player_id
-        - game_id
         - H (Hits)
         - D (Doubles)
         - T (Triples)
@@ -22,65 +26,60 @@ class RetrosheetParser:
         - RBI (Runs Batted In)
         - R (Runs Scored)
         - BB (Walks)
-        - HBP (Hit By Pitch)
+        - HBP (Hit By Pitch — batting stat)
         - SB (Stolen Bases)
         """
-        # Calculate Singles (H - D - T - HR)
+        df = df.copy()
         df['1B'] = df['H'] - df['D'] - df['T'] - df['HR']
-        
-        # Calculate DK points
-        df['dk_points'] = df.apply(
-            lambda row: calculate_batter_points(
-                single=row['1B'],
-                double=row['D'],
-                triple=row['T'],
-                hr=row['HR'],
-                rbi=row['RBI'],
-                run=row['R'],
-                walk=row['BB'],
-                hbp=row['HBP'],
-                sb=row['SB']
-            ),
-            axis=1
+        df['dk_points'] = (
+            df['1B'] * BATTER_SINGLE +
+            df['D'] * BATTER_DOUBLE +
+            df['T'] * BATTER_TRIPLE +
+            df['HR'] * BATTER_HOME_RUN +
+            df['RBI'] * BATTER_RBI +
+            df['R'] * BATTER_RUN +
+            df['BB'] * BATTER_WALK +
+            df['HBP'] * BATTER_HBP +
+            df['SB'] * BATTER_SB
         )
         return df
 
     @staticmethod
-    def process_pitching_stats(df: pd.DataFrame) -> pd.DataFrame:
+    def process_pitching_stats(df: pd.DataFrame, starters_only: bool = True) -> pd.DataFrame:
         """
         Process pitching statistics and calculate DraftKings points.
-        
+
         Expected columns in df:
-        - player_id
-        - game_id
+        - GS (Games Started: 1 if starter, 0 otherwise)
         - W (Win: 1 or 0)
-        - IP (Innings Pitched - Note: Chadwick might output this as outs or 12.1 style)
+        - IP (Innings Pitched as outs recorded — Chadwick cwbox outputs outs)
         - ER (Earned Runs)
         - K (Strikeouts)
         - H (Hits Against)
         - BB (Walks Against)
-        - HB (Hit Batters)
-        """
-        # Convert IP to decimal if it's in 12.1/12.2 format
-        def convert_ip(ip):
-            if isinstance(ip, str) and '.' in ip:
-                parts = ip.split('.')
-                return float(parts[0]) + (float(parts[1]) / 3.0)
-            return float(ip)
+        - HB (Hit Batters — pitching stat)
+        - CG (Complete Game: 1 or 0)
 
-        df['IP_dec'] = df['IP'].apply(convert_ip)
-        
-        # Calculate DK points
-        df['dk_points'] = df.apply(
-            lambda row: calculate_pitcher_points(
-                win=row['W'],
-                er=row['ER'],
-                so=row['K'],
-                ip=row['IP_dec'],
-                h=row['H'],
-                bb=row['BB'],
-                hb=row['HB']
-            ),
-            axis=1
+        Args:
+            starters_only: If True, filter to rows where GS == 1 before scoring.
+        """
+        df = df.copy()
+
+        if starters_only:
+            df = df[df['GS'] == 1].reset_index(drop=True)
+
+        # Chadwick cwbox outputs IP as total outs recorded (e.g. 37 outs = 12.1 innings).
+        # Convert to decimal innings.
+        df['IP_dec'] = df['IP'] / 3.0
+
+        df['dk_points'] = (
+            df['W'] * PITCHER_WIN +
+            df['ER'] * PITCHER_ER +
+            df['SO'] * PITCHER_SO +
+            df['IP_dec'] * PITCHER_IP +
+            df['H'] * PITCHER_H +
+            df['BB'] * PITCHER_BB +
+            df['HB'] * PITCHER_HB +
+            df['CG'] * PITCHER_CG
         )
         return df

@@ -126,24 +126,39 @@ def test_retrosheet_parser_process_batting_stats():
     assert processed_df.loc[1, 'dk_points'] == 5.0
 
 def test_retrosheet_parser_process_pitching_stats():
+    # IP is supplied as outs recorded (Chadwick cwbox output format).
+    # 21 outs = 7.0 IP, 16 outs = 5.1 IP (5 + 1/3 innings = 16/3 decimal).
     data = {
         'player_id': [1, 2],
         'game_id': ['GID1', 'GID1'],
-        'W': [1, 0], 'IP': ["7.0", "5.1"], 'ER': [1, 2], 'K': [8, 3],
-        'H': [5, 7], 'BB': [1, 2], 'HB': [0, 1]
+        'GS': [1, 1],
+        'W': [1, 0], 'IP': [21, 16], 'ER': [1, 2], 'SO': [8, 3],
+        'H': [5, 7], 'BB': [1, 2], 'HB': [0, 1], 'CG': [0, 0],
     }
     df = pd.DataFrame(data)
-    processed_df = RetrosheetParser.process_pitching_stats(df)
+    processed_df = RetrosheetParser.process_pitching_stats(df, starters_only=False)
 
-    # Player 1: 1W, 1ER, 8K, 7IP, 5H, 1BB, 0HB
-    # Points: (1*4) + (1*-2) + (8*2) + (7*2.25) + (5*-0.6) + (1*-0.6) + (0*-0.6) = 4 - 2 + 16 + 15.75 - 3 - 0.6 = 30.15
-    assert processed_df.loc[0, 'dk_points'] == 30.15
+    # Player 1: 1W, 1ER, 8K, 21 outs (7.0 IP), 5H, 1BB, 0HB, 0CG
+    # (1*4) + (1*-2) + (8*2) + (7.0*2.25) + (5*-0.6) + (1*-0.6) + 0 + 0 = 30.15
+    assert processed_df.loc[0, 'dk_points'] == pytest.approx(30.15)
 
-    # Player 2: 0W, 2ER, 3K, 5.1IP (5 + 1/3 = 5.333), 7H, 2BB, 1HB
-    # Points: (0*4) + (2*-2) + (3*2) + (5.333333*2.25) + (7*-0.6) + (2*-0.6) + (1*-0.6) = 0 - 4 + 6 + 12 - 4.2 - 1.2 - 0.6 = 8
-    # Note: Using approximate value for 5.333333*2.25 = 12
-    # Recalculating precisely:
-    # 5.1 IP -> 5 + 1/3 innings = 5.333333...
-    # (5 + 1/3) * 2.25 = (16/3) * (9/4) = (4*3) = 12
+    # Player 2: 0W, 2ER, 3K, 16 outs (16/3 = 5.333... IP), 7H, 2BB, 1HB, 0CG
+    # (0*4) + (2*-2) + (3*2) + ((16/3)*2.25) + (7*-0.6) + (2*-0.6) + (1*-0.6) + 0 = 8.0
     expected_p2_points = (0*4) + (2*-2) + (3*2) + ((16/3)*2.25) + (7*-0.6) + (2*-0.6) + (1*-0.6)
-    assert processed_df.loc[1, 'dk_points'] == expected_p2_points
+    assert processed_df.loc[1, 'dk_points'] == pytest.approx(expected_p2_points)
+
+
+def test_retrosheet_parser_process_pitching_stats_starters_only():
+    # When starters_only=True (the default), only rows with GS == 1 are kept.
+    data = {
+        'player_id': [1, 2, 3],
+        'game_id': ['GID1', 'GID1', 'GID1'],
+        'GS': [1, 0, 1],  # player 2 is a reliever
+        'W': [1, 0, 0], 'IP': [21, 3, 15], 'ER': [1, 1, 2], 'SO': [8, 1, 5],
+        'H': [5, 2, 6], 'BB': [1, 1, 2], 'HB': [0, 0, 0], 'CG': [0, 0, 0],
+    }
+    df = pd.DataFrame(data)
+    processed_df = RetrosheetParser.process_pitching_stats(df, starters_only=True)
+
+    assert len(processed_df) == 2
+    assert set(processed_df['player_id'].tolist()) == {1, 3}
