@@ -321,15 +321,13 @@ class BasinHoppingOptimizer:
             n_steps=self.n_steps,
         )
 
-    def optimize(self) -> Tuple[Lineup, float]:
-        """Run all chains and return the best (Lineup, score) found."""
+    def _run_chains(self) -> List[Tuple[Lineup, float]]:
+        """Run all chains and return a (Lineup, score) pair for each."""
         seeds = [
             (self.rng_seed + i if self.rng_seed is not None else i)
             for i in range(self.n_chains)
         ]
-
-        best_lineup: Optional[Lineup] = None
-        best_score = -1.0
+        results: List[Tuple[Lineup, float]] = []
 
         if self.n_workers > 1:
             chain_args = [
@@ -350,15 +348,46 @@ class BasinHoppingOptimizer:
                 for fut in as_completed(futures):
                     lineup, score = fut.result()
                     logger.debug("Chain completed score=%.4f", score)
-                    if score > best_score:
-                        best_score = score
-                        best_lineup = lineup
+                    results.append((lineup, score))
         else:
             for seed in seeds:
                 lineup, score = self._runner.run(seed)
                 logger.debug("Chain seed=%d score=%.4f", seed, score)
-                if score > best_score:
-                    best_score = score
-                    best_lineup = lineup
+                results.append((lineup, score))
 
-        return best_lineup, best_score
+        return results
+
+    def optimize(self) -> Tuple[Lineup, float]:
+        """Run all chains and return the best (Lineup, score) found."""
+        results = self._run_chains()
+        return max(results, key=lambda x: x[1])
+
+    def optimize_top_k(self, k: int) -> List[Tuple[Lineup, float]]:
+        """Run all chains and return the top-k distinct (Lineup, score) pairs.
+
+        Lineups are deduplicated by player set; the highest-scoring instance of
+        each distinct lineup is kept.  If fewer than ``k`` distinct lineups are
+        found across all chains, all available distinct lineups are returned.
+
+        Parameters
+        ----------
+        k : int
+            Maximum number of distinct lineups to return.
+
+        Returns
+        -------
+        List[Tuple[Lineup, float]]
+            Up to ``k`` (Lineup, score) pairs sorted best-first.
+        """
+        results = self._run_chains()
+        results.sort(key=lambda x: -x[1])
+        seen: set = set()
+        top_k: List[Tuple[Lineup, float]] = []
+        for lineup, score in results:
+            key = frozenset(lineup.player_ids)
+            if key not in seen:
+                seen.add(key)
+                top_k.append((lineup, score))
+            if len(top_k) == k:
+                break
+        return top_k
