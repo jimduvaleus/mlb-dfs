@@ -1,0 +1,43 @@
+# MLB DFS Portfolio Optimizer — configuration template
+# Copy to config.yaml and edit before running:
+#   cp config.yaml.example config.yaml
+#   python main.py config.yaml
+
+paths:
+  # Required: DraftKings salary CSV downloaded for the target slate.
+  dk_slate: "data/raw/DKSalaries.csv"
+
+  # Required: Pre-built empirical copula.
+  # Run once:  python scripts/build_copula.py
+  copula: "data/processed/empirical_copula.parquet"
+
+  # Optional (Phase 4+): Batter mixture model artifacts.
+  # Run once:  python scripts/fit_batter_pca.py --min-games 30
+  # Set both to null to fall back to Gaussian marginals for batters.
+  batter_pca_model: "data/processed/batter_pca_model.npz"
+  batter_score_grid: "data/processed/batter_score_grid.npy"
+
+  # Optional: Supplemental projections CSV.
+  # Expected columns: player_id, mean, std_dev  (or mu / sigma).
+  # If omitted, mean = salary / 400 and std_dev = mean * 0.4 are used.
+  projections: null
+
+  # Directory where portfolio.csv will be written.
+  output_dir: "outputs"
+
+simulation:
+  n_sims: 10000   # Number of Monte Carlo iterations
+
+optimizer:
+  n_chains: 250       # Independent Basin-Hopping chains per lineup round
+  temperature: 0.1    # Metropolis acceptance temperature
+  n_steps: 100        # Perturbation steps per chain
+  n_workers: 1        # Worker processes (>1 enables parallel chains)
+  rng_seed: null      # Integer seed for reproducibility; null = random
+
+portfolio:
+  size: 20            # Number of lineups to construct
+  # GPP score threshold.  Optimizer maximises P(lineup_total >= target).
+  # Set to null to auto-compute as the 80th-percentile total of the
+  # highest-projected valid lineup across all simulation rows.
+  target_score: null

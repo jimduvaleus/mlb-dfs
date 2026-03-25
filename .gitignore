@@ -12,3 +12,5 @@ data/processed/historical_logs.parquet
 data/processed/empirical_copula.parquet
 data/processed/batter_pca_model.npz
 data/processed/batter_score_grid.npy
+data/raw/DKSalaries.csv
+data/processed/projections.csv
