@@ -108,6 +108,8 @@ def test_calculate_pitcher_points():
     assert points == expected_points # 4 - 2 + 10 + 13.5 - 2.4 - 0.6 = 22.5
 
 def test_retrosheet_parser_process_batting_stats():
+    # Column names match cwdaily output after _prep_batting_df renaming.
+    # H=hits, D=doubles, T=triples, HR=home runs, RBI, R=runs, BB=walks, HBP, SB
     data = {
         'player_id': [1, 2],
         'game_id': ['GID1', 'GID1'],
@@ -118,16 +120,16 @@ def test_retrosheet_parser_process_batting_stats():
     processed_df = RetrosheetParser.process_batting_stats(df)
 
     # Player 1: 1B (2-1-0-1=0), 1D, 0T, 1HR, 2RBI, 1R, 1BB, 0HBP, 1SB
-    # Points: (0*3) + (1*5) + (0*8) + (1*10) + (2*2) + (1*2) + (1*2) + (0*2) + (1*5) = 0 + 5 + 0 + 10 + 4 + 2 + 2 + 0 + 5 = 28
+    # Points: (0*3) + (1*5) + (0*8) + (1*10) + (2*2) + (1*2) + (1*2) + (0*2) + (1*5) = 28
     assert processed_df.loc[0, 'dk_points'] == 28.0
 
     # Player 2: 1B (1-0-0-0=1), 0D, 0T, 0HR, 0RBI, 1R, 0BB, 0HBP, 0SB
-    # Points: (1*3) + (0*5) + (0*8) + (0*10) + (0*2) + (1*2) + (0*2) + (0*2) + (0*5) = 3 + 0 + 0 + 0 + 0 + 2 + 0 + 0 + 0 = 5
+    # Points: (1*3) + (1*2) = 5
     assert processed_df.loc[1, 'dk_points'] == 5.0
 
 def test_retrosheet_parser_process_pitching_stats():
-    # IP is supplied as outs recorded (Chadwick cwbox output format).
-    # 21 outs = 7.0 IP, 16 outs = 5.1 IP (5 + 1/3 innings = 16/3 decimal).
+    # IP is supplied as outs recorded (cwdaily P_OUT field).
+    # 21 outs = 7.0 IP, 16 outs = 5.333... IP
     data = {
         'player_id': [1, 2],
         'game_id': ['GID1', 'GID1'],
@@ -142,14 +144,13 @@ def test_retrosheet_parser_process_pitching_stats():
     # (1*4) + (1*-2) + (8*2) + (7.0*2.25) + (5*-0.6) + (1*-0.6) + 0 + 0 = 30.15
     assert processed_df.loc[0, 'dk_points'] == pytest.approx(30.15)
 
-    # Player 2: 0W, 2ER, 3K, 16 outs (16/3 = 5.333... IP), 7H, 2BB, 1HB, 0CG
-    # (0*4) + (2*-2) + (3*2) + ((16/3)*2.25) + (7*-0.6) + (2*-0.6) + (1*-0.6) + 0 = 8.0
+    # Player 2: 0W, 2ER, 3K, 16 outs (16/3 IP), 7H, 2BB, 1HB, 0CG
     expected_p2_points = (0*4) + (2*-2) + (3*2) + ((16/3)*2.25) + (7*-0.6) + (2*-0.6) + (1*-0.6)
     assert processed_df.loc[1, 'dk_points'] == pytest.approx(expected_p2_points)
 
 
 def test_retrosheet_parser_process_pitching_stats_starters_only():
-    # When starters_only=True (the default), only rows with GS == 1 are kept.
+    # When starters_only=True, only rows with GS == 1 are kept.
     data = {
         'player_id': [1, 2, 3],
         'game_id': ['GID1', 'GID1', 'GID1'],

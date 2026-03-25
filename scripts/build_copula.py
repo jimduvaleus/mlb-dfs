@@ -1,5 +1,4 @@
 import pandas as pd
-import numpy as np
 import os
 import argparse
 
@@ -14,33 +13,11 @@ def build_copula(input_path="data/processed/historical_logs.parquet", output_pat
     4. Save as empirical_copula.parquet.
     """
     if not os.path.exists(input_path):
-        print(f"Input file {input_path} not found. Creating sample data for demonstration.")
-        # Create dummy data for 1000 games
-        n_games = 1000
-        data = []
-        for g in range(n_games):
-            for team in [0, 1]:
-                # 9 batters
-                for slot in range(1, 10):
-                    data.append({
-                        'game_id': f"game_{g}",
-                        'team_id': f"team_{team}",
-                        'slot': slot,
-                        'dk_points': np.random.normal(8, 4) if slot < 5 else np.random.normal(5, 2)
-                    })
-                # 1 opposing pitcher
-                data.append({
-                    'game_id': f"game_{g}",
-                    'team_id': f"team_{team}",
-                    'slot': 10,
-                    'dk_points': np.random.normal(15, 8)
-                })
-        df = pd.DataFrame(data)
-        os.makedirs(os.path.dirname(input_path), exist_ok=True)
-        df.to_parquet(input_path, index=False)
-        print(f"Created sample historical logs at {input_path}")
-    else:
-        df = pd.read_parquet(input_path)
+        raise FileNotFoundError(
+            f"Input file {input_path} not found. "
+            "Run scripts/process_historical.py first to generate real historical data."
+        )
+    df = pd.read_parquet(input_path)
 
     print("Calculating quantiles...")
     # Calculate quantiles for each batter slot independently
