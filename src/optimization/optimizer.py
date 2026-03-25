@@ -176,8 +176,13 @@ class _ChainRunner:
     ) -> Tuple[Lineup, np.ndarray]:
         """One greedy pass: for each slot, accept the best single-player swap.
 
-        Uses a delta-update trick to avoid recomputing the full sum:
-            new_totals = totals - sim_matrix[:, col_out] + sim_matrix[:, col_in]
+        Batches all candidate evaluations for a given slot into a single matrix
+        operation instead of looping over candidates one at a time:
+
+            swapped[:, i] = totals - sim_matrix[:, col_out] + sim_matrix[:, col_in_i]
+
+        Candidates are then ranked by score; validity is checked in score order
+        so we stop as soon as we find the best valid swap.
         """
         ids = list(lineup.player_ids)
         lineup_set = set(ids)
@@ -188,24 +193,38 @@ class _ChainRunner:
             pos = self.player_meta[pid]['position']
             col_out = self.col_map[pid]
 
-            best_score = current_score
+            cand_ids = [c for c in self.players_by_pos[pos] if c not in lineup_set]
+            if not cand_ids:
+                continue
+
+            cand_cols = np.array([self.col_map[c] for c in cand_ids])
+
+            # (n_sims, n_cands) — one delta-updated total vector per candidate
+            col_out_scores = self.sim_matrix[:, col_out]
+            swapped = (
+                totals[:, np.newaxis]
+                - col_out_scores[:, np.newaxis]
+                + self.sim_matrix[:, cand_cols]
+            )
+            cand_scores = (swapped >= self.target).mean(axis=0)  # (n_cands,)
+
+            # Walk candidates best-first; check validity only until the first
+            # valid improvement is found (that candidate is necessarily the best).
+            order = np.argsort(-cand_scores)
             best_new_id: Optional[int] = None
             best_new_totals: Optional[np.ndarray] = None
+            best_score = current_score
 
-            for cand_id in self.players_by_pos[pos]:
-                if cand_id in lineup_set:
-                    continue
-                col_in = self.col_map[cand_id]
-                new_totals = totals - self.sim_matrix[:, col_out] + self.sim_matrix[:, col_in]
-                new_score = _score_totals(new_totals, self.target)
-                if new_score > best_score:
-                    # Validate only when we find an improvement (constraint check is cheap)
-                    test_ids = list(ids)
-                    test_ids[idx] = cand_id
-                    if Lineup(test_ids).is_valid(self.player_meta):
-                        best_score = new_score
-                        best_new_id = cand_id
-                        best_new_totals = new_totals
+            for i in order:
+                if cand_scores[i] <= best_score:
+                    break  # remaining candidates can only be worse
+                test_ids = list(ids)
+                test_ids[idx] = cand_ids[i]
+                if Lineup(test_ids).is_valid(self.player_meta):
+                    best_score = float(cand_scores[i])
+                    best_new_id = cand_ids[i]
+                    best_new_totals = swapped[:, i].copy()
+                    break  # first valid candidate in score order is the global best
 
             if best_new_id is not None:
                 ids[idx] = best_new_id
