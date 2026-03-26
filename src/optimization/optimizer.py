@@ -30,10 +30,16 @@ logger = logging.getLogger(__name__)
 def _build_player_meta(players_df: pd.DataFrame) -> PlayerMeta:
     """Convert a players DataFrame to a fast dict-based lookup."""
     has_game = 'game' in players_df.columns
+    has_eligible = 'eligible_positions' in players_df.columns
     meta: PlayerMeta = {}
     for _, row in players_df.iterrows():
+        pos = row['position']
+        elig = list(row['eligible_positions']) if has_eligible else []
+        if not elig:
+            elig = [pos]
         meta[int(row['player_id'])] = {
-            'position': row['position'],
+            'position': pos,
+            'eligible_positions': elig,
             'salary': float(row['salary']),
             'team': row['team'],
             'game': str(row['game']) if has_game else '',
@@ -200,8 +206,11 @@ class _ChainRunner:
             ok = True
             for idx in indices:
                 old_id = new_ids[idx]
-                pos = self.player_meta[old_id]['position']
-                pool = [p for p in self.players_by_pos[pos] if p not in used]
+                elig = self.player_meta[old_id]['eligible_positions']
+                pool_set: set = set()
+                for pos in elig:
+                    pool_set.update(self.players_by_pos[pos])
+                pool = [p for p in pool_set if p not in used]
                 if not pool:
                     ok = False
                     break
@@ -239,10 +248,13 @@ class _ChainRunner:
 
         for idx in rng.permutation(len(ids)).tolist():
             pid = ids[idx]
-            pos = self.player_meta[pid]['position']
+            elig = self.player_meta[pid]['eligible_positions']
             col_out = self.col_map[pid]
 
-            cand_ids = [c for c in self.players_by_pos[pos] if c not in lineup_set]
+            cand_set: set = set()
+            for pos in elig:
+                cand_set.update(self.players_by_pos[pos])
+            cand_ids = [c for c in cand_set if c not in lineup_set]
             if not cand_ids:
                 continue
 
@@ -370,9 +382,9 @@ class BasinHoppingOptimizer:
             pos: [] for pos in ROSTER_REQUIREMENTS
         }
         for pid, meta in self.player_meta.items():
-            pos = meta['position']
-            if pos in self._players_by_pos:
-                self._players_by_pos[pos].append(pid)
+            for pos in meta['eligible_positions']:
+                if pos in self._players_by_pos:
+                    self._players_by_pos[pos].append(pid)
 
         self._runner = _ChainRunner(
             sim_matrix=self.sim_matrix,

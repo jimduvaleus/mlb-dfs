@@ -11,8 +11,13 @@ SALARY_CAP: float = 50_000.0
 MAX_HITTERS_PER_TEAM: int = 5
 MIN_GAMES: int = 2
 
-# Type alias: player_id -> {position, salary, team, game}
+# Type alias: player_id -> {position, eligible_positions, salary, team, game}
 PlayerMeta = Dict[int, Dict]
+
+# Expanded slot list matching ROSTER_REQUIREMENTS; built once at import time.
+SLOTS: List[str] = []
+for _pos, _cnt in ROSTER_REQUIREMENTS.items():
+    SLOTS.extend([_pos] * _cnt)
 
 
 @dataclass
@@ -45,14 +50,34 @@ class Lineup:
         if len(rows) != 10:
             return False
 
-        # Position counts must match roster requirements exactly
-        pos_counts: Dict[str, int] = {}
-        for r in rows:
-            pos = r['position']
-            pos_counts[pos] = pos_counts.get(pos, 0) + 1
-        for pos, req in ROSTER_REQUIREMENTS.items():
-            if pos_counts.get(pos, 0) != req:
-                return False
+        # Verify a valid slot assignment exists via bipartite matching.
+        # Each player can fill any slot whose position label is in their
+        # eligible_positions list (falls back to [position] if absent).
+        rows_list = list(rows)
+
+        def _elig(r: Dict) -> set:
+            ep = r.get('eligible_positions')
+            return set(ep) if ep else {r['position']}
+
+        match_slot = [-1] * len(SLOTS)
+
+        def _try_assign(player_idx: int, elig: set, visited: set) -> bool:
+            for j, slot_pos in enumerate(SLOTS):
+                if slot_pos in elig and j not in visited:
+                    visited.add(j)
+                    if match_slot[j] == -1 or _try_assign(
+                        match_slot[j], _elig(rows_list[match_slot[j]]), visited
+                    ):
+                        match_slot[j] = player_idx
+                        return True
+            return False
+
+        matched = sum(
+            1 for i, row in enumerate(rows_list)
+            if _try_assign(i, _elig(row), set())
+        )
+        if matched != 10:
+            return False
 
         # Salary bounds
         total_salary = sum(r['salary'] for r in rows)

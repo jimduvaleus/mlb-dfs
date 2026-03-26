@@ -1,5 +1,5 @@
 import pandas as pd
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List
 
 @dataclass
@@ -7,9 +7,10 @@ class Player:
     player_id: int
     name: str
     position: str
-    salary: float
-    team: str
-    roster_position: str
+    eligible_positions: List[str] = field(default_factory=list)
+    salary: float = 0.0
+    team: str = ""
+    roster_position: str = ""
     game: str = ""
 
 
@@ -38,15 +39,22 @@ class DraftKingsSlateIngestor:
         if df['salary'].isnull().any():
             raise ValueError("Missing or invalid salaries found in CSV.")
 
-        # Normalize positions: take primary position from multi-eligible
-        # strings (e.g. "1B/2B" → "1B") and map DK-specific labels.
+        # Parse all eligible positions, mapping DK-specific labels.
         position_map = {'SP': 'P', 'RP': 'P'}
-        df['position'] = (
-            df['position']
-            .str.split('/')
-            .str[0]
-            .replace(position_map)
-        )
+
+        def _parse_positions(raw: str) -> List[str]:
+            tokens = str(raw).strip().split('/')
+            mapped = [position_map.get(t, t) for t in tokens]
+            seen: set = set()
+            result: List[str] = []
+            for t in mapped:
+                if t not in seen:
+                    seen.add(t)
+                    result.append(t)
+            return result
+
+        df['eligible_positions'] = df['position'].apply(_parse_positions)
+        df['position'] = df['eligible_positions'].str[0]
 
         # Basic validation for positions
         valid_positions = {'P', 'C', '1B', '2B', '3B', 'SS', 'OF'}
@@ -64,7 +72,7 @@ class DraftKingsSlateIngestor:
         else:
             df['game'] = ""
 
-        return df[['player_id', 'name', 'position', 'roster_position', 'salary', 'team', 'game']]
+        return df[['player_id', 'name', 'position', 'eligible_positions', 'roster_position', 'salary', 'team', 'game']]
 
     def get_players(self) -> List[Player]:
         players = []
@@ -73,6 +81,7 @@ class DraftKingsSlateIngestor:
                 player_id=row['player_id'],
                 name=row['name'],
                 position=row['position'],
+                eligible_positions=row['eligible_positions'],
                 salary=row['salary'],
                 team=row['team'],
                 roster_position=row['roster_position'],

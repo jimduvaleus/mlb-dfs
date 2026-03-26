@@ -149,6 +149,55 @@ def test_retrosheet_parser_process_pitching_stats():
     assert processed_df.loc[1, 'dk_points'] == pytest.approx(expected_p2_points)
 
 
+@pytest.fixture
+def sample_dk_csv_multi_pos(tmp_path):
+    csv_content = """ID,Name,Roster Position,Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame,"Name + ID",Tier,Player and position,Starter?,PPR
+10020,Bo Bichette,3B/SS,3B/SS,6500,"TOR @ NYY 04/01/2026 07:05PM ET",TOR,8.2,"Bo Bichette (10020)",,
+10021,Jazz Chisholm,2B/OF,2B/OF,7000,"NYM @ PHI 04/01/2026 07:10PM ET",NYM,9.1,"Jazz Chisholm (10021)",,
+10022,Nathan Eovaldi,SP/RP,SP/RP,8000,"TOR @ NYY 04/01/2026 07:05PM ET",NYY,14.5,"Nathan Eovaldi (10022)",,
+"""
+    f = tmp_path / "multi_pos.csv"
+    f.write_text(csv_content)
+    return str(f)
+
+
+def test_eligible_positions_preserved(sample_dk_csv_multi_pos):
+    df = DraftKingsSlateIngestor(sample_dk_csv_multi_pos).get_slate_dataframe()
+    bichette = df[df['name'] == 'Bo Bichette'].iloc[0]
+    assert bichette['eligible_positions'] == ['3B', 'SS']
+    chisholm = df[df['name'] == 'Jazz Chisholm'].iloc[0]
+    assert chisholm['eligible_positions'] == ['2B', 'OF']
+
+
+def test_primary_position_is_first_token(sample_dk_csv_multi_pos):
+    df = DraftKingsSlateIngestor(sample_dk_csv_multi_pos).get_slate_dataframe()
+    assert df[df['name'] == 'Bo Bichette'].iloc[0]['position'] == '3B'
+    assert df[df['name'] == 'Jazz Chisholm'].iloc[0]['position'] == '2B'
+
+
+def test_sp_rp_deduplicated_to_p(sample_dk_csv_multi_pos):
+    df = DraftKingsSlateIngestor(sample_dk_csv_multi_pos).get_slate_dataframe()
+    eovaldi = df[df['name'] == 'Nathan Eovaldi'].iloc[0]
+    assert eovaldi['position'] == 'P'
+    assert eovaldi['eligible_positions'] == ['P']
+
+
+def test_player_object_has_eligible_positions(sample_dk_csv_multi_pos):
+    players = DraftKingsSlateIngestor(sample_dk_csv_multi_pos).get_players()
+    bichette = next(p for p in players if p.name == 'Bo Bichette')
+    assert bichette.eligible_positions == ['3B', 'SS']
+
+
+def test_validation_rejects_unknown_primary(tmp_path):
+    csv_content = """ID,Name,Roster Position,Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame,"Name + ID",Tier,Player and position,Starter?,PPR
+10030,DH Player,DH,DH/OF,5000,"A @ B 04/01/2026 07:05PM ET",A,5.0,"DH Player (10030)",,
+"""
+    f = tmp_path / "dh.csv"
+    f.write_text(csv_content)
+    with pytest.raises(ValueError, match="Unexpected position strings found in CSV."):
+        DraftKingsSlateIngestor(str(f))
+
+
 def test_retrosheet_parser_process_pitching_stats_starters_only():
     # When starters_only=True, only rows with GS == 1 are kept.
     data = {

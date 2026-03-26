@@ -350,3 +350,136 @@ def test_optimize_floor_disabled_unchanged(sim_results, players_df):
     l2, s2 = opt_none.optimize()
     assert s1 == pytest.approx(s2)
     assert sorted(l1.player_ids) == sorted(l2.player_ids)
+
+
+# ------------------------------------------------------------------ #
+#  Multi-position eligibility                                          #
+# ------------------------------------------------------------------ #
+
+def test_build_player_meta_stores_eligible_positions():
+    rows = [_make_player(1, '3B', 4000, 'A')]
+    df = pd.DataFrame(rows)
+    df['eligible_positions'] = [['3B', 'SS']]
+    meta = _build_player_meta(df)
+    assert meta[1]['eligible_positions'] == ['3B', 'SS']
+    assert meta[1]['position'] == '3B'
+
+
+def test_build_player_meta_falls_back_without_column():
+    rows = [_make_player(1, 'SS', 4000, 'A')]
+    df = pd.DataFrame(rows)
+    # No eligible_positions column — should fall back to [position]
+    meta = _build_player_meta(df)
+    assert meta[1]['eligible_positions'] == ['SS']
+
+
+def test_players_by_pos_multi_eligible(sim_results, players_df):
+    # Add a 3B/SS player to the slate and simulation results
+    extra_row = _make_player(99, '3B', 4000, 'A', 'A@B')
+    extra_df = pd.concat([players_df, pd.DataFrame([extra_row])], ignore_index=True)
+    extra_df['eligible_positions'] = extra_df['position'].apply(lambda p: [p])
+    # Give player 99 dual eligibility
+    extra_df.loc[extra_df['player_id'] == 99, 'eligible_positions'] = \
+        extra_df.loc[extra_df['player_id'] == 99, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
+
+    pids = extra_df['player_id'].tolist()
+    rng = np.random.default_rng(0)
+    matrix = rng.uniform(0, 40, size=(500, len(pids))).astype(np.float64)
+    results = SimulationResults(player_ids=pids, results_matrix=matrix)
+
+    opt = BasinHoppingOptimizer(sim_results=results, players_df=extra_df, target=100.0)
+    assert 99 in opt._players_by_pos['3B']
+    assert 99 in opt._players_by_pos['SS']
+
+
+def test_is_valid_multipos_assignment_required():
+    # Lineup with no pure SS: player 20 is 3B/SS and must fill SS for the
+    # lineup to be valid; player 21 fills 3B.
+    positions = ['P', 'P', 'C', '1B', '2B', 'OF', 'OF', 'OF']
+    meta = {
+        i + 1: {'position': positions[i], 'eligible_positions': [positions[i]],
+                'salary': 4000.0, 'team': f'T{i}', 'game': 'A@B' if i < 5 else 'C@D'}
+        for i in range(len(positions))
+    }
+    # Player 20: primary 3B, also eligible SS
+    meta[20] = {'position': '3B', 'eligible_positions': ['3B', 'SS'],
+                'salary': 4000.0, 'team': 'T8', 'game': 'A@B'}
+    # Player 21: pure 3B
+    meta[21] = {'position': '3B', 'eligible_positions': ['3B'],
+                'salary': 4000.0, 'team': 'T9', 'game': 'C@D'}
+
+    # Lineup: standard 8 + player 20 (fills SS) + player 21 (fills 3B)
+    ids = list(range(1, 9)) + [20, 21]
+    assert Lineup(ids).is_valid(meta)
+
+
+def test_is_valid_rejects_impossible_assignment():
+    # Two 3B/SS players and no pure 3B or pure SS → can only fill one of each
+    # but we have two 3B/SS players and need exactly one 3B + one SS.
+    # That's actually fine (one fills 3B, other fills SS).
+    # Make it impossible: three 3B/SS players competing for one 3B + one SS slot.
+    positions = ['P', 'P', 'C', '1B', '2B', 'OF', 'OF', 'OF']
+    meta = {
+        i + 1: {'position': positions[i], 'eligible_positions': [positions[i]],
+                'salary': 4000.0, 'team': f'T{i}', 'game': 'A@B' if i < 5 else 'C@D'}
+        for i in range(len(positions))
+    }
+    # Players 20, 21, 22 all only eligible for 3B/SS — but we need exactly 1 3B + 1 SS
+    # and have 3 candidates for those 2 slots: one will be left unmatched,
+    # meaning the lineup has 10 players but only 9 can be assigned → invalid.
+    for pid, game in [(20, 'A@B'), (21, 'C@D'), (22, 'A@B')]:
+        meta[pid] = {'position': '3B', 'eligible_positions': ['3B', 'SS'],
+                     'salary': 4000.0, 'team': f'TX{pid}', 'game': game}
+
+    ids = list(range(1, 9)) + [20, 21, 22]  # 11 players → fails size check first
+    assert not Lineup(ids).is_valid(meta)
+
+    # Correct size but impossible: replace one of the 8 standard players with a third 3B/SS
+    # so we have 2 "pure" slots occupied by 3B/SS players but still need the 8th standard slot
+    # The cleaner impossible case: swap out an OF for a third 3B/SS player
+    ids_10 = list(range(1, 8)) + [20, 21, 22]  # 10 players: positions P,P,C,1B,2B,OF,OF + 3x(3B/SS)
+    # slots needed: 3B×1 + SS×1 but only 2 can be filled by the three 3B/SS players
+    # (one is left out) — wait, 3 players for 2 slots is fine (2 get matched).
+    # The real impossibility: we have positions P,P,C,1B,2B,OF,OF,3B/SS,3B/SS,3B/SS
+    # ROSTER needs: P×2,C×1,1B×1,2B×1,3B×1,SS×1,OF×3 — we have 3B/SS covering 3B+SS,
+    # but only 2 OF players for 3 OF slots → impossible.
+    assert not Lineup(ids_10).is_valid(meta)
+
+
+def test_optimize_multi_pos_slate():
+    """Slate where the only valid lineup requires a 3B/SS player to fill SS."""
+    rng = np.random.default_rng(7)
+    rows = [
+        _make_player(1,  'P',  8000, 'B', 'A@B'),
+        _make_player(2,  'P',  7500, 'D', 'C@D'),
+        _make_player(3,  'C',  4000, 'A', 'A@B'),
+        _make_player(4,  '1B', 4000, 'A', 'A@B'),
+        _make_player(5,  '2B', 4000, 'A', 'A@B'),
+        _make_player(6,  '3B', 4000, 'C', 'C@D'),
+        # No pure SS — player 7 is 3B/SS and must fill SS
+        _make_player(7,  '3B', 4000, 'A', 'A@B'),
+        _make_player(8,  'OF', 4000, 'A', 'A@B'),
+        _make_player(9,  'OF', 4000, 'C', 'C@D'),
+        _make_player(10, 'OF', 4000, 'D', 'C@D'),
+    ]
+    df = pd.DataFrame(rows)
+    df['eligible_positions'] = df['position'].apply(lambda p: [p])
+    df.loc[df['player_id'] == 7, 'eligible_positions'] = \
+        df.loc[df['player_id'] == 7, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
+
+    pids = df['player_id'].tolist()
+    matrix = rng.uniform(0, 40, size=(500, len(pids))).astype(np.float64)
+    results = SimulationResults(player_ids=pids, results_matrix=matrix)
+
+    opt = BasinHoppingOptimizer(
+        sim_results=results,
+        players_df=df,
+        target=100.0,
+        n_chains=5,
+        n_steps=20,
+        rng_seed=0,
+    )
+    lineup, _ = opt.optimize()
+    meta = _build_player_meta(df)
+    assert lineup.is_valid(meta)
+    assert 7 in lineup.player_ids  # the 3B/SS player must be in the lineup
