@@ -67,7 +67,7 @@ _sim   = _CFG.get("simulation", {})
 # Scenarios: every (n_sims, target_percentile) combination to benchmark.
 SCENARIOS = [
     (n_sims, pct)
-    for n_sims in [5_000, 10_000, 25_000, 50_000]
+    for n_sims in [5_000, 10_000, 15_000, 20_000]
     for pct in [80, 85, 90, 95, 99]
 ]
 
