@@ -162,7 +162,7 @@ def build_players_df(slate_df, proj_df=None):
             df.loc[has_slot, "slot"] = df.loc[has_slot, "lineup_slot"].astype(int)
     else:
         df["mean"] = df["salary"] / 400.0
-        df["std_dev"] = df["mean"] * 0.4
+        df["std_dev"] = df["mean"] * 0.85
     return df[["player_id", "team", "opponent", "slot", "mean", "std_dev", "position", "salary", "game"]]
 
 

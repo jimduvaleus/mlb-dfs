@@ -62,18 +62,28 @@ HEADERS = {
 }
 
 # std_dev heuristic: no source provides this, so we estimate as a fraction of
-# the projected mean.  Ratios derived from historical DK score distributions
-# in our batter_pca_model (σ/μ ≈ 0.75 for batters; pitchers are more bimodal).
+# the projected mean.  Ratios derived from historical DK score distributions:
+#
+# Batters: empirical σ/μ clusters 0.80–0.85 for above-average projected starters
+#   and rises toward 1.08 for below-average hitters (zero-inflation effect).
+#   0.85 is a calibrated central estimate for the DK starter pool.
+#   The BatterMixtureMarginal handles zero-inflation at runtime when the PCA
+#   model is available; std_dev here seeds that projection.
+#
+# Pitchers: empirical σ/μ is 0.47–0.61 for elite starters and 0.75–0.84 for
+#   average ones.  DK slates skew toward quality arms so 0.60 is appropriate.
+#   Pitcher distributions are approximately Gaussian (no zero-inflation spike);
+#   negative DK scores are possible (bad starts) but uncommon for projected SPs.
 STD_DEV_RATIO: dict[str, float] = {
-    "P":  0.45,
-    "C":  0.55,
-    "1B": 0.55,
-    "2B": 0.55,
-    "3B": 0.55,
-    "SS": 0.55,
-    "OF": 0.55,
+    "P":  0.60,
+    "C":  0.85,
+    "1B": 0.85,
+    "2B": 0.85,
+    "3B": 0.85,
+    "SS": 0.85,
+    "OF": 0.85,
 }
-DEFAULT_STD_DEV_RATIO = 0.55
+DEFAULT_STD_DEV_RATIO = 0.85
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)

@@ -73,7 +73,7 @@ def build_players_df(
     Derives ``opponent`` from the game string and assigns batting-order ``slot``
     values (1-9 for batters cycling within each team-unit, 10 for pitchers).
     Merges mean/std_dev from *proj_df* when provided; falls back to a
-    salary-based heuristic (mean = salary / 400, std_dev = 40 % of mean).
+    salary-based heuristic (mean = salary / 400, std_dev = 85 % of mean).
 
     Required output columns:
         player_id, team, opponent, slot, mean, std_dev, position, salary, game
@@ -137,7 +137,7 @@ def build_players_df(
     else:
         logger.info("No projections file — using salary-based heuristic (mean = salary / 400).")
         df["mean"] = df["salary"] / 400.0
-        df["std_dev"] = df["mean"] * 0.4
+        df["std_dev"] = df["mean"] * 0.85
 
     return df[
         ["player_id", "team", "opponent", "slot", "mean", "std_dev", "position", "salary", "game"]
