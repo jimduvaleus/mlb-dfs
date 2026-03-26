@@ -144,7 +144,7 @@ def build_players_df(slate_df, proj_df=None):
         df[batter_mask].groupby(["team", "opponent"]).cumcount().mod(9).add(1)
     )
     if proj_df is not None:
-        proj = proj_df.copy().rename(columns={"mu": "mean", "sigma": "std_dev"})
+        proj = proj_df.copy()
         proj_cols = ["player_id", "mean", "std_dev"]
         if "lineup_slot" in proj.columns:
             proj_cols.append("lineup_slot")
