@@ -200,6 +200,7 @@ def run_scenario(
     timeout: int,
     n_chains: int,
     n_steps: int,
+    temperature: float = OPT_TEMP,
     n_workers: int = 1,
     niter_success: int = OPT_NITER_SUCCESS,
     early_stopping_window: int = OPT_ES_WINDOW,
@@ -216,6 +217,7 @@ def run_scenario(
         "scenario_idx": idx,
         "n_sims": n_sims,
         "percentile": percentile,
+        "temperature": temperature,
         "sim_time_s": None,
         "target": None,
         "single_opt_time_s": None,
@@ -273,7 +275,7 @@ def run_scenario(
                 players_df=players_df,
                 target=target,
                 n_chains=n_chains,
-                temperature=OPT_TEMP,
+                temperature=temperature,
                 n_steps=n_steps,
                 niter_success=niter_success,
                 n_workers=n_workers,
@@ -306,7 +308,7 @@ def run_scenario(
                 target=target,
                 portfolio_size=portfolio_size,
                 n_chains=n_chains,
-                temperature=OPT_TEMP,
+                temperature=temperature,
                 n_steps=n_steps,
                 niter_success=niter_success,
                 n_workers=n_workers,
@@ -394,6 +396,13 @@ def main():
             f"(default: {TARGET_PERCENTILE} from config.yaml; use 0 to sweep all)"
         ),
     )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=OPT_TEMP,
+        metavar="T",
+        help=f"Metropolis acceptance temperature (default: {OPT_TEMP} from config.yaml)",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -413,6 +422,7 @@ def main():
     print(f"  mode              : {'QUICK' if args.quick else 'PRODUCTION'}")
     print(f"  timeout per phase : {args.timeout}s ({args.timeout / 60:.1f} min)")
     print(f"  chains / steps    : {n_chains} / {n_steps}")
+    print(f"  temperature       : {args.temperature}")
     print(f"  niter_success     : {OPT_NITER_SUCCESS}")
     print(f"  early_stop window : {OPT_ES_WINDOW}  threshold: {OPT_ES_THRESHOLD}")
     print(f"  workers           : {n_workers}")
@@ -476,6 +486,7 @@ def main():
             timeout=args.timeout,
             n_chains=n_chains,
             n_steps=n_steps,
+            temperature=args.temperature,
             n_workers=n_workers,
             niter_success=OPT_NITER_SUCCESS,
             early_stopping_window=OPT_ES_WINDOW,

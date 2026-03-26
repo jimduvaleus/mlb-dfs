@@ -16,3 +16,4 @@ data/raw/DKSalaries.csv
 data/processed/projections.csv
 outputs/benchmark_results.csv
 config.yaml
+.claude/settings.json
