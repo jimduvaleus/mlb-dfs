@@ -1,4 +1,6 @@
 
+- The negative-score clipping at engine.py:116 remains an open issue. Fixing that would require either allowing negative pitcher scores through to the optimizer (which actually helps — it makes 2-SP lineups look riskier, which is correct for tournaments) or using a truncated Gaussian for pitchers. Worth addressing as a separate change when you get to Phase 6 tuning.
+
 - Improvements to std dev estimates by player type?
 
 - Reduce chains/steps — A default setting of ~75 chains × 50 steps (3× quick mode) would likely land in 2–21 min range for those scenarios with meaningfully better lineup quality.
