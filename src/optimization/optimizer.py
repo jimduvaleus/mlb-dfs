@@ -96,6 +96,7 @@ class _ChainRunner:
         temperature: float,
         n_steps: int,
         niter_success: int = 25,
+        salary_floor: Optional[float] = None,
     ):
         self.sim_matrix = sim_matrix
         self.player_meta = player_meta
@@ -105,6 +106,7 @@ class _ChainRunner:
         self.temperature = temperature
         self.n_steps = n_steps
         self.niter_success = niter_success
+        self.salary_floor = salary_floor
 
     # ---- public entry point ---------------------------------------- #
 
@@ -162,12 +164,19 @@ class _ChainRunner:
                 if len(pool) < count:
                     ok = False
                     break
-                chosen = rng.choice(pool, size=count, replace=False).tolist()
+                if self.salary_floor is not None:
+                    weights = np.array(
+                        [self.player_meta[p]['salary'] for p in pool], dtype=float
+                    )
+                    weights /= weights.sum()
+                    chosen = rng.choice(pool, size=count, replace=False, p=weights).tolist()
+                else:
+                    chosen = rng.choice(pool, size=count, replace=False).tolist()
                 player_ids.extend(chosen)
                 used.update(chosen)
             if ok:
                 lineup = Lineup(player_ids)
-                if lineup.is_valid(self.player_meta):
+                if lineup.is_valid(self.player_meta, salary_floor=self.salary_floor):
                     return lineup
         raise RuntimeError(
             f"Could not build a valid lineup after {max_attempts} attempts. "
@@ -203,7 +212,7 @@ class _ChainRunner:
 
             if ok:
                 cand = Lineup(new_ids)
-                if cand.is_valid(self.player_meta):
+                if cand.is_valid(self.player_meta, salary_floor=self.salary_floor):
                     return cand
 
         return lineup  # fallback: return original if no valid mutation found
@@ -255,7 +264,7 @@ class _ChainRunner:
                     break  # remaining candidates can only be worse
                 test_ids = list(ids)
                 test_ids[idx] = cand_ids[i]
-                if Lineup(test_ids).is_valid(self.player_meta):
+                if Lineup(test_ids).is_valid(self.player_meta, salary_floor=self.salary_floor):
                     best_score = float(cand_scores[i])
                     best_new_id = cand_ids[i]
                     best_new_totals = (
@@ -277,7 +286,7 @@ class _ChainRunner:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor = args
     shm = SharedMemory(name=shm_name)
     sim_matrix = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
     try:
@@ -290,6 +299,7 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             temperature=temperature,
             n_steps=n_steps,
             niter_success=niter_success,
+            salary_floor=salary_floor,
         )
         return runner.run(seed)
     finally:
@@ -333,6 +343,7 @@ class BasinHoppingOptimizer:
         rng_seed: Optional[int] = None,
         early_stopping_window: int = 25,
         early_stopping_threshold: float = 0.001,
+        salary_floor: Optional[float] = None,
     ):
         # Restrict to players that appear in the simulation results
         sim_ids = set(sim_results.player_ids)
@@ -352,6 +363,7 @@ class BasinHoppingOptimizer:
         self.rng_seed = rng_seed
         self.early_stopping_window = early_stopping_window
         self.early_stopping_threshold = early_stopping_threshold
+        self.salary_floor = salary_floor
 
         # Pre-group player IDs by position for fast pool queries
         self._players_by_pos: Dict[str, List[int]] = {
@@ -371,6 +383,7 @@ class BasinHoppingOptimizer:
             temperature=self.temperature,
             n_steps=self.n_steps,
             niter_success=self.niter_success,
+            salary_floor=self.salary_floor,
         )
 
     def _run_chains(
@@ -421,6 +434,7 @@ class BasinHoppingOptimizer:
                     self.temperature,
                     self.n_steps,
                     self.niter_success,
+                    self.salary_floor,
                 )
                 for seed in seeds
             ]

@@ -292,3 +292,61 @@ def test_optimize_high_value_player_selected():
     )
     lineup, _ = opt.optimize()
     assert 8 in lineup.player_ids, "High-value player should be in the optimized lineup"
+
+
+# ------------------------------------------------------------------ #
+#  Salary floor                                                        #
+# ------------------------------------------------------------------ #
+
+# VALID_IDS total salary: P1(8000)+P2(7500)+C5(4000)+1B7(4000)+2B9(4000)
+#   +3B11(4000)+SS13(4000)+OF16(4000)+OF17(3800)+OF18(3800) = 47_100
+
+def test_lineup_salary_below_floor(player_meta):
+    # VALID_IDS sums to 47_100 which is below floor=48_000 → invalid
+    assert not Lineup(VALID_IDS).is_valid(player_meta, salary_floor=48_000.0)
+
+
+def test_lineup_salary_at_floor(player_meta):
+    # Exactly at floor → valid
+    assert Lineup(VALID_IDS).is_valid(player_meta, salary_floor=47_100.0)
+
+
+def test_lineup_floor_none_no_effect(player_meta):
+    # salary_floor=None should leave existing behaviour unchanged
+    assert Lineup(VALID_IDS).is_valid(player_meta, salary_floor=None)
+
+
+def test_optimize_respects_salary_floor(sim_results, players_df, player_meta):
+    floor = 45_000.0
+    opt = BasinHoppingOptimizer(
+        sim_results=sim_results,
+        players_df=players_df,
+        target=150.0,
+        n_chains=5,
+        n_steps=20,
+        rng_seed=7,
+        salary_floor=floor,
+    )
+    lineup, _ = opt.optimize()
+    total_salary = sum(player_meta[pid]['salary'] for pid in lineup.player_ids)
+    assert total_salary >= floor
+    assert lineup.is_valid(player_meta, salary_floor=floor)
+
+
+def test_optimize_floor_disabled_unchanged(sim_results, players_df):
+    # salary_floor=None must produce the same result as omitting the parameter
+    opt_default = make_optimizer(sim_results, players_df, target=150.0, n_chains=3, n_steps=10)
+    opt_none = BasinHoppingOptimizer(
+        sim_results=sim_results,
+        players_df=players_df,
+        target=150.0,
+        n_chains=3,
+        temperature=0.05,
+        n_steps=10,
+        rng_seed=42,
+        salary_floor=None,
+    )
+    l1, s1 = opt_default.optimize()
+    l2, s2 = opt_none.optimize()
+    assert s1 == pytest.approx(s2)
+    assert sorted(l1.player_ids) == sorted(l2.player_ids)

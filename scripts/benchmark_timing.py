@@ -79,6 +79,7 @@ OPT_WORKERS        = _opt.get("n_workers", 1)
 OPT_NITER_SUCCESS  = _opt.get("niter_success", 25)
 OPT_ES_WINDOW      = _opt.get("early_stopping_window", 25)
 OPT_ES_THRESHOLD   = _opt.get("early_stopping_threshold", 0.001)
+OPT_SALARY_FLOOR   = float(_opt["salary_floor"]) if _opt.get("salary_floor") is not None else None
 
 # Quick-mode defaults (fast enough to complete in seconds per scenario)
 OPT_CHAINS_QUICK = 25
@@ -206,6 +207,7 @@ def run_scenario(
     early_stopping_window: int = OPT_ES_WINDOW,
     early_stopping_threshold: float = OPT_ES_THRESHOLD,
     portfolio_size: int = PORTFOLIO_SIZE,
+    salary_floor: float = OPT_SALARY_FLOOR,
 ) -> dict:
     """Run one benchmark scenario and return a result dict."""
     label = f"scenario {idx}: n_sims={n_sims:,d}  p{percentile:02d}"
@@ -282,6 +284,7 @@ def run_scenario(
                 early_stopping_window=early_stopping_window,
                 early_stopping_threshold=early_stopping_threshold,
                 rng_seed=RNG_SEED,
+                salary_floor=salary_floor,
             )
             lineup, score = optimizer.optimize()
             elapsed = time.perf_counter() - t0
@@ -315,6 +318,7 @@ def run_scenario(
                 early_stopping_window=early_stopping_window,
                 early_stopping_threshold=early_stopping_threshold,
                 rng_seed=RNG_SEED,
+                salary_floor=salary_floor,
             )
             portfolio = constructor.construct()
             elapsed = time.perf_counter() - t0
@@ -425,6 +429,7 @@ def main():
     print(f"  temperature       : {args.temperature}")
     print(f"  niter_success     : {OPT_NITER_SUCCESS}")
     print(f"  early_stop window : {OPT_ES_WINDOW}  threshold: {OPT_ES_THRESHOLD}")
+    print(f"  salary_floor      : {OPT_SALARY_FLOOR if OPT_SALARY_FLOOR is not None else 'disabled'}")
     print(f"  workers           : {n_workers}")
     print(f"  portfolio size    : {args.portfolio_size}")
     print(f"  target percentile : {'all' if args.percentile == 0 else f'p{args.percentile}'}  (config default: p{TARGET_PERCENTILE})")
@@ -492,6 +497,7 @@ def main():
             early_stopping_window=OPT_ES_WINDOW,
             early_stopping_threshold=OPT_ES_THRESHOLD,
             portfolio_size=args.portfolio_size,
+            salary_floor=OPT_SALARY_FLOOR,
         )
         all_results.append(res)
 

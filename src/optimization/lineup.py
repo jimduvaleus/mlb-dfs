@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 
@@ -32,7 +32,11 @@ class Lineup:
         totals = sim_matrix[:, cols].sum(axis=1)
         return float((totals >= target).mean())
 
-    def is_valid(self, player_meta: PlayerMeta) -> bool:
+    def is_valid(
+        self,
+        player_meta: PlayerMeta,
+        salary_floor: Optional[float] = None,
+    ) -> bool:
         """Check all DraftKings Classic constraints."""
         if len(self.player_ids) != 10:
             return False
@@ -50,8 +54,11 @@ class Lineup:
             if pos_counts.get(pos, 0) != req:
                 return False
 
-        # Salary cap
-        if sum(r['salary'] for r in rows) > SALARY_CAP:
+        # Salary bounds
+        total_salary = sum(r['salary'] for r in rows)
+        if total_salary > SALARY_CAP:
+            return False
+        if salary_floor is not None and total_salary < salary_floor:
             return False
 
         # Max 5 hitters from one team (pitchers do not count toward this limit)
