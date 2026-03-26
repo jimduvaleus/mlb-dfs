@@ -1,10 +1,10 @@
 
-- The negative-score clipping at engine.py:116 remains an open issue. Fixing that would require either allowing negative pitcher scores through to the optimizer (which actually helps — it makes 2-SP lineups look riskier, which is correct for tournaments) or using a truncated Gaussian for pitchers. Worth addressing as a separate change when you get to Phase 6 tuning.
-
 - Parallelism: 
 Run m = 250 independent chains using multiprocessing or Ray.?
 
 - Add benchmark for 15000 and 20000 as opposed to 25000 and 50000
+
+- Doc that walks through simulations (what they are doing), how player projections factor in, how the optimizer selects a lineup from within the set of simulations, and how diversity is naturally achieved as the portfolio is constructed
 
 - Improvements to std dev estimates by player type?
 

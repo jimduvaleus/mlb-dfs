@@ -111,9 +111,10 @@ class SimulationEngine:
                 else:
                     marginal = GaussianMarginal(player['mean'], player['std_dev'])
                 simulated_points = marginal.ppf(q)
-                
-                # DFS points are typically non-negative
-                simulated_points = np.maximum(simulated_points, 0)
+
+                # Batters cannot score negative in DK; pitchers can (earned runs)
+                if is_batter:
+                    simulated_points = np.maximum(simulated_points, 0)
                 
                 # Store the results in the overall matrix
                 # idx is the row index in self.players_df
