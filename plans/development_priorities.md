@@ -1,8 +1,5 @@
 
-Revised performance gain opportunities:
-- Shared memory for the simulation matrix — replace the per-task pickle with multiprocessing.shared_memory so all workers read a single copy of the matrix from a shared memory block. This would allow the 8-worker parallelism to actually scale (~6–7×). Requires a moderate refactor of _run_chains in optimizer.py:324.
-
-- Reduce chains/steps — for now, the practical knob without any code changes. Quick mode (25 chains × 20 steps) ran all 5k/10k scenarios in 0.7–7 min. A setting of ~75 chains × 40 steps (3× quick mode) would likely land in 2–21 min range for those scenarios with meaningfully better lineup quality.
+- Reduce chains/steps — A default setting of ~75 chains × 50 steps (3× quick mode) would likely land in 2–21 min range for those scenarios with meaningfully better lineup quality.
 
 - Pool reuse across lineup iterations — PortfolioConstructor creates a new optimizer (and therefore a new ProcessPoolExecutor) for each of the 20 lineups. The pool spawn overhead is paid 20 times unnecessarily.
 

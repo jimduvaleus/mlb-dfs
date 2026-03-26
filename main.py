@@ -317,6 +317,8 @@ def main(config_path: str) -> None:
         n_steps=int(opt_cfg.get("n_steps", 100)),
         n_workers=int(opt_cfg.get("n_workers", 1)),
         rng_seed=opt_cfg.get("rng_seed"),
+        early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
+        early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
     )
     portfolio = constructor.construct()
     logger.info("Portfolio complete: %d lineups selected.", len(portfolio))

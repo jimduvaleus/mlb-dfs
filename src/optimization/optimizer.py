@@ -6,6 +6,7 @@ simulation results, subject to DK Classic salary and position constraints.
 """
 import logging
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing.shared_memory import SharedMemory
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -268,17 +269,22 @@ class _ChainRunner:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, sim_matrix, player_meta, col_map, players_by_pos, target, temperature, n_steps = args
-    runner = _ChainRunner(
-        sim_matrix=sim_matrix,
-        player_meta=player_meta,
-        col_map=col_map,
-        players_by_pos=players_by_pos,
-        target=target,
-        temperature=temperature,
-        n_steps=n_steps,
-    )
-    return runner.run(seed)
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps = args
+    shm = SharedMemory(name=shm_name)
+    sim_matrix = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
+    try:
+        runner = _ChainRunner(
+            sim_matrix=sim_matrix,
+            player_meta=player_meta,
+            col_map=col_map,
+            players_by_pos=players_by_pos,
+            target=target,
+            temperature=temperature,
+            n_steps=n_steps,
+        )
+        return runner.run(seed)
+    finally:
+        shm.close()  # detach; do NOT unlink from worker
 
 
 # ------------------------------------------------------------------ #
@@ -315,6 +321,8 @@ class BasinHoppingOptimizer:
         n_steps: int = 100,
         n_workers: int = 1,
         rng_seed: Optional[int] = None,
+        early_stopping_window: int = 25,
+        early_stopping_threshold: float = 0.001,
     ):
         # Restrict to players that appear in the simulation results
         sim_ids = set(sim_results.player_ids)
@@ -331,6 +339,8 @@ class BasinHoppingOptimizer:
         self.n_steps = n_steps
         self.n_workers = n_workers
         self.rng_seed = rng_seed
+        self.early_stopping_window = early_stopping_window
+        self.early_stopping_threshold = early_stopping_threshold
 
         # Pre-group player IDs by position for fast pool queries
         self._players_by_pos: Dict[str, List[int]] = {
@@ -352,18 +362,35 @@ class BasinHoppingOptimizer:
         )
 
     def _run_chains(self) -> List[Tuple[Lineup, float]]:
-        """Run all chains and return a (Lineup, score) pair for each."""
+        """Run all chains and return a (Lineup, score) pair for each.
+
+        Applies cross-chain early stopping: if the global best score has not
+        improved by at least ``early_stopping_threshold`` within the last
+        ``early_stopping_window`` completed chains, remaining chains are
+        skipped (sequential) or cancelled (parallel).
+        """
         seeds = [
             (self.rng_seed + i if self.rng_seed is not None else i)
             for i in range(self.n_chains)
         ]
         results: List[Tuple[Lineup, float]] = []
+        window = self.early_stopping_window
+        threshold = self.early_stopping_threshold
+
+        def _should_stop_early(best_so_far: float, scores_since_last_improvement: int) -> bool:
+            return scores_since_last_improvement >= window and best_so_far > 0.0
 
         if self.n_workers > 1:
+            mat = np.ascontiguousarray(self.sim_matrix)
+            shm = SharedMemory(create=True, size=mat.nbytes)
+            shm_array = np.ndarray(mat.shape, dtype=mat.dtype, buffer=shm.buf)
+            shm_array[:] = mat
             chain_args = [
                 (
                     seed,
-                    self.sim_matrix,
+                    shm.name,
+                    mat.shape,
+                    mat.dtype,
                     self.player_meta,
                     self.col_map,
                     self._players_by_pos,
@@ -373,17 +400,49 @@ class BasinHoppingOptimizer:
                 )
                 for seed in seeds
             ]
-            with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
-                futures = [executor.submit(_chain_worker, a) for a in chain_args]
-                for fut in as_completed(futures):
-                    lineup, score = fut.result()
-                    logger.debug("Chain completed score=%.4f", score)
-                    results.append((lineup, score))
+            try:
+                with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
+                    futures = [executor.submit(_chain_worker, a) for a in chain_args]
+                    best_so_far = -1.0
+                    steps_since_improvement = 0
+                    for fut in as_completed(futures):
+                        lineup, score = fut.result()
+                        logger.debug("Chain completed score=%.4f", score)
+                        results.append((lineup, score))
+                        if score >= best_so_far + threshold:
+                            best_so_far = score
+                            steps_since_improvement = 0
+                        else:
+                            steps_since_improvement += 1
+                        if _should_stop_early(best_so_far, steps_since_improvement):
+                            logger.debug(
+                                "Early stopping: best=%.4f unchanged for %d chains",
+                                best_so_far, steps_since_improvement,
+                            )
+                            for f in futures:
+                                f.cancel()
+                            break
+            finally:
+                shm.close()
+                shm.unlink()
         else:
+            best_so_far = -1.0
+            steps_since_improvement = 0
             for seed in seeds:
                 lineup, score = self._runner.run(seed)
                 logger.debug("Chain seed=%d score=%.4f", seed, score)
                 results.append((lineup, score))
+                if score >= best_so_far + threshold:
+                    best_so_far = score
+                    steps_since_improvement = 0
+                else:
+                    steps_since_improvement += 1
+                if _should_stop_early(best_so_far, steps_since_improvement):
+                    logger.debug(
+                        "Early stopping: best=%.4f unchanged for %d chains",
+                        best_so_far, steps_since_improvement,
+                    )
+                    break
 
         return results
 

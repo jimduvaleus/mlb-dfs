@@ -69,6 +69,8 @@ class PortfolioConstructor:
         n_steps: int = 100,
         n_workers: int = 1,
         rng_seed: Optional[int] = None,
+        early_stopping_window: int = 25,
+        early_stopping_threshold: float = 0.001,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -79,6 +81,8 @@ class PortfolioConstructor:
             temperature=temperature,
             n_steps=n_steps,
             n_workers=n_workers,
+            early_stopping_window=early_stopping_window,
+            early_stopping_threshold=early_stopping_threshold,
         )
         self._base_seed = rng_seed
 
