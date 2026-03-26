@@ -8,6 +8,8 @@ Run m = 250 independent chains using multiprocessing or Ray.?
 
 - Improvements to std dev estimates by player type?
 
+- Need DK Entry parser and DK Upload file maker
+
 - Reduce chains/steps — A default setting of ~75 chains × 50 steps (3× quick mode) would likely land in 2–21 min range for those scenarios with meaningfully better lineup quality.
 
 - Two-pass approach, pros and cons?
