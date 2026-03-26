@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from numba import njit
 
 from src.optimization.lineup import (
     Lineup,
@@ -41,6 +42,36 @@ def _build_player_meta(players_df: pd.DataFrame) -> PlayerMeta:
 
 def _score_totals(totals: np.ndarray, target: float) -> float:
     return float((totals >= target).mean())
+
+
+@njit(cache=True)
+def _score_swap_candidates(
+    sim_matrix: np.ndarray,
+    totals: np.ndarray,
+    col_out: int,
+    cand_cols: np.ndarray,
+    target: float,
+) -> np.ndarray:
+    """Score all swap candidates for one slot without allocating a swapped matrix.
+
+    Replaces:
+        swapped = totals[:,None] - col_out_scores[:,None] + sim_matrix[:,cand_cols]
+        cand_scores = (swapped >= target).mean(axis=0)
+
+    The inner loop over n_sims is compiled to native SIMD code, and no
+    (n_sims × n_cands) intermediate array is allocated.
+    """
+    n_sims = totals.shape[0]
+    n_cands = cand_cols.shape[0]
+    cand_scores = np.empty(n_cands, dtype=np.float64)
+    for j in range(n_cands):
+        count = 0.0
+        col_in = cand_cols[j]
+        for i in range(n_sims):
+            if totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in] >= target:
+                count += 1.0
+        cand_scores[j] = count / n_sims
+    return cand_scores
 
 
 # ------------------------------------------------------------------ #
@@ -199,14 +230,9 @@ class _ChainRunner:
 
             cand_cols = np.array([self.col_map[c] for c in cand_ids])
 
-            # (n_sims, n_cands) — one delta-updated total vector per candidate
-            col_out_scores = self.sim_matrix[:, col_out]
-            swapped = (
-                totals[:, np.newaxis]
-                - col_out_scores[:, np.newaxis]
-                + self.sim_matrix[:, cand_cols]
+            cand_scores = _score_swap_candidates(
+                self.sim_matrix, totals, col_out, cand_cols, self.target
             )
-            cand_scores = (swapped >= self.target).mean(axis=0)  # (n_cands,)
 
             # Walk candidates best-first; check validity only until the first
             # valid improvement is found (that candidate is necessarily the best).
@@ -223,7 +249,11 @@ class _ChainRunner:
                 if Lineup(test_ids).is_valid(self.player_meta):
                     best_score = float(cand_scores[i])
                     best_new_id = cand_ids[i]
-                    best_new_totals = swapped[:, i].copy()
+                    best_new_totals = (
+                        totals
+                        - self.sim_matrix[:, col_out]
+                        + self.sim_matrix[:, cand_cols[i]]
+                    )
                     break  # first valid candidate in score order is the global best
 
             if best_new_id is not None:

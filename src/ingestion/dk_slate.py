@@ -38,11 +38,19 @@ class DraftKingsSlateIngestor:
         if df['salary'].isnull().any():
             raise ValueError("Missing or invalid salaries found in CSV.")
 
-        # Basic validation for positions (can be expanded)
+        # Normalize positions: take primary position from multi-eligible
+        # strings (e.g. "1B/2B" → "1B") and map DK-specific labels.
+        position_map = {'SP': 'P', 'RP': 'P'}
+        df['position'] = (
+            df['position']
+            .str.split('/')
+            .str[0]
+            .replace(position_map)
+        )
+
+        # Basic validation for positions
         valid_positions = {'P', 'C', '1B', '2B', '3B', 'SS', 'OF'}
         if not df['position'].apply(lambda x: x in valid_positions).all():
-             # Log or handle unexpected positions more gracefully in a real app
-            # For now, we'll just raise an error as per the design to validate
             raise ValueError("Unexpected position strings found in CSV.")
 
         # Extract game ID from "Game Info" column (e.g. "LAD @ SD 03/20/2026 ..." -> "LAD@SD")

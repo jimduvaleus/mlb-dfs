@@ -107,15 +107,23 @@ def build_players_df(
         if "lineup_slot" in proj.columns:
             proj_cols.append("lineup_slot")
         df = df.merge(proj[proj_cols], on="player_id", how="left")
-        missing = df["mean"].isna().sum()
-        if missing:
-            logger.warning(
-                "%d player(s) missing from projections CSV; using salary heuristic.",
-                missing,
-            )
-        df.loc[df["mean"].isna(), "mean"] = df.loc[df["mean"].isna(), "salary"] / 400.0
-        df.loc[df["std_dev"].isna(), "std_dev"] = df.loc[df["std_dev"].isna(), "mean"] * 0.4
-        # Override sequential slot assignment with RotoWire batting order where present
+
+        # Restrict to projected starters only.  The projections CSV is already
+        # filtered to players with a lineup_slot (starters + SPs); any DK
+        # player that didn't match will have lineup_slot=NaN after the left
+        # join and must be excluded — carrying bench/bullpen players into the
+        # optimizer inflates the pool to hundreds of irrelevant candidates.
+        if "lineup_slot" in df.columns:
+            before = len(df)
+            df = df[df["lineup_slot"].notna()].copy()
+            excluded = before - len(df)
+            if excluded:
+                logger.info(
+                    "Excluded %d non-starter DK players not found in projections.",
+                    excluded,
+                )
+
+        # Override sequential slot assignment with RotoWire batting order
         if "lineup_slot" in df.columns:
             batter_with_slot = (
                 ~(df["position"] == "P")

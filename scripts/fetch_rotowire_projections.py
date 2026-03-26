@@ -352,6 +352,20 @@ def build_projections_csv(
 
     out_df = pd.DataFrame(matched)
 
+    # --- Filter to projected starters only ----------------------------------
+    # Only keep batters with a lineup slot (1-9) and starting pitchers (slot 10).
+    # Bench players and relief pitchers have lineup_slot=None and must not enter
+    # the simulation or optimizer — including them inflates the player pool
+    # dramatically and makes optimization intractably slow.
+    before_filter = len(out_df)
+    out_df = out_df[out_df["lineup_slot"].notna()].copy()
+    excluded = before_filter - len(out_df)
+    if excluded:
+        log.info(
+            "Excluded %d non-starter players (no projected lineup slot).",
+            excluded,
+        )
+
     # --- Estimate std_dev ---------------------------------------------------
     out_df["std_dev"] = out_df.apply(
         lambda r: r["mean"] * STD_DEV_RATIO.get(str(r["position"]), DEFAULT_STD_DEV_RATIO),
@@ -367,14 +381,12 @@ def build_projections_csv(
 
     pitchers = out_df[out_df["player_id"].map(dk_pos).eq("SP")]
     batters = out_df[out_df["player_id"].map(dk_pos).ne("SP")]
-    n_with_slot = out_df["lineup_slot"].notna().sum()
     log.info(
-        "Wrote %d projections → %s  (pitchers=%d, batters=%d, with slot=%d, unmatched=%d)",
+        "Wrote %d starter projections → %s  (pitchers=%d, batters=%d, unmatched=%d)",
         len(out_df),
         output_path,
         len(pitchers),
         len(batters),
-        n_with_slot,
         len(unmatched),
     )
     return out_df

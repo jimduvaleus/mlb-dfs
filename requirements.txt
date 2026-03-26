@@ -1,6 +1,7 @@
 pandas
 numpy
 scipy
+numba
 requests
 pytest
 pytest-cov
