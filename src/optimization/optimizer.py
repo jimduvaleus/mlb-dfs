@@ -5,7 +5,7 @@ Phase 3 implementation: maximizes P(lineup total >= target) over Monte Carlo
 simulation results, subject to DK Classic salary and position constraints.
 """
 import logging
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, Future, as_completed
 from multiprocessing.shared_memory import SharedMemory
 from typing import Dict, List, Optional, Tuple
 
@@ -95,6 +95,7 @@ class _ChainRunner:
         target: float,
         temperature: float,
         n_steps: int,
+        niter_success: int = 25,
     ):
         self.sim_matrix = sim_matrix
         self.player_meta = player_meta
@@ -103,6 +104,7 @@ class _ChainRunner:
         self.target = target
         self.temperature = temperature
         self.n_steps = n_steps
+        self.niter_success = niter_success
 
     # ---- public entry point ---------------------------------------- #
 
@@ -115,6 +117,7 @@ class _ChainRunner:
 
         best_lineup = lineup
         best_score = score
+        steps_since_improvement = 0
 
         for _ in range(self.n_steps):
             # Perturbation
@@ -136,6 +139,11 @@ class _ChainRunner:
             if score > best_score:
                 best_score = score
                 best_lineup = lineup
+                steps_since_improvement = 0
+            else:
+                steps_since_improvement += 1
+                if steps_since_improvement >= self.niter_success:
+                    break
 
         return best_lineup, best_score
 
@@ -269,7 +277,7 @@ class _ChainRunner:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success = args
     shm = SharedMemory(name=shm_name)
     sim_matrix = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
     try:
@@ -281,6 +289,7 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             target=target,
             temperature=temperature,
             n_steps=n_steps,
+            niter_success=niter_success,
         )
         return runner.run(seed)
     finally:
@@ -319,6 +328,7 @@ class BasinHoppingOptimizer:
         n_chains: int = 250,
         temperature: float = 0.1,
         n_steps: int = 100,
+        niter_success: int = 25,
         n_workers: int = 1,
         rng_seed: Optional[int] = None,
         early_stopping_window: int = 25,
@@ -337,6 +347,7 @@ class BasinHoppingOptimizer:
         self.n_chains = n_chains
         self.temperature = temperature
         self.n_steps = n_steps
+        self.niter_success = niter_success
         self.n_workers = n_workers
         self.rng_seed = rng_seed
         self.early_stopping_window = early_stopping_window
@@ -359,15 +370,27 @@ class BasinHoppingOptimizer:
             target=self.target,
             temperature=self.temperature,
             n_steps=self.n_steps,
+            niter_success=self.niter_success,
         )
 
-    def _run_chains(self) -> List[Tuple[Lineup, float]]:
+    def _run_chains(
+        self,
+        executor: Optional[ProcessPoolExecutor] = None,
+    ) -> List[Tuple[Lineup, float]]:
         """Run all chains and return a (Lineup, score) pair for each.
 
         Applies cross-chain early stopping: if the global best score has not
         improved by at least ``early_stopping_threshold`` within the last
         ``early_stopping_window`` completed chains, remaining chains are
         skipped (sequential) or cancelled (parallel).
+
+        Parameters
+        ----------
+        executor:
+            An already-running ``ProcessPoolExecutor`` to reuse. When provided
+            the executor is *not* shut down by this method — the caller owns its
+            lifecycle.  If ``None`` and ``n_workers > 1``, a new executor is
+            created and destroyed for this call.
         """
         seeds = [
             (self.rng_seed + i if self.rng_seed is not None else i)
@@ -397,34 +420,39 @@ class BasinHoppingOptimizer:
                     self.target,
                     self.temperature,
                     self.n_steps,
+                    self.niter_success,
                 )
                 for seed in seeds
             ]
+            owned_executor = executor is None
             try:
-                with ProcessPoolExecutor(max_workers=self.n_workers) as executor:
-                    futures = [executor.submit(_chain_worker, a) for a in chain_args]
-                    best_so_far = -1.0
-                    steps_since_improvement = 0
-                    for fut in as_completed(futures):
-                        lineup, score = fut.result()
-                        logger.debug("Chain completed score=%.4f", score)
-                        results.append((lineup, score))
-                        if score >= best_so_far + threshold:
-                            best_so_far = score
-                            steps_since_improvement = 0
-                        else:
-                            steps_since_improvement += 1
-                        if _should_stop_early(best_so_far, steps_since_improvement):
-                            logger.debug(
-                                "Early stopping: best=%.4f unchanged for %d chains",
-                                best_so_far, steps_since_improvement,
-                            )
-                            for f in futures:
-                                f.cancel()
-                            break
+                if owned_executor:
+                    executor = ProcessPoolExecutor(max_workers=self.n_workers)
+                futures: List[Future] = [executor.submit(_chain_worker, a) for a in chain_args]
+                best_so_far = -1.0
+                steps_since_improvement = 0
+                for fut in as_completed(futures):
+                    lineup, score = fut.result()
+                    logger.debug("Chain completed score=%.4f", score)
+                    results.append((lineup, score))
+                    if score >= best_so_far + threshold:
+                        best_so_far = score
+                        steps_since_improvement = 0
+                    else:
+                        steps_since_improvement += 1
+                    if _should_stop_early(best_so_far, steps_since_improvement):
+                        logger.debug(
+                            "Early stopping: best=%.4f unchanged for %d chains",
+                            best_so_far, steps_since_improvement,
+                        )
+                        for f in futures:
+                            f.cancel()
+                        break
             finally:
                 shm.close()
                 shm.unlink()
+                if owned_executor and executor is not None:
+                    executor.shutdown(wait=False)
         else:
             best_so_far = -1.0
             steps_since_improvement = 0
@@ -446,12 +474,22 @@ class BasinHoppingOptimizer:
 
         return results
 
-    def optimize(self) -> Tuple[Lineup, float]:
-        """Run all chains and return the best (Lineup, score) found."""
-        results = self._run_chains()
+    def optimize(
+        self,
+        executor: Optional[ProcessPoolExecutor] = None,
+    ) -> Tuple[Lineup, float]:
+        """Run all chains and return the best (Lineup, score) found.
+
+        Parameters
+        ----------
+        executor:
+            Optional pre-created ``ProcessPoolExecutor`` to reuse across
+            multiple calls. The caller is responsible for shutting it down.
+        """
+        results = self._run_chains(executor=executor)
         return max(results, key=lambda x: x[1])
 
-    def optimize_top_k(self, k: int) -> List[Tuple[Lineup, float]]:
+    def optimize_top_k(self, k: int, executor: Optional[ProcessPoolExecutor] = None) -> List[Tuple[Lineup, float]]:
         """Run all chains and return the top-k distinct (Lineup, score) pairs.
 
         Lineups are deduplicated by player set; the highest-scoring instance of
@@ -468,7 +506,7 @@ class BasinHoppingOptimizer:
         List[Tuple[Lineup, float]]
             Up to ``k`` (Lineup, score) pairs sorted best-first.
         """
-        results = self._run_chains()
+        results = self._run_chains(executor=executor)
         results.sort(key=lambda x: -x[1])
         seen: set = set()
         top_k: List[Tuple[Lineup, float]] = []

@@ -149,15 +149,15 @@ def build_players_df(
 # ---------------------------------------------------------------------------
 
 def _compute_auto_target(
-    players_df: pd.DataFrame, sim_results: SimulationResults
+    players_df: pd.DataFrame, sim_results: SimulationResults, percentile: int
 ) -> float:
     """
-    Estimate a GPP target score as the 80th-percentile total of a greedy
-    high-projection lineup.
+    Estimate a GPP target score as the *percentile*-th percentile total of a
+    greedy high-projection lineup.
 
     Greedily fills each roster slot with the highest-mean available player,
-    then returns p80 of that lineup's simulated totals.  Falls back to a
-    proportional row-sum estimate if the greedy fill fails.
+    then returns the requested percentile of that lineup's simulated totals.
+    Falls back to a proportional row-sum estimate if the greedy fill fails.
     """
     col_map = {pid: i for i, pid in enumerate(sim_results.player_ids)}
     sorted_df = players_df.sort_values("mean", ascending=False)
@@ -177,12 +177,12 @@ def _compute_auto_target(
         cols = [col_map[pid] for pid in selected if pid in col_map]
         if len(cols) == 10:
             totals = sim_results.results_matrix[:, cols].sum(axis=1)
-            return float(np.percentile(totals, 80))
+            return float(np.percentile(totals, percentile))
 
     # Fallback: proportional scaling of full-slate row sums
     n = len(players_df)
     row_sums = sim_results.results_matrix.sum(axis=1)
-    return float(np.percentile(row_sums * 10.0 / n, 80))
+    return float(np.percentile(row_sums * 10.0 / n, percentile))
 
 
 # ---------------------------------------------------------------------------
@@ -293,8 +293,12 @@ def main(config_path: str) -> None:
     # --- Target score -------------------------------------------------------
     target = port_cfg.get("target_score")
     if target is None:
-        target = _compute_auto_target(players_df, sim_results)
-        logger.info("Auto-computed target score: %.1f DK pts", target)
+        target_percentile = int(port_cfg.get("target_percentile", 90))
+        target = _compute_auto_target(players_df, sim_results, target_percentile)
+        logger.info(
+            "Auto-computed target score: %.1f DK pts  (p%d of greedy-best lineup)",
+            target, target_percentile,
+        )
     else:
         target = float(target)
         logger.info("Using configured target score: %.1f DK pts", target)
@@ -315,6 +319,7 @@ def main(config_path: str) -> None:
         n_chains=int(opt_cfg.get("n_chains", 250)),
         temperature=float(opt_cfg.get("temperature", 0.1)),
         n_steps=int(opt_cfg.get("n_steps", 100)),
+        niter_success=int(opt_cfg.get("niter_success", 25)),
         n_workers=int(opt_cfg.get("n_workers", 1)),
         rng_seed=opt_cfg.get("rng_seed"),
         early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),

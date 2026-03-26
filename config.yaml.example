@@ -32,12 +32,22 @@ optimizer:
   n_chains: 250       # Independent Basin-Hopping chains per lineup round
   temperature: 0.1    # Metropolis acceptance temperature
   n_steps: 100        # Perturbation steps per chain
-  n_workers: 1        # Worker processes (>1 enables parallel chains)
+  # Within-chain early stopping: halt a chain if the global best P(hit)
+  # has not improved for this many consecutive steps.
+  niter_success: 25
+  n_workers: 1        # Worker processes (>1 enables parallel chains via shared memory)
+  # Cross-chain early stopping: skip remaining chains if the global best
+  # P(hit) has not improved by at least threshold in the last window chains.
+  early_stopping_window: 25
+  early_stopping_threshold: 0.001
   rng_seed: null      # Integer seed for reproducibility; null = random
 
 portfolio:
   size: 20            # Number of lineups to construct
   # GPP score threshold.  Optimizer maximises P(lineup_total >= target).
-  # Set to null to auto-compute as the 80th-percentile total of the
-  # highest-projected valid lineup across all simulation rows.
+  # Set to null to auto-compute from target_percentile below.
   target_score: null
+  # Percentile of the greedy-best lineup's simulated totals used to derive
+  # target_score when target_score is null.
+  # p90 is appropriate for large-field GPPs; use p80 for 50/50s.
+  target_percentile: 90

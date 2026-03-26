@@ -36,6 +36,7 @@ logging.basicConfig(level=logging.WARNING)
 
 import numpy as np
 import pandas as pd
+import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,6 +49,19 @@ from src.optimization.portfolio import PortfolioConstructor
 from src.simulation.engine import SimulationEngine
 from src.simulation.results import SimulationResults
 
+# ── Load config.yaml ────────────────────────────────────────────────────────
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CONFIG_PATH = os.path.join(_REPO_ROOT, "config.yaml")
+
+with open(_CONFIG_PATH) as _f:
+    _CFG = yaml.safe_load(_f)
+
+_paths = _CFG.get("paths", {})
+_opt   = _CFG.get("optimizer", {})
+_port  = _CFG.get("portfolio", {})
+_sim   = _CFG.get("simulation", {})
+
 # ── Configuration ───────────────────────────────────────────────────────────
 
 # Scenarios: every (n_sims, target_percentile) combination to benchmark.
@@ -57,29 +71,33 @@ SCENARIOS = [
     for pct in [80, 85, 90, 95, 99]
 ]
 
-# Optimizer settings — production defaults
-OPT_CHAINS_DEFAULT = 250
-OPT_STEPS_DEFAULT = 100
-OPT_TEMP = 0.1
-OPT_WORKERS = 1
+# Optimizer settings — sourced from config.yaml
+OPT_CHAINS_DEFAULT = _opt.get("n_chains", 250)
+OPT_STEPS_DEFAULT  = _opt.get("n_steps", 100)
+OPT_TEMP           = _opt.get("temperature", 0.1)
+OPT_WORKERS        = _opt.get("n_workers", 1)
+OPT_NITER_SUCCESS  = _opt.get("niter_success", 25)
+OPT_ES_WINDOW      = _opt.get("early_stopping_window", 25)
+OPT_ES_THRESHOLD   = _opt.get("early_stopping_threshold", 0.001)
 
 # Quick-mode defaults (fast enough to complete in seconds per scenario)
 OPT_CHAINS_QUICK = 25
-OPT_STEPS_QUICK = 20
+OPT_STEPS_QUICK  = 20
 
-PORTFOLIO_SIZE = 20
-RNG_SEED = 42
+PORTFOLIO_SIZE     = _port.get("size", 20)
+TARGET_PERCENTILE  = _port.get("target_percentile", 90)
+RNG_SEED           = _opt.get("rng_seed", 42)
 
 # Default timeout per phase (seconds).  Override with --timeout.
 DEFAULT_TIMEOUT = 600  # 10 minutes
 
-# Paths
-DK_PATH = "data/raw/DKSalaries.csv"
-COPULA_PATH = "data/processed/empirical_copula.parquet"
-PROJ_PATH = "data/processed/projections.csv"
-PCA_PATH = "data/processed/batter_pca_model.npz"
-GRID_PATH = "data/processed/batter_score_grid.npy"
-OUTPUT_DIR = "outputs"
+# Paths — sourced from config.yaml
+DK_PATH    = _paths.get("dk_slate",          "data/raw/DKSalaries.csv")
+COPULA_PATH = _paths.get("copula",           "data/processed/empirical_copula.parquet")
+PROJ_PATH  = _paths.get("projections",       "data/processed/projections.csv")
+PCA_PATH   = _paths.get("batter_pca_model",  "data/processed/batter_pca_model.npz")
+GRID_PATH  = _paths.get("batter_score_grid", "data/processed/batter_score_grid.npy")
+OUTPUT_DIR = _paths.get("output_dir",        "outputs")
 
 
 # ── Timeout helper ──────────────────────────────────────────────────────────
@@ -183,6 +201,10 @@ def run_scenario(
     n_chains: int,
     n_steps: int,
     n_workers: int = 1,
+    niter_success: int = OPT_NITER_SUCCESS,
+    early_stopping_window: int = OPT_ES_WINDOW,
+    early_stopping_threshold: float = OPT_ES_THRESHOLD,
+    portfolio_size: int = PORTFOLIO_SIZE,
 ) -> dict:
     """Run one benchmark scenario and return a result dict."""
     label = f"scenario {idx}: n_sims={n_sims:,d}  p{percentile:02d}"
@@ -253,7 +275,10 @@ def run_scenario(
                 n_chains=n_chains,
                 temperature=OPT_TEMP,
                 n_steps=n_steps,
+                niter_success=niter_success,
                 n_workers=n_workers,
+                early_stopping_window=early_stopping_window,
+                early_stopping_threshold=early_stopping_threshold,
                 rng_seed=RNG_SEED,
             )
             lineup, score = optimizer.optimize()
@@ -279,11 +304,14 @@ def run_scenario(
                 sim_results=sim_results,
                 players_df=players_df,
                 target=target,
-                portfolio_size=PORTFOLIO_SIZE,
+                portfolio_size=portfolio_size,
                 n_chains=n_chains,
                 temperature=OPT_TEMP,
                 n_steps=n_steps,
+                niter_success=niter_success,
                 n_workers=n_workers,
+                early_stopping_window=early_stopping_window,
+                early_stopping_threshold=early_stopping_threshold,
                 rng_seed=RNG_SEED,
             )
             portfolio = constructor.construct()
@@ -349,6 +377,23 @@ def main():
         metavar="N",
         help=f"Number of parallel chain workers (default: {OPT_WORKERS}; 1 = sequential)",
     )
+    parser.add_argument(
+        "--portfolio-size",
+        type=int,
+        default=PORTFOLIO_SIZE,
+        metavar="N",
+        help=f"Number of lineups to construct per scenario (default: {PORTFOLIO_SIZE})",
+    )
+    parser.add_argument(
+        "--percentile",
+        type=int,
+        default=TARGET_PERCENTILE,
+        metavar="PCT",
+        help=(
+            f"Target percentile for score threshold "
+            f"(default: {TARGET_PERCENTILE} from config.yaml; use 0 to sweep all)"
+        ),
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -364,11 +409,15 @@ def main():
 
     print("=" * 72)
     print("MLB DFS Timing Benchmark")
+    print(f"  config            : {_CONFIG_PATH}")
     print(f"  mode              : {'QUICK' if args.quick else 'PRODUCTION'}")
     print(f"  timeout per phase : {args.timeout}s ({args.timeout / 60:.1f} min)")
     print(f"  chains / steps    : {n_chains} / {n_steps}")
+    print(f"  niter_success     : {OPT_NITER_SUCCESS}")
+    print(f"  early_stop window : {OPT_ES_WINDOW}  threshold: {OPT_ES_THRESHOLD}")
     print(f"  workers           : {n_workers}")
-    print(f"  portfolio size    : {PORTFOLIO_SIZE}")
+    print(f"  portfolio size    : {args.portfolio_size}")
+    print(f"  target percentile : {'all' if args.percentile == 0 else f'p{args.percentile}'}  (config default: p{TARGET_PERCENTILE})")
     print("=" * 72)
 
     # Load data once
@@ -403,6 +452,11 @@ def main():
         selected = [(args.scenario, *SCENARIOS[args.scenario])]
     else:
         selected = [(i, n, p) for i, (n, p) in enumerate(SCENARIOS)]
+        if args.percentile != 0:
+            selected = [(i, n, p) for i, n, p in selected if p == args.percentile]
+            if not selected:
+                print(f"ERROR: no scenarios match --percentile {args.percentile}")
+                sys.exit(1)
 
     print(f"\nRunning {len(selected)} scenario(s)...\n")
 
@@ -423,6 +477,10 @@ def main():
             n_chains=n_chains,
             n_steps=n_steps,
             n_workers=n_workers,
+            niter_success=OPT_NITER_SUCCESS,
+            early_stopping_window=OPT_ES_WINDOW,
+            early_stopping_threshold=OPT_ES_THRESHOLD,
+            portfolio_size=args.portfolio_size,
         )
         all_results.append(res)
 

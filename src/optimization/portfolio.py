@@ -12,6 +12,8 @@ maintaining beam_width candidate portfolio paths and pruning by coverage after
 each round.
 """
 import logging
+from concurrent.futures import ProcessPoolExecutor
+from contextlib import nullcontext
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -67,6 +69,7 @@ class PortfolioConstructor:
         n_chains: int = 250,
         temperature: float = 0.1,
         n_steps: int = 100,
+        niter_success: int = 25,
         n_workers: int = 1,
         rng_seed: Optional[int] = None,
         early_stopping_window: int = 25,
@@ -80,6 +83,7 @@ class PortfolioConstructor:
             n_chains=n_chains,
             temperature=temperature,
             n_steps=n_steps,
+            niter_success=niter_success,
             n_workers=n_workers,
             early_stopping_window=early_stopping_window,
             early_stopping_threshold=early_stopping_threshold,
@@ -104,60 +108,64 @@ class PortfolioConstructor:
         full_matrix = self.sim_results.results_matrix  # shape (n_sims, n_players)
         col_map = {pid: i for i, pid in enumerate(self.sim_results.player_ids)}
         active_mask = np.ones(self.sim_results.n_sims, dtype=bool)
+        n_workers = self._optimizer_kwargs.get('n_workers', 1)
 
-        for i in range(self.portfolio_size):
-            n_active = int(active_mask.sum())
-            if n_active == 0:
+        with (
+            ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else nullcontext()
+        ) as shared_executor:
+            for i in range(self.portfolio_size):
+                n_active = int(active_mask.sum())
+                if n_active == 0:
+                    logger.info(
+                        "All simulation rows consumed after %d lineups; "
+                        "stopping early (requested %d).",
+                        len(portfolio),
+                        self.portfolio_size,
+                    )
+                    break
+
                 logger.info(
-                    "All simulation rows consumed after %d lineups; "
-                    "stopping early (requested %d).",
-                    len(portfolio),
+                    "Optimizing lineup %d/%d — %d active simulation rows remaining.",
+                    i + 1,
                     self.portfolio_size,
+                    n_active,
                 )
-                break
 
-            logger.info(
-                "Optimizing lineup %d/%d — %d active simulation rows remaining.",
-                i + 1,
-                self.portfolio_size,
-                n_active,
-            )
+                # Build a SimulationResults view over the active rows only.
+                active_sim = SimulationResults(
+                    player_ids=self.sim_results.player_ids,
+                    results_matrix=full_matrix[active_mask],
+                )
 
-            # Build a SimulationResults view over the active rows only.
-            active_sim = SimulationResults(
-                player_ids=self.sim_results.player_ids,
-                results_matrix=full_matrix[active_mask],
-            )
+                seed = None if self._base_seed is None else self._base_seed + i
+                optimizer = BasinHoppingOptimizer(
+                    sim_results=active_sim,
+                    players_df=self.players_df,
+                    target=self.target,
+                    rng_seed=seed,
+                    **self._optimizer_kwargs,
+                )
+                lineup, _ = optimizer.optimize(executor=shared_executor if n_workers > 1 else None)
 
-            seed = None if self._base_seed is None else self._base_seed + i
-            optimizer = BasinHoppingOptimizer(
-                sim_results=active_sim,
-                players_df=self.players_df,
-                target=self.target,
-                rng_seed=seed,
-                **self._optimizer_kwargs,
-            )
-            lineup, _ = optimizer.optimize()
+                # Score against the full matrix for comparability.
+                cols = [col_map[pid] for pid in lineup.player_ids]
+                full_totals = full_matrix[:, cols].sum(axis=1)
+                full_score = float((full_totals >= self.target).mean())
 
-            # Score against the full matrix for comparability.
-            cols = [col_map[pid] for pid in lineup.player_ids]
-            full_totals = full_matrix[:, cols].sum(axis=1)
-            full_score = float((full_totals >= self.target).mean())
+                portfolio.append((lineup, full_score))
+                logger.info("  Lineup %d score (full): %.4f", i + 1, full_score)
 
-            portfolio.append((lineup, full_score))
-            logger.info("  Lineup %d score (full): %.4f", i + 1, full_score)
-
-            # Consume active rows where this lineup already hits the target.
-            active_indices = np.where(active_mask)[0]
-            active_totals = full_matrix[active_mask][:, cols].sum(axis=1)
-            hit_mask = active_totals >= self.target
-            consumed = int(hit_mask.sum())
-            active_mask[active_indices[hit_mask]] = False
-            logger.info(
-                "  Consumed %d rows; %d remain.",
-                consumed,
-                int(active_mask.sum()),
-            )
+                # Consume active rows where this lineup already hits the target.
+                active_indices = np.where(active_mask)[0]
+                active_totals = full_matrix[active_mask][:, cols].sum(axis=1)
+                hit_mask = active_totals >= self.target
+                consumed = int(hit_mask.sum())
+                active_mask[active_indices[hit_mask]] = False
+                logger.info(
+                    "  Consumed %d rows; %d remain.",
+                    consumed,
+                    int(active_mask.sum()),
+                )
 
         return portfolio
 
@@ -213,6 +221,7 @@ class BeamPortfolioConstructor:
         n_chains: int = 250,
         temperature: float = 0.1,
         n_steps: int = 100,
+        niter_success: int = 25,
         n_workers: int = 1,
         rng_seed: Optional[int] = None,
     ) -> None:
@@ -225,6 +234,7 @@ class BeamPortfolioConstructor:
             n_chains=n_chains,
             temperature=temperature,
             n_steps=n_steps,
+            niter_success=niter_success,
             n_workers=n_workers,
         )
         self._base_seed = rng_seed
@@ -247,6 +257,7 @@ class BeamPortfolioConstructor:
         full_matrix = self.sim_results.results_matrix
         col_map = {pid: i for i, pid in enumerate(self.sim_results.player_ids)}
         n_sims = self.sim_results.n_sims
+        n_workers = self._optimizer_kwargs.get('n_workers', 1)
 
         # Each beam state: (portfolio, active_mask)
         # - portfolio : List[Tuple[Lineup, float]]  — lineups selected so far
@@ -256,100 +267,106 @@ class BeamPortfolioConstructor:
             ([], initial_mask)
         ]
 
-        for depth in range(self.portfolio_size):
-            next_candidates: List[Tuple[List[Tuple[Lineup, float]], np.ndarray]] = []
+        with (
+            ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else nullcontext()
+        ) as shared_executor:
+            for depth in range(self.portfolio_size):
+                next_candidates: List[Tuple[List[Tuple[Lineup, float]], np.ndarray]] = []
 
-            for path_idx, (path_portfolio, path_mask) in enumerate(beam):
-                n_active = int(path_mask.sum())
+                for path_idx, (path_portfolio, path_mask) in enumerate(beam):
+                    n_active = int(path_mask.sum())
 
-                if n_active == 0:
-                    # This path has exhausted all rows; carry it forward unchanged.
+                    if n_active == 0:
+                        # This path has exhausted all rows; carry it forward unchanged.
+                        logger.info(
+                            "Beam depth %d/%d, path %d: all rows consumed; "
+                            "cannot extend further.",
+                            depth + 1,
+                            self.portfolio_size,
+                            path_idx,
+                        )
+                        next_candidates.append((path_portfolio, path_mask))
+                        continue
+
                     logger.info(
-                        "Beam depth %d/%d, path %d: all rows consumed; "
-                        "cannot extend further.",
+                        "Beam depth %d/%d, path %d — %d active rows.",
                         depth + 1,
                         self.portfolio_size,
                         path_idx,
+                        n_active,
                     )
-                    next_candidates.append((path_portfolio, path_mask))
-                    continue
+
+                    active_sim = SimulationResults(
+                        player_ids=self.sim_results.player_ids,
+                        results_matrix=full_matrix[path_mask],
+                    )
+
+                    seed = (
+                        None
+                        if self._base_seed is None
+                        else self._base_seed + depth * self.beam_width * 10 + path_idx
+                    )
+                    optimizer = BasinHoppingOptimizer(
+                        sim_results=active_sim,
+                        players_df=self.players_df,
+                        target=self.target,
+                        rng_seed=seed,
+                        **self._optimizer_kwargs,
+                    )
+                    top_k = optimizer.optimize_top_k(
+                        self.beam_width,
+                        executor=shared_executor if n_workers > 1 else None,
+                    )
+
+                    for lineup, _ in top_k:
+                        cols = [col_map[pid] for pid in lineup.player_ids]
+
+                        # Score against the full matrix for comparability.
+                        full_totals = full_matrix[:, cols].sum(axis=1)
+                        full_score = float((full_totals >= self.target).mean())
+
+                        # Consume active rows where this lineup hits the target.
+                        new_mask = path_mask.copy()
+                        active_indices = np.where(new_mask)[0]
+                        active_totals = full_matrix[new_mask][:, cols].sum(axis=1)
+                        hit = active_totals >= self.target
+                        consumed = int(hit.sum())
+                        new_mask[active_indices[hit]] = False
+                        logger.debug(
+                            "  Depth %d path %d candidate: full_score=%.4f "
+                            "consumed=%d remaining=%d",
+                            depth + 1,
+                            path_idx,
+                            full_score,
+                            consumed,
+                            int(new_mask.sum()),
+                        )
+
+                        next_candidates.append(
+                            (path_portfolio + [(lineup, full_score)], new_mask)
+                        )
+
+                if not next_candidates:
+                    break
+
+                # Prune: keep top beam_width paths.
+                # Primary key: fewest active rows remaining (maximum coverage).
+                # Secondary key: highest sum of full-matrix scores across the portfolio.
+                next_candidates.sort(
+                    key=lambda x: (
+                        int(x[1].sum()),
+                        -sum(s for _, s in x[0]),
+                    )
+                )
+                beam = next_candidates[: self.beam_width]
 
                 logger.info(
-                    "Beam depth %d/%d, path %d — %d active rows.",
+                    "Beam depth %d: pruned to %d paths. "
+                    "Best path has %d active rows remaining.",
                     depth + 1,
-                    self.portfolio_size,
-                    path_idx,
-                    n_active,
+                    len(beam),
+                    int(beam[0][1].sum()),
                 )
-
-                active_sim = SimulationResults(
-                    player_ids=self.sim_results.player_ids,
-                    results_matrix=full_matrix[path_mask],
-                )
-
-                seed = (
-                    None
-                    if self._base_seed is None
-                    else self._base_seed + depth * self.beam_width * 10 + path_idx
-                )
-                optimizer = BasinHoppingOptimizer(
-                    sim_results=active_sim,
-                    players_df=self.players_df,
-                    target=self.target,
-                    rng_seed=seed,
-                    **self._optimizer_kwargs,
-                )
-                top_k = optimizer.optimize_top_k(self.beam_width)
-
-                for lineup, _ in top_k:
-                    cols = [col_map[pid] for pid in lineup.player_ids]
-
-                    # Score against the full matrix for comparability.
-                    full_totals = full_matrix[:, cols].sum(axis=1)
-                    full_score = float((full_totals >= self.target).mean())
-
-                    # Consume active rows where this lineup hits the target.
-                    new_mask = path_mask.copy()
-                    active_indices = np.where(new_mask)[0]
-                    active_totals = full_matrix[new_mask][:, cols].sum(axis=1)
-                    hit = active_totals >= self.target
-                    consumed = int(hit.sum())
-                    new_mask[active_indices[hit]] = False
-                    logger.debug(
-                        "  Depth %d path %d candidate: full_score=%.4f "
-                        "consumed=%d remaining=%d",
-                        depth + 1,
-                        path_idx,
-                        full_score,
-                        consumed,
-                        int(new_mask.sum()),
-                    )
-
-                    next_candidates.append(
-                        (path_portfolio + [(lineup, full_score)], new_mask)
-                    )
-
-            if not next_candidates:
-                break
-
-            # Prune: keep top beam_width paths.
-            # Primary key: fewest active rows remaining (maximum coverage).
-            # Secondary key: highest sum of full-matrix scores across the portfolio.
-            next_candidates.sort(
-                key=lambda x: (
-                    int(x[1].sum()),
-                    -sum(s for _, s in x[0]),
-                )
-            )
-            beam = next_candidates[: self.beam_width]
-
-            logger.info(
-                "Beam depth %d: pruned to %d paths. "
-                "Best path has %d active rows remaining.",
-                depth + 1,
-                len(beam),
-                int(beam[0][1].sum()),
-            )
 
         if not beam:
             return []
