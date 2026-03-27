@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useState } from 'react'
 import type { AppConfig, LineupResult, RunStatus, CompleteEvent } from './types'
-import { fetchConfig } from './api'
+import { fetchConfig, fetchPortfolio } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -51,11 +51,19 @@ export default function App() {
 
   const running = state.runStatus === 'running'
 
-  // Load config on mount
+  // Load config and existing portfolio on mount
   useEffect(() => {
     fetchConfig()
       .then(cfg => dispatch({ type: 'set_config', config: cfg }))
       .catch(e => setConfigError(String(e)))
+    fetchPortfolio()
+      .then(portfolio => {
+        if (portfolio.length > 0) {
+          dispatch({ type: 'set_portfolio', portfolio })
+          dispatch({ type: 'set_run_status', status: 'complete' })
+        }
+      })
+      .catch(() => {})
   }, [])
 
   // React to SSE events

@@ -92,7 +92,7 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'optimize_lineup': {
       const ev = e as OptimizeLineupEvent
-      return `Lineup ${ev.lineup_index}/${ev.total} — P(hit) = ${ev.score.toFixed(4)}`
+      return `Lineup ${ev.lineup_index}/${ev.total} — score ${ev.score.toFixed(4)}`
     }
     case 'complete': {
       const ev = e as unknown as { n_lineups: number }

@@ -116,41 +116,89 @@ class BatterPCAModel:
 
     def project(self, mu_proj: float, sigma_proj: float) -> Tuple[float, float, float, float]:
         """
-        Find the point on the 2-D PCA plane whose mu and sigma components
-        best match the supplied projections, then reconstruct the full 4-D
-        parameter vector (w, lam, mu, sigma).
+        Find the point on the 2-D PCA plane whose mixture-distribution mean
+        and std best match the supplied projections, then reconstruct the
+        full 4-D parameter vector (w, lam, mu, sigma).
 
-        The approach solves a 2×2 linear system:
-          components_ @ alpha = [mu_norm, sigma_norm]
-        (using the mu and sigma rows of the component matrix), then
-        reconstructs the full 4-D point as: alpha @ components_.
-
-        Falls back to the global mean parameters when the system is poorly
-        conditioned.
+        Strategy:
+        1. Try the full 2×2 solve (constrain both mu and sigma).
+        2. If the result is degenerate (w or lam out of physical range),
+           fall back to a 1-constraint solve that matches only mu_proj
+           and picks the closest point on the PCA line to the manifold
+           centre.  This handles the common case where sigma_proj is a
+           heuristic (e.g. 0.85 × mu) that does not match the historical
+           sigma/mu relationship captured by the PCA.
         """
         if self.mean_ is None:
             raise RuntimeError("BatterPCAModel has not been fitted yet.")
 
-        # Normalised target for mu (index 2) and sigma (index 3)
+        result = self._project_2d(mu_proj, sigma_proj)
+        if result is not None:
+            return result
+
+        # Fallback: match only mu, minimise distance to manifold centre
+        result = self._project_1d(mu_proj)
+        if result is not None:
+            return result
+
+        # Last resort: scale the global mean parameters to match mu_proj
+        scale = mu_proj / self.mean_[2] if self.mean_[2] != 0 else 1.0
+        w = float(np.clip(self.mean_[0], 1e-6, 1.0 - 1e-6))
+        lam = float(max(self.mean_[1] / scale, 1e-4))
+        return w, lam, mu_proj, float(max(self.mean_[3] * scale, 0.1))
+
+    def _project_2d(
+        self, mu_proj: float, sigma_proj: float
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Full 2-constraint solve.  Returns None if result is degenerate."""
         mu_norm = (mu_proj - self.mean_[2]) / self.std_[2]
         sigma_norm = (sigma_proj - self.mean_[3]) / self.std_[3]
 
-        # Build 2×2 system:  A @ alpha = b
-        # A[i, j] = components_[j, dim_i]  where dim_0=2 (mu), dim_1=3 (sigma)
         A = np.array([
             [self.components_[0, 2], self.components_[1, 2]],
             [self.components_[0, 3], self.components_[1, 3]],
         ])
         b = np.array([mu_norm, sigma_norm])
+        alpha, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
 
-        alpha, _, rank, _ = np.linalg.lstsq(A, b, rcond=None)
+        return self._reconstruct_if_valid(alpha)
 
-        # Reconstruct 4-D point in normalised space, then un-normalise
-        reconstructed_norm = alpha @ self.components_  # shape (4,)
+    def _project_1d(
+        self, mu_proj: float
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """1-constraint solve: match mu only, minimise ‖alpha‖ (closest to
+        manifold centre on the PCA line satisfying the mu constraint)."""
+        mu_norm = (mu_proj - self.mean_[2]) / self.std_[2]
+
+        # components_[:, 2] are the two PCA loadings on the mu dimension.
+        # We want:  alpha . components_[:, 2] = mu_norm
+        # with minimum ‖alpha‖.  Solution: alpha = c * v  where
+        # v = components_[:, 2] and c = mu_norm / (v . v).
+        v = self.components_[:, 2]
+        denom = v @ v
+        if abs(denom) < 1e-12:
+            return None
+        c = mu_norm / denom
+        alpha = c * v
+
+        return self._reconstruct_if_valid(alpha)
+
+    def _reconstruct_if_valid(
+        self, alpha: np.ndarray
+    ) -> Optional[Tuple[float, float, float, float]]:
+        """Reconstruct 4-D params from PCA coords; return None if degenerate."""
+        reconstructed_norm = alpha @ self.components_
         reconstructed = reconstructed_norm * self.std_ + self.mean_
 
-        w = float(np.clip(reconstructed[0], 1e-6, 1.0 - 1e-6))
-        lam = float(max(reconstructed[1], 1e-4))
+        w_raw = reconstructed[0]
+        lam_raw = reconstructed[1]
+
+        # Reject clearly degenerate solutions
+        if w_raw > 1.5 or w_raw < -0.5 or lam_raw < 0.5:
+            return None
+
+        w = float(np.clip(w_raw, 1e-6, 1.0 - 1e-6))
+        lam = float(max(lam_raw, 1e-4))
         mu = float(reconstructed[2])
         sigma = float(max(reconstructed[3], 0.1))
 

@@ -47,27 +47,33 @@ def _build_player_meta(players_df: pd.DataFrame) -> PlayerMeta:
     return meta
 
 
-def _score_totals(totals: np.ndarray, target: float) -> float:
+# ------------------------------------------------------------------ #
+#  Objective functions                                                  #
+# ------------------------------------------------------------------ #
+
+# Supported objective names (used in config and API).
+OBJECTIVES = ("p_hit", "expected_surplus")
+
+
+def _score_totals_p_hit(totals: np.ndarray, target: float) -> float:
+    """P(lineup total >= target)."""
     return float((totals >= target).mean())
 
 
+def _score_totals_surplus(totals: np.ndarray, target: float) -> float:
+    """E[max(lineup total - target, 0)]."""
+    return float(np.maximum(totals - target, 0.0).mean())
+
+
 @njit(cache=True)
-def _score_swap_candidates(
+def _score_swap_candidates_p_hit(
     sim_matrix: np.ndarray,
     totals: np.ndarray,
     col_out: int,
     cand_cols: np.ndarray,
     target: float,
 ) -> np.ndarray:
-    """Score all swap candidates for one slot without allocating a swapped matrix.
-
-    Replaces:
-        swapped = totals[:,None] - col_out_scores[:,None] + sim_matrix[:,cand_cols]
-        cand_scores = (swapped >= target).mean(axis=0)
-
-    The inner loop over n_sims is compiled to native SIMD code, and no
-    (n_sims × n_cands) intermediate array is allocated.
-    """
+    """Score all swap candidates using P(hit) objective (Numba-accelerated)."""
     n_sims = totals.shape[0]
     n_cands = cand_cols.shape[0]
     cand_scores = np.empty(n_cands, dtype=np.float64)
@@ -78,6 +84,29 @@ def _score_swap_candidates(
             if totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in] >= target:
                 count += 1.0
         cand_scores[j] = count / n_sims
+    return cand_scores
+
+
+@njit(cache=True)
+def _score_swap_candidates_surplus(
+    sim_matrix: np.ndarray,
+    totals: np.ndarray,
+    col_out: int,
+    cand_cols: np.ndarray,
+    target: float,
+) -> np.ndarray:
+    """Score all swap candidates using expected surplus objective (Numba-accelerated)."""
+    n_sims = totals.shape[0]
+    n_cands = cand_cols.shape[0]
+    cand_scores = np.empty(n_cands, dtype=np.float64)
+    for j in range(n_cands):
+        surplus = 0.0
+        col_in = cand_cols[j]
+        for i in range(n_sims):
+            val = totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in]
+            if val > target:
+                surplus += val - target
+        cand_scores[j] = surplus / n_sims
     return cand_scores
 
 
@@ -103,7 +132,10 @@ class _ChainRunner:
         n_steps: int,
         niter_success: int = 25,
         salary_floor: Optional[float] = None,
+        objective: str = "expected_surplus",
     ):
+        if objective not in OBJECTIVES:
+            raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
         self.sim_matrix = sim_matrix
         self.player_meta = player_meta
         self.col_map = col_map
@@ -113,6 +145,15 @@ class _ChainRunner:
         self.n_steps = n_steps
         self.niter_success = niter_success
         self.salary_floor = salary_floor
+        self.objective = objective
+
+        # Bind the right scoring functions based on objective
+        if objective == "p_hit":
+            self._score_totals = _score_totals_p_hit
+            self._score_swap_candidates = _score_swap_candidates_p_hit
+        else:
+            self._score_totals = _score_totals_surplus
+            self._score_swap_candidates = _score_swap_candidates_surplus
 
     # ---- public entry point ---------------------------------------- #
 
@@ -121,7 +162,7 @@ class _ChainRunner:
         lineup = self._random_valid_lineup(rng)
         cols = [self.col_map[pid] for pid in lineup.player_ids]
         totals = self.sim_matrix[:, cols].sum(axis=1)
-        score = _score_totals(totals, self.target)
+        score = self._score_totals(totals, self.target)
 
         best_lineup = lineup
         best_score = score
@@ -135,7 +176,7 @@ class _ChainRunner:
 
             # Local search (greedy hill-climbing)
             candidate, cand_totals = self._local_search(candidate, cand_totals, rng)
-            cand_score = _score_totals(cand_totals, self.target)
+            cand_score = self._score_totals(cand_totals, self.target)
 
             # Metropolis acceptance
             delta = cand_score - score
@@ -157,7 +198,21 @@ class _ChainRunner:
 
     # ---- lineup construction --------------------------------------- #
 
+    # GPP-oriented stack templates: (primary_stack, secondary_stack).
+    # Remaining hitters are filled from other teams.
+    STACK_TEMPLATES = [(5, 3), (5, 2), (4, 4), (4, 3)]
+
     def _random_valid_lineup(
+        self, rng: np.random.Generator, max_attempts: int = 1000
+    ) -> Lineup:
+        """Sample a random valid lineup, ~80% seeded with a stack template."""
+        if rng.random() < 0.8:
+            lineup = self._stacked_lineup(rng, max_attempts=max_attempts // 2)
+            if lineup is not None:
+                return lineup
+        return self._unstacked_lineup(rng, max_attempts=max_attempts)
+
+    def _unstacked_lineup(
         self, rng: np.random.Generator, max_attempts: int = 1000
     ) -> Lineup:
         """Sample a random valid lineup by filling positions greedily."""
@@ -189,7 +244,139 @@ class _ChainRunner:
             "Check that enough players of each position are in the simulation results."
         )
 
+    def _stacked_lineup(
+        self, rng: np.random.Generator, max_attempts: int = 500
+    ) -> Optional[Lineup]:
+        """Build a lineup seeded with a GPP-style stack template (e.g. 5-3)."""
+        # Group non-pitcher players by team
+        team_batters: Dict[str, List[int]] = {}
+        for pid, meta in self.player_meta.items():
+            if meta['position'] != 'P':
+                team_batters.setdefault(meta['team'], []).append(pid)
+
+        # Only consider teams with enough batters
+        teams_with_enough: Dict[int, List[str]] = {}
+        for team, pids in team_batters.items():
+            n = len(pids)
+            for size in (3, 4, 5):
+                if n >= size:
+                    teams_with_enough.setdefault(size, []).append(team)
+
+        template = self.STACK_TEMPLATES[int(rng.integers(len(self.STACK_TEMPLATES)))]
+        primary_size, secondary_size = template
+
+        primary_teams = teams_with_enough.get(primary_size, [])
+        if not primary_teams:
+            return None
+
+        for _ in range(max_attempts):
+            # Pick primary stack team
+            primary_team = primary_teams[int(rng.integers(len(primary_teams)))]
+
+            # Pick secondary stack team (different team, different game preferred)
+            secondary_teams = [
+                t for t in teams_with_enough.get(secondary_size, [])
+                if t != primary_team
+            ]
+            if not secondary_teams:
+                continue
+            secondary_team = secondary_teams[int(rng.integers(len(secondary_teams)))]
+
+            # Select stack batters
+            primary_pool = team_batters[primary_team]
+            secondary_pool = team_batters[secondary_team]
+
+            primary_chosen = rng.choice(
+                primary_pool, size=primary_size, replace=False
+            ).tolist()
+            secondary_chosen = rng.choice(
+                secondary_pool, size=secondary_size, replace=False
+            ).tolist()
+
+            stack_ids = set(primary_chosen + secondary_chosen)
+
+            # Fill pitchers
+            pitcher_pool = [
+                p for p in self.players_by_pos['P'] if p not in stack_ids
+            ]
+            if len(pitcher_pool) < 2:
+                continue
+            pitchers = rng.choice(pitcher_pool, size=2, replace=False).tolist()
+
+            # Determine which batter positions are already covered by the stack
+            needed: Dict[str, int] = {}
+            for pos in ('C', '1B', '2B', '3B', 'SS', 'OF'):
+                needed[pos] = ROSTER_REQUIREMENTS[pos]
+
+            for pid in list(stack_ids):
+                pos = self.player_meta[pid]['position']
+                elig = self.player_meta[pid]['eligible_positions']
+                # Try to fill a needed slot
+                placed = False
+                for e in elig:
+                    if e != 'P' and needed.get(e, 0) > 0:
+                        needed[e] -= 1
+                        placed = True
+                        break
+                if not placed:
+                    # Player doesn't fill a remaining needed slot — check if
+                    # any slot still has room (bipartite will sort it out)
+                    pass
+
+            # Fill remaining positions from other teams
+            used = set(pitchers) | stack_ids
+            remaining_ids: List[int] = []
+            total_hitters_needed = 8 - primary_size - secondary_size
+            if total_hitters_needed < 0:
+                continue
+
+            ok = True
+            for pos, count in ROSTER_REQUIREMENTS.items():
+                if pos == 'P':
+                    continue
+                fill_count = needed.get(pos, 0)
+                if fill_count <= 0:
+                    continue
+                pool = [
+                    p for p in self.players_by_pos[pos]
+                    if p not in used
+                ]
+                if len(pool) < fill_count:
+                    ok = False
+                    break
+                chosen = rng.choice(pool, size=fill_count, replace=False).tolist()
+                remaining_ids.extend(chosen)
+                used.update(chosen)
+
+            if not ok:
+                continue
+
+            all_ids = pitchers + list(stack_ids) + remaining_ids
+            # Deduplicate (stack players may overlap with remaining)
+            if len(set(all_ids)) != len(all_ids) or len(all_ids) != 10:
+                continue
+
+            lineup = Lineup(all_ids)
+            if lineup.is_valid(self.player_meta, salary_floor=self.salary_floor):
+                return lineup
+
+        return None
+
     def _mutate(
+        self,
+        lineup: Lineup,
+        rng: np.random.Generator,
+        n_swaps: int = 3,
+        max_attempts: int = 50,
+    ) -> Lineup:
+        """Mutate a lineup — 40% chance of stack-swap, 60% random swaps."""
+        if rng.random() < 0.4:
+            result = self._stack_swap(lineup, rng, max_attempts)
+            if result is not None:
+                return result
+        return self._random_swap(lineup, rng, n_swaps, max_attempts)
+
+    def _random_swap(
         self,
         lineup: Lineup,
         rng: np.random.Generator,
@@ -226,6 +413,62 @@ class _ChainRunner:
 
         return lineup  # fallback: return original if no valid mutation found
 
+    def _stack_swap(
+        self,
+        lineup: Lineup,
+        rng: np.random.Generator,
+        max_attempts: int = 50,
+    ) -> Optional[Lineup]:
+        """Replace a mini-stack (2-3 hitters from one team) with same-sized
+        group from a different team, preserving position coverage."""
+        ids = list(lineup.player_ids)
+        # Find teams with 2+ hitters in the lineup
+        team_indices: Dict[str, List[int]] = {}
+        for i, pid in enumerate(ids):
+            meta = self.player_meta[pid]
+            if meta['position'] != 'P':
+                team_indices.setdefault(meta['team'], []).append(i)
+
+        swappable = [(t, idxs) for t, idxs in team_indices.items() if len(idxs) >= 2]
+        if not swappable:
+            return None
+
+        for _ in range(max_attempts):
+            # Pick a team to swap out
+            team_out, out_indices = swappable[int(rng.integers(len(swappable)))]
+            swap_size = min(int(rng.integers(2, min(len(out_indices), 3) + 1)), len(out_indices))
+            chosen_indices = rng.choice(out_indices, size=swap_size, replace=False).tolist()
+
+            # Pick a different team to swap in
+            team_batters: Dict[str, List[int]] = {}
+            used = set(ids)
+            for pid, meta in self.player_meta.items():
+                if meta['position'] != 'P' and meta['team'] != team_out and pid not in used:
+                    team_batters.setdefault(meta['team'], []).append(pid)
+
+            eligible_teams = [
+                (t, pids) for t, pids in team_batters.items()
+                if len(pids) >= swap_size
+            ]
+            if not eligible_teams:
+                continue
+
+            team_in, in_pool = eligible_teams[int(rng.integers(len(eligible_teams)))]
+            new_players = rng.choice(in_pool, size=swap_size, replace=False).tolist()
+
+            new_ids = list(ids)
+            for i, idx in enumerate(chosen_indices):
+                new_ids[idx] = new_players[i]
+
+            if len(set(new_ids)) != len(new_ids):
+                continue
+
+            cand = Lineup(new_ids)
+            if cand.is_valid(self.player_meta, salary_floor=self.salary_floor):
+                return cand
+
+        return None
+
     def _local_search(
         self,
         lineup: Lineup,
@@ -234,33 +477,53 @@ class _ChainRunner:
     ) -> Tuple[Lineup, np.ndarray]:
         """One greedy pass: for each slot, accept the best single-player swap.
 
+        Stack-aware: players who are part of a stack (3+ teammates in the
+        lineup) can only be swapped for same-team replacements, preserving the
+        correlation structure that the objective function rewards.
+
         Batches all candidate evaluations for a given slot into a single matrix
-        operation instead of looping over candidates one at a time:
-
-            swapped[:, i] = totals - sim_matrix[:, col_out] + sim_matrix[:, col_in_i]
-
-        Candidates are then ranked by score; validity is checked in score order
-        so we stop as soon as we find the best valid swap.
+        operation instead of looping over candidates one at a time.
         """
         ids = list(lineup.player_ids)
         lineup_set = set(ids)
-        current_score = _score_totals(totals, self.target)
+        current_score = self._score_totals(totals, self.target)
+
+        # Identify stacked teams: teams with 3+ hitters in the lineup.
+        team_counts: Dict[str, int] = {}
+        for pid in ids:
+            meta = self.player_meta[pid]
+            if meta['position'] != 'P':
+                team_counts[meta['team']] = team_counts.get(meta['team'], 0) + 1
+        stacked_teams = {t for t, c in team_counts.items() if c >= 3}
 
         for idx in rng.permutation(len(ids)).tolist():
             pid = ids[idx]
-            elig = self.player_meta[pid]['eligible_positions']
+            meta = self.player_meta[pid]
+            elig = meta['eligible_positions']
             col_out = self.col_map[pid]
 
+            # Build candidate pool
             cand_set: set = set()
             for pos in elig:
                 cand_set.update(self.players_by_pos[pos])
-            cand_ids = [c for c in cand_set if c not in lineup_set]
+
+            # Stack protection: if this player belongs to a stacked team,
+            # only consider same-team replacements.
+            player_team = meta['team']
+            is_stacked = meta['position'] != 'P' and player_team in stacked_teams
+            if is_stacked:
+                cand_ids = [
+                    c for c in cand_set
+                    if c not in lineup_set and self.player_meta[c]['team'] == player_team
+                ]
+            else:
+                cand_ids = [c for c in cand_set if c not in lineup_set]
             if not cand_ids:
                 continue
 
             cand_cols = np.array([self.col_map[c] for c in cand_ids])
 
-            cand_scores = _score_swap_candidates(
+            cand_scores = self._score_swap_candidates(
                 self.sim_matrix, totals, col_out, cand_cols, self.target
             )
 
@@ -287,18 +550,26 @@ class _ChainRunner:
                     break  # first valid candidate in score order is the global best
 
             if best_new_id is not None:
+                old_team = self.player_meta[pid]['team']
+                new_team = self.player_meta[best_new_id]['team']
                 ids[idx] = best_new_id
                 lineup_set.discard(pid)
                 lineup_set.add(best_new_id)
                 totals = best_new_totals
                 current_score = best_score
 
+                # Update team counts and stacked_teams if team changed
+                if old_team != new_team and self.player_meta[pid]['position'] != 'P':
+                    team_counts[old_team] = team_counts.get(old_team, 1) - 1
+                    team_counts[new_team] = team_counts.get(new_team, 0) + 1
+                    stacked_teams = {t for t, c in team_counts.items() if c >= 3}
+
         return Lineup(ids), totals
 
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective = args
     shm = SharedMemory(name=shm_name)
     sim_matrix = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
     try:
@@ -312,6 +583,7 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             n_steps=n_steps,
             niter_success=niter_success,
             salary_floor=salary_floor,
+            objective=objective,
         )
         return runner.run(seed)
     finally:
@@ -356,7 +628,11 @@ class BasinHoppingOptimizer:
         early_stopping_window: int = 25,
         early_stopping_threshold: float = 0.001,
         salary_floor: Optional[float] = None,
+        objective: str = "expected_surplus",
     ):
+        if objective not in OBJECTIVES:
+            raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
+
         # Restrict to players that appear in the simulation results
         sim_ids = set(sim_results.player_ids)
         meta_df = players_df[players_df['player_id'].isin(sim_ids)].copy()
@@ -376,6 +652,7 @@ class BasinHoppingOptimizer:
         self.early_stopping_window = early_stopping_window
         self.early_stopping_threshold = early_stopping_threshold
         self.salary_floor = salary_floor
+        self.objective = objective
 
         # Pre-group player IDs by position for fast pool queries
         self._players_by_pos: Dict[str, List[int]] = {
@@ -396,6 +673,7 @@ class BasinHoppingOptimizer:
             n_steps=self.n_steps,
             niter_success=self.niter_success,
             salary_floor=self.salary_floor,
+            objective=self.objective,
         )
 
     def _run_chains(
@@ -447,6 +725,7 @@ class BasinHoppingOptimizer:
                     self.n_steps,
                     self.niter_success,
                     self.salary_floor,
+                    self.objective,
                 )
                 for seed in seeds
             ]

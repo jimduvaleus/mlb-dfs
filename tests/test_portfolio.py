@@ -61,7 +61,7 @@ def sim_results(players_df):
     return SimulationResults(player_ids=pids, results_matrix=matrix)
 
 
-def _make_constructor(sim_results, players_df, portfolio_size=3, target=150.0, seed=42):
+def _make_constructor(sim_results, players_df, portfolio_size=3, target=150.0, seed=42, objective="p_hit"):
     return PortfolioConstructor(
         sim_results=sim_results,
         players_df=players_df,
@@ -70,6 +70,7 @@ def _make_constructor(sim_results, players_df, portfolio_size=3, target=150.0, s
         n_chains=3,
         n_steps=10,
         rng_seed=seed,
+        objective=objective,
     )
 
 

@@ -29,6 +29,11 @@ simulation:
   n_sims: 10000   # Number of Monte Carlo iterations
 
 optimizer:
+  # Objective function for lineup optimization:
+  #   "expected_surplus" — E[max(score-target, 0)], rewards ceiling/stacking
+  #   "p_hit"           — P(score >= target), rewards consistency
+  objective: expected_surplus
+
   n_chains: 250       # Independent Basin-Hopping chains per lineup round
   temperature: 0.1    # Metropolis acceptance temperature
   n_steps: 100        # Perturbation steps per chain

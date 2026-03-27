@@ -107,7 +107,17 @@ class SimulationEngine:
                     w, lam, mu, sigma = self.batter_pca_model.project(
                         float(player['mean']), float(player['std_dev'])
                     )
-                    marginal = BatterMixtureMarginal(w, lam, mu, sigma, self.score_grid)
+                    # Safety net: degenerate mixture params produce a
+                    # near-constant PPF; fall back to Gaussian.
+                    if w > 0.99 or lam < 0.01:
+                        import logging
+                        logging.getLogger(__name__).warning(
+                            "Degenerate mixture for player %s (w=%.4f, lam=%.4f); "
+                            "falling back to Gaussian", player['player_id'], w, lam
+                        )
+                        marginal = GaussianMarginal(player['mean'], player['std_dev'])
+                    else:
+                        marginal = BatterMixtureMarginal(w, lam, mu, sigma, self.score_grid)
                 else:
                     marginal = GaussianMarginal(player['mean'], player['std_dev'])
                 simulated_points = marginal.ppf(q)

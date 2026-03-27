@@ -1,22 +1,12 @@
-import type { LineupResult, PlayerRow, SSEEvent, OptimizeLineupEvent } from '../types'
+import type { LineupResult, SSEEvent, OptimizeLineupEvent } from '../types'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from 'recharts'
+import { getStackNotation } from '../utils'
 
 interface Props {
   lineups: LineupResult[]
   events: SSEEvent[]
-}
-
-function getStackNotation(players: PlayerRow[]): string {
-  const hitters = players.filter(p => p.position !== 'P')
-  const counts: Record<string, number> = {}
-  for (const p of hitters) {
-    counts[p.team] = (counts[p.team] ?? 0) + 1
-  }
-  return Object.values(counts)
-    .sort((a, b) => b - a)
-    .join('-')
 }
 
 function formatMs(ms: number): string {
@@ -101,7 +91,7 @@ export function MetricsPanel({ lineups, events }: Props) {
         <div className="stack-list">
           {stackList.map(([stack, count]) => (
             <div key={stack} className="stack-row">
-              <span className="stack-tag">{stack}</span>
+              <span className="stack-tag">{stack || 'None'}</span>
               <span className="stack-bar-wrap">
                 <span
                   className="stack-bar"

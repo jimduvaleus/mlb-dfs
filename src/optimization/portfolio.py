@@ -75,6 +75,7 @@ class PortfolioConstructor:
         early_stopping_window: int = 25,
         early_stopping_threshold: float = 0.001,
         salary_floor: Optional[float] = None,
+        objective: str = "expected_surplus",
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -89,6 +90,7 @@ class PortfolioConstructor:
             early_stopping_window=early_stopping_window,
             early_stopping_threshold=early_stopping_threshold,
             salary_floor=salary_floor,
+            objective=objective,
         )
         self._base_seed = rng_seed
 
@@ -238,6 +240,7 @@ class BeamPortfolioConstructor:
         n_workers: int = 1,
         rng_seed: Optional[int] = None,
         salary_floor: Optional[float] = None,
+        objective: str = "expected_surplus",
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -251,6 +254,7 @@ class BeamPortfolioConstructor:
             niter_success=niter_success,
             n_workers=n_workers,
             salary_floor=salary_floor,
+            objective=objective,
         )
         self._base_seed = rng_seed
 

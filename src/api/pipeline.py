@@ -153,6 +153,7 @@ class PipelineRunner:
             early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
             early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
             salary_floor=float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None,
+            objective=str(opt_cfg.get("objective", "expected_surplus")),
         )
 
         def _on_lineup_complete(lineup_index: int, total: int, score: float) -> None:

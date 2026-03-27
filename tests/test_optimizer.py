@@ -219,10 +219,10 @@ def test_local_search_does_not_decrease_score(sim_results, players_df, player_me
     lineup = opt._runner._random_valid_lineup(rng)
     cols = [opt.col_map[pid] for pid in lineup.player_ids]
     totals = opt.sim_matrix[:, cols].sum(axis=1)
-    score_before = float((totals >= opt.target).mean())
+    score_before = opt._runner._score_totals(totals, opt.target)
 
     improved_lineup, improved_totals = opt._runner._local_search(lineup, totals, rng)
-    score_after = float((improved_totals >= opt.target).mean())
+    score_after = opt._runner._score_totals(improved_totals, opt.target)
 
     assert score_after >= score_before - 1e-9
     assert improved_lineup.is_valid(player_meta)
@@ -238,7 +238,7 @@ def test_optimize_returns_valid_lineup(sim_results, players_df, player_meta):
 
     assert isinstance(lineup, Lineup)
     assert lineup.is_valid(player_meta)
-    assert 0.0 <= score <= 1.0
+    assert score >= 0.0
 
 
 def test_optimize_score_is_reproducible(sim_results, players_df):
