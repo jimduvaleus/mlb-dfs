@@ -250,6 +250,14 @@ class _ChainRunner:
             self._score_totals = _score_totals_surplus
             self._score_swap_candidates = _score_swap_candidates_surplus
 
+        # Pre-built parallel arrays for each position pool so _local_search
+        # can collect cand_ids and cand_cols in one pass without a second
+        # col_map lookup loop.
+        self._pos_col_arr: Dict[str, np.ndarray] = {
+            pos: np.array([col_map[pid] for pid in pids], dtype=np.int32)
+            for pos, pids in players_by_pos.items()
+        }
+
     # ---- public entry point ---------------------------------------- #
 
     def run(self, seed: int) -> Tuple[Lineup, float]:
@@ -631,38 +639,36 @@ class _ChainRunner:
             old_game = meta.get('game', '')
             old_is_pitcher = meta['position'] == 'P'
 
-            # Build candidate pool (stack protection unchanged)
-            cand_set: set = set()
-            for pos in elig:
-                cand_set.update(self.players_by_pos[pos])
-
-            # Salary window for this slot: any candidate whose salary falls
-            # outside [sal_min, sal_max] will fail the salary check regardless
-            # of everything else, so exclude them before Numba scoring.
+            # Salary window for this slot.
             sal_max = SALARY_CAP - running_salary + old_salary
             sal_min = (
                 (self.salary_floor - running_salary + old_salary)
                 if self.salary_floor is not None else 0.0
             )
 
+            # Build candidate pool in one pass using the pre-built parallel
+            # arrays, collecting ids and col indices together so no second
+            # col_map lookup loop is needed.
             is_stacked = not old_is_pitcher and old_team in stacked_teams
-            if is_stacked:
-                cand_ids = [
-                    c for c in cand_set
-                    if c not in lineup_set
-                    and self.player_meta[c]['team'] == old_team
-                    and sal_min <= self.player_meta[c]['salary'] <= sal_max
-                ]
-            else:
-                cand_ids = [
-                    c for c in cand_set
-                    if c not in lineup_set
-                    and sal_min <= self.player_meta[c]['salary'] <= sal_max
-                ]
+            cand_ids: List[int] = []
+            cand_col_list: List[int] = []
+            seen: set = set()
+            for pos in elig:
+                for c, col in zip(self.players_by_pos[pos], self._pos_col_arr[pos]):
+                    if c in seen or c in lineup_set:
+                        continue
+                    sal = self.player_meta[c]['salary']
+                    if sal < sal_min or sal > sal_max:
+                        continue
+                    if is_stacked and self.player_meta[c]['team'] != old_team:
+                        continue
+                    seen.add(c)
+                    cand_ids.append(c)
+                    cand_col_list.append(int(col))
             if not cand_ids:
                 continue
 
-            cand_cols = np.array([self.col_map[c] for c in cand_ids])
+            cand_cols = np.array(cand_col_list, dtype=np.int32)
             cand_scores = self._score_swap_candidates(
                 self.sim_matrix, totals, col_out, cand_cols, self.target
             )
