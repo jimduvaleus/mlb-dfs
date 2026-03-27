@@ -30,6 +30,7 @@ Usage
 
 import argparse
 import difflib
+import json
 import logging
 import re
 import sys
@@ -44,6 +45,8 @@ import requests
 # ---------------------------------------------------------------------------
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+DEFAULT_NAME_MAP_PATH = PROJECT_ROOT / "data" / "name_map.json"
 
 BASE_URL = "https://www.rotowire.com/daily/mlb/api"
 SLATE_LIST_URL = f"{BASE_URL}/slate-list.php"
@@ -96,6 +99,28 @@ def _estimate_std_dev(mean: float, position: str) -> float:
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
+
+
+def _load_name_map(path: str | Path | None) -> dict[str, str]:
+    """
+    Load a JSON file mapping RotoWire names to DK canonical names.
+
+    Example file (data/name_map.json):
+        {
+            "Enrique Hernandez": "Kike Hernandez"
+        }
+
+    Returns an empty dict if the file does not exist or path is None.
+    """
+    if path is None:
+        return {}
+    p = Path(path)
+    if not p.exists():
+        return {}
+    with p.open() as f:
+        mapping = json.load(f)
+    log.info("Loaded %d name mapping(s) from %s", len(mapping), p)
+    return mapping
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +316,7 @@ def build_projections_csv(
     dk_path: str,
     slate_id: int | str,
     output_path: str,
+    name_map: dict[str, str] | None = None,
     debug: bool = False,
 ) -> pd.DataFrame:
     # --- Load DK salary file ------------------------------------------------
@@ -340,16 +366,20 @@ def build_projections_csv(
         )
 
     # --- Match to DK player IDs ---------------------------------------------
+    name_map = name_map or {}
     matched, unmatched = [], []
     for _, row in proj_df.iterrows():
         if row["projected_fpts"] is None:
             continue
-        pid = _match_name(row["rw_name"], dk_lookup, rw_salary=row["rw_salary"])
+        rw_name = name_map.get(row["rw_name"], row["rw_name"])
+        if rw_name != row["rw_name"]:
+            log.debug("Name map: %r → %r", row["rw_name"], rw_name)
+        pid = _match_name(rw_name, dk_lookup, rw_salary=row["rw_salary"])
         if pid is not None:
             matched.append(
                 {
                     "player_id": pid,
-                    "name": row["rw_name"],
+                    "name": rw_name,
                     "mean": row["projected_fpts"],
                     "position": dk_pos.get(pid, row["position"]),
                     "lineup_slot": row["lineup_slot"],
@@ -445,6 +475,13 @@ def main() -> None:
         help="Print available DraftKings slates and exit",
     )
     parser.add_argument(
+        "--name-map",
+        default=str(DEFAULT_NAME_MAP_PATH),
+        metavar="PATH",
+        help="JSON file mapping RotoWire names to DK canonical names "
+             "(default: data/name_map.json; silently ignored if absent)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print raw API responses for debugging",
@@ -503,6 +540,7 @@ def main() -> None:
         dk_path=args.dk_slate,
         slate_id=slate_id,
         output_path=args.output,
+        name_map=_load_name_map(args.name_map),
         debug=args.debug,
     )
 
