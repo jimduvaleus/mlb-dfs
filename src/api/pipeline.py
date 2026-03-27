@@ -64,6 +64,18 @@ class PipelineRunner:
         opt_cfg = cfg.get("optimizer", {})
         port_cfg = cfg.get("portfolio", {})
 
+        # --- Entry file discovery ----------------------------------------
+        from src.api.dk_entries import parse_entry_file, scan_entry_files
+        raw_dir = os.path.dirname(paths["dk_slate"])
+        entry_files = scan_entry_files(raw_dir)
+        all_file_entries = [(ef, parse_entry_file(ef)) for ef in entry_files]
+        total_entries = sum(len(recs) for _, recs in all_file_entries)
+        if total_entries > 0:
+            logger.info(
+                "Found %d entry file(s) with %d total entries.",
+                len(entry_files), total_entries,
+            )
+
         # --- Load slate --------------------------------------------------
         dk_path = paths["dk_slate"]
         logger.info("Loading DK slate: %s", dk_path)
@@ -136,7 +148,13 @@ class PipelineRunner:
             self._cb("compute_target", {"target": target, "percentile": None})
 
         # --- Construct portfolio ----------------------------------------
-        portfolio_size = int(port_cfg.get("size", 20))
+        config_size = int(port_cfg.get("size", 20))
+        portfolio_size = max(config_size, total_entries) if total_entries > 0 else config_size
+        if total_entries > 0 and portfolio_size > config_size:
+            logger.info(
+                "Entry files require %d lineups; overriding config size %d.",
+                total_entries, config_size,
+            )
         logger.info(
             "Constructing portfolio — size=%d, target=%.1f, chains=%d",
             portfolio_size, target, opt_cfg.get("n_chains", 250),
@@ -179,6 +197,15 @@ class PipelineRunner:
         output_path = os.path.join(output_dir, "portfolio.csv")
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Portfolio saved to %s", output_path)
+
+        # --- Generate DK upload files ------------------------------------
+        if all_file_entries:
+            from src.api.dk_entries import assign_lineups_to_entries, write_upload_files
+            assignments = assign_lineups_to_entries(all_file_entries, portfolio)
+            paths_written = write_upload_files(
+                all_file_entries, assignments, slate_df, output_dir
+            )
+            self._cb("upload_files", {"n_files": len(paths_written), "paths": paths_written})
 
         return result
 
