@@ -17,6 +17,10 @@ from src.optimization.lineup import (
     Lineup,
     PlayerMeta,
     ROSTER_REQUIREMENTS,
+    SALARY_CAP,
+    MAX_HITTERS_PER_TEAM,
+    MIN_GAMES,
+    SLOTS,
 )
 from src.simulation.results import SimulationResults
 
@@ -116,6 +120,89 @@ def _score_swap_candidates_surplus(
                 surplus += val - target
         cand_scores[j] = surplus / n_sims
     return cand_scores
+
+
+# ------------------------------------------------------------------ #
+#  Slot assignment helpers (fast path for _local_search)              #
+# ------------------------------------------------------------------ #
+
+def _compute_slot_assignment(
+    ids: List[int],
+    player_meta: PlayerMeta,
+) -> Tuple[List[int], List[int]]:
+    """Compute a valid player→slot bipartite matching via augmenting-path DFS.
+
+    Returns ``(slot_to_pidx, pidx_to_slot)`` where:
+      ``slot_to_pidx[j]`` = index into *ids* matched to SLOTS[j]  (-1 = free)
+      ``pidx_to_slot[i]`` = slot index matched to ids[i]          (-1 = unmatched)
+
+    Raises RuntimeError if no full matching exists — only call with lineups
+    that have already passed Lineup.is_valid().
+    """
+    n = len(ids)
+    slot_to_pidx: List[int] = [-1] * len(SLOTS)
+    pidx_to_slot: List[int] = [-1] * n
+
+    def _elig(pidx: int) -> List[int]:
+        meta = player_meta[ids[pidx]]
+        ep = meta.get('eligible_positions') or [meta['position']]
+        ep_set = set(ep)
+        return [j for j, s in enumerate(SLOTS) if s in ep_set]
+
+    def _dfs(pidx: int, visited: set) -> bool:
+        for j in _elig(pidx):
+            if j not in visited:
+                visited.add(j)
+                occ = slot_to_pidx[j]
+                if occ == -1 or _dfs(occ, visited):
+                    slot_to_pidx[j] = pidx
+                    pidx_to_slot[pidx] = j
+                    return True
+        return False
+
+    for i in range(n):
+        if not _dfs(i, set()):
+            raise RuntimeError(
+                f"_compute_slot_assignment: could not match player index {i} "
+                f"(id={ids[i]}); lineup appears invalid."
+            )
+    return slot_to_pidx, pidx_to_slot
+
+
+def _try_augment_swap(
+    pidx: int,
+    ids: List[int],
+    player_meta: PlayerMeta,
+    slot_to_pidx: List[int],
+    pidx_to_slot: List[int],
+) -> bool:
+    """Attempt to place the player at *pidx* into a slot via one augmenting-path DFS.
+
+    **Pre-condition**: the old player's slot has already been freed in the
+    passed arrays (``slot_to_pidx[old_slot] = -1``, ``pidx_to_slot[pidx] = -1``),
+    and ``ids[pidx]`` holds the *new* player's id.
+
+    Modifies *slot_to_pidx* and *pidx_to_slot* in-place on success only
+    (a failed DFS leaves them unchanged). Returns True iff placement succeeded.
+    """
+    def _elig(p: int) -> List[int]:
+        meta = player_meta[ids[p]]
+        ep = meta.get('eligible_positions') or [meta['position']]
+        ep_set = set(ep)
+        return [j for j, s in enumerate(SLOTS) if s in ep_set]
+
+    def _dfs(p: int, visited: set) -> bool:
+        for j in _elig(p):
+            if j not in visited:
+                visited.add(j)
+                occ = slot_to_pidx[j]
+                if occ == -1 or _dfs(occ, visited):
+                    slot_to_pidx[j] = p
+                    pidx_to_slot[p] = j
+                    return True
+        return False
+
+    return _dfs(pidx, set())
 
 
 # ------------------------------------------------------------------ #
@@ -489,54 +576,97 @@ class _ChainRunner:
         lineup) can only be swapped for same-team replacements, preserving the
         correlation structure that the objective function rewards.
 
-        Batches all candidate evaluations for a given slot into a single matrix
-        operation instead of looping over candidates one at a time.
+        Uses an incremental fast-path validity check instead of rebuilding the
+        full bipartite match from scratch on every candidate:
+          1. O(1) salary check (eliminates most expensive replacements early)
+          2. O(1) team hitter-cap check
+          3. O(1) pitcher-batter conflict check
+          4. O(1) min-games check (rarely triggered)
+          5. Single augmenting-path DFS for position eligibility — O(n) worst
+             case but O(1) in the common same-position swap, and always correct
+             for multi-position eligible players.
         """
         ids = list(lineup.player_ids)
         lineup_set = set(ids)
         current_score = self._score_totals(totals, self.target)
 
-        # Identify stacked teams: teams with 3+ hitters in the lineup.
+        # ── incremental validity state ──────────────────────────────── #
+        slot_to_pidx, pidx_to_slot = _compute_slot_assignment(ids, self.player_meta)
+
+        running_salary: float = sum(self.player_meta[pid]['salary'] for pid in ids)
+
         team_counts: Dict[str, int] = {}
         for pid in ids:
-            meta = self.player_meta[pid]
-            if meta['position'] != 'P':
-                team_counts[meta['team']] = team_counts.get(meta['team'], 0) + 1
+            if self.player_meta[pid]['position'] != 'P':
+                t = self.player_meta[pid]['team']
+                team_counts[t] = team_counts.get(t, 0) + 1
         stacked_teams = {t for t, c in team_counts.items() if c >= 3}
 
+        game_counts: Dict[str, int] = {}
+        for pid in ids:
+            g = self.player_meta[pid].get('game', '')
+            if g:
+                game_counts[g] = game_counts.get(g, 0) + 1
+
+        pitcher_opponents: set = {
+            self.player_meta[pid]['opponent']
+            for pid in ids
+            if self.player_meta[pid]['position'] == 'P'
+            and self.player_meta[pid].get('opponent')
+        }
+        batter_teams: set = {
+            self.player_meta[pid]['team']
+            for pid in ids
+            if self.player_meta[pid]['position'] != 'P'
+        }
+
+        # ── main greedy loop ─────────────────────────────────────────── #
         for idx in rng.permutation(len(ids)).tolist():
             pid = ids[idx]
             meta = self.player_meta[pid]
             elig = meta['eligible_positions']
             col_out = self.col_map[pid]
+            old_salary = meta['salary']
+            old_team = meta['team']
+            old_game = meta.get('game', '')
+            old_is_pitcher = meta['position'] == 'P'
 
-            # Build candidate pool
+            # Build candidate pool (stack protection unchanged)
             cand_set: set = set()
             for pos in elig:
                 cand_set.update(self.players_by_pos[pos])
 
-            # Stack protection: if this player belongs to a stacked team,
-            # only consider same-team replacements.
-            player_team = meta['team']
-            is_stacked = meta['position'] != 'P' and player_team in stacked_teams
+            # Salary window for this slot: any candidate whose salary falls
+            # outside [sal_min, sal_max] will fail the salary check regardless
+            # of everything else, so exclude them before Numba scoring.
+            sal_max = SALARY_CAP - running_salary + old_salary
+            sal_min = (
+                (self.salary_floor - running_salary + old_salary)
+                if self.salary_floor is not None else 0.0
+            )
+
+            is_stacked = not old_is_pitcher and old_team in stacked_teams
             if is_stacked:
                 cand_ids = [
                     c for c in cand_set
-                    if c not in lineup_set and self.player_meta[c]['team'] == player_team
+                    if c not in lineup_set
+                    and self.player_meta[c]['team'] == old_team
+                    and sal_min <= self.player_meta[c]['salary'] <= sal_max
                 ]
             else:
-                cand_ids = [c for c in cand_set if c not in lineup_set]
+                cand_ids = [
+                    c for c in cand_set
+                    if c not in lineup_set
+                    and sal_min <= self.player_meta[c]['salary'] <= sal_max
+                ]
             if not cand_ids:
                 continue
 
             cand_cols = np.array([self.col_map[c] for c in cand_ids])
-
             cand_scores = self._score_swap_candidates(
                 self.sim_matrix, totals, col_out, cand_cols, self.target
             )
 
-            # Walk candidates best-first; check validity only until the first
-            # valid improvement is found (that candidate is necessarily the best).
             order = np.argsort(-cand_scores)
             best_new_id: Optional[int] = None
             best_new_totals: Optional[np.ndarray] = None
@@ -544,33 +674,120 @@ class _ChainRunner:
 
             for i in order:
                 if cand_scores[i] <= best_score:
-                    break  # remaining candidates can only be worse
-                test_ids = list(ids)
-                test_ids[idx] = cand_ids[i]
-                if Lineup(test_ids).is_valid(self.player_meta, salary_floor=self.salary_floor):
-                    best_score = float(cand_scores[i])
-                    best_new_id = cand_ids[i]
-                    best_new_totals = (
-                        totals
-                        - self.sim_matrix[:, col_out]
-                        + self.sim_matrix[:, cand_cols[i]]
+                    break
+                new_id = cand_ids[i]
+                new_meta = self.player_meta[new_id]
+                new_salary = new_meta['salary']
+                new_team = new_meta['team']
+                new_game = new_meta.get('game', '')
+                new_is_pitcher = new_meta['position'] == 'P'
+
+                # 1. Team hitter cap: only check when new_team gains a hitter
+                if not new_is_pitcher and (old_is_pitcher or old_team != new_team):
+                    if team_counts.get(new_team, 0) + 1 > MAX_HITTERS_PER_TEAM:
+                        continue
+
+                # 3. Pitcher-batter conflict
+                if new_is_pitcher:
+                    new_opp = new_meta.get('opponent', '')
+                    if new_opp:
+                        # Swapping out a hitter may shrink batter_teams.
+                        if not old_is_pitcher and team_counts.get(old_team, 0) == 1:
+                            eff_batter_teams = batter_teams - {old_team}
+                        else:
+                            eff_batter_teams = batter_teams
+                        if new_opp in eff_batter_teams:
+                            continue
+                elif old_is_pitcher:
+                    # Pitcher → hitter: remaining pitcher opponents shrink by old opp.
+                    old_opp = meta.get('opponent', '')
+                    eff_pitcher_opps = pitcher_opponents - ({old_opp} if old_opp else set())
+                    if new_team in eff_pitcher_opps:
+                        continue
+                else:
+                    # Hitter → hitter: pitcher opponents unchanged.
+                    if new_team in pitcher_opponents:
+                        continue
+
+                # 4. Min games (only when removing a player unique to their game)
+                if old_game and old_game != new_game and game_counts.get(old_game, 0) == 1:
+                    n_games_after = sum(
+                        1 for g, c in game_counts.items() if g != old_game and c > 0
                     )
-                    break  # first valid candidate in score order is the global best
+                    if new_game and new_game not in game_counts:
+                        n_games_after += 1
+                    if n_games_after < MIN_GAMES:
+                        continue
+
+                # 5. Position eligibility: incremental augmenting-path on copies.
+                #    A failed attempt leaves the originals unchanged.
+                st_copy = list(slot_to_pidx)
+                ps_copy = list(pidx_to_slot)
+                old_slot = ps_copy[idx]
+                st_copy[old_slot] = -1
+                ps_copy[idx] = -1
+
+                ids_test = list(ids)
+                ids_test[idx] = new_id
+
+                if not _try_augment_swap(idx, ids_test, self.player_meta, st_copy, ps_copy):
+                    continue
+
+                # Valid swap — commit
+                best_score = float(cand_scores[i])
+                best_new_id = new_id
+                best_new_totals = (
+                    totals
+                    - self.sim_matrix[:, col_out]
+                    + self.sim_matrix[:, self.col_map[new_id]]
+                )
+                slot_to_pidx[:] = st_copy
+                pidx_to_slot[:] = ps_copy
+                break
 
             if best_new_id is not None:
-                old_team = self.player_meta[pid]['team']
-                new_team = self.player_meta[best_new_id]['team']
+                new_meta = self.player_meta[best_new_id]
+                new_team = new_meta['team']
+                new_game = new_meta.get('game', '')
+                new_is_pitcher = new_meta['position'] == 'P'
+
                 ids[idx] = best_new_id
                 lineup_set.discard(pid)
                 lineup_set.add(best_new_id)
                 totals = best_new_totals
                 current_score = best_score
 
-                # Update team counts and stacked_teams if team changed
-                if old_team != new_team and self.player_meta[pid]['position'] != 'P':
-                    team_counts[old_team] = team_counts.get(old_team, 1) - 1
-                    team_counts[new_team] = team_counts.get(new_team, 0) + 1
+                # Salary
+                running_salary += new_meta['salary'] - old_salary
+
+                # Team counts and stacked_teams
+                if old_is_pitcher != new_is_pitcher or old_team != new_team:
+                    if not old_is_pitcher:
+                        team_counts[old_team] = team_counts.get(old_team, 1) - 1
+                    if not new_is_pitcher:
+                        team_counts[new_team] = team_counts.get(new_team, 0) + 1
                     stacked_teams = {t for t, c in team_counts.items() if c >= 3}
+
+                # Game counts
+                if old_game:
+                    game_counts[old_game] = game_counts.get(old_game, 1) - 1
+                if new_game:
+                    game_counts[new_game] = game_counts.get(new_game, 0) + 1
+
+                # Pitcher opponents and batter teams
+                if old_is_pitcher:
+                    old_opp = meta.get('opponent', '')
+                    if old_opp:
+                        pitcher_opponents.discard(old_opp)
+                else:
+                    if team_counts.get(old_team, 0) == 0:
+                        batter_teams.discard(old_team)
+                if new_is_pitcher:
+                    new_opp = new_meta.get('opponent', '')
+                    if new_opp:
+                        pitcher_opponents.add(new_opp)
+                else:
+                    batter_teams.add(new_team)
 
         return Lineup(ids), totals
 

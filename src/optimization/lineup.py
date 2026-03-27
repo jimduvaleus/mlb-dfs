@@ -43,7 +43,7 @@ class Lineup:
         salary_floor: Optional[float] = None,
     ) -> bool:
         """Check all DraftKings Classic constraints."""
-        if len(self.player_ids) != 10:
+        if len(self.player_ids) != 10 or len(set(self.player_ids)) != 10:
             return False
 
         rows = [player_meta[pid] for pid in self.player_ids if pid in player_meta]
