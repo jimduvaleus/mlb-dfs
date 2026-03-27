@@ -113,3 +113,28 @@ export interface ErrorEvent extends SSEEvent {
 }
 
 export type RunStatus = 'idle' | 'running' | 'complete' | 'error'
+
+// Slate game/team exclusion types
+export interface TeamStatus {
+  team: string
+  excluded: boolean
+}
+
+export interface GameStatus {
+  game: string
+  away: string
+  home: string
+  excluded: boolean
+  teams: TeamStatus[]
+}
+
+export interface SlateGamesResponse {
+  slate_id: string
+  games: GameStatus[]
+}
+
+export interface ExclusionsUpdate {
+  slate_id: string
+  excluded_teams: string[]
+  excluded_games: string[]
+}

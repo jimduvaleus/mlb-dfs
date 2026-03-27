@@ -7,9 +7,10 @@ import { ProjectionsPanel } from './components/ProjectionsPanel'
 import { ProgressPanel } from './components/ProgressPanel'
 import { PortfolioTable } from './components/PortfolioTable'
 import { MetricsPanel } from './components/MetricsPanel'
+import { SlatePanel } from './components/SlatePanel'
 import './App.css'
 
-type Tab = 'config' | 'run' | 'portfolio' | 'metrics'
+type Tab = 'config' | 'slate' | 'run' | 'portfolio' | 'metrics'
 
 interface State {
   config: AppConfig | null
@@ -116,7 +117,7 @@ export default function App() {
       </header>
 
       <nav className="tabs">
-        {(['config', 'run', 'portfolio', 'metrics'] as Tab[]).map(tab => (
+        {(['config', 'slate', 'run', 'portfolio', 'metrics'] as Tab[]).map(tab => (
           <button
             key={tab}
             className={`tab ${state.activeTab === tab ? 'active' : ''}`}
@@ -149,6 +150,10 @@ export default function App() {
               <p className="muted">Loading config…</p>
             )}
           </div>
+        )}
+
+        {state.activeTab === 'slate' && (
+          <SlatePanel disabled={running} />
         )}
 
         {state.activeTab === 'run' && (

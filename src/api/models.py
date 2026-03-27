@@ -66,3 +66,27 @@ class ProjectionsStatus(BaseModel):
     last_modified: Optional[float] = None  # Unix timestamp
     age_seconds: Optional[float] = None
     row_count: Optional[int] = None
+
+
+class TeamStatus(BaseModel):
+    team: str
+    excluded: bool
+
+
+class GameStatus(BaseModel):
+    game: str
+    away: str
+    home: str
+    excluded: bool
+    teams: list[TeamStatus]
+
+
+class SlateGamesResponse(BaseModel):
+    slate_id: str
+    games: list[GameStatus]
+
+
+class ExclusionsUpdate(BaseModel):
+    slate_id: str
+    excluded_teams: list[str]
+    excluded_games: list[str]

@@ -1,4 +1,4 @@
-import type { AppConfig, ProjectionsStatus, LineupResult } from './types'
+import type { AppConfig, ExclusionsUpdate, ProjectionsStatus, LineupResult, SlateGamesResponse } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -36,5 +36,24 @@ export async function fetchPortfolio(): Promise<LineupResult[]> {
 export async function fetchRunStatus(): Promise<{ status: string; error: string | null }> {
   const res = await fetch('/api/run/status')
   if (!res.ok) throw new Error(`Failed to get run status`)
+  return res.json()
+}
+
+export async function fetchSlateGames(): Promise<SlateGamesResponse> {
+  const res = await fetch('/api/slate/games')
+  if (!res.ok) throw new Error(`Failed to load slate games: ${res.statusText}`)
+  return res.json()
+}
+
+export async function saveSlateExclusions(update: ExclusionsUpdate): Promise<SlateGamesResponse> {
+  const res = await fetch('/api/slate/exclusions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  })
+  if (!res.ok) {
+    const detail = await res.text()
+    throw new Error(`Failed to save exclusions: ${detail}`)
+  }
   return res.json()
 }

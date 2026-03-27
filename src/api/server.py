@@ -22,7 +22,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config_io import read_config, write_config
-from .models import AppConfig, PortfolioResult, ProjectionsStatus
+from .models import AppConfig, ExclusionsUpdate, GameStatus, PortfolioResult, ProjectionsStatus, SlateGamesResponse
+from .slate_exclusions import get_slate_games_with_status, write_exclusions
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 UI_DIST = PROJECT_ROOT / "ui" / "dist"
@@ -53,6 +54,53 @@ def get_config() -> AppConfig:
 def post_config(cfg: AppConfig) -> AppConfig:
     write_config(cfg)
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Slate game/team exclusion endpoints
+# ---------------------------------------------------------------------------
+
+def _load_slate_games() -> list[str]:
+    """Parse the configured DK slate CSV and return unique game strings."""
+    cfg = read_config()
+    dk_path = cfg.paths.dk_slate
+    if not dk_path:
+        return []
+    p = PROJECT_ROOT / dk_path if not Path(dk_path).is_absolute() else Path(dk_path)
+    if not p.exists():
+        return []
+    from src.ingestion.dk_slate import DraftKingsSlateIngestor
+    df = DraftKingsSlateIngestor(str(p)).get_slate_dataframe()
+    return [g for g in df["game"].dropna().unique().tolist() if g]
+
+
+@app.get("/api/slate/games")
+def get_slate_games() -> SlateGamesResponse:
+    games = _load_slate_games()
+    if not games:
+        return SlateGamesResponse(slate_id="", games=[])
+    slate_id, game_dicts = get_slate_games_with_status(games)
+    return SlateGamesResponse(
+        slate_id=slate_id,
+        games=[GameStatus(**g) for g in game_dicts],
+    )
+
+
+@app.post("/api/slate/exclusions")
+def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
+    write_exclusions(
+        slate_id=update.slate_id,
+        excluded_teams=update.excluded_teams,
+        excluded_games=update.excluded_games,
+    )
+    games = _load_slate_games()
+    if not games:
+        return SlateGamesResponse(slate_id=update.slate_id, games=[])
+    slate_id, game_dicts = get_slate_games_with_status(games)
+    return SlateGamesResponse(
+        slate_id=slate_id,
+        games=[GameStatus(**g) for g in game_dicts],
+    )
 
 
 # ---------------------------------------------------------------------------

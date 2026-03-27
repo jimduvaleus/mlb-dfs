@@ -1,4 +1,6 @@
 
+- game/team/player excuders
+
 
 - Need DK Entry parser and DK Upload file maker
 

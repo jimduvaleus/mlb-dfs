@@ -86,6 +86,8 @@ class PipelineRunner:
                 slate_df[["player_id", "name"]], on="player_id", how="left"
             )
 
+        players_df = self._apply_exclusions(players_df)
+
         n_units = players_df.groupby(["team", "opponent"]).ngroups
         self._cb("load_slate", {
             "n_players": len(players_df),
@@ -244,6 +246,36 @@ class PipelineRunner:
             df["mean"] = df["salary"] / 400.0
             df["std_dev"] = df["mean"] * 0.85
         return df[["player_id", "team", "opponent", "slot", "mean", "std_dev", "position", "salary", "game"]]
+
+    @staticmethod
+    def _apply_exclusions(players_df: pd.DataFrame) -> pd.DataFrame:
+        """Filter players_df based on persisted slate exclusions."""
+        from .slate_exclusions import compute_slate_id, read_exclusions
+        stored = read_exclusions()
+        if not stored.get("slate_id"):
+            return players_df
+
+        current_games = [g for g in players_df["game"].dropna().unique().tolist() if g]
+        if compute_slate_id(current_games) != stored["slate_id"]:
+            logger.warning(
+                "Slate exclusions slate_id mismatch — skipping exclusions to avoid stale filtering."
+            )
+            return players_df
+
+        excluded_games = set(stored.get("excluded_games", []))
+        excluded_teams = set(stored.get("excluded_teams", []))
+        if not excluded_games and not excluded_teams:
+            return players_df
+
+        mask = (
+            players_df["game"].isin(excluded_games) |
+            players_df["team"].isin(excluded_teams)
+        )
+        filtered = players_df[~mask].copy()
+        n_removed = len(players_df) - len(filtered)
+        if n_removed:
+            logger.info("Exclusions removed %d players (%d remain).", n_removed, len(filtered))
+        return filtered
 
     @staticmethod
     def _compute_auto_target(

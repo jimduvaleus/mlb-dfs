@@ -23,3 +23,4 @@ config.yaml
 ui/node_modules/
 ui/dist/
 data/processed/test_sim_results.parquet
+data/raw/MEDKEntries.csv

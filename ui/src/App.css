@@ -573,3 +573,159 @@ button { cursor: pointer; }
   text-align: right;
   font-variant-numeric: tabular-nums;
 }
+
+/* ── Slate Panel ── */
+
+.slate-panel {
+  padding: 24px;
+  max-width: 960px;
+}
+
+.slate-header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.slate-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #e2e8f0;
+}
+
+.slate-summary {
+  font-size: 0.8rem;
+  color: #718096;
+}
+
+.slate-saving {
+  color: #4a9de4;
+}
+
+.slate-muted {
+  padding: 24px;
+  color: #718096;
+}
+
+.slate-error {
+  padding: 24px;
+  color: #fc8181;
+}
+
+.slate-games-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.game-card {
+  background: #1a2035;
+  border: 1px solid #2d3748;
+  border-radius: 8px;
+  padding: 12px;
+  transition: opacity 0.15s, border-color 0.15s;
+}
+
+.game-excluded {
+  opacity: 0.45;
+  border-style: dashed;
+  border-color: #4a5568;
+}
+
+.game-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+  gap: 8px;
+}
+
+.game-label {
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: #cbd5e0;
+  white-space: nowrap;
+}
+
+.btn-game-toggle {
+  font-size: 0.7rem;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s;
+}
+
+.btn-game-included {
+  background: #2d3748;
+  color: #a0aec0;
+  border-color: #4a5568;
+}
+
+.btn-game-included:hover:not(:disabled) {
+  background: #4a5568;
+  color: #e2e8f0;
+}
+
+.btn-game-excluded {
+  background: #742a2a;
+  color: #feb2b2;
+  border-color: #9b2c2c;
+}
+
+.btn-game-excluded:hover:not(:disabled) {
+  background: #9b2c2c;
+  color: #fff5f5;
+}
+
+.btn-game-toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.game-teams {
+  display: flex;
+  gap: 8px;
+}
+
+.team-chip {
+  flex: 1;
+  padding: 5px 0;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  font-size: 0.78rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  cursor: pointer;
+  transition: background 0.12s, opacity 0.12s;
+}
+
+.team-active {
+  background: #1a3a2a;
+  color: #68d391;
+  border-color: #276749;
+}
+
+.team-active:hover:not(:disabled) {
+  background: #22543d;
+  color: #9ae6b4;
+}
+
+.team-excluded {
+  background: #2d2d2d;
+  color: #718096;
+  border-color: #4a5568;
+}
+
+.team-excluded:hover:not(:disabled) {
+  background: #4a5568;
+  color: #e2e8f0;
+}
+
+.team-chip:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
