@@ -96,8 +96,17 @@ class PortfolioConstructor:
     #  Public API                                                          #
     # ------------------------------------------------------------------ #
 
-    def construct(self) -> List[Tuple[Lineup, float]]:
+    def construct(
+        self,
+        on_lineup_complete=None,
+    ) -> List[Tuple[Lineup, float]]:
         """Run greedy portfolio construction.
+
+        Parameters
+        ----------
+        on_lineup_complete : callable(lineup_index, total, score), optional
+            Called after each lineup is selected with its 1-based index,
+            total lineups requested, and full-matrix score.
 
         Returns
         -------
@@ -156,6 +165,8 @@ class PortfolioConstructor:
 
                 portfolio.append((lineup, full_score))
                 logger.info("  Lineup %d score (full): %.4f", i + 1, full_score)
+                if on_lineup_complete is not None:
+                    on_lineup_complete(i + 1, self.portfolio_size, full_score)
 
                 # Consume active rows where this lineup already hits the target.
                 active_indices = np.where(active_mask)[0]

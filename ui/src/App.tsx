@@ -1,0 +1,160 @@
+import { useEffect, useReducer, useState } from 'react'
+import type { AppConfig, LineupResult, RunStatus, CompleteEvent } from './types'
+import { fetchConfig } from './api'
+import { useSSE } from './hooks/useSSE'
+import { ConfigForm } from './components/ConfigForm'
+import { ProjectionsPanel } from './components/ProjectionsPanel'
+import { ProgressPanel } from './components/ProgressPanel'
+import { PortfolioTable } from './components/PortfolioTable'
+import { MetricsPanel } from './components/MetricsPanel'
+import './App.css'
+
+type Tab = 'config' | 'run' | 'portfolio' | 'metrics'
+
+interface State {
+  config: AppConfig | null
+  portfolio: LineupResult[]
+  runStatus: RunStatus
+  activeTab: Tab
+}
+
+type Action =
+  | { type: 'set_config'; config: AppConfig }
+  | { type: 'set_portfolio'; portfolio: LineupResult[] }
+  | { type: 'set_run_status'; status: RunStatus }
+  | { type: 'set_tab'; tab: Tab }
+
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'set_config':
+      return { ...state, config: action.config }
+    case 'set_portfolio':
+      return { ...state, portfolio: action.portfolio }
+    case 'set_run_status':
+      return { ...state, runStatus: action.status }
+    case 'set_tab':
+      return { ...state, activeTab: action.tab }
+  }
+}
+
+const initial: State = {
+  config: null,
+  portfolio: [],
+  runStatus: 'idle',
+  activeTab: 'config',
+}
+
+export default function App() {
+  const [state, dispatch] = useReducer(reducer, initial)
+  const [configError, setConfigError] = useState<string | null>(null)
+  const { events, status: sseStatus, start: startSSE, reset: resetSSE } = useSSE('/api/run/stream')
+
+  const running = state.runStatus === 'running'
+
+  // Load config on mount
+  useEffect(() => {
+    fetchConfig()
+      .then(cfg => dispatch({ type: 'set_config', config: cfg }))
+      .catch(e => setConfigError(String(e)))
+  }, [])
+
+  // React to SSE events
+  useEffect(() => {
+    for (const event of events) {
+      if (event.stage === 'complete') {
+        const ce = event as CompleteEvent
+        dispatch({ type: 'set_portfolio', portfolio: ce.portfolio })
+        dispatch({ type: 'set_run_status', status: 'complete' })
+        dispatch({ type: 'set_tab', tab: 'portfolio' })
+      } else if (event.stage === 'error') {
+        dispatch({ type: 'set_run_status', status: 'error' })
+      }
+    }
+  }, [events])
+
+  const handleRun = () => {
+    if (running) return
+    resetSSE()
+    dispatch({ type: 'set_run_status', status: 'running' })
+    dispatch({ type: 'set_tab', tab: 'run' })
+    startSSE()
+  }
+
+  const tabDisabled = (tab: Tab): boolean => {
+    if (tab === 'portfolio' && state.portfolio.length === 0) return true
+    if (tab === 'metrics' && state.portfolio.length === 0) return true
+    return false
+  }
+
+  // Suppress unused import warning
+  void sseStatus
+
+  return (
+    <div className="app">
+      <header className="app-header">
+        <h1>MLB DFS Optimizer</h1>
+        <div className="header-actions">
+          <span className={`status-badge status-${state.runStatus}`}>
+            {state.runStatus}
+          </span>
+          <button
+            className="btn-run"
+            onClick={handleRun}
+            disabled={running || state.config === null}
+          >
+            {running ? 'Running…' : 'Run Portfolio'}
+          </button>
+        </div>
+      </header>
+
+      <nav className="tabs">
+        {(['config', 'run', 'portfolio', 'metrics'] as Tab[]).map(tab => (
+          <button
+            key={tab}
+            className={`tab ${state.activeTab === tab ? 'active' : ''}`}
+            onClick={() => dispatch({ type: 'set_tab', tab })}
+            disabled={tabDisabled(tab)}
+          >
+            {tab.charAt(0).toUpperCase() + tab.slice(1)}
+            {tab === 'run' && running && <span className="tab-dot" />}
+            {tab === 'portfolio' && state.portfolio.length > 0 && (
+              <span className="tab-count">{state.portfolio.length}</span>
+            )}
+          </button>
+        ))}
+      </nav>
+
+      <main className="app-main">
+        {state.activeTab === 'config' && (
+          <div>
+            {configError && <p className="error">{configError}</p>}
+            {state.config ? (
+              <>
+                <ProjectionsPanel disabled={running} />
+                <ConfigForm
+                  config={state.config}
+                  onSaved={cfg => dispatch({ type: 'set_config', config: cfg })}
+                  disabled={running}
+                />
+              </>
+            ) : (
+              <p className="muted">Loading config…</p>
+            )}
+          </div>
+        )}
+
+        {state.activeTab === 'run' && (
+          <ProgressPanel events={events} running={running} />
+        )}
+
+        {state.activeTab === 'portfolio' && (
+          <PortfolioTable lineups={state.portfolio} />
+        )}
+
+        {state.activeTab === 'metrics' && (
+          <MetricsPanel lineups={state.portfolio} events={events} />
+        )}
+      </main>
+    </div>
+  )
+}
