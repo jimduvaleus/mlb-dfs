@@ -100,4 +100,10 @@ class Lineup:
         if games and len(games) < MIN_GAMES:
             return False
 
+        # No pitcher may oppose any batter in the same lineup (negative correlation)
+        pitcher_opponents = {r['opponent'] for r in rows if r['position'] == 'P' and r.get('opponent')}
+        batter_teams = {r['team'] for r in rows if r['position'] != 'P'}
+        if pitcher_opponents & batter_teams:
+            return False
+
         return True

@@ -63,6 +63,14 @@ def players_df():
         _make_player(17, 'OF', 3800, 'C', 'C@D'),
         _make_player(18, 'OF', 3800, 'D', 'C@D'),
         _make_player(19, 'OF', 3600, 'A', 'A@B'),
+        # Extra pitchers from teams A and C (oppose B and D respectively),
+        # needed for lineups where the opposing team's batters are not stacked.
+        _make_player(20, 'P',  8000, 'A', 'A@B'),
+        _make_player(21, 'P',  7500, 'C', 'C@D'),
+        # Extra OFs from C so VALID_IDS can field 3 OFs without exceeding the
+        # 5-hitter-per-team cap on team A.
+        _make_player(22, 'OF', 3800, 'C', 'C@D'),
+        _make_player(23, 'OF', 3600, 'C', 'C@D'),
     ]
     return pd.DataFrame(rows)
 
@@ -84,10 +92,10 @@ def player_meta(players_df):
 #  Lineup.is_valid                                                     #
 # ------------------------------------------------------------------ #
 
-# Valid baseline lineup: P1(B,A@B), P2(D,C@D) | C5(A) | 1B7(A) | 2B9(A) | 3B11(A) | SS13(A)
-# | OF16(B,A@B) | OF17(C,C@D) | OF18(D,C@D)
-# Hitters from A = 5 (C,1B,2B,3B,SS) ≤ MAX; 2 games (A@B, C@D) ✓
-VALID_IDS = [1, 2, 5, 7, 9, 11, 13, 16, 17, 18]
+# Valid baseline lineup: P20(A,A@B,oppB), P21(C,C@D,oppD) | C5(A) | 1B7(A) | 2B9(A)
+# | 3B11(A) | SS13(A) | OF17(C) | OF22(C) | OF23(C)
+# Hitters from A = 5 (C,1B,2B,3B,SS) ≤ MAX; 2 games ✓; no pitcher opposes any batter ✓
+VALID_IDS = [20, 21, 5, 7, 9, 11, 13, 17, 22, 23]
 
 
 def test_lineup_is_valid_baseline(player_meta):
@@ -111,10 +119,28 @@ def test_lineup_wrong_position_mix(player_meta):
 
 
 def test_lineup_too_many_hitters_one_team(player_meta):
-    # P1(B,A@B), P2(D,C@D), C5(A), 1B7(A), 2B9(A), 3B11(A), SS13(A), OF15(A), OF17(C), OF18(D)
-    # Hitters from A: C5, 1B7, 2B9, 3B11, SS13, OF15 = 6 > 5 → invalid
-    too_many_a = [1, 2, 5, 7, 9, 11, 13, 15, 17, 18]
+    # P20(A,oppB), P21(C,oppD), C5(A), 1B7(A), 2B9(A), 3B11(A), SS13(A), OF15(A), OF17(C), OF19(A)
+    # Hitters from A: C5, 1B7, 2B9, 3B11, SS13, OF15, OF19 = 7 > 5 → invalid
+    # (pitchers P20/P21 oppose B/D, none of which appear as batters → pitcher check passes)
+    too_many_a = [20, 21, 5, 7, 9, 11, 13, 15, 17, 19]
     assert not Lineup(too_many_a).is_valid(player_meta)
+
+
+def test_lineup_pitcher_opposing_batter_invalid(player_meta):
+    # P1(B,A@B) opposes team A; lineup includes C5/1B7/2B9/3B11/SS13 all from A → invalid
+    ids = [1, 2, 5, 7, 9, 11, 13, 16, 17, 18]
+    assert not Lineup(ids).is_valid(player_meta)
+
+
+def test_lineup_pitcher_opposing_constraint_skipped_without_opponent_info():
+    # When opponent key is absent from meta the check is skipped (analogous to game check)
+    positions = ['P', 'P', 'C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']
+    meta = {
+        i + 1: {'position': positions[i], 'salary': 4000.0,
+                'team': f'T{i}', 'game': f'G{i // 2}@G{i // 2 + 1}'}
+        for i in range(10)
+    }
+    assert Lineup(list(range(1, 11))).is_valid(meta)
 
 
 def test_lineup_only_one_game():
@@ -261,8 +287,10 @@ def test_optimize_high_value_player_selected():
     # Two pitchers (P), one catcher, one 1B, one 2B, one 3B, one SS, three OF
     # per game – two games to satisfy the multi-game constraint.
     rows = [
-        _make_player(1,  'P',  8000, 'B', 'A@B'),
-        _make_player(2,  'P',  7000, 'D', 'C@D'),
+        # Pitchers from A and C oppose B and D respectively; no batters from B or D
+        # are in this slate, so the pitcher/opposing-batter constraint is satisfied.
+        _make_player(1,  'P',  8000, 'A', 'A@B'),
+        _make_player(2,  'P',  7000, 'C', 'C@D'),
         _make_player(3,  'C',  4000, 'A', 'A@B'),
         _make_player(4,  '1B', 4000, 'A', 'A@B'),
         _make_player(5,  '2B', 4000, 'A', 'A@B'),
@@ -271,8 +299,8 @@ def test_optimize_high_value_player_selected():
         # OF – player 8 is the "stud", players 9-11 are average
         _make_player(8,  'OF', 4000, 'C', 'C@D'),   # stud
         _make_player(9,  'OF', 4000, 'A', 'A@B'),
-        _make_player(10, 'OF', 4000, 'D', 'C@D'),
-        _make_player(11, 'OF', 3500, 'B', 'A@B'),
+        _make_player(10, 'OF', 4000, 'A', 'A@B'),
+        _make_player(11, 'OF', 3500, 'C', 'C@D'),
     ]
     df = pd.DataFrame(rows)
     pids = df['player_id'].tolist()
@@ -298,17 +326,17 @@ def test_optimize_high_value_player_selected():
 #  Salary floor                                                        #
 # ------------------------------------------------------------------ #
 
-# VALID_IDS total salary: P1(8000)+P2(7500)+C5(4000)+1B7(4000)+2B9(4000)
-#   +3B11(4000)+SS13(4000)+OF16(4000)+OF17(3800)+OF18(3800) = 47_100
+# VALID_IDS total salary: P20(8000)+P21(7500)+C5(4000)+1B7(4000)+2B9(4000)
+#   +3B11(4000)+SS13(4000)+OF17(3800)+OF22(3800)+OF23(3600) = 46_700
 
 def test_lineup_salary_below_floor(player_meta):
-    # VALID_IDS sums to 47_100 which is below floor=48_000 → invalid
+    # VALID_IDS sums to 46_700 which is below floor=48_000 → invalid
     assert not Lineup(VALID_IDS).is_valid(player_meta, salary_floor=48_000.0)
 
 
 def test_lineup_salary_at_floor(player_meta):
     # Exactly at floor → valid
-    assert Lineup(VALID_IDS).is_valid(player_meta, salary_floor=47_100.0)
+    assert Lineup(VALID_IDS).is_valid(player_meta, salary_floor=46_700.0)
 
 
 def test_lineup_floor_none_no_effect(player_meta):
@@ -450,8 +478,9 @@ def test_optimize_multi_pos_slate():
     """Slate where the only valid lineup requires a 3B/SS player to fill SS."""
     rng = np.random.default_rng(7)
     rows = [
-        _make_player(1,  'P',  8000, 'B', 'A@B'),
-        _make_player(2,  'P',  7500, 'D', 'C@D'),
+        # Pitchers from A and C oppose B and D; no batters in this slate are from B or D.
+        _make_player(1,  'P',  8000, 'A', 'A@B'),
+        _make_player(2,  'P',  7500, 'C', 'C@D'),
         _make_player(3,  'C',  4000, 'A', 'A@B'),
         _make_player(4,  '1B', 4000, 'A', 'A@B'),
         _make_player(5,  '2B', 4000, 'A', 'A@B'),
@@ -460,7 +489,7 @@ def test_optimize_multi_pos_slate():
         _make_player(7,  '3B', 4000, 'A', 'A@B'),
         _make_player(8,  'OF', 4000, 'A', 'A@B'),
         _make_player(9,  'OF', 4000, 'C', 'C@D'),
-        _make_player(10, 'OF', 4000, 'D', 'C@D'),
+        _make_player(10, 'OF', 4000, 'C', 'C@D'),
     ]
     df = pd.DataFrame(rows)
     df['eligible_positions'] = df['position'].apply(lambda p: [p])

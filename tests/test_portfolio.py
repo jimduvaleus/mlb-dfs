@@ -49,6 +49,12 @@ def players_df():
         _make_player(17, 'OF', 3800, 'C', 'C@D'),
         _make_player(18, 'OF', 3800, 'D', 'C@D'),
         _make_player(19, 'OF', 3600, 'A', 'A@B'),
+        # Pitchers from A and C oppose B and D respectively, enabling valid lineups
+        # where the stacked batters (A and C) are not opposed by the pitchers.
+        _make_player(20, 'P',  8000, 'A', 'A@B'),
+        _make_player(21, 'P',  7500, 'C', 'C@D'),
+        _make_player(22, 'OF', 3800, 'C', 'C@D'),
+        _make_player(23, 'OF', 3600, 'C', 'C@D'),
     ]
     return pd.DataFrame(rows)
 
@@ -123,31 +129,30 @@ def test_consumption_produces_diverse_lineups():
     In the off-half, only the 2 pitchers score → 60 < 270, so that half is NOT
     consumed by the wrong lineup.
     """
-    # Pitchers (both lineups must include P1 from A@B and P2 from C@D)
+    # Pitchers from A and C oppose B and D; no batter in either group is from B or D.
     # Group A (rows 0-499): C3, 1B4, 2B5, 3B6, SS7, OF8, OF9, OF10
     # Group B (rows 500-999): C11, 1B12, 2B13, 3B14, SS15, OF16, OF17, OF18
     rows = [
-        _make_player(1,  'P',  8000, 'B', 'A@B'),
-        _make_player(2,  'P',  7000, 'D', 'C@D'),
-        # Group A non-pitchers (all team A from game A@B — max 5 hitters per team so
-        # we spread across two teams to stay within constraints)
+        _make_player(1,  'P',  8000, 'A', 'A@B'),
+        _make_player(2,  'P',  7000, 'C', 'C@D'),
+        # Group A non-pitchers (teams A and C, spread to stay within 5-hitter cap)
         _make_player(3,  'C',  4000, 'A', 'A@B'),
         _make_player(4,  '1B', 4000, 'A', 'A@B'),
         _make_player(5,  '2B', 4000, 'A', 'A@B'),
         _make_player(6,  '3B', 4000, 'C', 'C@D'),
         _make_player(7,  'SS', 4000, 'C', 'C@D'),
         _make_player(8,  'OF', 4000, 'C', 'C@D'),
-        _make_player(9,  'OF', 4000, 'D', 'C@D'),
-        _make_player(10, 'OF', 4000, 'B', 'A@B'),
-        # Group B non-pitchers (alternate pool, same position mix, different teams)
+        _make_player(9,  'OF', 4000, 'C', 'C@D'),
+        _make_player(10, 'OF', 4000, 'A', 'A@B'),
+        # Group B non-pitchers (alternate pool, same position mix, different players)
         _make_player(11, 'C',  4000, 'C', 'C@D'),
         _make_player(12, '1B', 4000, 'C', 'C@D'),
         _make_player(13, '2B', 4000, 'C', 'C@D'),
         _make_player(14, '3B', 4000, 'A', 'A@B'),
         _make_player(15, 'SS', 4000, 'A', 'A@B'),
         _make_player(16, 'OF', 4000, 'A', 'A@B'),
-        _make_player(17, 'OF', 4000, 'D', 'C@D'),
-        _make_player(18, 'OF', 4000, 'B', 'A@B'),
+        _make_player(17, 'OF', 4000, 'C', 'C@D'),
+        _make_player(18, 'OF', 4000, 'A', 'A@B'),
     ]
     df = pd.DataFrame(rows)
     pids = df['player_id'].tolist()
@@ -414,24 +419,24 @@ def test_beam_consumption_produces_diverse_lineups():
     of simulation rows each requiring a different lineup.  The beam constructor
     should still select one lineup per group, producing diverse portfolios."""
     rows = [
-        _make_player(1,  'P',  8000, 'B', 'A@B'),
-        _make_player(2,  'P',  7000, 'D', 'C@D'),
+        _make_player(1,  'P',  8000, 'A', 'A@B'),
+        _make_player(2,  'P',  7000, 'C', 'C@D'),
         _make_player(3,  'C',  4000, 'A', 'A@B'),
         _make_player(4,  '1B', 4000, 'A', 'A@B'),
         _make_player(5,  '2B', 4000, 'A', 'A@B'),
         _make_player(6,  '3B', 4000, 'C', 'C@D'),
         _make_player(7,  'SS', 4000, 'C', 'C@D'),
         _make_player(8,  'OF', 4000, 'C', 'C@D'),
-        _make_player(9,  'OF', 4000, 'D', 'C@D'),
-        _make_player(10, 'OF', 4000, 'B', 'A@B'),
+        _make_player(9,  'OF', 4000, 'C', 'C@D'),
+        _make_player(10, 'OF', 4000, 'A', 'A@B'),
         _make_player(11, 'C',  4000, 'C', 'C@D'),
         _make_player(12, '1B', 4000, 'C', 'C@D'),
         _make_player(13, '2B', 4000, 'C', 'C@D'),
         _make_player(14, '3B', 4000, 'A', 'A@B'),
         _make_player(15, 'SS', 4000, 'A', 'A@B'),
         _make_player(16, 'OF', 4000, 'A', 'A@B'),
-        _make_player(17, 'OF', 4000, 'D', 'C@D'),
-        _make_player(18, 'OF', 4000, 'B', 'A@B'),
+        _make_player(17, 'OF', 4000, 'C', 'C@D'),
+        _make_player(18, 'OF', 4000, 'A', 'A@B'),
     ]
     df = pd.DataFrame(rows)
     pids = df['player_id'].tolist()
@@ -537,10 +542,11 @@ def test_beam_covers_more_rows_than_greedy_on_lock_in():
     picks a block lineup too — but let's verify the beam at least matches
     or exceeds greedy coverage.
     """
-    # Build a minimal two-game slate.
+    # Build a minimal two-game slate. Pitchers from A and C oppose B and D;
+    # no batter in either group is from B or D.
     rows = [
-        _make_player(1,  'P',  8000, 'B', 'A@B'),
-        _make_player(2,  'P',  7000, 'D', 'C@D'),
+        _make_player(1,  'P',  8000, 'A', 'A@B'),
+        _make_player(2,  'P',  7000, 'C', 'C@D'),
         # Group-A batters
         _make_player(3,  'C',  4000, 'A', 'A@B'),
         _make_player(4,  '1B', 4000, 'A', 'A@B'),
@@ -548,8 +554,8 @@ def test_beam_covers_more_rows_than_greedy_on_lock_in():
         _make_player(6,  '3B', 4000, 'C', 'C@D'),
         _make_player(7,  'SS', 4000, 'C', 'C@D'),
         _make_player(8,  'OF', 4000, 'C', 'C@D'),
-        _make_player(9,  'OF', 4000, 'D', 'C@D'),
-        _make_player(10, 'OF', 4000, 'B', 'A@B'),
+        _make_player(9,  'OF', 4000, 'C', 'C@D'),
+        _make_player(10, 'OF', 4000, 'A', 'A@B'),
         # Group-B batters
         _make_player(11, 'C',  4000, 'C', 'C@D'),
         _make_player(12, '1B', 4000, 'C', 'C@D'),
@@ -557,8 +563,8 @@ def test_beam_covers_more_rows_than_greedy_on_lock_in():
         _make_player(14, '3B', 4000, 'A', 'A@B'),
         _make_player(15, 'SS', 4000, 'A', 'A@B'),
         _make_player(16, 'OF', 4000, 'A', 'A@B'),
-        _make_player(17, 'OF', 4000, 'D', 'C@D'),
-        _make_player(18, 'OF', 4000, 'B', 'A@B'),
+        _make_player(17, 'OF', 4000, 'C', 'C@D'),
+        _make_player(18, 'OF', 4000, 'A', 'A@B'),
     ]
     df = pd.DataFrame(rows)
     pids = df['player_id'].tolist()

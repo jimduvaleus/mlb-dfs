@@ -37,12 +37,20 @@ def _build_player_meta(players_df: pd.DataFrame) -> PlayerMeta:
         elig = list(row['eligible_positions']) if has_eligible else []
         if not elig:
             elig = [pos]
+        team = row['team']
+        game_str = str(row['game']) if has_game else ''
+        if has_game and '@' in game_str:
+            away, home = game_str.split('@', 1)
+            opponent = home if team == away else away
+        else:
+            opponent = ''
         meta[int(row['player_id'])] = {
             'position': pos,
             'eligible_positions': elig,
             'salary': float(row['salary']),
-            'team': row['team'],
-            'game': str(row['game']) if has_game else '',
+            'team': team,
+            'opponent': opponent,
+            'game': game_str,
         }
     return meta
 
