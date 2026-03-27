@@ -137,7 +137,7 @@ def build_players_df(
     else:
         logger.info("No projections file — using salary-based heuristic (mean = salary / 400).")
         df["mean"] = df["salary"] / 400.0
-        df["std_dev"] = df["mean"] * 0.85
+        df["std_dev"] = 4.0 + 0.40 * df["mean"]
 
     return df[
         ["player_id", "team", "opponent", "slot", "mean", "std_dev", "position", "salary", "game"]

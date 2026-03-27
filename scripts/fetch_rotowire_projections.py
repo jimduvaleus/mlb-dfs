@@ -61,29 +61,38 @@ HEADERS = {
     "X-Requested-With": "XMLHttpRequest",
 }
 
-# std_dev heuristic: no source provides this, so we estimate as a fraction of
-# the projected mean.  Ratios derived from historical DK score distributions:
+# std_dev estimation: no source provides this directly, so we estimate via a
+# linear model fitted to empirical DK score distributions across player types.
 #
-# Batters: empirical σ/μ clusters 0.80–0.85 for above-average projected starters
-#   and rises toward 1.08 for below-average hitters (zero-inflation effect).
-#   0.85 is a calibrated central estimate for the DK starter pool.
-#   The BatterMixtureMarginal handles zero-inflation at runtime when the PCA
-#   model is available; std_dev here seeds that projection.
+# A flat σ/μ ratio systematically over-estimates variance for weak players and
+# under-estimates it for strong ones.  A linear model captures the floor effect:
+# variance has a baseline component that does not scale with projected output.
 #
-# Pitchers: empirical σ/μ is 0.47–0.61 for elite starters and 0.75–0.84 for
-#   average ones.  DK slates skew toward quality arms so 0.60 is appropriate.
-#   Pitcher distributions are approximately Gaussian (no zero-inflation spike);
-#   negative DK scores are possible (bad starts) but uncommon for projected SPs.
-STD_DEV_RATIO: dict[str, float] = {
-    "P":  0.60,
-    "C":  0.85,
-    "1B": 0.85,
-    "2B": 0.85,
-    "3B": 0.85,
-    "SS": 0.85,
-    "OF": 0.85,
-}
-DEFAULT_STD_DEV_RATIO = 0.85
+# Coefficients derived from career DK score distributions for a range of player
+# types (6 batters from poor to all-time great; 5 pitchers from average to elite):
+#
+#   Batters:  std ≈ 4.0 + 0.40 × mean
+#     σ/μ ≈ 0.97 at mean= 7,  0.84 at mean=10,  0.76 at mean=13
+#     The BatterMixtureMarginal handles zero-inflation at runtime when the PCA
+#     model is available; std_dev here seeds that projection.
+#
+#   Pitchers: std ≈ 7.2 + 0.23 × mean
+#     σ/μ ≈ 0.71 at mean=15,  0.59 at mean=20,  0.52 at mean=25
+#     Pitcher distributions are approximately Gaussian (no zero-inflation spike);
+#     negative DK scores are possible (bad starts) and preserved in simulation.
+#
+# Note: fit on a small sample of historical players skewed toward greats.
+# Long-term improvement: refit coefficients from historical_logs.parquet.
+_BATTER_STD_INTERCEPT = 4.0
+_BATTER_STD_SLOPE     = 0.40
+_PITCHER_STD_INTERCEPT = 7.2
+_PITCHER_STD_SLOPE     = 0.23
+
+
+def _estimate_std_dev(mean: float, position: str) -> float:
+    if position == "P":
+        return max(_PITCHER_STD_INTERCEPT + _PITCHER_STD_SLOPE * mean, 1.0)
+    return max(_BATTER_STD_INTERCEPT + _BATTER_STD_SLOPE * mean, 1.0)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -378,7 +387,7 @@ def build_projections_csv(
 
     # --- Estimate std_dev ---------------------------------------------------
     out_df["std_dev"] = out_df.apply(
-        lambda r: r["mean"] * STD_DEV_RATIO.get(str(r["position"]), DEFAULT_STD_DEV_RATIO),
+        lambda r: _estimate_std_dev(float(r["mean"]), str(r["position"])),
         axis=1,
     )
 
