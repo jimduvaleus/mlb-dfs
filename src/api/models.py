@@ -60,12 +60,26 @@ class PortfolioResult(BaseModel):
     lineups: list[LineupResult]
 
 
+class SlateOption(BaseModel):
+    slate_id: str
+    name: str
+    is_default: bool
+
+
+class SlateListResponse(BaseModel):
+    date: Optional[str] = None
+    slates: list[SlateOption]
+
+
 class ProjectionsStatus(BaseModel):
     exists: bool
     path: Optional[str] = None
     last_modified: Optional[float] = None  # Unix timestamp
     age_seconds: Optional[float] = None
     row_count: Optional[int] = None
+    fetch_timestamp_utc: Optional[float] = None  # Unix seconds, from metadata
+    unconfirmed_count: Optional[int] = None
+    no_changes: Optional[bool] = None  # None = fewer than 2 fetches recorded
 
 
 class TeamStatus(BaseModel):

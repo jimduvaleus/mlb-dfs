@@ -1,4 +1,4 @@
-import type { AppConfig, ExclusionsUpdate, ProjectionsStatus, LineupResult, SlateGamesResponse } from './types'
+import type { AppConfig, ExclusionsUpdate, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -22,6 +22,12 @@ export async function saveConfig(cfg: AppConfig): Promise<AppConfig> {
 export async function fetchProjectionsStatus(): Promise<ProjectionsStatus> {
   const res = await fetch('/api/projections/status')
   if (!res.ok) throw new Error(`Failed to get projections status: ${res.statusText}`)
+  return res.json()
+}
+
+export async function fetchProjectionSlates(): Promise<SlateListResponse> {
+  const res = await fetch('/api/projections/slates')
+  if (!res.ok) throw new Error(`Failed to load projection slates: ${res.statusText}`)
   return res.json()
 }
 

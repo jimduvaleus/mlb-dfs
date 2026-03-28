@@ -53,12 +53,26 @@ export interface LineupResult {
   players: PlayerRow[]
 }
 
+export interface SlateOption {
+  slate_id: string
+  name: string
+  is_default: boolean
+}
+
+export interface SlateListResponse {
+  date: string | null
+  slates: SlateOption[]
+}
+
 export interface ProjectionsStatus {
   exists: boolean
   path: string | null
   last_modified: number | null  // Unix timestamp (seconds)
   age_seconds: number | null
   row_count: number | null
+  fetch_timestamp_utc: number | null  // Unix seconds, from metadata
+  unconfirmed_count: number | null
+  no_changes: boolean | null  // null = fewer than 2 fetches recorded
 }
 
 // SSE event payloads

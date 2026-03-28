@@ -22,7 +22,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config_io import read_config, write_config
-from .models import AppConfig, ExclusionsUpdate, GameStatus, PortfolioResult, ProjectionsStatus, SlateGamesResponse
+from .models import AppConfig, ExclusionsUpdate, GameStatus, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption
+from .projections_meta import (
+    fetch_and_cache_slates,
+    get_cached_slates,
+    get_status_fields,
+    record_fetch_from_csv,
+)
 from .slate_exclusions import get_slate_games_with_status, write_exclusions
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -111,12 +117,14 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
 def projections_status() -> ProjectionsStatus:
     cfg = read_config()
     proj_path = cfg.paths.projections
+    extra = get_status_fields()
+
     if not proj_path:
-        return ProjectionsStatus(exists=False)
+        return ProjectionsStatus(exists=False, **extra)
 
     p = PROJECT_ROOT / proj_path if not Path(proj_path).is_absolute() else Path(proj_path)
     if not p.exists():
-        return ProjectionsStatus(exists=False, path=str(proj_path))
+        return ProjectionsStatus(exists=False, path=str(proj_path), **extra)
 
     stat = p.stat()
     age = time.time() - stat.st_mtime
@@ -135,19 +143,55 @@ def projections_status() -> ProjectionsStatus:
         last_modified=stat.st_mtime,
         age_seconds=age,
         row_count=row_count,
+        **extra,
     )
 
 
-@app.post("/api/projections/fetch")
-async def projections_fetch(request: Request):
+@app.get("/api/projections/slates")
+async def projections_slates() -> SlateListResponse:
+    cfg = read_config()
+    dk_raw = cfg.paths.dk_slate
+    if not dk_raw:
+        return SlateListResponse(date=None, slates=[])
+    dk_path = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
+    if not dk_path.exists():
+        return SlateListResponse(date=None, slates=[])
+
+    cached = get_cached_slates(dk_path)
+    if cached is not None:
+        return SlateListResponse(
+            date=None,
+            slates=[SlateOption(**s) for s in cached],
+        )
+
+    try:
+        dk_date, options = fetch_and_cache_slates(dk_path)
+    except Exception:
+        return SlateListResponse(date=None, slates=[])
+
+    return SlateListResponse(
+        date=dk_date,
+        slates=[SlateOption(**s) for s in options],
+    )
+
+
+@app.get("/api/projections/fetch")
+async def projections_fetch(request: Request, slate_id: str | None = None):
     if _state["status"] == "running":
         raise HTTPException(409, "A pipeline run is already in progress")
+
+    cfg = read_config()
+    proj_path_str = cfg.paths.projections or "data/processed/projections.csv"
+    proj_path = PROJECT_ROOT / proj_path_str if not Path(proj_path_str).is_absolute() else Path(proj_path_str)
 
     async def _stream():
         script = PROJECT_ROOT / "scripts" / "fetch_rotowire_projections.py"
         python = PROJECT_ROOT / "venv" / "bin" / "python"
+        cmd = [str(python), str(script)]
+        if slate_id:
+            cmd += ["--slate-id", slate_id]
         proc = await asyncio.create_subprocess_exec(
-            str(python), str(script),
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(PROJECT_ROOT),
@@ -160,6 +204,11 @@ async def projections_fetch(request: Request):
             payload = {"type": "log", "line": line.decode().rstrip(), "timestamp": int(time.time() * 1000)}
             yield f"data: {json.dumps(payload)}\n\n"
         returncode = await proc.wait()
+        if returncode == 0:
+            try:
+                record_fetch_from_csv(proj_path, slate_id or "auto")
+            except Exception:
+                pass
         yield f"data: {json.dumps({'type': 'done', 'returncode': returncode, 'timestamp': int(time.time() * 1000)})}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")

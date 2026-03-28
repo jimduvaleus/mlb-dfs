@@ -271,6 +271,48 @@ button { cursor: pointer; }
 .badge-ok { background: #1a472a; color: #68d391; }
 .badge-warn { background: #744210; color: #f6ad55; }
 
+.proj-slate-selector {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.proj-slate-selector label {
+  color: #a0aec0;
+  font-weight: 500;
+}
+
+.proj-slate-selector select {
+  background: #1a202c;
+  border: 1px solid #4a5568;
+  color: #e2e8f0;
+  border-radius: 5px;
+  padding: 5px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.proj-slate-selector select:focus {
+  outline: none;
+  border-color: #63b3ed;
+}
+
+.proj-slate-selector select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.proj-slate-name {
+  font-size: 13px;
+  margin-bottom: 10px;
+}
+
+.proj-no-changes {
+  font-style: italic;
+}
+
 .proj-log {
   margin-top: 10px;
   background: #0d1117;

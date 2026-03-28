@@ -1,10 +1,10 @@
 
 - Need player excluders
-- Need details on unconfirmed batter slots
 - Need weather
-- Need DK Entry parser and DK Upload file maker
 - Need an abort feature
-- rotowire fetch should indicate if something has changed
+- Enhance UI stack strings with team/team notation
+- Enhance UI with unconfirmed indicator on portfolio cards
+- Enhance UI with team logos or colors on portfolio cards
 
 - fancy prediction market-based projections
 

@@ -383,6 +383,7 @@ def build_projections_csv(
                     "mean": row["projected_fpts"],
                     "position": dk_pos.get(pid, row["position"]),
                     "lineup_slot": row["lineup_slot"],
+                    "slot_confirmed": row["slot_confirmed"],
                 }
             )
         else:
@@ -422,7 +423,7 @@ def build_projections_csv(
     )
 
     # --- Write output -------------------------------------------------------
-    out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot"]
+    out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
     out_df = out_df[out_cols].sort_values("mean", ascending=False).reset_index(drop=True)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
