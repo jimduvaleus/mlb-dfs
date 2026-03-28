@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ProjectionsStatus, SlateOption } from '../types'
-import { fetchProjectionsStatus, fetchProjectionSlates } from '../api'
+import type { ProjectionsStatus } from '../types'
+import { fetchProjectionsStatus } from '../api'
 
 interface Props {
   disabled?: boolean
@@ -19,31 +19,18 @@ function formatET(unixSec: number): string {
 
 export function ProjectionsPanel({ disabled }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
-  const [slates, setSlates] = useState<SlateOption[]>([])
-  const [selectedSlateId, setSelectedSlateId] = useState<string | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
   const [done, setDone] = useState<{ success: boolean; code: number } | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const esRef = useRef<EventSource | null>(null)
 
-  const loadSlates = () => {
-    fetchProjectionSlates()
-      .then(res => {
-        setSlates(res.slates)
-        // Only set the default if no slate is selected yet
-        setSelectedSlateId(prev => {
-          if (prev !== null) return prev
-          const def = res.slates.find(s => s.is_default)
-          return def ? def.slate_id : (res.slates[0]?.slate_id ?? null)
-        })
-      })
-      .catch(console.error)
+  const refreshStatus = () => {
+    fetchProjectionsStatus().then(setStatus).catch(console.error)
   }
 
   useEffect(() => {
-    fetchProjectionsStatus().then(setStatus).catch(console.error)
-    loadSlates()
+    refreshStatus()
     return () => esRef.current?.close()
   }, [])
 
@@ -59,10 +46,7 @@ export function ProjectionsPanel({ disabled }: Props) {
     setLog([])
     setDone(null)
 
-    const url = selectedSlateId
-      ? `/api/projections/fetch?slate_id=${encodeURIComponent(selectedSlateId)}`
-      : '/api/projections/fetch'
-    const es = new EventSource(url)
+    const es = new EventSource('/api/projections/fetch')
     esRef.current = es
 
     es.onmessage = (e) => {
@@ -74,8 +58,7 @@ export function ProjectionsPanel({ disabled }: Props) {
         setDone({ success: event.returncode === 0, code: event.returncode })
         es.close()
         esRef.current = null
-        fetchProjectionsStatus().then(setStatus).catch(console.error)
-        loadSlates()
+        refreshStatus()
       }
     }
 
@@ -86,41 +69,33 @@ export function ProjectionsPanel({ disabled }: Props) {
     }
   }
 
-  const defaultSlate = slates.find(s => s.is_default)
-
   return (
     <div className="projections-panel">
       <h3>Projections</h3>
-
-      {slates.length > 1 && (
-        <div className="proj-slate-selector">
-          <label htmlFor="slate-select">Slate</label>
-          <select
-            id="slate-select"
-            value={selectedSlateId ?? ''}
-            onChange={e => setSelectedSlateId(e.target.value)}
-            disabled={fetching || disabled}
-          >
-            {slates.map(s => (
-              <option key={s.slate_id} value={s.slate_id}>
-                {s.name}{s.is_default ? ' (default)' : ''}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
-
-      {slates.length === 1 && (
-        <div className="proj-slate-name muted">
-          {defaultSlate?.name ?? slates[0].name}
-        </div>
-      )}
 
       {status === null ? (
         <p className="muted">Loading…</p>
       ) : status.exists ? (
         <div className="proj-status">
-          <span className="badge badge-ok">up to date</span>
+          {status.is_fresh === false ? (
+            <span
+              className="badge badge-warn"
+              onClick={refreshStatus}
+              style={{ cursor: 'pointer' }}
+              title="Click to re-check"
+            >
+              stale
+            </span>
+          ) : (
+            <span
+              className="badge badge-ok"
+              onClick={refreshStatus}
+              style={{ cursor: 'pointer' }}
+              title="Click to re-check"
+            >
+              up to date
+            </span>
+          )}
           <span className="proj-path">{status.path}</span>
           {status.fetch_timestamp_utc !== null ? (
             <span className="muted">Updated {formatET(status.fetch_timestamp_utc)}</span>
@@ -132,7 +107,7 @@ export function ProjectionsPanel({ disabled }: Props) {
           )}
           {status.unconfirmed_count !== null && status.unconfirmed_count > 0 && (
             <span className="badge badge-warn">
-              {status.unconfirmed_count} unconfirmed lineup{status.unconfirmed_count !== 1 ? 's' : ''}
+              {status.unconfirmed_count} unconfirmed lineup slot{status.unconfirmed_count !== 1 ? 's' : ''}
             </span>
           )}
           {status.no_changes === true && (

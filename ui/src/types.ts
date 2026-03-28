@@ -73,6 +73,7 @@ export interface ProjectionsStatus {
   fetch_timestamp_utc: number | null  // Unix seconds, from metadata
   unconfirmed_count: number | null
   no_changes: boolean | null  // null = fewer than 2 fetches recorded
+  is_fresh: boolean | null  // true=fresh, false=stale, null=unknown
 }
 
 // SSE event payloads

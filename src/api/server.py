@@ -24,6 +24,7 @@ from fastapi.staticfiles import StaticFiles
 from .config_io import read_config, write_config
 from .models import AppConfig, ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse
 from .projections_meta import (
+    compute_freshness,
     fetch_and_cache_slates,
     get_cached_slates,
     get_status_fields,
@@ -200,6 +201,14 @@ def projections_status() -> ProjectionsStatus:
     proj_path = cfg.paths.projections
     extra = get_status_fields()
 
+    # Resolve DK path for freshness check
+    dk_raw = cfg.paths.dk_slate
+    dk_path: Path | None = None
+    if dk_raw:
+        dk_path = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
+        if not dk_path.exists():
+            dk_path = None
+
     if not proj_path:
         return ProjectionsStatus(exists=False, **extra)
 
@@ -218,12 +227,15 @@ def projections_status() -> ProjectionsStatus:
     except Exception:
         pass
 
+    is_fresh = compute_freshness(dk_path, p) if dk_path is not None else None
+
     return ProjectionsStatus(
         exists=True,
         path=str(proj_path),
         last_modified=stat.st_mtime,
         age_seconds=age,
         row_count=row_count,
+        is_fresh=is_fresh,
         **extra,
     )
 
@@ -257,7 +269,7 @@ async def projections_slates() -> SlateListResponse:
 
 
 @app.get("/api/projections/fetch")
-async def projections_fetch(request: Request, slate_id: str | None = None):
+async def projections_fetch(request: Request):
     if _state["status"] == "running":
         raise HTTPException(409, "A pipeline run is already in progress")
 
@@ -265,12 +277,17 @@ async def projections_fetch(request: Request, slate_id: str | None = None):
     proj_path_str = cfg.paths.projections or "data/processed/projections.csv"
     proj_path = PROJECT_ROOT / proj_path_str if not Path(proj_path_str).is_absolute() else Path(proj_path_str)
 
+    dk_raw = cfg.paths.dk_slate
+    dk_path: Path | None = None
+    if dk_raw:
+        _dp = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
+        if _dp.exists():
+            dk_path = _dp
+
     async def _stream():
         script = PROJECT_ROOT / "scripts" / "fetch_rotowire_projections.py"
         python = PROJECT_ROOT / "venv" / "bin" / "python"
         cmd = [str(python), str(script)]
-        if slate_id:
-            cmd += ["--slate-id", slate_id]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -287,7 +304,7 @@ async def projections_fetch(request: Request, slate_id: str | None = None):
         returncode = await proc.wait()
         if returncode == 0:
             try:
-                record_fetch_from_csv(proj_path, slate_id or "auto")
+                record_fetch_from_csv(proj_path, "auto", dk_path)
             except Exception:
                 pass
         yield f"data: {json.dumps({'type': 'done', 'returncode': returncode, 'timestamp': int(time.time() * 1000)})}\n\n"

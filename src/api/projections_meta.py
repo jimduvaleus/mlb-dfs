@@ -91,6 +91,30 @@ def _extract_dk_date(dk_path: Path) -> Optional[str]:
     return None
 
 
+def _extract_dk_game_set(dk_path: Path) -> list[str]:
+    """
+    Return a sorted list of 'TEAM@TEAM_YYYY-MM-DD' identifiers from DK CSV.
+    Each unique game (teams + date, ignoring time) becomes one entry.
+    """
+    try:
+        df = pd.read_csv(str(dk_path), usecols=["Game Info"])
+        games: set[str] = set()
+        for raw in df["Game Info"].dropna():
+            raw = str(raw)
+            # "PHI@NYM 03/29/2026 01:35PM ET"
+            m = re.match(r"(\w+@\w+)\s+(\d{2})/(\d{2})/(\d{4})", raw)
+            if m:
+                teams, mo, dy, yr = m.groups()
+                games.add(f"{teams}_{yr}-{mo}-{dy}")
+        return sorted(games)
+    except Exception:
+        return []
+
+
+def _hash_game_set(games: list[str]) -> str:
+    return hashlib.md5("".join(games).encode()).hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Slate fetching & caching
 # ---------------------------------------------------------------------------
@@ -172,9 +196,12 @@ def fetch_and_cache_slates(dk_path: Path) -> tuple[Optional[str], list[dict]]:
     options = _build_slate_options(raw_slates, dk_date)
 
     meta = load_metadata()
-    # Reset fetches if date changed
+    # Reset date-specific fields if date changed, but preserve slate_teams
+    # (game sets are immutable so the cache is valid indefinitely).
     if meta.get("date") != dk_date:
+        slate_teams = meta.get("slate_teams", {})
         meta = dict(_EMPTY_META)
+        meta["slate_teams"] = slate_teams
     meta["date"] = dk_date
     meta["slates_fetched_at"] = time.time()
     meta["slates"] = options
@@ -201,10 +228,11 @@ def _hash_projections(proj_path: Path) -> Optional[str]:
         return None
 
 
-def record_fetch_from_csv(proj_path: Path, slate_id: str) -> None:
+def record_fetch_from_csv(proj_path: Path, slate_id: str, dk_path: Optional[Path] = None) -> None:
     """
     Called after a successful projection fetch. Reads the output CSV, computes
     unconfirmed_count and projections_hash, and appends to the metadata fetches list.
+    Also records dk_games_hash from the DK salary file (used for freshness checks).
     """
     row_count = None
     unconfirmed_count = None
@@ -218,12 +246,19 @@ def record_fetch_from_csv(proj_path: Path, slate_id: str) -> None:
 
     proj_hash = _hash_projections(proj_path)
 
+    dk_games_hash: Optional[str] = None
+    if dk_path is not None:
+        games = _extract_dk_game_set(dk_path)
+        if games:
+            dk_games_hash = _hash_game_set(games)
+
     entry = {
         "timestamp_utc": time.time(),
         "slate_id": slate_id,
         "row_count": row_count,
         "unconfirmed_count": unconfirmed_count,
         "projections_hash": proj_hash,
+        "dk_games_hash": dk_games_hash,
     }
 
     meta = load_metadata()
@@ -236,6 +271,28 @@ def record_fetch_from_csv(proj_path: Path, slate_id: str) -> None:
 # ---------------------------------------------------------------------------
 # Status field derivation
 # ---------------------------------------------------------------------------
+
+def compute_freshness(dk_path: Path, proj_path: Path) -> Optional[bool]:
+    """
+    Check whether projections.csv is consistent with DKSalaries.csv by comparing
+    player IDs directly.  Returns True if ≥90 % of projection player IDs appear in
+    the DK salary file, False if not, None if either file cannot be read.
+
+    This catches both "DK file was swapped" and "wrong RotoWire slate was fetched"
+    without requiring any stored state.
+    """
+    try:
+        proj_ids = set(pd.read_csv(str(proj_path), usecols=["player_id"])["player_id"])
+        dk_ids   = set(pd.read_csv(str(dk_path),   usecols=["ID"])["ID"])
+        # A complete projection has at least ~10 starters per game; fewer than 20
+        # means the file is broken or nearly empty — treat as stale.
+        if len(proj_ids) < 20:
+            return False
+        overlap = len(proj_ids & dk_ids) / len(proj_ids)
+        return overlap >= 0.9
+    except Exception:
+        return None
+
 
 def get_status_fields() -> dict:
     """

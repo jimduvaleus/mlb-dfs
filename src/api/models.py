@@ -80,6 +80,7 @@ class ProjectionsStatus(BaseModel):
     fetch_timestamp_utc: Optional[float] = None  # Unix seconds, from metadata
     unconfirmed_count: Optional[int] = None
     no_changes: Optional[bool] = None  # None = fewer than 2 fetches recorded
+    is_fresh: Optional[bool] = None  # True=fresh, False=stale, None=unknown
 
 
 class TeamStatus(BaseModel):

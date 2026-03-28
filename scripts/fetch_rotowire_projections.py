@@ -47,6 +47,7 @@ import requests
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DEFAULT_NAME_MAP_PATH = PROJECT_ROOT / "data" / "name_map.json"
+_METADATA_PATH = PROJECT_ROOT / "data" / "processed" / "projection_metadata.json"
 
 BASE_URL = "https://www.rotowire.com/daily/mlb/api"
 SLATE_LIST_URL = f"{BASE_URL}/slate-list.php"
@@ -235,6 +236,142 @@ def find_slate(slates: list[dict], target_date: str | None) -> dict | None:
     return slates[0] if slates else None
 
 
+def _load_slate_teams_cache() -> dict[str, list[str]]:
+    """Return the slate_teams dict from projection_metadata.json, or {} if absent."""
+    try:
+        with _METADATA_PATH.open() as f:
+            return json.load(f).get("slate_teams", {})
+    except Exception:
+        return {}
+
+
+def _save_slate_teams_cache(slate_id: str, teams: list[str]) -> None:
+    """Persist team list for *slate_id* into projection_metadata.json."""
+    meta: dict = {}
+    try:
+        with _METADATA_PATH.open() as f:
+            meta = json.load(f)
+    except Exception:
+        pass
+    meta.setdefault("slate_teams", {})[str(slate_id)] = sorted(teams)
+    _METADATA_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _METADATA_PATH.open("w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def _dk_teams(dk_path: str) -> set[str]:
+    """Return the set of team abbreviations present in a DK salary CSV."""
+    teams: set[str] = set()
+    try:
+        df = pd.read_csv(dk_path, usecols=["Game Info"])
+        for raw in df["Game Info"].dropna():
+            m = re.match(r"(\w+)@(\w+)", str(raw))
+            if m:
+                teams.add(m.group(1).upper())
+                teams.add(m.group(2).upper())
+    except Exception:
+        pass
+    return teams
+
+
+def _teams_from_records(records: list[dict]) -> set[str]:
+    """Extract team abbreviations from RotoWire player records.
+
+    The API returns team as a nested object: {"team": {"abbr": "TEX", ...}}
+    and opponent as: {"opponent": {"team": "PHI", ...}}.
+    """
+    teams: set[str] = set()
+    for r in records:
+        team = r.get("team")
+        if isinstance(team, dict):
+            abbr = team.get("abbr")
+            if abbr and isinstance(abbr, str):
+                teams.add(abbr.upper())
+        opp = r.get("opponent")
+        if isinstance(opp, dict):
+            abbr = opp.get("team")
+            if abbr and isinstance(abbr, str):
+                teams.add(abbr.upper())
+    return teams
+
+
+def find_best_slate(
+    slates: list[dict],
+    target_date: str | None,
+    dk_path: str | None = None,
+    debug: bool = False,
+) -> tuple[dict | None, list[dict] | None]:
+    """
+    Return (slate, records) where *slate* is the Classic DK slate that best
+    matches the game set in *dk_path* and *records* are the player records
+    fetched for that slate during scoring (to avoid a redundant fetch later).
+    *records* is None when the team set was served from cache or only one
+    candidate existed — the caller should fetch records itself in that case.
+
+    When multiple Classic slates share the same date (e.g. Early / Afternoon /
+    Night / All), fetches player records for each uncached candidate and picks
+    the one whose team set most closely matches the DK salary file's teams.
+
+    Scoring (higher = better):
+      primary:   fewest DK teams absent from the slate
+      secondary: fewest extra slate teams not in DK (avoids "All" over sub-slates)
+
+    Falls back to defaultSlate flag if the DK file is unavailable or no team
+    data can be extracted from the player records.
+    """
+    def _matches_date(s: dict) -> bool:
+        return target_date is not None and target_date in (s.get("startDateOnly") or "")
+
+    def _is_classic(s: dict) -> bool:
+        return (s.get("contestType") or "").lower() == "classic"
+
+    candidates = [s for s in slates if _matches_date(s) and _is_classic(s)]
+    if not candidates:
+        return find_slate(slates, target_date), None
+    if len(candidates) == 1:
+        return candidates[0], None
+
+    # Multiple candidates on the same date — score by game-set overlap.
+    if dk_path:
+        dk_team_set = _dk_teams(dk_path)
+        if dk_team_set:
+            cache = _load_slate_teams_cache()
+            # scored entries: (score_primary, score_secondary, slate, fetched_records)
+            scored: list[tuple] = []
+            for s in candidates:
+                sid = str(s["slateID"])
+                fetched_records: list[dict] | None = None
+                try:
+                    if sid in cache:
+                        slate_teams = set(cache[sid])
+                        log.debug("Slate %s (%s): using cached team set", sid, s.get("slateName"))
+                    else:
+                        fetched_records = fetch_players(s["slateID"], debug=debug)
+                        slate_teams = _teams_from_records(fetched_records)
+                        if slate_teams:
+                            _save_slate_teams_cache(sid, list(slate_teams))
+                    if slate_teams:
+                        missing = len(dk_team_set - slate_teams)
+                        extra   = len(slate_teams - dk_team_set)
+                        scored.append((-missing, -extra, s, fetched_records))
+                        log.info(
+                            "Slate %s (%s): %d teams, missing=%d, extra=%d",
+                            s["slateID"], s.get("slateName"),
+                            len(slate_teams), missing, extra,
+                        )
+                except Exception as exc:
+                    log.debug("Could not score slate %s: %s", s.get("slateID"), exc)
+            if scored:
+                scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+                return scored[0][2], scored[0][3]
+
+    # Fallback: prefer defaultSlate among candidates, then first.
+    for s in candidates:
+        if s.get("defaultSlate"):
+            return s, None
+    return candidates[0], None
+
+
 # ---------------------------------------------------------------------------
 # Players fetch & parse
 # ---------------------------------------------------------------------------
@@ -318,6 +455,7 @@ def build_projections_csv(
     output_path: str,
     name_map: dict[str, str] | None = None,
     debug: bool = False,
+    prefetched_records: list[dict] | None = None,
 ) -> pd.DataFrame:
     # --- Load DK salary file ------------------------------------------------
     log.info("Loading DK salary file: %s", dk_path)
@@ -337,16 +475,20 @@ def build_projections_csv(
         dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
 
     # --- Fetch RotoWire players ---------------------------------------------
-    log.info("Fetching RotoWire players for slate %s…", slate_id)
-    records = fetch_players(slate_id, debug=debug)
-    if not records:
-        log.error(
-            "No player records returned for slateID=%s. "
-            "Use --list-slates to verify the slate ID.",
-            slate_id,
-        )
-        sys.exit(1)
-    log.info("Fetched %d player records.", len(records))
+    if prefetched_records is not None:
+        records = prefetched_records
+        log.info("Using %d prefetched player records for slate %s.", len(records), slate_id)
+    else:
+        log.info("Fetching RotoWire players for slate %s…", slate_id)
+        records = fetch_players(slate_id, debug=debug)
+        if not records:
+            log.error(
+                "No player records returned for slateID=%s. "
+                "Use --list-slates to verify the slate ID.",
+                slate_id,
+            )
+            sys.exit(1)
+        log.info("Fetched %d player records.", len(records))
 
     proj_df = parse_players(records)
 
@@ -523,18 +665,22 @@ def main() -> None:
                 "Try --slate-id to override."
             )
             sys.exit(1)
-        slate = find_slate(slates, target_date)
+        slate, prefetched_records = find_best_slate(
+            slates, target_date, dk_path=args.dk_slate, debug=args.debug
+        )
         if not slate:
             log.error("No matching slate found. Run --list-slates to see options.")
             sys.exit(1)
         slate_id = slate["slateID"]
         log.info(
-            "Using slate: ID=%s  Type=%s  Date=%s  Default=%s",
+            "Using slate: ID=%s  Type=%s  Date=%s  Name=%s",
             slate_id,
             slate.get("contestType"),
             slate.get("startDateOnly"),
-            slate.get("defaultSlate"),
+            slate.get("slateName"),
         )
+    else:
+        prefetched_records = None
 
     # --- Build projections CSV ----------------------------------------------
     build_projections_csv(
@@ -543,6 +689,7 @@ def main() -> None:
         output_path=args.output,
         name_map=_load_name_map(args.name_map),
         debug=args.debug,
+        prefetched_records=prefetched_records,
     )
 
 
