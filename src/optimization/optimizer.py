@@ -803,6 +803,7 @@ class _ChainRunner:
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
     seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective = args
     shm = SharedMemory(name=shm_name)
+    resource_tracker.unregister(f'/{shm_name}', 'shared_memory')
     sim_matrix = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
     try:
         runner = _ChainRunner(
