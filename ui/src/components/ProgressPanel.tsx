@@ -48,6 +48,15 @@ export function ProgressPanel({ events, running }: Props) {
         )}
       </h3>
 
+      {(running || latestLineup) && total > 0 && (
+        <div className="progress-bar-wrap">
+          <div className="progress-bar" style={{ width: `${pct}%` }} />
+          <span className="progress-label">
+            Lineup {current} / {total}
+          </span>
+        </div>
+      )}
+
       <div className="event-list">
         {events.map((e, i) => (
           <div key={i} className={`event-row event-${e.stage}`}>
@@ -61,15 +70,6 @@ export function ProgressPanel({ events, running }: Props) {
           </div>
         )}
       </div>
-
-      {(running || latestLineup) && total > 0 && (
-        <div className="progress-bar-wrap">
-          <div className="progress-bar" style={{ width: `${pct}%` }} />
-          <span className="progress-label">
-            Lineup {current} / {total}
-          </span>
-        </div>
-      )}
     </div>
   )
 }
