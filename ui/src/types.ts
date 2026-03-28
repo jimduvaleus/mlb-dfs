@@ -145,10 +145,31 @@ export interface GameStatus {
 export interface SlateGamesResponse {
   slate_id: string
   games: GameStatus[]
+  excluded_player_ids: number[]
 }
 
 export interface ExclusionsUpdate {
   slate_id: string
   excluded_teams: string[]
   excluded_games: string[]
+}
+
+// Player-level exclusion types
+export interface PlayerExclusionStatus {
+  player_id: number
+  name: string
+  position: string
+  team: string
+  salary: number
+  excluded: boolean
+}
+
+export interface SlatePlayersResponse {
+  slate_id: string
+  players: PlayerExclusionStatus[]
+}
+
+export interface PlayerExclusionsUpdate {
+  slate_id: string
+  excluded_player_ids: number[]
 }

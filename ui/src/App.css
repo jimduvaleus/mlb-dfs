@@ -771,3 +771,157 @@ button { cursor: pointer; }
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* ── Player Exclusions ── */
+
+.player-exclusions {
+  margin-top: 28px;
+}
+
+.player-exclusions-header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.player-search-wrap {
+  position: relative;
+  max-width: 360px;
+  margin-bottom: 14px;
+}
+
+.player-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 7px 12px;
+  background: #1a2035;
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  color: #e2e8f0;
+  font-size: 0.85rem;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.player-search-input::placeholder {
+  color: #4a5568;
+}
+
+.player-search-input:focus {
+  border-color: #4a9de4;
+}
+
+.player-search-input:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.player-search-results {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  background: #1a2035;
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  z-index: 100;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+}
+
+.player-search-results li {
+  margin: 0;
+}
+
+.player-search-result-btn {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 12px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  transition: background 0.1s;
+}
+
+.player-search-result-btn:hover {
+  background: #2d3748;
+}
+
+.psr-name {
+  font-size: 0.85rem;
+  color: #e2e8f0;
+  font-weight: 500;
+}
+
+.psr-meta {
+  font-size: 0.75rem;
+  color: #718096;
+}
+
+.player-search-empty {
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  color: #718096;
+  background: #1a2035;
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  z-index: 100;
+}
+
+.excluded-players-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.excluded-player-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 4px 10px;
+  background: #2d1f1f;
+  border: 1px solid #742a2a;
+  border-radius: 20px;
+  font-size: 0.8rem;
+}
+
+.epc-name {
+  color: #feb2b2;
+  font-weight: 500;
+}
+
+.epc-meta {
+  color: #a0aec0;
+  font-size: 0.72rem;
+}
+
+.epc-remove {
+  background: transparent;
+  border: none;
+  color: #fc8181;
+  cursor: pointer;
+  font-size: 0.7rem;
+  padding: 0 2px;
+  line-height: 1;
+  opacity: 0.7;
+  transition: opacity 0.1s;
+}
+
+.epc-remove:hover:not(:disabled) {
+  opacity: 1;
+}
+
+.epc-remove:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}

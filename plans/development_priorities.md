@@ -1,10 +1,10 @@
 
-- Need player excluders
 - Need weather
 - Need an abort feature
 - Enhance UI stack strings with team/team notation
 - Enhance UI with unconfirmed indicator on portfolio cards
 - Enhance UI with team logos or colors on portfolio cards
+- late swap?
 
 - fancy prediction market-based projections
 

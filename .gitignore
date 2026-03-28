@@ -25,3 +25,4 @@ ui/dist/
 data/processed/test_sim_results.parquet
 data/raw/MEDKEntries.csv
 data/processed/projection_metadata.json
+data/slate_exclusions.json

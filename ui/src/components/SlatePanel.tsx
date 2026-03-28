@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from 'react'
-import type { ExclusionsUpdate, GameStatus, SlateGamesResponse } from '../types'
-import { fetchSlateGames, saveSlateExclusions } from '../api'
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, SlateGamesResponse, SlatePlayersResponse } from '../types'
+import { fetchSlateGames, fetchSlatePlayers, savePlayerExclusions, saveSlateExclusions } from '../api'
 
 interface Props {
   disabled?: boolean
@@ -8,13 +8,31 @@ interface Props {
 
 export function SlatePanel({ disabled }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
+  const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [search, setSearch] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const searchRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     fetchSlateGames()
-      .then(setSlate)
+      .then(data => { setSlate(data) })
       .catch(e => setError(String(e)))
+    fetchSlatePlayers()
+      .then(setPlayers)
+      .catch(e => setError(String(e)))
+  }, [])
+
+  // Close search dropdown when clicking outside
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (searchRef.current && !searchRef.current.contains(e.target as Node)) {
+        setSearchOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
   }, [])
 
   const buildUpdate = useCallback(
@@ -36,6 +54,9 @@ export function SlatePanel({ disabled }: Props) {
       try {
         const result = await saveSlateExclusions(buildUpdate(updated.games))
         setSlate(result)
+        // Refresh player list since team/game exclusions affect the pool
+        const updatedPlayers = await fetchSlatePlayers()
+        setPlayers(updatedPlayers)
       } catch (e) {
         setError(String(e))
       } finally {
@@ -84,6 +105,46 @@ export function SlatePanel({ disabled }: Props) {
     [slate, disabled, saving, persist]
   )
 
+  const excludePlayer = useCallback(
+    async (player: PlayerExclusionStatus) => {
+      if (!players || disabled || saving) return
+      const newIds = [...players.players.filter(p => p.excluded).map(p => p.player_id), player.player_id]
+      const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, excluded_player_ids: newIds }
+      setSaving(true)
+      setError(null)
+      setSearch('')
+      setSearchOpen(false)
+      try {
+        const result = await savePlayerExclusions(update)
+        setPlayers(result)
+      } catch (e) {
+        setError(String(e))
+      } finally {
+        setSaving(false)
+      }
+    },
+    [players, disabled, saving]
+  )
+
+  const includePlayer = useCallback(
+    async (playerId: number) => {
+      if (!players || disabled || saving) return
+      const newIds = players.players.filter(p => p.excluded && p.player_id !== playerId).map(p => p.player_id)
+      const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, excluded_player_ids: newIds }
+      setSaving(true)
+      setError(null)
+      try {
+        const result = await savePlayerExclusions(update)
+        setPlayers(result)
+      } catch (e) {
+        setError(String(e))
+      } finally {
+        setSaving(false)
+      }
+    },
+    [players, disabled, saving]
+  )
+
   if (error) return <p className="slate-error">{error}</p>
   if (!slate) return <p className="slate-muted">Loading slate…</p>
   if (slate.games.length === 0)
@@ -94,6 +155,13 @@ export function SlatePanel({ disabled }: Props) {
     (n, g) => n + g.teams.filter(t => !t.excluded).length,
     0
   )
+
+  const searchLower = search.toLowerCase().trim()
+  const activePlayers = players?.players.filter(p => !p.excluded) ?? []
+  const excludedPlayers = players?.players.filter(p => p.excluded) ?? []
+  const searchResults = searchLower.length > 0
+    ? activePlayers.filter(p => p.name.toLowerCase().includes(searchLower)).slice(0, 8)
+    : []
 
   return (
     <div className="slate-panel">
@@ -136,6 +204,64 @@ export function SlatePanel({ disabled }: Props) {
             </div>
           </div>
         ))}
+      </div>
+
+      <div className="player-exclusions">
+        <div className="player-exclusions-header">
+          <h3 className="slate-title">Player Exclusions</h3>
+          {excludedPlayers.length > 0 && (
+            <span className="slate-summary">{excludedPlayers.length} excluded</span>
+          )}
+        </div>
+
+        <div className="player-search-wrap" ref={searchRef}>
+          <input
+            className="player-search-input"
+            type="text"
+            placeholder="Search players to exclude…"
+            value={search}
+            onChange={e => { setSearch(e.target.value); setSearchOpen(true) }}
+            onFocus={() => setSearchOpen(true)}
+            disabled={disabled || saving}
+          />
+          {searchOpen && searchResults.length > 0 && (
+            <ul className="player-search-results">
+              {searchResults.map(p => (
+                <li key={p.player_id}>
+                  <button
+                    className="player-search-result-btn"
+                    onMouseDown={e => { e.preventDefault(); excludePlayer(p) }}
+                  >
+                    <span className="psr-name">{p.name}</span>
+                    <span className="psr-meta">{p.position} · {p.team} · ${p.salary.toLocaleString()}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {searchOpen && searchLower.length > 0 && searchResults.length === 0 && (
+            <div className="player-search-empty">No active players match</div>
+          )}
+        </div>
+
+        {excludedPlayers.length > 0 && (
+          <div className="excluded-players-list">
+            {excludedPlayers.map(p => (
+              <span key={p.player_id} className="excluded-player-chip">
+                <span className="epc-name">{p.name}</span>
+                <span className="epc-meta">{p.position} · {p.team}</span>
+                <button
+                  className="epc-remove"
+                  onClick={() => includePlayer(p.player_id)}
+                  disabled={disabled || saving}
+                  title={`Re-include ${p.name}`}
+                >
+                  ✕
+                </button>
+              </span>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   )

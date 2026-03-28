@@ -291,12 +291,14 @@ class PipelineRunner:
 
         excluded_games = set(stored.get("excluded_games", []))
         excluded_teams = set(stored.get("excluded_teams", []))
-        if not excluded_games and not excluded_teams:
+        excluded_player_ids = set(stored.get("excluded_player_ids", []))
+        if not excluded_games and not excluded_teams and not excluded_player_ids:
             return players_df
 
         mask = (
             players_df["game"].isin(excluded_games) |
-            players_df["team"].isin(excluded_teams)
+            players_df["team"].isin(excluded_teams) |
+            players_df["player_id"].isin(excluded_player_ids)
         )
         filtered = players_df[~mask].copy()
         n_removed = len(players_df) - len(filtered)

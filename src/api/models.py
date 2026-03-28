@@ -98,9 +98,29 @@ class GameStatus(BaseModel):
 class SlateGamesResponse(BaseModel):
     slate_id: str
     games: list[GameStatus]
+    excluded_player_ids: list[int] = []
 
 
 class ExclusionsUpdate(BaseModel):
     slate_id: str
     excluded_teams: list[str]
     excluded_games: list[str]
+
+
+class PlayerExclusionStatus(BaseModel):
+    player_id: int
+    name: str
+    position: str
+    team: str
+    salary: int
+    excluded: bool
+
+
+class SlatePlayersResponse(BaseModel):
+    slate_id: str
+    players: list[PlayerExclusionStatus]
+
+
+class PlayerExclusionsUpdate(BaseModel):
+    slate_id: str
+    excluded_player_ids: list[int]
