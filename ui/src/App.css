@@ -161,11 +161,17 @@ button { cursor: pointer; }
 /* ── Config form ── */
 
 .config-form {
-  max-width: 680px;
+  max-width: 820px;
+}
+
+.config-form-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px 32px;
 }
 
 .config-form section {
-  margin-bottom: 28px;
+  margin-bottom: 12px;
 }
 
 .config-form h3 {
@@ -174,17 +180,17 @@ button { cursor: pointer; }
   color: #a0aec0;
   text-transform: uppercase;
   letter-spacing: 0.08em;
-  margin: 0 0 12px;
+  margin: 0 0 10px;
   padding-bottom: 6px;
   border-bottom: 1px solid #2d3748;
 }
 
 .field-row {
   display: grid;
-  grid-template-columns: 200px 1fr;
+  grid-template-columns: 1fr 100px;
   align-items: center;
-  gap: 12px;
-  margin-bottom: 8px;
+  gap: 10px;
+  margin-bottom: 6px;
 }
 
 .field-row label {
@@ -212,17 +218,37 @@ button { cursor: pointer; }
   opacity: 0.5;
 }
 
+.config-form-footer {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
 .config-form button[type="submit"] {
   padding: 8px 24px;
-  background: #2d6a4f;
-  color: #d8f3dc;
   border: none;
   border-radius: 6px;
   font-size: 14px;
   font-weight: 600;
-  margin-top: 8px;
+  cursor: pointer;
+  transition: background 0.2s, opacity 0.2s;
 }
-.config-form button[type="submit"]:hover:not(:disabled) { background: #1b4332; }
+
+.config-form button[type="submit"].btn-clean {
+  background: #2d3748;
+  color: #718096;
+  opacity: 0.6;
+  cursor: default;
+}
+
+.config-form button[type="submit"].btn-dirty {
+  background: #38a169;
+  color: #fff;
+  opacity: 1;
+}
+.config-form button[type="submit"].btn-dirty:hover:not(:disabled) { background: #2f855a; }
+
 .config-form button[type="submit"]:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ── Projections panel ── */
