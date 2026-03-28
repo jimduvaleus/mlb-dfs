@@ -72,18 +72,20 @@ export function MetricsPanel({ lineups, events }: Props) {
     <div className="metrics-panel">
       <h3>Portfolio Metrics</h3>
 
-      {/* Timing */}
-      <div className="metrics-section">
-        <h4>Build Time</h4>
-        <div className="metrics-row">
-          {totalMs !== null && (
-            <span className="metric-chip">Total: {formatMs(totalMs)}</span>
-          )}
-          {avgLineupMs !== null && (
-            <span className="metric-chip">Avg/lineup: {formatMs(avgLineupMs)}</span>
-          )}
+      {/* Timing — only shown when SSE events from a live run are present */}
+      {(totalMs !== null || avgLineupMs !== null) && (
+        <div className="metrics-section">
+          <h4>Build Time</h4>
+          <div className="metrics-row">
+            {totalMs !== null && (
+              <span className="metric-chip">Total: {formatMs(totalMs)}</span>
+            )}
+            {avgLineupMs !== null && (
+              <span className="metric-chip">Avg/lineup: {formatMs(avgLineupMs)}</span>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Stacking */}
       <div className="metrics-section">

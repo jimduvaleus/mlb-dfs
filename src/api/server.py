@@ -48,6 +48,49 @@ _state: dict = {
 }
 
 
+def _portfolio_csv_path() -> Path:
+    cfg = read_config()
+    output_dir = cfg.paths.output_dir or "outputs"
+    base = PROJECT_ROOT / output_dir if not Path(output_dir).is_absolute() else Path(output_dir)
+    return base / "portfolio.csv"
+
+
+@app.on_event("startup")
+def _load_persisted_portfolio() -> None:
+    """Restore the last portfolio from portfolio.csv so the UI shows it after restart."""
+    import pandas as pd
+
+    try:
+        path = _portfolio_csv_path()
+        if not path.exists():
+            return
+        df = pd.read_csv(path)
+        portfolio: list[dict] = []
+        for lineup_idx, group in df.groupby("lineup", sort=True):
+            first = group.iloc[0]
+            players = [
+                {
+                    "player_id": int(row["player_id"]),
+                    "name": str(row["name"]),
+                    "position": str(row["position"]),
+                    "team": str(row["team"]),
+                    "salary": int(row["salary"]),
+                }
+                for _, row in group.iterrows()
+            ]
+            portfolio.append({
+                "lineup_index": int(lineup_idx),
+                "p_hit_target": float(first["p_hit_target"]),
+                "lineup_salary": int(first["lineup_salary"]),
+                "players": players,
+            })
+        if portfolio:
+            _state["portfolio"] = portfolio
+            _state["status"] = "complete"
+    except Exception:
+        pass  # corrupt or missing CSV — start fresh
+
+
 # ---------------------------------------------------------------------------
 # Config endpoints
 # ---------------------------------------------------------------------------
