@@ -63,7 +63,7 @@ export function MetricsPanel({ lineups, events }: Props) {
   // --- Stacking breakdown ---
   const stackCounts: Record<string, number> = {}
   for (const lineup of lineups) {
-    const stack = getStackNotation(lineup.players)
+    const stack = getStackNotation(lineup.players).split(' ')[0]
     stackCounts[stack] = (stackCounts[stack] ?? 0) + 1
   }
   const stackList = Object.entries(stackCounts).sort((a, b) => b[1] - a[1])
