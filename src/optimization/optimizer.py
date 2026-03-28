@@ -7,6 +7,7 @@ simulation results, subject to DK Classic salary and position constraints.
 import logging
 from concurrent.futures import ProcessPoolExecutor, Future, as_completed
 from multiprocessing.shared_memory import SharedMemory
+from multiprocessing import resource_tracker
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -986,6 +987,7 @@ class BasinHoppingOptimizer:
                         break
             finally:
                 shm.close()
+                resource_tracker.unregister(f'/{shm.name}', 'shared_memory')
                 shm.unlink()
                 if owned_executor and executor is not None:
                     executor.shutdown(wait=False)
