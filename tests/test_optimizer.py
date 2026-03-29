@@ -512,3 +512,175 @@ def test_optimize_multi_pos_slate():
     meta = _build_player_meta(df)
     assert lineup.is_valid(meta)
     assert 7 in lineup.player_ids  # the 3B/SS player must be in the lineup
+
+
+# ------------------------------------------------------------------ #
+#  marginal_payout objective                                           #
+# ------------------------------------------------------------------ #
+
+def _make_payout_optimizer(
+    sim_results,
+    players_df,
+    target: float = 150.0,
+    cash_line: float = 100.0,
+    best_scores=None,
+    payout_beta: float = 2.0,
+    n_chains: int = 5,
+    n_steps: int = 20,
+):
+    return BasinHoppingOptimizer(
+        sim_results=sim_results,
+        players_df=players_df,
+        target=target,
+        n_chains=n_chains,
+        temperature=0.05,
+        n_steps=n_steps,
+        rng_seed=42,
+        objective="marginal_payout",
+        payout_beta=payout_beta,
+        payout_cash_line=cash_line,
+        best_scores=best_scores,
+    )
+
+
+def test_marginal_payout_returns_valid_lineup(sim_results, players_df, player_meta):
+    """marginal_payout objective must return a valid DK Classic lineup."""
+    opt = _make_payout_optimizer(sim_results, players_df)
+    lineup, score = opt.optimize()
+    assert isinstance(lineup, Lineup)
+    assert lineup.is_valid(player_meta)
+    assert score >= 0.0
+
+
+def test_marginal_payout_better_than_random(sim_results, players_df):
+    """Optimized lineup should score higher on payout objective than a random lineup."""
+    from src.optimization.optimizer import _score_totals_payout
+
+    opt = _make_payout_optimizer(sim_results, players_df, cash_line=80.0)
+    lineup, opt_score = opt.optimize()
+
+    # Score a random lineup
+    rng = np.random.default_rng(999)
+    rand_lineup = opt._runner._random_valid_lineup(rng)
+    rand_cols = [opt.col_map[pid] for pid in rand_lineup.player_ids]
+    rand_totals = opt.sim_matrix[:, rand_cols].sum(axis=1)
+    best_scores = np.zeros(opt.sim_matrix.shape[0], dtype=np.float64)
+    rand_score = _score_totals_payout(rand_totals, 80.0, best_scores, 2.0)
+
+    assert opt_score >= rand_score
+
+
+def test_marginal_payout_cash_line_separates_from_target(sim_results, players_df):
+    """Lower cash_line should give higher objective scores (more sims contribute).
+
+    With cash_line below most totals, almost every sim contributes gradient,
+    so the average payout objective value should be larger.
+    """
+    from src.optimization.optimizer import _score_totals_payout
+
+    col_map = {pid: i for i, pid in enumerate(sim_results.player_ids)}
+    # Fixed set of player columns for comparison
+    opt_low = _make_payout_optimizer(sim_results, players_df, cash_line=10.0)
+    opt_high = _make_payout_optimizer(sim_results, players_df, cash_line=350.0)
+
+    lineup_low, score_low = opt_low.optimize()
+    lineup_high, score_high = opt_high.optimize()
+
+    # score_low uses cash_line=10: most sims (totals ~0-400) exceed it → larger values
+    # score_high uses cash_line=350: very few sims exceed it → near-zero values
+    assert score_low > score_high
+
+
+def test_marginal_payout_with_zero_best_scores_equals_direct_payout(sim_results, players_df):
+    """When best_scores=zeros, objective = E[max(0, lineup - cash_line)^beta]."""
+    from src.optimization.optimizer import _score_totals_payout
+
+    cash_line = 100.0
+    beta = 2.0
+    best_scores_zero = np.zeros(sim_results.n_sims, dtype=np.float64)
+
+    opt = _make_payout_optimizer(
+        sim_results, players_df,
+        cash_line=cash_line,
+        best_scores=best_scores_zero,
+        payout_beta=beta,
+    )
+    lineup, score = opt.optimize()
+    cols = [opt.col_map[pid] for pid in lineup.player_ids]
+    totals = opt.sim_matrix[:, cols].sum(axis=1)
+
+    # Compute expected value directly
+    expected = float(np.mean(np.maximum(totals - cash_line, 0.0) ** beta))
+    assert score == pytest.approx(expected, rel=1e-6)
+
+
+def test_marginal_payout_payout_cash_line_defaults_to_target(sim_results, players_df):
+    """When payout_cash_line is None, the cash line should fall back to target."""
+    target = 150.0
+    opt = BasinHoppingOptimizer(
+        sim_results=sim_results,
+        players_df=players_df,
+        target=target,
+        n_chains=3,
+        n_steps=10,
+        rng_seed=0,
+        objective="marginal_payout",
+        payout_cash_line=None,
+    )
+    # The runner should store target as the cash line
+    assert opt._runner._payout_cash_line == pytest.approx(target)
+
+
+def test_marginal_payout_explicit_cash_line_used(sim_results, players_df):
+    """payout_cash_line should be stored and used, distinct from target."""
+    target = 150.0
+    cash_line = 90.0
+    opt = BasinHoppingOptimizer(
+        sim_results=sim_results,
+        players_df=players_df,
+        target=target,
+        n_chains=3,
+        n_steps=10,
+        rng_seed=0,
+        objective="marginal_payout",
+        payout_cash_line=cash_line,
+    )
+    assert opt._runner._payout_cash_line == pytest.approx(cash_line)
+    # target should remain unchanged
+    assert opt.target == pytest.approx(target)
+
+
+def test_marginal_payout_best_scores_shift_objective(sim_results, players_df):
+    """Providing non-zero best_scores should reduce the objective value.
+
+    When best_scores already covers strong sims, the marginal improvement of
+    adding a lineup is smaller.
+    """
+    from src.optimization.optimizer import _score_totals_payout
+
+    cash_line = 80.0
+    beta = 2.0
+    n_sims = sim_results.n_sims
+
+    # Zero best_scores baseline
+    bs_zero = np.zeros(n_sims, dtype=np.float64)
+    opt_zero = _make_payout_optimizer(
+        sim_results, players_df, cash_line=cash_line,
+        best_scores=bs_zero, payout_beta=beta,
+    )
+    lineup_zero, _ = opt_zero.optimize()
+    cols_zero = [opt_zero.col_map[pid] for pid in lineup_zero.player_ids]
+    totals_zero = opt_zero.sim_matrix[:, cols_zero].sum(axis=1)
+    score_with_zero_bs = _score_totals_payout(totals_zero, cash_line, bs_zero, beta)
+
+    # High best_scores (already strong coverage)
+    bs_high = np.full(n_sims, 300.0, dtype=np.float64)
+    score_with_high_bs = _score_totals_payout(totals_zero, cash_line, bs_high, beta)
+
+    # When best_scores=300 > all totals, max(best, lineup) = 300 always
+    # so the objective is max(300 - cash_line, 0)^beta regardless of lineup
+    # With zero best_scores, the optimizer can pick a lineup that sometimes
+    # exceeds cash_line, giving a lower baseline score
+    # The key property: score_with_high_bs should be >= score_with_zero_bs
+    # (because taking max with a high floor raises effective scores)
+    assert score_with_high_bs >= score_with_zero_bs

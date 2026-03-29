@@ -64,7 +64,7 @@ def _build_player_meta(players_df: pd.DataFrame) -> PlayerMeta:
 # ------------------------------------------------------------------ #
 
 # Supported objective names (used in config and API).
-OBJECTIVES = ("p_hit", "expected_surplus")
+OBJECTIVES = ("p_hit", "expected_surplus", "marginal_payout")
 
 
 def _score_totals_p_hit(totals: np.ndarray, target: float) -> float:
@@ -119,6 +119,48 @@ def _score_swap_candidates_surplus(
             if val > target:
                 surplus += val - target
         cand_scores[j] = surplus / n_sims
+    return cand_scores
+
+
+def _score_totals_payout(
+    totals: np.ndarray, cash_line: float, best_scores: np.ndarray, beta: float,
+) -> float:
+    """E[payout(max(best_scores, lineup_scores))] using power-law payout."""
+    effective = np.maximum(totals, best_scores)
+    diff = np.maximum(effective - cash_line, 0.0)
+    return float(np.mean(diff ** beta))
+
+
+@njit(cache=True)
+def _score_swap_candidates_payout(
+    sim_matrix: np.ndarray,
+    totals: np.ndarray,
+    col_out: int,
+    cand_cols: np.ndarray,
+    cash_line: float,
+    best_scores: np.ndarray,
+    beta: float,
+) -> np.ndarray:
+    """Score all swap candidates using marginal payout objective (Numba-accelerated).
+
+    For each candidate, computes E[P(max(best_scores, new_total))] where
+    P(s) = max(0, s - cash_line)^beta.
+    """
+    n_sims = totals.shape[0]
+    n_cands = cand_cols.shape[0]
+    cand_scores = np.empty(n_cands, dtype=np.float64)
+    for j in range(n_cands):
+        total_payout = 0.0
+        col_in = cand_cols[j]
+        for i in range(n_sims):
+            new_total = totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in]
+            effective = new_total
+            if best_scores[i] > effective:
+                effective = best_scores[i]
+            diff = effective - cash_line
+            if diff > 0.0:
+                total_payout += diff ** beta
+        cand_scores[j] = total_payout / n_sims
     return cand_scores
 
 
@@ -228,6 +270,9 @@ class _ChainRunner:
         niter_success: int = 25,
         salary_floor: Optional[float] = None,
         objective: str = "expected_surplus",
+        best_scores: Optional[np.ndarray] = None,
+        payout_beta: float = 2.5,
+        payout_cash_line: Optional[float] = None,
     ):
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
@@ -246,6 +291,18 @@ class _ChainRunner:
         if objective == "p_hit":
             self._score_totals = _score_totals_p_hit
             self._score_swap_candidates = _score_swap_candidates_p_hit
+        elif objective == "marginal_payout":
+            if best_scores is None:
+                best_scores = np.zeros(sim_matrix.shape[0], dtype=np.float64)
+            self._best_scores = best_scores
+            self._payout_beta = payout_beta
+            self._payout_cash_line = payout_cash_line if payout_cash_line is not None else target
+            self._score_totals = lambda totals, tgt: _score_totals_payout(
+                totals, self._payout_cash_line, self._best_scores, self._payout_beta
+            )
+            self._score_swap_candidates = lambda sm, t, co, cc, tgt: _score_swap_candidates_payout(
+                sm, t, co, cc, self._payout_cash_line, self._best_scores, self._payout_beta
+            )
         else:
             self._score_totals = _score_totals_surplus
             self._score_swap_candidates = _score_swap_candidates_surplus
@@ -800,7 +857,7 @@ class _ChainRunner:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line = args
     shm = SharedMemory(name=shm_name)
     # Do NOT unregister here: with fork start method all workers share the
     # parent's resource tracker subprocess, so the first unregister removes
@@ -819,6 +876,9 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             niter_success=niter_success,
             salary_floor=salary_floor,
             objective=objective,
+            best_scores=best_scores,
+            payout_beta=payout_beta,
+            payout_cash_line=payout_cash_line,
         )
         return runner.run(seed)
     finally:
@@ -864,6 +924,9 @@ class BasinHoppingOptimizer:
         early_stopping_threshold: float = 0.001,
         salary_floor: Optional[float] = None,
         objective: str = "expected_surplus",
+        best_scores: Optional[np.ndarray] = None,
+        payout_beta: float = 2.5,
+        payout_cash_line: Optional[float] = None,
     ):
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
@@ -888,6 +951,9 @@ class BasinHoppingOptimizer:
         self.early_stopping_threshold = early_stopping_threshold
         self.salary_floor = salary_floor
         self.objective = objective
+        self.best_scores = best_scores
+        self.payout_beta = payout_beta
+        self.payout_cash_line = payout_cash_line
 
         # Pre-group player IDs by position for fast pool queries
         self._players_by_pos: Dict[str, List[int]] = {
@@ -909,6 +975,9 @@ class BasinHoppingOptimizer:
             niter_success=self.niter_success,
             salary_floor=self.salary_floor,
             objective=self.objective,
+            best_scores=self.best_scores,
+            payout_beta=self.payout_beta,
+            payout_cash_line=self.payout_cash_line,
         )
 
     def _run_chains(
@@ -961,6 +1030,9 @@ class BasinHoppingOptimizer:
                     self.niter_success,
                     self.salary_floor,
                     self.objective,
+                    self.best_scores,
+                    self.payout_beta,
+                    self.payout_cash_line,
                 )
                 for seed in seeds
             ]

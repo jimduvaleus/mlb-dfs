@@ -72,6 +72,20 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
 
           <section>
             <h3>Optimizer</h3>
+            <FieldRow label="Objective">
+              <select value={draft.optimizer.objective}
+                onChange={e => set('optimizer', 'objective', e.target.value)} disabled={disabled}>
+                <option value="expected_surplus">Expected Surplus</option>
+                <option value="p_hit">Probability Hit</option>
+                <option value="marginal_payout">Marginal Payout</option>
+              </select>
+            </FieldRow>
+            {draft.optimizer.objective === 'marginal_payout' && (
+              <FieldRow label="Payout beta (blank = auto)">
+                <input type="number" step={0.1} min={1} max={5} value={str(draft.optimizer.payout_beta)}
+                  onChange={e => set('optimizer', 'payout_beta', num(e.target.value))} disabled={disabled} />
+              </FieldRow>
+            )}
             <FieldRow label="Chains (n_chains)">
               <input type="number" min={1} value={draft.optimizer.n_chains}
                 onChange={e => set('optimizer', 'n_chains', Number(e.target.value))} disabled={disabled} />

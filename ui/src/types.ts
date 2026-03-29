@@ -23,6 +23,8 @@ export interface OptimizerConfig {
   early_stopping_threshold: number
   salary_floor: number | null
   rng_seed: number | null
+  objective: string
+  payout_beta: number | null
 }
 
 export interface PortfolioConfig {
@@ -81,6 +83,7 @@ export type SSEStage =
   | 'load_slate'
   | 'simulate'
   | 'compute_target'
+  | 'calibrate_beta'
   | 'optimize_lineup'
   | 'complete'
   | 'stopped'

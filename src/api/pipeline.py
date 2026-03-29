@@ -150,6 +150,27 @@ class PipelineRunner:
             logger.info("Using configured target: %.1f DK pts", target)
             self._cb("compute_target", {"target": target, "percentile": None})
 
+        # --- Resolve payout beta and cash line ----------------------------------
+        objective = str(opt_cfg.get("objective", "expected_surplus"))
+        payout_beta_cfg = opt_cfg.get("payout_beta")
+        if objective == "marginal_payout":
+            from src.optimization.payout import calibrate_beta, load_payout_structure, get_cash_line_score
+            score_dist = self._best_lineup_score_distribution(players_df, sim_results)
+            score_percentiles = np.percentile(score_dist, np.arange(1, 101))
+            structure = load_payout_structure("dk_classic_gpp")
+            payout_cash_line = get_cash_line_score(structure, score_percentiles)
+            logger.info("Payout cash line score: %.1f DK pts", payout_cash_line)
+            self._cb("calibrate_beta", {"payout_cash_line": round(float(payout_cash_line), 1)})
+            if payout_beta_cfg is None:
+                payout_beta = calibrate_beta(structure, score_percentiles, payout_cash_line)
+                logger.info("Auto-calibrated payout beta: %.2f", payout_beta)
+                self._cb("calibrate_beta", {"payout_beta": round(payout_beta, 2), "payout_cash_line": round(float(payout_cash_line), 1)})
+            else:
+                payout_beta = float(payout_beta_cfg)
+        else:
+            payout_cash_line = None
+            payout_beta = float(payout_beta_cfg) if payout_beta_cfg is not None else 2.5
+
         # --- Construct portfolio ----------------------------------------
         config_size = int(port_cfg.get("size", 20))
         portfolio_size = max(config_size, total_entries) if total_entries > 0 else config_size
@@ -176,7 +197,9 @@ class PipelineRunner:
             early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
             early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
             salary_floor=float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None,
-            objective=str(opt_cfg.get("objective", "expected_surplus")),
+            objective=objective,
+            payout_beta=payout_beta,
+            payout_cash_line=payout_cash_line,
         )
 
         def _on_lineup_complete(lineup_index: int, total: int, score: float, sims_covered: int, sims_remaining: int) -> None:
@@ -343,11 +366,15 @@ class PipelineRunner:
         return filtered
 
     @staticmethod
-    def _compute_auto_target(
+    def _best_lineup_score_distribution(
         players_df: pd.DataFrame,
-        sim_results: SimulationResults,
-        percentile: int,
-    ) -> float:
+        sim_results: "SimulationResults",
+    ) -> np.ndarray:
+        """Compute the per-sim score totals for the top-mean lineup.
+
+        Returns an (n_sims,) array of lineup totals — one per simulation.
+        Used for both auto-target computation and payout beta calibration.
+        """
         col_map = {pid: i for i, pid in enumerate(sim_results.player_ids)}
         sorted_df = players_df.sort_values("mean", ascending=False)
         counts: dict[str, int] = {pos: 0 for pos in ROSTER_REQUIREMENTS}
@@ -362,11 +389,19 @@ class PipelineRunner:
         if len(selected) == 10:
             cols = [col_map[pid] for pid in selected if pid in col_map]
             if len(cols) == 10:
-                totals = sim_results.results_matrix[:, cols].sum(axis=1)
-                return float(np.percentile(totals, percentile))
+                return sim_results.results_matrix[:, cols].sum(axis=1)
         n = len(players_df)
         row_sums = sim_results.results_matrix.sum(axis=1)
-        return float(np.percentile(row_sums * 10.0 / n, percentile))
+        return row_sums * 10.0 / n
+
+    @staticmethod
+    def _compute_auto_target(
+        players_df: pd.DataFrame,
+        sim_results: "SimulationResults",
+        percentile: int,
+    ) -> float:
+        totals = PipelineRunner._best_lineup_score_distribution(players_df, sim_results)
+        return float(np.percentile(totals, percentile))
 
     @staticmethod
     def _serialize_portfolio(

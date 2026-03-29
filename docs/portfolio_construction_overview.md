@@ -47,7 +47,11 @@ The copula determines **who moves together**; the marginal (parameterized by the
 
 ## 3. How the Optimizer Selects Lineups
 
-Each lineup is found by the **Basin-Hopping Optimizer** (`BasinHoppingOptimizer`). It maximizes a single objective: `P(lineup_total ≥ target)`, estimated by summing the lineup's column scores across all active simulation rows and checking what fraction clear the target.
+Each lineup is found by the **Basin-Hopping Optimizer** (`BasinHoppingOptimizer`). It maximizes one of three configurable objectives (set via `optimizer.objective` in `config.yaml`):
+
+- **`p_hit`** — `P(lineup_total ≥ target)`, estimated by the fraction of simulation rows where the lineup clears the target.
+- **`expected_surplus`** — `E[max(lineup_total − target, 0)]`, the expected score above target for lineups that hit.
+- **`marginal_payout`** — `E[P(max(best_scores, lineup_scores))]` where `P(s) = max(0, s − target)^β`. Maximizes marginal expected payout given prior portfolio lineups' best per-sim scores. The `β` parameter (`optimizer.payout_beta`, default 2.5) controls how heavily top scores are weighted — higher values push toward monster-ceiling lineups.
 
 ### The search process (per chain)
 
@@ -69,9 +73,9 @@ The optimizer runs `n_chains` (default 250) independent chains from different ra
 
 ## 4. How Portfolio Diversity Is Achieved
 
-Diversity is not enforced via explicit constraints (like exposure caps). Instead, it emerges naturally from the **simulation row consumption** mechanic built into the portfolio construction loop.
+Diversity is not enforced via explicit constraints (like exposure caps). Instead, it emerges naturally from the portfolio construction mechanics. Two approaches are available, selected by the `optimizer.objective` setting.
 
-### The core algorithm (`PortfolioConstructor`)
+### Row consumption (`p_hit` / `expected_surplus` objectives)
 
 1. Start with all `n_sims` rows **active**.
 2. Run the optimizer on the active rows to find the best lineup `L₁`.
@@ -81,6 +85,31 @@ Diversity is not enforced via explicit constraints (like exposure caps). Instead
 Because later lineups are optimized over scenarios that earlier lineups *did not* cover, they are forced to find upside through different player combinations — different teams, different game stacks, different salary allocations. Lineups that would simply replicate the same "good game" scenarios as a prior lineup provide no incremental coverage and score poorly on the active rows.
 
 **Coverage is the driving force for diversity**: two lineups that target the same set of high-upside scenarios will overlap heavily, so the algorithm naturally prefers lineups that spread coverage across different simulation branches.
+
+### Payout-weighted optimization (`marginal_payout` objective)
+
+The row-consumption approach treats "clearing the target" as binary — a sim where a lineup scores 131 (barely above a 128.7 target) is marked as fully covered, just like one where it scores 220. But in a top-heavy GPP, the 220-point sim might pay out 500× more than the 131-point sim.
+
+The `marginal_payout` objective addresses this by replacing binary coverage with a continuous payout function:
+
+**P(s) = max(0, s − cash_line)^β**
+
+where `cash_line` is the target score and `β` (configurable via `optimizer.payout_beta`, default 2.5) controls how aggressively the optimizer chases ceiling vs. floor.
+
+Instead of consuming simulation rows, the portfolio constructor tracks `best_scores` — the best score any portfolio lineup has achieved in each sim. At step k, the optimizer maximizes **marginal payout improvement**:
+
+```
+ΔEV = (1/N) × Σᵢ [ P(max(bestᵢ, scoreₖᵢ)) − P(bestᵢ) ]
+```
+
+This naturally gives:
+- **High weight** to sims where no current lineup does well (big room for improvement)
+- **Moderate weight** to sims where a lineup barely cleared target (room to "upgrade" from 131 to 200)
+- **Near-zero weight** to sims where a lineup already scored 200+ (diminishing returns)
+
+The result is portfolio diversity driven directly by the payout structure: lineups diversify not just to cover different scenarios, but to maximize marginal dollar value across the portfolio.
+
+A reference GPP payout structure is stored in `data/payout_structures/dk_classic_gpp.json`. The `calibrate_beta()` function in `src/optimization/payout.py` can fit `β` to an actual payout table given simulated score percentiles.
 
 ### Addressing greedy lock-in (`BeamPortfolioConstructor`)
 
@@ -100,5 +129,6 @@ This allows a path with a slightly weaker first lineup to survive if it enables 
 |---|---|---|
 | Simulation | Bootstrap copula rows → correlated quantiles → marginal PPF | `n_sims` |
 | Player projections | `(mean, std_dev)` parameterize each player's marginal | External projection source |
-| Lineup optimization | Basin-Hopping over `P(total ≥ target)` on active rows | `n_chains`, `n_steps`, `target` |
-| Portfolio diversity | Row consumption forces successive lineups to cover new scenarios | `portfolio_size`, `beam_width` |
+| Lineup optimization | Basin-Hopping over objective on simulation matrix | `n_chains`, `n_steps`, `target`, `objective` |
+| Portfolio diversity (row consumption) | Row consumption forces successive lineups to cover new scenarios | `portfolio_size`, `beam_width` |
+| Portfolio diversity (payout-weighted) | Marginal payout maximization with `best_scores` tracking | `portfolio_size`, `payout_beta` |

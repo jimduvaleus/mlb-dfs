@@ -234,7 +234,7 @@ button { cursor: pointer; }
 
 .field-row {
   display: grid;
-  grid-template-columns: 1fr 100px;
+  grid-template-columns: 1fr 150px;
   align-items: center;
   gap: 10px;
   margin-bottom: 6px;
@@ -246,7 +246,8 @@ button { cursor: pointer; }
   text-align: right;
 }
 
-.field-row input {
+.field-row input,
+.field-row select {
   background: #1a202c;
   border: 1px solid #4a5568;
   color: #e2e8f0;
@@ -256,12 +257,18 @@ button { cursor: pointer; }
   width: 100%;
 }
 
-.field-row input:focus {
+.field-row select {
+  cursor: pointer;
+}
+
+.field-row input:focus,
+.field-row select:focus {
   outline: none;
   border-color: #63b3ed;
 }
 
-.field-row input:disabled {
+.field-row input:disabled,
+.field-row select:disabled {
   opacity: 0.5;
 }
 

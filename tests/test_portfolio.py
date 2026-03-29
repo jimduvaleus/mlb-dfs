@@ -626,3 +626,123 @@ def test_beam_covers_more_rows_than_greedy_on_lock_in():
     assert beam_cov >= greedy_cov, (
         f"Beam coverage {beam_cov} < greedy coverage {greedy_cov}"
     )
+
+
+# ================================================================== #
+#  marginal_payout objective in PortfolioConstructor                  #
+# ================================================================== #
+
+def _make_payout_constructor(
+    sim_results,
+    players_df,
+    portfolio_size=2,
+    target=150.0,
+    cash_line=80.0,
+    payout_beta=2.0,
+    seed=42,
+):
+    return PortfolioConstructor(
+        sim_results=sim_results,
+        players_df=players_df,
+        target=target,
+        portfolio_size=portfolio_size,
+        n_chains=3,
+        n_steps=10,
+        rng_seed=seed,
+        objective="marginal_payout",
+        payout_beta=payout_beta,
+        payout_cash_line=cash_line,
+    )
+
+
+def test_payout_weighted_returns_requested_size(sim_results, players_df):
+    """marginal_payout portfolio should return portfolio_size lineups."""
+    pc = _make_payout_constructor(sim_results, players_df, portfolio_size=2)
+    portfolio = pc.construct()
+    assert len(portfolio) == 2
+
+
+def test_payout_weighted_returns_valid_lineups(sim_results, players_df):
+    """All lineups from marginal_payout construction must be valid."""
+    from src.optimization.optimizer import _build_player_meta
+    player_meta = _build_player_meta(players_df)
+    pc = _make_payout_constructor(sim_results, players_df, portfolio_size=2)
+    for lineup, score in pc.construct():
+        assert isinstance(lineup, Lineup)
+        assert lineup.is_valid(player_meta)
+        assert 0.0 <= score <= 1.0
+
+
+def test_payout_weighted_each_lineup_has_ten_players(sim_results, players_df):
+    pc = _make_payout_constructor(sim_results, players_df, portfolio_size=2)
+    for lineup, _ in pc.construct():
+        assert len(lineup.player_ids) == 10
+
+
+def test_payout_weighted_score_above_cash_line_fraction(sim_results, players_df):
+    """At least one lineup should exceed the cash_line in a reasonable fraction
+    of sims when cash_line is well below typical scores.
+
+    The sim matrix has per-player scores uniform in [0, 40]; a 10-player
+    lineup has expected total ~200. We set cash_line=80 (well below median)
+    so that a typical lineup total (~200) > 80 in many sims.
+    """
+    cash_line = 80.0
+    pc = _make_payout_constructor(
+        sim_results, players_df, portfolio_size=1,
+        target=350.0,  # above typical totals so p_hit doesn't drive selection
+        cash_line=cash_line,
+    )
+    portfolio = pc.construct()
+    assert len(portfolio) == 1
+    lineup, _ = portfolio[0]
+
+    col_map = {pid: i for i, pid in enumerate(sim_results.player_ids)}
+    full_matrix = sim_results.results_matrix
+    cols = [col_map[pid] for pid in lineup.player_ids]
+    totals = full_matrix[:, cols].sum(axis=1)
+    frac_above = float((totals >= cash_line).mean())
+    # With totals ~200 and cash_line=80, expect > 50% of sims above cash line
+    assert frac_above > 0.5, (
+        f"Expected >50% of sims above cash_line={cash_line}, got {frac_above:.2f}"
+    )
+
+
+def test_payout_weighted_is_reproducible(sim_results, players_df):
+    """Same seed → same portfolio with marginal_payout objective."""
+    pc1 = _make_payout_constructor(sim_results, players_df, portfolio_size=2, seed=7)
+    pc2 = _make_payout_constructor(sim_results, players_df, portfolio_size=2, seed=7)
+    port1 = pc1.construct()
+    port2 = pc2.construct()
+    assert len(port1) == len(port2)
+    for (lu1, s1), (lu2, s2) in zip(port1, port2):
+        assert s1 == pytest.approx(s2)
+        assert sorted(lu1.player_ids) == sorted(lu2.player_ids)
+
+
+def test_payout_cash_line_passed_through_to_optimizer(sim_results, players_df):
+    """payout_cash_line in PortfolioConstructor kwargs should reach the optimizer."""
+    cash_line = 95.0
+    pc = _make_payout_constructor(
+        sim_results, players_df, portfolio_size=1, cash_line=cash_line
+    )
+    assert pc._optimizer_kwargs["payout_cash_line"] == pytest.approx(cash_line)
+
+
+def test_beam_payout_cash_line_passed_through(sim_results, players_df):
+    """payout_cash_line in BeamPortfolioConstructor kwargs should reach the optimizer."""
+    cash_line = 85.0
+    pc = BeamPortfolioConstructor(
+        sim_results=sim_results,
+        players_df=players_df,
+        target=150.0,
+        portfolio_size=1,
+        beam_width=2,
+        n_chains=3,
+        n_steps=5,
+        rng_seed=0,
+        objective="marginal_payout",
+        payout_beta=2.0,
+        payout_cash_line=cash_line,
+    )
+    assert pc._optimizer_kwargs["payout_cash_line"] == pytest.approx(cash_line)

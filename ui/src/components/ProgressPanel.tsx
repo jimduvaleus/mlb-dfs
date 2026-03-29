@@ -17,6 +17,7 @@ const STAGE_LABELS: Record<string, string> = {
   load_slate: 'Load slate',
   simulate: 'Simulate',
   compute_target: 'Compute target',
+  calibrate_beta: 'Calibrate beta',
   optimize_lineup: 'Optimize lineups',
   complete: 'Complete',
   stopped: 'Stopped',
@@ -90,6 +91,10 @@ function renderDetail(e: SSEEvent): string {
       return ev.percentile
         ? `Target: ${ev.target.toFixed(1)} pts (p${ev.percentile})`
         : `Target: ${ev.target.toFixed(1)} pts (manual)`
+    }
+    case 'calibrate_beta': {
+      const ev = e as unknown as { payout_beta: number }
+      return `Payout beta: ${ev.payout_beta}`
     }
     case 'optimize_lineup': {
       const ev = e as OptimizeLineupEvent

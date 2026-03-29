@@ -1,0 +1,32 @@
+{
+  "name": "DraftKings $4 Classic GPP",
+  "entry_fee": 4.00,
+  "total_entries": 14863,
+  "total_payout_positions": 3855,
+  "payouts": [
+    {"start": 1, "end": 1, "amount": 5000.00},
+    {"start": 2, "end": 2, "amount": 2500.00},
+    {"start": 3, "end": 3, "amount": 1500.00},
+    {"start": 4, "end": 4, "amount": 1000.00},
+    {"start": 5, "end": 5, "amount": 750.00},
+    {"start": 6, "end": 7, "amount": 600.00},
+    {"start": 8, "end": 10, "amount": 500.00},
+    {"start": 11, "end": 13, "amount": 400.00},
+    {"start": 14, "end": 16, "amount": 300.00},
+    {"start": 17, "end": 19, "amount": 250.00},
+    {"start": 20, "end": 22, "amount": 200.00},
+    {"start": 23, "end": 25, "amount": 150.00},
+    {"start": 26, "end": 30, "amount": 100.00},
+    {"start": 31, "end": 35, "amount": 75.00},
+    {"start": 36, "end": 45, "amount": 60.00},
+    {"start": 46, "end": 55, "amount": 50.00},
+    {"start": 56, "end": 70, "amount": 40.00},
+    {"start": 71, "end": 85, "amount": 30.00},
+    {"start": 86, "end": 120, "amount": 25.00},
+    {"start": 121, "end": 195, "amount": 20.00},
+    {"start": 196, "end": 375, "amount": 15.00},
+    {"start": 376, "end": 845, "amount": 10.00},
+    {"start": 846, "end": 1740, "amount": 8.00},
+    {"start": 1741, "end": 3855, "amount": 6.00}
+  ]
+}

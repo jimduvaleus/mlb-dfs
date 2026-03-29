@@ -35,35 +35,6 @@ python scripts/build_copula.py
 python tests/test_simulation_pipeline.py
 ```
 
-**Build the empirical copula** (uses dummy data if `historical_logs.parquet` is absent):
-```bash
-python scripts/build_copula.py
-```
-
-**Fit the batter PCA model** (requires real `historical_logs.parquet` from Retrosheet):
-```bash
-python scripts/fit_batter_pca.py --min-games 30
-```
-
-**Process Retrosheet data into `historical_logs.parquet`:**
-```bash
-python scripts/process_historical.py
-```
-
-**Start the web UI** (FastAPI backend + React dev server):
-```bash
-./scripts/start_ui.sh
-```
-
-**Stop the web UI:**
-```bash
-./scripts/stop_ui.sh
-```
-
-## Architecture
-
-This is a modular numerical pipeline that transforms a DraftKings salary CSV and historical Retrosheet data into an optimized portfolio of DFS lineups. See `plans/mlb_dfs_architecture.md` for the full design.
-
 ### Data flow
 
 ```
@@ -123,9 +94,9 @@ Players are grouped by `(team, opponent)` into 10-player "units": the 9 batters 
 **Objective functions** (set via `optimizer.objective` in `config.yaml`):
 - `p_hit` — `P(lineup_total ≥ target)` estimated from the simulation matrix.
 - `expected_surplus` — expected score above target for lineups that hit.
+- `marginal_payout` — `E[P(max(best_scores, lineup_scores))]` where `P(s) = max(0, s - target)^beta`. Maximizes marginal expected payout improvement given prior portfolio lineups' best scores. Controlled by `optimizer.payout_beta` (default 2.5).
 
 **Additional constraints:**
-- `salary_floor` — minimum total salary (default 47500).
 - `early_stopping_window` / `early_stopping_threshold` — cross-chain early stopping when improvement stalls.
 
 DraftKings Classic constraints enforced in `Lineup.is_valid()`: roster `{P×2, C, 1B, 2B, 3B, SS, OF×3}`, $50k salary cap, max 5 hitters from one team, min 2 different games.
@@ -134,8 +105,12 @@ DraftKings Classic constraints enforced in `Lineup.is_valid()`: roster `{P×2, C
 
 Two implementations in `src/optimization/portfolio.py`:
 
-- **`PortfolioConstructor`** — Iterative greedy: each round optimizes a new lineup over remaining active simulation rows (rows where no prior lineup already hit target). Fast but can lock in on correlated first lineups.
+- **`PortfolioConstructor`** — Iterative greedy: each round optimizes a new lineup over remaining active simulation rows (rows where no prior lineup already hit target). Fast but can lock in on correlated first lineups. When objective is `marginal_payout`, switches to payout-weighted mode: tracks `best_scores` (per-sim best lineup score) instead of binary row consumption, and passes these to the optimizer so it maximizes marginal payout improvement.
 - **`BeamPortfolioConstructor`** — Beam search: maintains `beam_width` (default 3) candidate portfolio paths in parallel, pruning by coverage (fewest active rows remaining). Mitigates greedy lock-in at the cost of extra optimization rounds.
+
+### Payout functions
+
+`src/optimization/payout.py` provides a power-law payout function `P(s) = max(0, s - cash_line)^beta` used by the `marginal_payout` objective. A reference GPP payout structure is stored in `data/payout_structures/dk_classic_gpp.json`. The `calibrate_beta()` function can fit beta to an actual payout table given simulated score percentiles.
 
 ### Entry file workflow
 
@@ -164,6 +139,7 @@ Two implementations in `src/optimization/portfolio.py`:
 | `data/processed/batter_pca_model.npz` | `scripts/fit_batter_pca.py` | `SimulationEngine` |
 | `data/processed/batter_score_grid.npy` | `scripts/fit_batter_pca.py` | `SimulationEngine` |
 | `data/slate_exclusions.json` | runtime (API) | `slate_exclusions.py` |
+| `data/payout_structures/dk_classic_gpp.json` | manual / reference | `payout.py` (calibration) |
 
 ### Web UI and API
 
@@ -183,8 +159,3 @@ The web app is a React + TypeScript + Vite frontend (`ui/`) backed by a FastAPI 
 **UI components** (`ui/src/components/`): `ConfigForm`, `SlatePanel`, `ProjectionsPanel`, `ProgressPanel`, `PortfolioTable`, `MetricsPanel`, `TeamBadge`, `StopUploadDialog`.
 
 Team logos for all 30 MLB franchises are in `ui/public/team-logos/`.
-
-### Implementation roadmap
-
-Phases 1-5 are complete. Remaining:
-- **Phase 6**: Performance tuning (Numba/Ray) and prop market projection integration. Other candidates: weather integration, late-swap handling, additional projection sources (Fangraphs, prediction markets).

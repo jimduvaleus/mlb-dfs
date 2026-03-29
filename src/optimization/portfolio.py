@@ -76,11 +76,15 @@ class PortfolioConstructor:
         early_stopping_threshold: float = 0.001,
         salary_floor: Optional[float] = None,
         objective: str = "expected_surplus",
+        payout_beta: float = 2.5,
+        payout_cash_line: Optional[float] = None,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
         self.target = target
         self.portfolio_size = portfolio_size
+        self._payout_weighted = objective == "marginal_payout"
+        self._payout_beta = payout_beta
         self._optimizer_kwargs = dict(
             n_chains=n_chains,
             temperature=temperature,
@@ -91,6 +95,8 @@ class PortfolioConstructor:
             early_stopping_threshold=early_stopping_threshold,
             salary_floor=salary_floor,
             objective=objective,
+            payout_beta=payout_beta,
+            payout_cash_line=payout_cash_line,
         )
         self._base_seed = rng_seed
 
@@ -104,6 +110,14 @@ class PortfolioConstructor:
         stop_check: Optional[Callable[[], bool]] = None,
     ) -> List[Tuple[Lineup, float]]:
         """Run greedy portfolio construction.
+
+        When the objective is ``marginal_payout``, uses payout-weighted
+        optimization: instead of consuming simulation rows, tracks the best
+        score any portfolio lineup achieves in each sim and passes that to
+        the optimizer so it maximizes marginal payout improvement.
+
+        For other objectives (``p_hit``, ``expected_surplus``), uses the
+        original binary row-consumption approach.
 
         Parameters
         ----------
@@ -119,6 +133,16 @@ class PortfolioConstructor:
             ``score`` is P(lineup_total >= target) over the *full* simulation
             matrix so values are comparable across all lineups in the portfolio.
         """
+        if self._payout_weighted:
+            return self._construct_payout_weighted(on_lineup_complete, stop_check)
+        return self._construct_row_consumption(on_lineup_complete, stop_check)
+
+    def _construct_row_consumption(
+        self,
+        on_lineup_complete=None,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> List[Tuple[Lineup, float]]:
+        """Original row-consumption portfolio construction."""
         portfolio: List[Tuple[Lineup, float]] = []
         full_matrix = self.sim_results.results_matrix  # shape (n_sims, n_players)
         col_map = {pid: i for i, pid in enumerate(self.sim_results.player_ids)}
@@ -194,6 +218,93 @@ class PortfolioConstructor:
 
         return portfolio
 
+    def _construct_payout_weighted(
+        self,
+        on_lineup_complete=None,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> List[Tuple[Lineup, float]]:
+        """Payout-weighted portfolio construction.
+
+        Instead of binary row consumption, tracks the best score any portfolio
+        lineup achieves in each simulation. The optimizer maximizes marginal
+        payout: E[P(max(best_scores, lineup_scores))] where P is a power-law
+        payout function. This naturally gives high weight to sims where current
+        coverage is weak and where the upside is large.
+        """
+        portfolio: List[Tuple[Lineup, float]] = []
+        full_matrix = self.sim_results.results_matrix
+        col_map = {pid: i for i, pid in enumerate(self.sim_results.player_ids)}
+        n_sims = self.sim_results.n_sims
+        best_scores = np.zeros(n_sims, dtype=np.float64)
+        n_workers = self._optimizer_kwargs.get('n_workers', 1)
+
+        # Build optimizer kwargs without best_scores (we pass it per-round).
+        opt_kwargs = dict(self._optimizer_kwargs)
+
+        with (
+            ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else nullcontext()
+        ) as shared_executor:
+            for i in range(self.portfolio_size):
+                # Count sims not yet covered (best_score < target).
+                n_uncovered = int((best_scores < self.target).sum())
+
+                logger.info(
+                    "Optimizing lineup %d/%d — %d uncovered sims "
+                    "(payout-weighted, beta=%.1f).",
+                    i + 1,
+                    self.portfolio_size,
+                    n_uncovered,
+                    self._payout_beta,
+                )
+
+                seed = None if self._base_seed is None else self._base_seed + i
+                optimizer = BasinHoppingOptimizer(
+                    sim_results=self.sim_results,
+                    players_df=self.players_df,
+                    target=self.target,
+                    rng_seed=seed,
+                    best_scores=best_scores,
+                    **opt_kwargs,
+                )
+                lineup, _ = optimizer.optimize(
+                    executor=shared_executor if n_workers > 1 else None,
+                )
+
+                # Compute this lineup's scores across all sims.
+                cols = [col_map[pid] for pid in lineup.player_ids]
+                lineup_totals = full_matrix[:, cols].sum(axis=1)
+
+                # Full-matrix p_hit for comparability with other objectives.
+                full_score = float((lineup_totals >= self.target).mean())
+                portfolio.append((lineup, full_score))
+                logger.info("  Lineup %d p_hit (full): %.4f", i + 1, full_score)
+
+                # Update best_scores and compute coverage stats for the callback.
+                newly_covered = int(
+                    ((best_scores < self.target) & (lineup_totals >= self.target)).sum()
+                )
+                best_scores = np.maximum(best_scores, lineup_totals)
+                remaining_uncovered = int((best_scores < self.target).sum())
+                logger.info(
+                    "  Newly covered %d sims; %d still uncovered.",
+                    newly_covered,
+                    remaining_uncovered,
+                )
+
+                if on_lineup_complete is not None:
+                    on_lineup_complete(
+                        i + 1, self.portfolio_size, full_score,
+                        newly_covered, remaining_uncovered,
+                    )
+
+                if stop_check is not None and stop_check():
+                    logger.info(
+                        "Stop requested — halting after %d lineups.", len(portfolio)
+                    )
+                    break
+
+        return portfolio
+
 
 class BeamPortfolioConstructor:
     """Beam-search portfolio builder with simulation-row consumption.
@@ -251,6 +362,8 @@ class BeamPortfolioConstructor:
         rng_seed: Optional[int] = None,
         salary_floor: Optional[float] = None,
         objective: str = "expected_surplus",
+        payout_beta: float = 2.5,
+        payout_cash_line: Optional[float] = None,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -265,6 +378,8 @@ class BeamPortfolioConstructor:
             n_workers=n_workers,
             salary_floor=salary_floor,
             objective=objective,
+            payout_beta=payout_beta,
+            payout_cash_line=payout_cash_line,
         )
         self._base_seed = rng_seed
 
