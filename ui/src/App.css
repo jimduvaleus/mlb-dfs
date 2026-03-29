@@ -473,38 +473,44 @@ button { cursor: pointer; }
 }
 
 .lineup-card-players {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 24px 1fr auto auto;
+  column-gap: 10px;
 }
 
 .lineup-player {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 5px 14px;
+  display: contents;
   font-size: 14px;
+}
+
+.lineup-player > * {
+  padding-top: 5px;
+  padding-bottom: 5px;
   border-bottom: 1px solid #1a202c;
 }
 
-.lineup-player:last-child {
+.lineup-player:last-child > * {
   border-bottom: none;
 }
 
 .lineup-player-pos {
-  min-width: 24px;
+  padding-left: 14px;
   font-weight: 700;
   color: #718096;
   font-size: 12px;
   text-transform: uppercase;
+  display: flex;
+  align-items: center;
 }
 
 .lineup-player-name {
-  flex: 1;
   color: #e2e8f0;
   font-weight: 500;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
 }
 
 .lineup-player-team {
@@ -516,11 +522,15 @@ button { cursor: pointer; }
 }
 
 .lineup-player-sal {
+  padding-right: 14px;
   color: #4a5568;
   font-size: 12px;
   min-width: 40px;
   text-align: right;
   font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
 }
 
 /* ── Metrics panel ── */
