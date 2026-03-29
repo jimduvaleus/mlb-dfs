@@ -107,9 +107,10 @@ class PortfolioConstructor:
 
         Parameters
         ----------
-        on_lineup_complete : callable(lineup_index, total, score), optional
+        on_lineup_complete : callable(lineup_index, total, score, sims_covered, sims_remaining), optional
             Called after each lineup is selected with its 1-based index,
-            total lineups requested, and full-matrix score.
+            total lineups requested, full-matrix score, number of simulation
+            rows consumed by this lineup, and number of rows still active.
 
         Returns
         -------
@@ -168,8 +169,6 @@ class PortfolioConstructor:
 
                 portfolio.append((lineup, full_score))
                 logger.info("  Lineup %d score (full): %.4f", i + 1, full_score)
-                if on_lineup_complete is not None:
-                    on_lineup_complete(i + 1, self.portfolio_size, full_score)
 
                 # Consume active rows where this lineup already hits the target.
                 active_indices = np.where(active_mask)[0]
@@ -177,11 +176,15 @@ class PortfolioConstructor:
                 hit_mask = active_totals >= self.target
                 consumed = int(hit_mask.sum())
                 active_mask[active_indices[hit_mask]] = False
+                remaining = int(active_mask.sum())
                 logger.info(
                     "  Consumed %d rows; %d remain.",
                     consumed,
-                    int(active_mask.sum()),
+                    remaining,
                 )
+
+                if on_lineup_complete is not None:
+                    on_lineup_complete(i + 1, self.portfolio_size, full_score, consumed, remaining)
 
                 if stop_check is not None and stop_check():
                     logger.info(

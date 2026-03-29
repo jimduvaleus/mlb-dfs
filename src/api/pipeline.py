@@ -179,11 +179,13 @@ class PipelineRunner:
             objective=str(opt_cfg.get("objective", "expected_surplus")),
         )
 
-        def _on_lineup_complete(lineup_index: int, total: int, score: float) -> None:
+        def _on_lineup_complete(lineup_index: int, total: int, score: float, sims_covered: int, sims_remaining: int) -> None:
             self._cb("optimize_lineup", {
                 "lineup_index": lineup_index,
                 "total": total,
                 "score": round(score, 4),
+                "sims_covered": sims_covered,
+                "sims_remaining": sims_remaining,
             })
 
         portfolio = constructor.construct(

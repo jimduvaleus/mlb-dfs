@@ -115,6 +115,8 @@ export interface OptimizeLineupEvent extends SSEEvent {
   lineup_index: number
   total: number
   score: number
+  sims_covered: number
+  sims_remaining: number
 }
 
 export interface CompleteEvent extends SSEEvent {
