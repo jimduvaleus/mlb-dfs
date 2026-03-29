@@ -7,7 +7,6 @@ simulation results, subject to DK Classic salary and position constraints.
 import logging
 from concurrent.futures import ProcessPoolExecutor, Future, as_completed
 from multiprocessing.shared_memory import SharedMemory
-from multiprocessing import resource_tracker
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -803,7 +802,10 @@ class _ChainRunner:
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
     seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective = args
     shm = SharedMemory(name=shm_name)
-    resource_tracker.unregister(f'/{shm_name}', 'shared_memory')
+    # Do NOT unregister here: with fork start method all workers share the
+    # parent's resource tracker subprocess, so the first unregister removes
+    # the name from the set and every subsequent call gets KeyError.
+    # The main process unlinks (and thus unregisters) via shm.unlink() below.
     sim_matrix = np.ndarray(shm_shape, dtype=shm_dtype, buffer=shm.buf)
     try:
         runner = _ChainRunner(
@@ -988,8 +990,7 @@ class BasinHoppingOptimizer:
                         break
             finally:
                 shm.close()
-                resource_tracker.unregister(f'/{shm.name}', 'shared_memory')
-                shm.unlink()
+                shm.unlink()  # internally calls resource_tracker.unregister once
                 if owned_executor and executor is not None:
                     executor.shutdown(wait=False)
         else:
