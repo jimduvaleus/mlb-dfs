@@ -4,6 +4,7 @@ import { fetchProjectionsStatus } from '../api'
 
 interface Props {
   disabled?: boolean
+  onFetched?: () => void
 }
 
 function formatET(unixSec: number): string {
@@ -17,7 +18,7 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-export function ProjectionsPanel({ disabled }: Props) {
+export function ProjectionsPanel({ disabled, onFetched }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
@@ -59,6 +60,7 @@ export function ProjectionsPanel({ disabled }: Props) {
         es.close()
         esRef.current = null
         refreshStatus()
+        if (event.returncode === 0) onFetched?.()
       }
     }
 

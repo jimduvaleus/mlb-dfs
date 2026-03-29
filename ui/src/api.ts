@@ -25,6 +25,13 @@ export async function fetchProjectionsStatus(): Promise<ProjectionsStatus> {
   return res.json()
 }
 
+export async function fetchUnconfirmedPlayerIds(): Promise<number[]> {
+  const res = await fetch('/api/projections/unconfirmed')
+  if (!res.ok) return []
+  const data = await res.json()
+  return data.player_ids ?? []
+}
+
 export async function fetchProjectionSlates(): Promise<SlateListResponse> {
   const res = await fetch('/api/projections/slates')
   if (!res.ok) throw new Error(`Failed to load projection slates: ${res.statusText}`)

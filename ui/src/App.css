@@ -102,9 +102,7 @@ body {
 
 .app-main {
   padding: 24px;
-  max-width: 1400px;
   width: 100%;
-  margin: 0 auto;
 }
 
 /* ── Buttons ── */
@@ -560,6 +558,14 @@ button { cursor: pointer; }
   text-overflow: ellipsis;
   display: flex;
   align-items: center;
+}
+
+.unconfirmed-icon {
+  margin-left: 5px;
+  color: #f6ad55;
+  font-size: 10px;
+  flex-shrink: 0;
+  line-height: 1;
 }
 
 .lineup-player-team {

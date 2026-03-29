@@ -1,3 +1,4 @@
+- enhance run tab with n_sims countdowngr
 - Need weather
 - Enhance UI with unconfirmed indicator on portfolio cards
 - late swap?

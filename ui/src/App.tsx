@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useState } from 'react'
 import type { AppConfig, LineupResult, RunStatus, CompleteEvent, StoppedEvent } from './types'
-import { fetchConfig, fetchPortfolio, stopRun, writeUploadFiles } from './api'
+import { fetchConfig, fetchPortfolio, fetchUnconfirmedPlayerIds, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -18,6 +18,7 @@ interface State {
   portfolio: LineupResult[]
   runStatus: RunStatus
   activeTab: Tab
+  unconfirmedPlayerIds: number[]
 }
 
 type Action =
@@ -25,6 +26,7 @@ type Action =
   | { type: 'set_portfolio'; portfolio: LineupResult[] }
   | { type: 'set_run_status'; status: RunStatus }
   | { type: 'set_tab'; tab: Tab }
+  | { type: 'set_unconfirmed'; ids: number[] }
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -36,6 +38,8 @@ function reducer(state: State, action: Action): State {
       return { ...state, runStatus: action.status }
     case 'set_tab':
       return { ...state, activeTab: action.tab }
+    case 'set_unconfirmed':
+      return { ...state, unconfirmedPlayerIds: action.ids }
   }
 }
 
@@ -44,6 +48,7 @@ const initial: State = {
   portfolio: [],
   runStatus: 'idle',
   activeTab: 'config',
+  unconfirmedPlayerIds: [],
 }
 
 export default function App() {
@@ -56,7 +61,13 @@ export default function App() {
 
   const running = state.runStatus === 'running'
 
-  // Load config and existing portfolio on mount
+  const refreshUnconfirmed = () => {
+    fetchUnconfirmedPlayerIds()
+      .then(ids => dispatch({ type: 'set_unconfirmed', ids }))
+      .catch(() => {})
+  }
+
+  // Load config, existing portfolio, and unconfirmed player IDs on mount
   useEffect(() => {
     fetchConfig()
       .then(cfg => dispatch({ type: 'set_config', config: cfg }))
@@ -69,6 +80,7 @@ export default function App() {
         }
       })
       .catch(() => {})
+    refreshUnconfirmed()
   }, [])
 
   // React to SSE events
@@ -175,7 +187,7 @@ export default function App() {
             {configError && <p className="error">{configError}</p>}
             {state.config ? (
               <>
-                <ProjectionsPanel disabled={running} />
+                <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} />
                 <ConfigForm
                   config={state.config}
                   onSaved={cfg => dispatch({ type: 'set_config', config: cfg })}
@@ -197,7 +209,7 @@ export default function App() {
         )}
 
         {state.activeTab === 'portfolio' && (
-          <PortfolioTable lineups={state.portfolio} />
+          <PortfolioTable lineups={state.portfolio} unconfirmedPlayerIds={state.unconfirmedPlayerIds} />
         )}
 
         {state.activeTab === 'metrics' && (

@@ -4,6 +4,7 @@ import TeamBadge from './TeamBadge'
 
 interface Props {
   lineups: LineupResult[]
+  unconfirmedPlayerIds?: number[]
 }
 
 function sortPlayersByPosition(players: PlayerRow[]): PlayerRow[] {
@@ -23,8 +24,9 @@ function sortPlayersByPosition(players: PlayerRow[]): PlayerRow[] {
   return filled
 }
 
-export function PortfolioTable({ lineups }: Props) {
+export function PortfolioTable({ lineups, unconfirmedPlayerIds }: Props) {
   if (lineups.length === 0) return null
+  const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
   return (
     <div className="portfolio-table-wrap">
@@ -44,7 +46,12 @@ export function PortfolioTable({ lineups }: Props) {
                 {sorted.map((p, i) => (
                   <div key={i} className="lineup-player">
                     <span className="lineup-player-pos">{p.position}</span>
-                    <span className="lineup-player-name">{p.name}</span>
+                    <span className="lineup-player-name">
+                      {p.name}
+                      {unconfirmedSet.has(p.player_id) && (
+                        <span className="unconfirmed-icon" title="Lineup slot unconfirmed">✕</span>
+                      )}
+                    </span>
                     <TeamBadge team={p.team} className="lineup-player-team" />
                     <span className="lineup-player-sal">${(p.salary / 1000).toFixed(1)}k</span>
                   </div>

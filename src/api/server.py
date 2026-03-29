@@ -287,6 +287,26 @@ def projections_status() -> ProjectionsStatus:
     )
 
 
+@app.get("/api/projections/unconfirmed")
+def projections_unconfirmed():
+    cfg = read_config()
+    proj_path_str = cfg.paths.projections
+    if not proj_path_str:
+        return {"player_ids": []}
+    p = PROJECT_ROOT / proj_path_str if not Path(proj_path_str).is_absolute() else Path(proj_path_str)
+    if not p.exists():
+        return {"player_ids": []}
+    try:
+        import pandas as pd
+        df = pd.read_csv(p)
+        if "slot_confirmed" not in df.columns or "player_id" not in df.columns:
+            return {"player_ids": []}
+        unconfirmed = df[~df["slot_confirmed"].astype(bool)]["player_id"].tolist()
+        return {"player_ids": [int(x) for x in unconfirmed]}
+    except Exception:
+        return {"player_ids": []}
+
+
 @app.get("/api/projections/slates")
 async def projections_slates() -> SlateListResponse:
     cfg = read_config()

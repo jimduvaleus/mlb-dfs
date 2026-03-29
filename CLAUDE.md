@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Target device
+
+The web UI is **desktop-only**. No consideration needs to be given to mobile or tablet layouts.
+
 ## Commands
 
 All commands must be run inside the virtualenv:
