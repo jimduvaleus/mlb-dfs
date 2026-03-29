@@ -1,5 +1,6 @@
 import type { LineupResult, PlayerRow } from '../types'
 import { getStackNotation } from '../utils'
+import TeamBadge from './TeamBadge'
 
 interface Props {
   lineups: LineupResult[]
@@ -44,7 +45,7 @@ export function PortfolioTable({ lineups }: Props) {
                   <div key={i} className="lineup-player">
                     <span className="lineup-player-pos">{p.position}</span>
                     <span className="lineup-player-name">{p.name}</span>
-                    <span className="lineup-player-team">{p.team}</span>
+                    <TeamBadge team={p.team} className="lineup-player-team" />
                     <span className="lineup-player-sal">${(p.salary / 1000).toFixed(1)}k</span>
                   </div>
                 ))}

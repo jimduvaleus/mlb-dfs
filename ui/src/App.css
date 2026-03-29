@@ -499,15 +499,20 @@ button { cursor: pointer; }
 }
 
 .lineup-player-name {
+  flex: 1;
   color: #e2e8f0;
   font-weight: 500;
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .lineup-player-team {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   color: #718096;
   font-size: 12px;
-  margin-left: auto;
 }
 
 .lineup-player-sal {
@@ -617,7 +622,10 @@ button { cursor: pointer; }
 }
 
 .exposure-name { min-width: 160px; color: #e2e8f0; }
-.exposure-team { min-width: 40px; color: #718096; }
+.exposure-team { display: inline-flex; align-items: center; gap: 4px; min-width: 60px; color: #718096; }
+
+.team-badge { display: inline-flex; align-items: center; gap: 4px; }
+.team-badge-logo { height: 1.1em; width: auto; object-fit: contain; flex-shrink: 0; }
 
 .exposure-bar-wrap {
   flex: 1;

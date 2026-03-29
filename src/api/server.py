@@ -421,6 +421,7 @@ def get_portfolio():
 
 if UI_DIST.exists():
     app.mount("/assets", StaticFiles(directory=str(UI_DIST / "assets")), name="assets")
+    app.mount("/team-logos", StaticFiles(directory=str(UI_DIST / "team-logos")), name="team-logos")
 
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):

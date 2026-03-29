@@ -3,6 +3,7 @@ import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from 'recharts'
 import { getStackNotation } from '../utils'
+import TeamBadge from './TeamBadge'
 
 interface Props {
   lineups: LineupResult[]
@@ -137,7 +138,7 @@ export function MetricsPanel({ lineups, events }: Props) {
           {exposureList.map(({ name, team, count }) => (
             <div key={name} className="exposure-row">
               <span className="exposure-name">{name}</span>
-              <span className="exposure-team">{team}</span>
+              <TeamBadge team={team} className="exposure-team" />
               <span className="exposure-bar-wrap">
                 <span
                   className="exposure-bar"
