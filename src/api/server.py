@@ -14,6 +14,7 @@ Endpoints:
 import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -42,10 +43,13 @@ app = FastAPI(title="MLB DFS Optimizer")
 # ---------------------------------------------------------------------------
 
 _state: dict = {
-    "status": "idle",      # idle | running | complete | error
+    "status": "idle",      # idle | running | complete | stopped | error
     "portfolio": None,     # PortfolioResult dict or None
     "error": None,
+    "_runner_last": None,  # Last PipelineRunner instance (for upload file writing)
 }
+
+_stop_event = threading.Event()
 
 
 def _portfolio_csv_path() -> Path:
@@ -364,6 +368,26 @@ def run_status():
     return {"status": _state["status"], "error": _state.get("error")}
 
 
+@app.post("/api/run/stop")
+def stop_run():
+    if _state["status"] != "running":
+        raise HTTPException(400, "No run in progress")
+    _stop_event.set()
+    return {"ok": True}
+
+
+@app.post("/api/run/write_upload")
+def write_upload():
+    runner = _state.get("_runner_last")
+    if runner is None or not hasattr(runner, "_raw_portfolio"):
+        raise HTTPException(400, "No portfolio available for upload")
+    try:
+        paths = runner.write_upload_files()
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+    return {"paths": paths}
+
+
 @app.get("/api/run/stream")
 async def run_stream(request: Request):
     if _state["status"] == "running":
@@ -372,6 +396,7 @@ async def run_stream(request: Request):
     _state["status"] = "running"
     _state["portfolio"] = None
     _state["error"] = None
+    _stop_event.clear()
 
     loop = asyncio.get_event_loop()
     queue: asyncio.Queue = asyncio.Queue()
@@ -383,10 +408,15 @@ async def run_stream(request: Request):
     def run_pipeline() -> None:
         try:
             from .pipeline import PipelineRunner
-            runner = PipelineRunner(str(PROJECT_ROOT / "config.yaml"), progress_cb)
+            runner = PipelineRunner(
+                str(PROJECT_ROOT / "config.yaml"),
+                progress_cb,
+                stop_check=_stop_event.is_set,
+            )
             portfolio = runner.run()
             _state["portfolio"] = portfolio
-            _state["status"] = "complete"
+            _state["_runner_last"] = runner
+            _state["status"] = "stopped" if _stop_event.is_set() else "complete"
         except Exception as exc:
             _state["status"] = "error"
             _state["error"] = str(exc)

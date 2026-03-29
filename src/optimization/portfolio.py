@@ -14,7 +14,7 @@ each round.
 import logging
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -101,6 +101,7 @@ class PortfolioConstructor:
     def construct(
         self,
         on_lineup_complete=None,
+        stop_check: Optional[Callable[[], bool]] = None,
     ) -> List[Tuple[Lineup, float]]:
         """Run greedy portfolio construction.
 
@@ -181,6 +182,12 @@ class PortfolioConstructor:
                     consumed,
                     int(active_mask.sum()),
                 )
+
+                if stop_check is not None and stop_check():
+                    logger.info(
+                        "Stop requested — halting after %d lineups.", len(portfolio)
+                    )
+                    break
 
         return portfolio
 

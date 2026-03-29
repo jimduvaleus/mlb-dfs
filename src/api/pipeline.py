@@ -40,9 +40,11 @@ class PipelineRunner:
         self,
         config_path: str,
         progress_cb: Optional[Callable[[str, dict], None]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
     ):
         self._config_path = config_path
         self._cb = progress_cb or (lambda stage, data: None)
+        self._stop_check = stop_check
 
     # ------------------------------------------------------------------
     # Public API
@@ -70,6 +72,7 @@ class PipelineRunner:
         entry_files = scan_entry_files(raw_dir)
         all_file_entries = [(ef, parse_entry_file(ef)) for ef in entry_files]
         total_entries = sum(len(recs) for _, recs in all_file_entries)
+        output_dir = paths.get("output_dir", "outputs")
         if total_entries > 0:
             logger.info(
                 "Found %d entry file(s) with %d total entries.",
@@ -183,23 +186,38 @@ class PipelineRunner:
                 "score": round(score, 4),
             })
 
-        portfolio = constructor.construct(on_lineup_complete=_on_lineup_complete)
+        portfolio = constructor.construct(
+            on_lineup_complete=_on_lineup_complete,
+            stop_check=self._stop_check,
+        )
         logger.info("Portfolio complete: %d lineups.", len(portfolio))
+
+        # Store raw artifacts for on-demand upload file writing.
+        self._raw_portfolio = portfolio
+        self._all_file_entries = all_file_entries
+        self._slate_df = slate_df
+        self._output_dir = output_dir
 
         # --- Serialize --------------------------------------------------
         result = self._serialize_portfolio(portfolio, players_df)
-        self._cb("complete", {"portfolio": result, "n_lineups": len(result)})
+
+        was_stopped = self._stop_check is not None and self._stop_check()
+
+        if was_stopped:
+            logger.info("Run stopped by user after %d lineups.", len(portfolio))
+            self._cb("stopped", {"portfolio": result, "n_lineups": len(result)})
+        else:
+            self._cb("complete", {"portfolio": result, "n_lineups": len(result)})
 
         # --- Save CSV ---------------------------------------------------
-        output_dir = paths.get("output_dir", "outputs")
         os.makedirs(output_dir, exist_ok=True)
         portfolio_df = self._format_portfolio_df(portfolio, players_df)
         output_path = os.path.join(output_dir, "portfolio.csv")
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Portfolio saved to %s", output_path)
 
-        # --- Generate DK upload files ------------------------------------
-        if all_file_entries:
+        # --- Generate DK upload files (skipped when stopped) -------------
+        if not was_stopped and all_file_entries:
             from src.api.dk_entries import assign_lineups_to_entries, write_upload_files
             assignments = assign_lineups_to_entries(all_file_entries, portfolio)
             paths_written = write_upload_files(
@@ -208,6 +226,22 @@ class PipelineRunner:
             self._cb("upload_files", {"n_files": len(paths_written), "paths": paths_written})
 
         return result
+
+    def write_upload_files(self) -> list[str]:
+        """Write DK upload CSVs using the portfolio from the last run.
+
+        Returns list of file paths written. Raises RuntimeError if no run
+        artifacts are available.
+        """
+        if not hasattr(self, "_raw_portfolio"):
+            raise RuntimeError("No pipeline run artifacts available.")
+        if not self._all_file_entries:
+            return []
+        from src.api.dk_entries import assign_lineups_to_entries, write_upload_files
+        assignments = assign_lineups_to_entries(self._all_file_entries, self._raw_portfolio)
+        return write_upload_files(
+            self._all_file_entries, assignments, self._slate_df, self._output_dir
+        )
 
     # ------------------------------------------------------------------
     # Private helpers (mirrored from main.py)

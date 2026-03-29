@@ -151,6 +151,55 @@ button { cursor: pointer; }
 .status-running { background: #744210; color: #f6ad55; }
 .status-complete { background: #1a472a; color: #68d391; }
 .status-error { background: #742a2a; color: #fc8181; }
+.status-stopped { background: #44337a; color: #d6bcfa; }
+
+/* ── Stop button ── */
+
+.btn-stop {
+  padding: 8px 20px;
+  background: #c53030;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+.btn-stop:hover { background: #9b2c2c; }
+
+/* ── Confirmation dialog ── */
+
+.dialog-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.dialog {
+  background: #1a202c;
+  border: 1px solid #2d3748;
+  border-radius: 10px;
+  padding: 28px 32px;
+  max-width: 420px;
+  width: 90%;
+}
+
+.dialog-message {
+  color: #e2e8f0;
+  font-size: 15px;
+  line-height: 1.5;
+  margin: 0 0 20px;
+}
+
+.dialog-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+}
 
 /* ── Utility ── */
 

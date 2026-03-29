@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useState } from 'react'
-import type { AppConfig, LineupResult, RunStatus, CompleteEvent } from './types'
-import { fetchConfig, fetchPortfolio } from './api'
+import type { AppConfig, LineupResult, RunStatus, CompleteEvent, StoppedEvent } from './types'
+import { fetchConfig, fetchPortfolio, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -8,6 +8,7 @@ import { ProgressPanel } from './components/ProgressPanel'
 import { PortfolioTable } from './components/PortfolioTable'
 import { MetricsPanel } from './components/MetricsPanel'
 import { SlatePanel } from './components/SlatePanel'
+import { StopUploadDialog } from './components/StopUploadDialog'
 import './App.css'
 
 type Tab = 'config' | 'slate' | 'run' | 'portfolio' | 'metrics'
@@ -48,6 +49,9 @@ const initial: State = {
 export default function App() {
   const [state, dispatch] = useReducer(reducer, initial)
   const [configError, setConfigError] = useState<string | null>(null)
+  const [showUploadDialog, setShowUploadDialog] = useState(false)
+  const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
+  const [stopPending, setStopPending] = useState(false)
   const { events, status: sseStatus, start: startSSE, reset: resetSSE } = useSSE('/api/run/stream')
 
   const running = state.runStatus === 'running'
@@ -75,6 +79,16 @@ export default function App() {
         dispatch({ type: 'set_portfolio', portfolio: ce.portfolio })
         dispatch({ type: 'set_run_status', status: 'complete' })
         dispatch({ type: 'set_tab', tab: 'portfolio' })
+      } else if (event.stage === 'stopped') {
+        const se = event as StoppedEvent
+        dispatch({ type: 'set_portfolio', portfolio: se.portfolio })
+        dispatch({ type: 'set_run_status', status: 'stopped' })
+        dispatch({ type: 'set_tab', tab: 'portfolio' })
+        setStopPending(false)
+        if (se.n_lineups > 0) {
+          setStoppedLineupCount(se.n_lineups)
+          setShowUploadDialog(true)
+        }
       } else if (event.stage === 'error') {
         dispatch({ type: 'set_run_status', status: 'error' })
       }
@@ -84,9 +98,22 @@ export default function App() {
   const handleRun = () => {
     if (running) return
     resetSSE()
+    setShowUploadDialog(false)
+    setStopPending(false)
     dispatch({ type: 'set_run_status', status: 'running' })
     dispatch({ type: 'set_tab', tab: 'run' })
     startSSE()
+  }
+
+  const handleStop = () => {
+    if (!running || stopPending) return
+    setStopPending(true)
+    stopRun().catch(() => setStopPending(false))
+  }
+
+  const handleWriteUpload = () => {
+    setShowUploadDialog(false)
+    writeUploadFiles().catch(() => {})
   }
 
   const tabDisabled = (tab: Tab): boolean => {
@@ -106,6 +133,15 @@ export default function App() {
           <span className={`status-badge status-${state.runStatus}`}>
             {state.runStatus}
           </span>
+          {running && (
+            <button
+              className="btn-stop"
+              onClick={handleStop}
+              disabled={stopPending}
+            >
+              Stop
+            </button>
+          )}
           <button
             className="btn-run"
             onClick={handleRun}
@@ -168,6 +204,14 @@ export default function App() {
           <MetricsPanel lineups={state.portfolio} events={events} />
         )}
       </main>
+
+      {showUploadDialog && (
+        <StopUploadDialog
+          lineupCount={stoppedLineupCount}
+          onConfirm={handleWriteUpload}
+          onDismiss={() => setShowUploadDialog(false)}
+        />
+      )}
     </div>
   )
 }

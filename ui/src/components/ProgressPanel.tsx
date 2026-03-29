@@ -19,6 +19,7 @@ const STAGE_LABELS: Record<string, string> = {
   compute_target: 'Compute target',
   optimize_lineup: 'Optimize lineups',
   complete: 'Complete',
+  stopped: 'Stopped',
   error: 'Error',
 }
 

@@ -83,6 +83,7 @@ export type SSEStage =
   | 'compute_target'
   | 'optimize_lineup'
   | 'complete'
+  | 'stopped'
   | 'error'
 
 export interface SSEEvent {
@@ -122,12 +123,18 @@ export interface CompleteEvent extends SSEEvent {
   n_lineups: number
 }
 
+export interface StoppedEvent extends SSEEvent {
+  stage: 'stopped'
+  portfolio: LineupResult[]
+  n_lineups: number
+}
+
 export interface ErrorEvent extends SSEEvent {
   stage: 'error'
   message: string
 }
 
-export type RunStatus = 'idle' | 'running' | 'complete' | 'error'
+export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error'
 
 // Slate game/team exclusion types
 export interface TeamStatus {

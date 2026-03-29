@@ -31,7 +31,7 @@ export function useSSE(url: string): UseSSEResult {
       try {
         const event: SSEEvent = JSON.parse(e.data)
         setEvents(prev => [...prev, event])
-        if (event.stage === 'complete' || event.stage === 'error') {
+        if (event.stage === 'complete' || event.stage === 'stopped' || event.stage === 'error') {
           setStatus('done')
           es.close()
           esRef.current = null

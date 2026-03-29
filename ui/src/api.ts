@@ -45,6 +45,23 @@ export async function fetchRunStatus(): Promise<{ status: string; error: string 
   return res.json()
 }
 
+export async function stopRun(): Promise<void> {
+  const res = await fetch('/api/run/stop', { method: 'POST' })
+  if (!res.ok) {
+    const detail = await res.text()
+    throw new Error(`Failed to stop run: ${detail}`)
+  }
+}
+
+export async function writeUploadFiles(): Promise<{ paths: string[] }> {
+  const res = await fetch('/api/run/write_upload', { method: 'POST' })
+  if (!res.ok) {
+    const detail = await res.text()
+    throw new Error(`Failed to write upload files: ${detail}`)
+  }
+  return res.json()
+}
+
 export async function fetchSlateGames(): Promise<SlateGamesResponse> {
   const res = await fetch('/api/slate/games')
   if (!res.ok) throw new Error(`Failed to load slate games: ${res.statusText}`)
