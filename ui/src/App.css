@@ -432,7 +432,7 @@ button { cursor: pointer; }
 
 .portfolio-cards {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 12px;
 }
 
@@ -447,16 +447,16 @@ button { cursor: pointer; }
   display: flex;
   align-items: center;
   gap: 14px;
-  padding: 9px 14px;
+  padding: 11px 17px;
   background: #1a1f2e;
   border-bottom: 1px solid #2d3748;
-  font-size: 14px;
+  font-size: 17px;
 }
 
 .lineup-card-num {
   font-weight: 700;
   color: #a0aec0;
-  font-size: 15px;
+  font-size: 18px;
 }
 
 .lineup-card-salary {
@@ -474,18 +474,18 @@ button { cursor: pointer; }
 
 .lineup-card-players {
   display: grid;
-  grid-template-columns: 24px 1fr auto auto;
-  column-gap: 10px;
+  grid-template-columns: 29px 1fr auto auto;
+  column-gap: 12px;
 }
 
 .lineup-player {
   display: contents;
-  font-size: 14px;
+  font-size: 17px;
 }
 
 .lineup-player > * {
-  padding-top: 5px;
-  padding-bottom: 5px;
+  padding-top: 6px;
+  padding-bottom: 6px;
   border-bottom: 1px solid #1a202c;
 }
 
@@ -494,10 +494,10 @@ button { cursor: pointer; }
 }
 
 .lineup-player-pos {
-  padding-left: 14px;
+  padding-left: 17px;
   font-weight: 700;
   color: #718096;
-  font-size: 12px;
+  font-size: 14px;
   text-transform: uppercase;
   display: flex;
   align-items: center;
@@ -518,14 +518,14 @@ button { cursor: pointer; }
   align-items: center;
   gap: 4px;
   color: #718096;
-  font-size: 12px;
+  font-size: 14px;
 }
 
 .lineup-player-sal {
-  padding-right: 14px;
+  padding-right: 17px;
   color: #4a5568;
-  font-size: 12px;
-  min-width: 40px;
+  font-size: 14px;
+  min-width: 48px;
   text-align: right;
   font-variant-numeric: tabular-nums;
   display: flex;
@@ -707,7 +707,7 @@ button { cursor: pointer; }
 }
 
 .game-card {
-  background: #1a2035;
+  background: #1a202c;
   border: 1px solid #2d3748;
   border-radius: 8px;
   padding: 12px;
@@ -839,7 +839,7 @@ button { cursor: pointer; }
   width: 100%;
   box-sizing: border-box;
   padding: 7px 12px;
-  background: #1a2035;
+  background: #1a202c;
   border: 1px solid #2d3748;
   border-radius: 6px;
   color: #e2e8f0;
@@ -866,7 +866,7 @@ button { cursor: pointer; }
   top: calc(100% + 4px);
   left: 0;
   right: 0;
-  background: #1a2035;
+  background: #1a202c;
   border: 1px solid #2d3748;
   border-radius: 6px;
   list-style: none;
@@ -912,7 +912,7 @@ button { cursor: pointer; }
   padding: 8px 12px;
   font-size: 0.8rem;
   color: #718096;
-  background: #1a2035;
+  background: #1a202c;
   border: 1px solid #2d3748;
   border-radius: 6px;
   position: absolute;
