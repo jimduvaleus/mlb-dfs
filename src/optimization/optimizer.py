@@ -9,9 +9,11 @@ from concurrent.futures import ProcessPoolExecutor, Future, as_completed
 from multiprocessing.shared_memory import SharedMemory
 from typing import Dict, List, Optional, Tuple
 
+import os
+
 import numpy as np
 import pandas as pd
-from numba import njit
+from numba import njit, prange, set_num_threads as _numba_set_num_threads
 
 from src.optimization.lineup import (
     Lineup,
@@ -131,7 +133,7 @@ def _score_totals_payout(
     return float(np.mean(diff ** beta))
 
 
-@njit(cache=True)
+@njit(parallel=True, cache=True)
 def _score_swap_candidates_payout(
     sim_matrix: np.ndarray,
     totals: np.ndarray,
@@ -141,22 +143,24 @@ def _score_swap_candidates_payout(
     best_scores: np.ndarray,
     beta: float,
 ) -> np.ndarray:
-    """Score all swap candidates using marginal payout objective (Numba-accelerated).
+    """Score all swap candidates using marginal payout objective.
 
     For each candidate, computes E[P(max(best_scores, new_total))] where
     P(s) = max(0, s - cash_line)^beta.
+
+    Candidates are scored in parallel via Numba prange. In worker processes,
+    numba thread count is capped to cpu_count // n_workers to prevent
+    over-subscription; in single-process mode all threads are available.
     """
     n_sims = totals.shape[0]
     n_cands = cand_cols.shape[0]
     cand_scores = np.empty(n_cands, dtype=np.float64)
-    for j in range(n_cands):
+    for j in prange(n_cands):
         total_payout = 0.0
         col_in = cand_cols[j]
         for i in range(n_sims):
             new_total = totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in]
-            effective = new_total
-            if best_scores[i] > effective:
-                effective = best_scores[i]
+            effective = new_total if best_scores[i] <= new_total else best_scores[i]
             diff = effective - cash_line
             if diff > 0.0:
                 total_payout += diff ** beta
@@ -317,9 +321,12 @@ class _ChainRunner:
 
     # ---- public entry point ---------------------------------------- #
 
-    def run(self, seed: int) -> Tuple[Lineup, float]:
+    def run(self, seed: int, initial_lineup: Optional[Lineup] = None) -> Tuple[Lineup, float]:
         rng = np.random.default_rng(seed)
-        lineup = self._random_valid_lineup(rng)
+        if initial_lineup is not None and all(pid in self.col_map for pid in initial_lineup.player_ids):
+            lineup = initial_lineup
+        else:
+            lineup = self._random_valid_lineup(rng)
         cols = [self.col_map[pid] for pid in lineup.player_ids]
         totals = self.sim_matrix[:, cols].sum(axis=1)
         score = self._score_totals(totals, self.target)
@@ -857,7 +864,12 @@ class _ChainRunner:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, n_workers, initial_lineup = args
+    # Cap Numba intra-op threads so that n_workers processes don't collectively
+    # over-subscribe the CPU.  Single-process mode (n_workers=1) leaves Numba
+    # free to use all available cores for prange parallelism.
+    cpu_count = os.cpu_count() or 1
+    _numba_set_num_threads(max(1, cpu_count // n_workers))
     shm = SharedMemory(name=shm_name)
     # Do NOT unregister here: with fork start method all workers share the
     # parent's resource tracker subprocess, so the first unregister removes
@@ -880,7 +892,7 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
         )
-        return runner.run(seed)
+        return runner.run(seed, initial_lineup=initial_lineup)
     finally:
         shm.close()  # detach; do NOT unlink from worker
 
@@ -983,6 +995,7 @@ class BasinHoppingOptimizer:
     def _run_chains(
         self,
         executor: Optional[ProcessPoolExecutor] = None,
+        seed_lineups: Optional[List[Lineup]] = None,
     ) -> List[Tuple[Lineup, float]]:
         """Run all chains and return a (Lineup, score) pair for each.
 
@@ -1015,8 +1028,10 @@ class BasinHoppingOptimizer:
             shm = SharedMemory(create=True, size=mat.nbytes)
             shm_array = np.ndarray(mat.shape, dtype=mat.dtype, buffer=shm.buf)
             shm_array[:] = mat
-            chain_args = [
-                (
+            chain_args = []
+            for i, seed in enumerate(seeds):
+                initial = seed_lineups[i] if (seed_lineups and i < len(seed_lineups)) else None
+                chain_args.append((
                     seed,
                     shm.name,
                     mat.shape,
@@ -1033,9 +1048,9 @@ class BasinHoppingOptimizer:
                     self.best_scores,
                     self.payout_beta,
                     self.payout_cash_line,
-                )
-                for seed in seeds
-            ]
+                    self.n_workers,
+                    initial,
+                ))
             owned_executor = executor is None
             try:
                 if owned_executor:
@@ -1068,8 +1083,9 @@ class BasinHoppingOptimizer:
         else:
             best_so_far = -1.0
             steps_since_improvement = 0
-            for seed in seeds:
-                lineup, score = self._runner.run(seed)
+            for i, seed in enumerate(seeds):
+                initial = seed_lineups[i] if (seed_lineups and i < len(seed_lineups)) else None
+                lineup, score = self._runner.run(seed, initial_lineup=initial)
                 logger.debug("Chain seed=%d score=%.4f", seed, score)
                 results.append((lineup, score))
                 if score >= best_so_far + threshold:
@@ -1089,6 +1105,7 @@ class BasinHoppingOptimizer:
     def optimize(
         self,
         executor: Optional[ProcessPoolExecutor] = None,
+        seed_lineups: Optional[List[Lineup]] = None,
     ) -> Tuple[Lineup, float]:
         """Run all chains and return the best (Lineup, score) found.
 
@@ -1097,11 +1114,15 @@ class BasinHoppingOptimizer:
         executor:
             Optional pre-created ``ProcessPoolExecutor`` to reuse across
             multiple calls. The caller is responsible for shutting it down.
+        seed_lineups:
+            Optional list of ``Lineup`` objects to use as warm-start initial
+            points for the first ``len(seed_lineups)`` chains. Chains beyond
+            that index start from a random valid lineup as usual.
         """
-        results = self._run_chains(executor=executor)
+        results = self._run_chains(executor=executor, seed_lineups=seed_lineups)
         return max(results, key=lambda x: x[1])
 
-    def optimize_top_k(self, k: int, executor: Optional[ProcessPoolExecutor] = None) -> List[Tuple[Lineup, float]]:
+    def optimize_top_k(self, k: int, executor: Optional[ProcessPoolExecutor] = None, seed_lineups: Optional[List[Lineup]] = None) -> List[Tuple[Lineup, float]]:
         """Run all chains and return the top-k distinct (Lineup, score) pairs.
 
         Lineups are deduplicated by player set; the highest-scoring instance of
@@ -1118,7 +1139,7 @@ class BasinHoppingOptimizer:
         List[Tuple[Lineup, float]]
             Up to ``k`` (Lineup, score) pairs sorted best-first.
         """
-        results = self._run_chains(executor=executor)
+        results = self._run_chains(executor=executor, seed_lineups=seed_lineups)
         results.sort(key=lambda x: -x[1])
         seen: set = set()
         top_k: List[Tuple[Lineup, float]] = []

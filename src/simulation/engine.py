@@ -79,56 +79,49 @@ class SimulationEngine:
         
         units = self.players_df.groupby(['team', 'opponent'])
         
+        import logging
+        _log = logging.getLogger(__name__)
+
+        # Pre-compute marginals for every player so the simulation loop does
+        # no per-player object construction or PCA projection work at runtime.
+        marginals: List[Any] = [None] * n_players
+        is_batter_flags: List[bool] = [False] * n_players
+        for row_idx, player in self.players_df.iterrows():
+            slot = int(player['slot'])
+            is_batter = (1 <= slot <= 9)
+            is_batter_flags[row_idx] = is_batter
+            if is_batter and self.batter_pca_model is not None:
+                w, lam, mu, sigma = self.batter_pca_model.project(
+                    float(player['mean']), float(player['std_dev'])
+                )
+                if w > 0.99 or lam < 0.01:
+                    _log.warning(
+                        "Degenerate mixture for player %s (w=%.4f, lam=%.4f); "
+                        "falling back to Gaussian", player['player_id'], w, lam
+                    )
+                    marginals[row_idx] = GaussianMarginal(player['mean'], player['std_dev'])
+                else:
+                    marginals[row_idx] = BatterMixtureMarginal(w, lam, mu, sigma, self.score_grid)
+            else:
+                marginals[row_idx] = GaussianMarginal(player['mean'], player['std_dev'])
+
         for (team, opponent), unit_group in units:
-            print(f"Simulating unit: {team} vs {opponent}")
-            print(f"Players in unit: {unit_group['player_id'].tolist()}")
-            print(f"Slots in unit: {unit_group['slot'].tolist()}")
             # Sample joint quantiles from the copula for this 10-player unit
-            # Each sample is a (10,) vector of quantiles.
             # sampled_quantiles shape: (n_sims, 10)
             sampled_quantiles = self.copula.sample(n_sims)
-            
-            for idx, player in unit_group.iterrows():
-                slot = int(player['slot'])
-                
-                # Check if the slot is within the copula's 1-10 range
-                if not (1 <= slot <= 10):
-                    # For non-standard slots, we can fallback to independent sampling (not implemented here)
-                    continue
-                
-                # Extract the sampled quantiles for this player's specific slot
-                # Slot is 1-indexed, so we subtract 1 for 0-based NumPy indexing.
-                q = sampled_quantiles[:, slot - 1]
-                
-                # Choose marginal: mixture for batters (slot 1-9) when a PCA
-                # model is available, Gaussian otherwise and for pitchers.
-                is_batter = (1 <= slot <= 9)
-                if is_batter and self.batter_pca_model is not None:
-                    w, lam, mu, sigma = self.batter_pca_model.project(
-                        float(player['mean']), float(player['std_dev'])
-                    )
-                    # Safety net: degenerate mixture params produce a
-                    # near-constant PPF; fall back to Gaussian.
-                    if w > 0.99 or lam < 0.01:
-                        import logging
-                        logging.getLogger(__name__).warning(
-                            "Degenerate mixture for player %s (w=%.4f, lam=%.4f); "
-                            "falling back to Gaussian", player['player_id'], w, lam
-                        )
-                        marginal = GaussianMarginal(player['mean'], player['std_dev'])
-                    else:
-                        marginal = BatterMixtureMarginal(w, lam, mu, sigma, self.score_grid)
-                else:
-                    marginal = GaussianMarginal(player['mean'], player['std_dev'])
-                simulated_points = marginal.ppf(q)
 
-                # Batters cannot score negative in DK; pitchers can (earned runs)
-                if is_batter:
+            slots = unit_group['slot'].values
+            indices = unit_group.index.values
+            for i in range(len(indices)):
+                slot = int(slots[i])
+                if not (1 <= slot <= 10):
+                    continue
+                row_idx = indices[i]
+                q = sampled_quantiles[:, slot - 1]
+                simulated_points = marginals[row_idx].ppf(q)
+                if is_batter_flags[row_idx]:
                     simulated_points = np.maximum(simulated_points, 0)
-                
-                # Store the results in the overall matrix
-                # idx is the row index in self.players_df
-                all_simulated_points[:, idx] = simulated_points
+                all_simulated_points[:, row_idx] = simulated_points
                 
         # Wrap the results in the SimulationResults container
         return SimulationResults(self.players_df['player_id'].tolist(), all_simulated_points)

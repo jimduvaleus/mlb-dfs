@@ -78,6 +78,7 @@ class PortfolioConstructor:
         objective: str = "expected_surplus",
         payout_beta: float = 2.5,
         payout_cash_line: Optional[float] = None,
+        n_seed_lineups: int = 5,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -85,6 +86,7 @@ class PortfolioConstructor:
         self.portfolio_size = portfolio_size
         self._payout_weighted = objective == "marginal_payout"
         self._payout_beta = payout_beta
+        self._n_seed_lineups = n_seed_lineups
         self._optimizer_kwargs = dict(
             n_chains=n_chains,
             temperature=temperature,
@@ -148,6 +150,7 @@ class PortfolioConstructor:
         col_map = {pid: i for i, pid in enumerate(self.sim_results.player_ids)}
         active_mask = np.ones(self.sim_results.n_sims, dtype=bool)
         n_workers = self._optimizer_kwargs.get('n_workers', 1)
+        pending_seeds: List[Lineup] = []
 
         with (
             ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else nullcontext()
@@ -184,7 +187,13 @@ class PortfolioConstructor:
                     rng_seed=seed,
                     **self._optimizer_kwargs,
                 )
-                lineup, _ = optimizer.optimize(executor=shared_executor if n_workers > 1 else None)
+                top_k = optimizer.optimize_top_k(
+                    self._n_seed_lineups + 1,
+                    executor=shared_executor if n_workers > 1 else None,
+                    seed_lineups=pending_seeds if pending_seeds else None,
+                )
+                lineup = top_k[0][0]
+                pending_seeds = [lu for lu, _ in top_k[1:]]
 
                 # Score against the full matrix for comparability.
                 cols = [col_map[pid] for pid in lineup.player_ids]
@@ -237,6 +246,7 @@ class PortfolioConstructor:
         n_sims = self.sim_results.n_sims
         best_scores = np.zeros(n_sims, dtype=np.float64)
         n_workers = self._optimizer_kwargs.get('n_workers', 1)
+        pending_seeds: List[Lineup] = []
 
         # Build optimizer kwargs without best_scores (we pass it per-round).
         opt_kwargs = dict(self._optimizer_kwargs)
@@ -266,9 +276,13 @@ class PortfolioConstructor:
                     best_scores=best_scores,
                     **opt_kwargs,
                 )
-                lineup, _ = optimizer.optimize(
+                top_k = optimizer.optimize_top_k(
+                    self._n_seed_lineups + 1,
                     executor=shared_executor if n_workers > 1 else None,
+                    seed_lineups=pending_seeds if pending_seeds else None,
                 )
+                lineup = top_k[0][0]
+                pending_seeds = [lu for lu, _ in top_k[1:]]
 
                 # Compute this lineup's scores across all sims.
                 cols = [col_map[pid] for pid in lineup.player_ids]
@@ -364,12 +378,14 @@ class BeamPortfolioConstructor:
         objective: str = "expected_surplus",
         payout_beta: float = 2.5,
         payout_cash_line: Optional[float] = None,
+        n_seed_lineups: int = 5,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
         self.target = target
         self.portfolio_size = portfolio_size
         self.beam_width = beam_width
+        self._n_seed_lineups = n_seed_lineups
         self._optimizer_kwargs = dict(
             n_chains=n_chains,
             temperature=temperature,
@@ -403,21 +419,22 @@ class BeamPortfolioConstructor:
         n_sims = self.sim_results.n_sims
         n_workers = self._optimizer_kwargs.get('n_workers', 1)
 
-        # Each beam state: (portfolio, active_mask)
-        # - portfolio : List[Tuple[Lineup, float]]  — lineups selected so far
-        # - active_mask : ndarray bool (n_sims,)    — rows not yet consumed
+        # Each beam state: (portfolio, active_mask, pending_seeds)
+        # - portfolio     : List[Tuple[Lineup, float]]  — lineups selected so far
+        # - active_mask   : ndarray bool (n_sims,)      — rows not yet consumed
+        # - pending_seeds : List[Lineup]                — warm-start seeds for next depth
         initial_mask = np.ones(n_sims, dtype=bool)
-        beam: List[Tuple[List[Tuple[Lineup, float]], np.ndarray]] = [
-            ([], initial_mask)
+        beam: List[Tuple[List[Tuple[Lineup, float]], np.ndarray, List[Lineup]]] = [
+            ([], initial_mask, [])
         ]
 
         with (
             ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else nullcontext()
         ) as shared_executor:
             for depth in range(self.portfolio_size):
-                next_candidates: List[Tuple[List[Tuple[Lineup, float]], np.ndarray]] = []
+                next_candidates: List[Tuple[List[Tuple[Lineup, float]], np.ndarray, List[Lineup]]] = []
 
-                for path_idx, (path_portfolio, path_mask) in enumerate(beam):
+                for path_idx, (path_portfolio, path_mask, path_seeds) in enumerate(beam):
                     n_active = int(path_mask.sum())
 
                     if n_active == 0:
@@ -429,7 +446,7 @@ class BeamPortfolioConstructor:
                             self.portfolio_size,
                             path_idx,
                         )
-                        next_candidates.append((path_portfolio, path_mask))
+                        next_candidates.append((path_portfolio, path_mask, []))
                         continue
 
                     logger.info(
@@ -460,9 +477,10 @@ class BeamPortfolioConstructor:
                     top_k = optimizer.optimize_top_k(
                         self.beam_width,
                         executor=shared_executor if n_workers > 1 else None,
+                        seed_lineups=path_seeds if path_seeds else None,
                     )
 
-                    for lineup, _ in top_k:
+                    for j, (lineup, _) in enumerate(top_k):
                         cols = [col_map[pid] for pid in lineup.player_ids]
 
                         # Score against the full matrix for comparability.
@@ -486,8 +504,11 @@ class BeamPortfolioConstructor:
                             int(new_mask.sum()),
                         )
 
+                        branch_seeds = [
+                            lu for k2, (lu, _) in enumerate(top_k) if k2 != j
+                        ][: self._n_seed_lineups]
                         next_candidates.append(
-                            (path_portfolio + [(lineup, full_score)], new_mask)
+                            (path_portfolio + [(lineup, full_score)], new_mask, branch_seeds)
                         )
 
                 if not next_candidates:
@@ -516,5 +537,5 @@ class BeamPortfolioConstructor:
             return []
 
         # Return the best path (lowest active rows, then highest total score).
-        best_portfolio, _ = beam[0]
+        best_portfolio, _, _ = beam[0]
         return best_portfolio

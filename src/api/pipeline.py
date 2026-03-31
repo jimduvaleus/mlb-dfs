@@ -200,6 +200,7 @@ class PipelineRunner:
             objective=objective,
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
+            n_seed_lineups=int(opt_cfg.get("n_seed_lineups", 5)),
         )
 
         def _on_lineup_complete(lineup_index: int, total: int, score: float, sims_covered: int, sims_remaining: int) -> None:
