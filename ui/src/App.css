@@ -412,7 +412,7 @@ button { cursor: pointer; }
 /* ── Progress panel ── */
 
 .progress-panel {
-  max-width: 680px;
+  max-width: 1200px;
 }
 
 .progress-panel h3 {
@@ -449,6 +449,13 @@ button { cursor: pointer; }
 .event-row.event-complete { background: #1a2f1e; }
 .event-row.event-error { background: #2a1a1a; }
 .event-row.event-error .event-stage { color: #fc8181; }
+
+.event-list-two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 16px;
+}
 
 .progress-bar-wrap {
   position: relative;

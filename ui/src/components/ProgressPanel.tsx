@@ -60,7 +60,7 @@ export function ProgressPanel({ events, running }: Props) {
       )}
 
       <div className="event-list">
-        {events.map((e, i) => (
+        {events.filter(e => e.stage !== 'optimize_lineup').map((e, i) => (
           <div key={i} className={`event-row event-${e.stage}`}>
             <span className="event-stage">{STAGE_LABELS[e.stage] ?? e.stage}</span>
             <span className="event-detail">{renderDetail(e)}</span>
@@ -72,6 +72,17 @@ export function ProgressPanel({ events, running }: Props) {
           </div>
         )}
       </div>
+
+      {events.some(e => e.stage === 'optimize_lineup') && (
+        <div className="event-list event-list-two-col">
+          {events.filter(e => e.stage === 'optimize_lineup').map((e, i) => (
+            <div key={i} className="event-row event-optimize_lineup">
+              <span className="event-stage">{STAGE_LABELS[e.stage] ?? e.stage}</span>
+              <span className="event-detail">{renderDetail(e)}</span>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
