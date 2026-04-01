@@ -352,7 +352,13 @@ async def projections_fetch(request: Request):
             dk_path = _dp
 
     async def _stream():
-        script = PROJECT_ROOT / "scripts" / "fetch_rotowire_projections.py"
+        source = (cfg.paths.projections_source or "rotowire").strip().lower()
+        script_name = (
+            "fetch_dff_projections.py"
+            if source == "dailyfantasyfuel"
+            else "fetch_rotowire_projections.py"
+        )
+        script = PROJECT_ROOT / "scripts" / script_name
         python = PROJECT_ROOT / "venv" / "bin" / "python"
         cmd = [str(python), str(script)]
         proc = await asyncio.create_subprocess_exec(

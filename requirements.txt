@@ -6,4 +6,4 @@ requests
 pytest
 pytest-cov
 pyarrow
-pyyaml
+pyyamlplaywright

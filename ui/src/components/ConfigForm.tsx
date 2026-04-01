@@ -63,6 +63,17 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
       <div className="config-form-grid">
         <div>
           <section>
+            <h3>Projections</h3>
+            <FieldRow label="Source">
+              <select value={draft.paths.projections_source}
+                onChange={e => set('paths', 'projections_source', e.target.value)} disabled={disabled}>
+                <option value="rotowire">RotoWire</option>
+                <option value="dailyfantasyfuel">Daily Fantasy Fuel</option>
+              </select>
+            </FieldRow>
+          </section>
+
+          <section>
             <h3>Simulation</h3>
             <FieldRow label="Simulations (n_sims)">
               <input type="number" min={1000} step={1000} value={draft.simulation.n_sims}

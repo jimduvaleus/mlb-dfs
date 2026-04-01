@@ -7,6 +7,7 @@ export interface PathsConfig {
   projections: string | null
   batter_pca_model: string | null
   batter_score_grid: string | null
+  projections_source: string
 }
 
 export interface SimulationConfig {
