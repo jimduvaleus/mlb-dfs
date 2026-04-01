@@ -409,6 +409,28 @@ button { cursor: pointer; }
 .log-line.success { color: #68d391; }
 .log-line.error { color: #fc8181; }
 
+.merge-info-callout {
+  margin-top: 10px;
+  background: #1a2535;
+  border: 1px solid #4a6fa5;
+  border-left: 3px solid #63b3ed;
+  border-radius: 5px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #e2e8f0;
+}
+
+.merge-info-callout strong {
+  display: block;
+  color: #63b3ed;
+  margin-bottom: 4px;
+}
+
+.merge-info-players {
+  color: #a0aec0;
+  line-height: 1.5;
+}
+
 /* ── Progress panel ── */
 
 .progress-panel {

@@ -353,16 +353,17 @@ async def projections_fetch(request: Request):
 
     async def _stream():
         source = (cfg.paths.projections_source or "rotowire").strip().lower()
-        script_name = (
-            "fetch_dff_projections.py"
-            if source == "dailyfantasyfuel"
-            else "fetch_rotowire_projections.py"
-        )
-        script = PROJECT_ROOT / "scripts" / script_name
+        is_dff = source == "dailyfantasyfuel"
+        primary_script = "fetch_dff_projections.py" if is_dff else "fetch_rotowire_projections.py"
+        secondary_script = "fetch_rotowire_projections.py" if is_dff else "fetch_dff_projections.py"
+        secondary_source_label = "RotoWire" if is_dff else "Daily Fantasy Fuel"
+
         python = PROJECT_ROOT / "venv" / "bin" / "python"
-        cmd = [str(python), str(script)]
+
+        # --- Run primary script ---
+        script = PROJECT_ROOT / "scripts" / primary_script
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            str(python), str(script),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(PROJECT_ROOT),
@@ -374,13 +375,73 @@ async def projections_fetch(request: Request):
                 break
             payload = {"type": "log", "line": line.decode().rstrip(), "timestamp": int(time.time() * 1000)}
             yield f"data: {json.dumps(payload)}\n\n"
-        returncode = await proc.wait()
-        if returncode == 0:
+        primary_returncode = await proc.wait()
+
+        if primary_returncode != 0:
+            yield f"data: {json.dumps({'type': 'done', 'returncode': primary_returncode, 'timestamp': int(time.time() * 1000)})}\n\n"
+            return
+
+        # --- Run secondary script to fill in missing players ---
+        secondary_path = proj_path.parent / "projections_secondary.csv"
+        sec_script = PROJECT_ROOT / "scripts" / secondary_script
+
+        yield f"data: {json.dumps({'type': 'log', 'line': f'--- Fetching secondary projections from {secondary_source_label} ---', 'timestamp': int(time.time() * 1000)})}\n\n"
+
+        sec_proc = await asyncio.create_subprocess_exec(
+            str(python), str(sec_script), "--output", str(secondary_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=str(PROJECT_ROOT),
+        )
+        assert sec_proc.stdout is not None
+        async for line in sec_proc.stdout:
+            if await request.is_disconnected():
+                sec_proc.kill()
+                break
+            payload = {"type": "log", "line": line.decode().rstrip(), "timestamp": int(time.time() * 1000)}
+            yield f"data: {json.dumps(payload)}\n\n"
+        secondary_returncode = await sec_proc.wait()
+
+        if secondary_returncode == 0 and secondary_path.exists():
             try:
-                record_fetch_from_csv(proj_path, "auto", dk_path)
+                import pandas as pd
+                primary_df = pd.read_csv(proj_path)
+                secondary_df = pd.read_csv(secondary_path)
+                primary_ids = set(primary_df["player_id"].tolist())
+                fill_in_df = secondary_df[~secondary_df["player_id"].isin(primary_ids)]
+                if not fill_in_df.empty:
+                    merged_df = pd.concat([primary_df, fill_in_df], ignore_index=True)
+                    merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
+                    merged_df.to_csv(proj_path, index=False)
+                    merge_payload = {
+                        "type": "merge_info",
+                        "secondary_source": secondary_source_label,
+                        "count": len(fill_in_df),
+                        "players": fill_in_df["name"].tolist(),
+                        "timestamp": int(time.time() * 1000),
+                    }
+                    yield f"data: {json.dumps(merge_payload)}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'log', 'line': f'No additional players found in {secondary_source_label}.', 'timestamp': int(time.time() * 1000)})}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'type': 'log', 'line': f'Warning: could not merge secondary projections: {exc}', 'timestamp': int(time.time() * 1000)})}\n\n"
+            finally:
+                try:
+                    secondary_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+        else:
+            yield f"data: {json.dumps({'type': 'log', 'line': f'Secondary fetch from {secondary_source_label} failed (exit {secondary_returncode}); using primary projections only.', 'timestamp': int(time.time() * 1000)})}\n\n"
+            try:
+                secondary_path.unlink(missing_ok=True)
             except Exception:
                 pass
-        yield f"data: {json.dumps({'type': 'done', 'returncode': returncode, 'timestamp': int(time.time() * 1000)})}\n\n"
+
+        try:
+            record_fetch_from_csv(proj_path, "auto", dk_path)
+        except Exception:
+            pass
+        yield f"data: {json.dumps({'type': 'done', 'returncode': 0, 'timestamp': int(time.time() * 1000)})}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
 

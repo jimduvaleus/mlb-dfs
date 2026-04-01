@@ -18,11 +18,18 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
+interface MergeInfo {
+  secondarySource: string
+  count: number
+  players: string[]
+}
+
 export function ProjectionsPanel({ disabled, onFetched }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
   const [done, setDone] = useState<{ success: boolean; code: number } | null>(null)
+  const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const esRef = useRef<EventSource | null>(null)
 
@@ -46,6 +53,7 @@ export function ProjectionsPanel({ disabled, onFetched }: Props) {
     setFetching(true)
     setLog([])
     setDone(null)
+    setMergeInfo(null)
 
     const es = new EventSource('/api/projections/fetch')
     esRef.current = es
@@ -54,6 +62,8 @@ export function ProjectionsPanel({ disabled, onFetched }: Props) {
       const event = JSON.parse(e.data)
       if (event.type === 'log') {
         setLog(prev => [...prev, event.line])
+      } else if (event.type === 'merge_info') {
+        setMergeInfo({ secondarySource: event.secondary_source, count: event.count, players: event.players })
       } else if (event.type === 'done') {
         setFetching(false)
         setDone({ success: event.returncode === 0, code: event.returncode })
@@ -141,6 +151,15 @@ export function ProjectionsPanel({ disabled, onFetched }: Props) {
               {done.success ? '✓ Done' : `✗ Exited with code ${done.code}`}
             </div>
           )}
+        </div>
+      )}
+
+      {mergeInfo && (
+        <div className="merge-info-callout">
+          <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} filled in from {mergeInfo.secondarySource}</strong>
+          <div className="merge-info-players">
+            {mergeInfo.players.join(', ')}
+          </div>
         </div>
       )}
     </div>
