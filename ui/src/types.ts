@@ -139,7 +139,7 @@ export interface ErrorEvent extends SSEEvent {
   message: string
 }
 
-export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error'
+export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 'replacing'
 
 // Slate game/team exclusion types
 export interface TeamStatus {

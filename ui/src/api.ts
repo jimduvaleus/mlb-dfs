@@ -69,6 +69,15 @@ export async function writeUploadFiles(): Promise<{ paths: string[] }> {
   return res.json()
 }
 
+export async function replaceLineup(lineupIndex: number): Promise<LineupResult[]> {
+  const res = await fetch(`/api/portfolio/replace/${lineupIndex}`, { method: 'POST' })
+  if (!res.ok) {
+    const detail = await res.text()
+    throw new Error(`Failed to replace lineup: ${detail}`)
+  }
+  return res.json()
+}
+
 export async function fetchSlateGames(): Promise<SlateGamesResponse> {
   const res = await fetch('/api/slate/games')
   if (!res.ok) throw new Error(`Failed to load slate games: ${res.statusText}`)

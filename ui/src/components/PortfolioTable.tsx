@@ -5,6 +5,8 @@ import TeamBadge from './TeamBadge'
 interface Props {
   lineups: LineupResult[]
   unconfirmedPlayerIds?: number[]
+  onDeleteLineup?: (lineupIndex: number) => void
+  replacingLineupIndex?: number | null
 }
 
 function sortPlayersByPosition(players: PlayerRow[]): PlayerRow[] {
@@ -24,7 +26,7 @@ function sortPlayersByPosition(players: PlayerRow[]): PlayerRow[] {
   return filled
 }
 
-export function PortfolioTable({ lineups, unconfirmedPlayerIds }: Props) {
+export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex }: Props) {
   if (lineups.length === 0) return null
   const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
@@ -35,12 +37,31 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds }: Props) {
         {lineups.map(lineup => {
           const sorted = sortPlayersByPosition(lineup.players)
           const stack = getStackNotation(lineup.players)
+          const isReplacing = replacingLineupIndex === lineup.lineup_index
           return (
             <div key={lineup.lineup_index} className="lineup-card">
               <div className="lineup-card-header">
                 <span className="lineup-card-num">#{lineup.lineup_index}</span>
                 <span className="lineup-card-salary">${lineup.lineup_salary.toLocaleString()}</span>
-                {stack && <span className="lineup-card-stack">{stack}</span>}
+                <div className="lineup-card-header-right">
+                  {isReplacing ? (
+                    <span className="lineup-card-generating">Generating…</span>
+                  ) : (
+                    <>
+                      {stack && <span className="lineup-card-stack">{stack}</span>}
+                      {onDeleteLineup && (
+                        <button
+                          className="lineup-card-delete"
+                          onClick={() => onDeleteLineup(lineup.lineup_index)}
+                          title="Delete and replace this lineup"
+                          disabled={replacingLineupIndex != null}
+                        >
+                          🗑
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
               </div>
               <div className="lineup-card-players">
                 {sorted.map((p, i) => (

@@ -410,7 +410,7 @@ def write_upload():
 
 @app.get("/api/run/stream")
 async def run_stream(request: Request):
-    if _state["status"] == "running":
+    if _state["status"] in ("running", "replacing"):
         raise HTTPException(409, "A run is already in progress")
 
     _state["status"] = "running"
@@ -456,6 +456,29 @@ async def run_stream(request: Request):
             yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(_sse_generator(), media_type="text/event-stream")
+
+
+@app.post("/api/portfolio/replace/{lineup_index}")
+async def replace_lineup_endpoint(lineup_index: int):
+    if _state["status"] in ("running", "replacing"):
+        raise HTTPException(409, "Cannot replace lineup while a run is in progress")
+    runner = _state.get("_runner_last")
+    if runner is None or not hasattr(runner, "_raw_portfolio"):
+        raise HTTPException(400, "No portfolio available")
+    if not hasattr(runner, "_sim_results"):
+        raise HTTPException(400, "Simulation results not available — please re-run the portfolio")
+    if lineup_index < 1 or lineup_index > len(runner._raw_portfolio):
+        raise HTTPException(400, f"Invalid lineup index: {lineup_index}")
+    _state["status"] = "replacing"
+    try:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, runner.replace_lineup, lineup_index)
+        _state["portfolio"] = result
+        return result
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+    finally:
+        _state["status"] = "complete"
 
 
 @app.get("/api/portfolio")

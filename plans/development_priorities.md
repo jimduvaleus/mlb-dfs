@@ -1,5 +1,4 @@
 - back to needing optimization speed improvements again
-- X out lineup and grab another?
 - Need weather
 - late swap?
 - on projections fetch, if number of changes is small, report them

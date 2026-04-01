@@ -525,8 +525,45 @@ button { cursor: pointer; }
   color: #f6ad55;
 }
 
-.lineup-card-stack {
+.lineup-card-header-right {
   margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lineup-card-delete {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: #718096;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 14px;
+  line-height: 1;
+}
+.lineup-card-delete:hover:not(:disabled) { color: #fc8181; background: rgba(252, 129, 129, 0.1); }
+.lineup-card-delete:disabled { opacity: 0.3; cursor: not-allowed; }
+
+.lineup-card-generating {
+  font-size: 12px;
+  color: #90cdf4;
+  font-style: italic;
+}
+
+.btn-danger {
+  background: #c53030;
+  border: none;
+  border-radius: 6px;
+  color: #fff;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  padding: 8px 18px;
+}
+.btn-danger:hover { background: #e53e3e; }
+
+.lineup-card-stack {
   font-weight: 700;
   color: #b794f4;
   font-family: monospace;

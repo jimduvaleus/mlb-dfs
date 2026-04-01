@@ -171,6 +171,26 @@ class PipelineRunner:
             payout_cash_line = None
             payout_beta = float(payout_beta_cfg) if payout_beta_cfg is not None else 2.5
 
+        # Store simulation artifacts for post-run operations (lineup replacement).
+        self._sim_results = sim_results
+        self._players_df = players_df
+        self._target = target
+        self._objective = objective
+        self._optimizer_kwargs_replace = dict(
+            n_chains=int(opt_cfg.get("n_chains", 250)),
+            temperature=float(opt_cfg.get("temperature", 0.1)),
+            n_steps=int(opt_cfg.get("n_steps", 100)),
+            niter_success=int(opt_cfg.get("niter_success", 25)),
+            n_workers=int(opt_cfg.get("n_workers", 1)),
+            rng_seed=opt_cfg.get("rng_seed"),
+            early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
+            early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
+            salary_floor=float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None,
+            objective=objective,
+            payout_beta=payout_beta,
+            payout_cash_line=payout_cash_line,
+        )
+
         # --- Construct portfolio ----------------------------------------
         config_size = int(port_cfg.get("size", 20))
         portfolio_size = max(config_size, total_entries) if total_entries > 0 else config_size
@@ -268,6 +288,82 @@ class PipelineRunner:
         return write_upload_files(
             self._all_file_entries, assignments, self._slate_df, self._output_dir
         )
+
+    def replace_lineup(self, lineup_index: int) -> list[dict]:
+        """Delete the lineup at lineup_index (1-based) and generate a replacement.
+
+        The replacement is optimized on the simulation rows NOT consumed by the
+        remaining lineups, then appended to the end of the portfolio. The updated
+        portfolio.csv and any DK upload files are written automatically.
+
+        Returns
+        -------
+        list[dict]
+            Updated portfolio serialized in the same format as ``run()``.
+        """
+        from src.optimization.optimizer import BasinHoppingOptimizer
+
+        idx = lineup_index - 1
+        deleted_lineup, _ = self._raw_portfolio[idx]
+        deleted_player_set = frozenset(deleted_lineup.player_ids)
+        remaining = self._raw_portfolio[:idx] + self._raw_portfolio[idx + 1:]
+
+        full_matrix = self._sim_results.results_matrix
+        col_map = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
+
+        # Request enough candidates to find one that differs from the deleted lineup.
+        n_candidates = 5
+
+        if self._objective == "marginal_payout":
+            best_scores = np.zeros(self._sim_results.n_sims, dtype=np.float64)
+            for lineup, _ in remaining:
+                cols = [col_map[pid] for pid in lineup.player_ids]
+                best_scores = np.maximum(best_scores, full_matrix[:, cols].sum(axis=1))
+            optimizer = BasinHoppingOptimizer(
+                sim_results=self._sim_results,
+                players_df=self._players_df,
+                target=self._target,
+                best_scores=best_scores,
+                **self._optimizer_kwargs_replace,
+            )
+        else:
+            active_mask = np.ones(self._sim_results.n_sims, dtype=bool)
+            for lineup, _ in remaining:
+                cols = [col_map[pid] for pid in lineup.player_ids]
+                active_mask[full_matrix[:, cols].sum(axis=1) >= self._target] = False
+            active_sim = SimulationResults(
+                player_ids=self._sim_results.player_ids,
+                results_matrix=full_matrix[active_mask],
+            )
+            optimizer = BasinHoppingOptimizer(
+                sim_results=active_sim,
+                players_df=self._players_df,
+                target=self._target,
+                **self._optimizer_kwargs_replace,
+            )
+
+        candidates = optimizer.optimize_top_k(n_candidates)
+        # Pick the best candidate that is not identical to the deleted lineup.
+        new_lineup, _ = next(
+            ((lu, sc) for lu, sc in candidates if frozenset(lu.player_ids) != deleted_player_set),
+            candidates[0],  # fall back to best if all candidates match (very unlikely)
+        )
+        cols = [col_map[pid] for pid in new_lineup.player_ids]
+        full_score = float((full_matrix[:, cols].sum(axis=1) >= self._target).mean())
+
+        self._raw_portfolio = remaining + [(new_lineup, full_score)]
+        result = self._serialize_portfolio(self._raw_portfolio, self._players_df)
+
+        os.makedirs(self._output_dir, exist_ok=True)
+        portfolio_df = self._format_portfolio_df(self._raw_portfolio, self._players_df)
+        output_path = os.path.join(self._output_dir, "portfolio.csv")
+        portfolio_df.to_csv(output_path, index=False)
+        logger.info("Updated portfolio saved to %s", output_path)
+
+        if self._all_file_entries:
+            self.write_upload_files()
+
+        return result
 
     # ------------------------------------------------------------------
     # Private helpers (mirrored from main.py)

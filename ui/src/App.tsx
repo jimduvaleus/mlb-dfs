@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useState } from 'react'
 import type { AppConfig, LineupResult, RunStatus, CompleteEvent, StoppedEvent } from './types'
-import { fetchConfig, fetchPortfolio, fetchUnconfirmedPlayerIds, stopRun, writeUploadFiles } from './api'
+import { fetchConfig, fetchPortfolio, fetchUnconfirmedPlayerIds, replaceLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -9,6 +9,7 @@ import { PortfolioTable } from './components/PortfolioTable'
 import { MetricsPanel } from './components/MetricsPanel'
 import { SlatePanel } from './components/SlatePanel'
 import { StopUploadDialog } from './components/StopUploadDialog'
+import { DeleteConfirmModal } from './components/DeleteConfirmModal'
 import './App.css'
 
 type Tab = 'config' | 'slate' | 'run' | 'portfolio' | 'metrics'
@@ -57,6 +58,8 @@ export default function App() {
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
   const [stopPending, setStopPending] = useState(false)
+  const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null)
+  const [replacingIndex, setReplacingIndex] = useState<number | null>(null)
   const { events, status: sseStatus, start: startSSE, reset: resetSSE } = useSSE('/api/run/stream')
 
   const running = state.runStatus === 'running'
@@ -128,6 +131,29 @@ export default function App() {
     writeUploadFiles().catch(() => {})
   }
 
+  const handleDeleteLineup = (lineupIndex: number) => {
+    setPendingDeleteIndex(lineupIndex)
+  }
+
+  const handleConfirmDelete = async () => {
+    if (pendingDeleteIndex === null) return
+    const idx = pendingDeleteIndex
+    setPendingDeleteIndex(null)
+    setReplacingIndex(idx)
+    dispatch({ type: 'set_run_status', status: 'replacing' })
+    try {
+      const updated = await replaceLineup(idx)
+      dispatch({ type: 'set_portfolio', portfolio: updated })
+    } catch {
+      fetchPortfolio()
+        .then(p => { if (p.length > 0) dispatch({ type: 'set_portfolio', portfolio: p }) })
+        .catch(() => {})
+    } finally {
+      setReplacingIndex(null)
+      dispatch({ type: 'set_run_status', status: 'complete' })
+    }
+  }
+
   const tabDisabled = (tab: Tab): boolean => {
     if (tab === 'portfolio' && state.portfolio.length === 0) return true
     if (tab === 'metrics' && state.portfolio.length === 0) return true
@@ -157,7 +183,7 @@ export default function App() {
           <button
             className="btn-run"
             onClick={handleRun}
-            disabled={running || state.config === null}
+            disabled={running || state.runStatus === 'replacing' || state.config === null}
           >
             {running ? 'Running…' : 'Run Portfolio'}
           </button>
@@ -209,13 +235,26 @@ export default function App() {
         )}
 
         {state.activeTab === 'portfolio' && (
-          <PortfolioTable lineups={state.portfolio} unconfirmedPlayerIds={state.unconfirmedPlayerIds} />
+          <PortfolioTable
+            lineups={state.portfolio}
+            unconfirmedPlayerIds={state.unconfirmedPlayerIds}
+            onDeleteLineup={state.runStatus === 'complete' ? handleDeleteLineup : undefined}
+            replacingLineupIndex={replacingIndex}
+          />
         )}
 
         {state.activeTab === 'metrics' && (
           <MetricsPanel lineups={state.portfolio} events={events} />
         )}
       </main>
+
+      {pendingDeleteIndex !== null && (
+        <DeleteConfirmModal
+          lineupIndex={pendingDeleteIndex}
+          onConfirm={handleConfirmDelete}
+          onCancel={() => setPendingDeleteIndex(null)}
+        />
+      )}
 
       {showUploadDialog && (
         <StopUploadDialog
