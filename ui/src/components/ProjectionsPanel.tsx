@@ -156,7 +156,7 @@ export function ProjectionsPanel({ disabled, onFetched }: Props) {
 
       {mergeInfo && (
         <div className="merge-info-callout">
-          <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} filled in from {mergeInfo.secondarySource}</strong>
+          <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback projection</strong>
           <div className="merge-info-players">
             {mergeInfo.players.join(', ')}
           </div>

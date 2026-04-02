@@ -574,11 +574,11 @@ def build_projections_csv(
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_path, index=False)
 
-    pitchers = out_df[out_df["player_id"].map(dk_pos).eq("SP")]
-    batters  = out_df[out_df["player_id"].map(dk_pos).ne("SP")]
+    n_pitchers = int((out_df["lineup_slot"] == 10).sum())
+    n_batters  = len(out_df) - n_pitchers
     log.info(
         "Wrote %d starter projections → %s  (pitchers=%d, batters=%d, unmatched=%d)",
-        len(out_df), output_path, len(pitchers), len(batters), len(unmatched),
+        len(out_df), output_path, n_pitchers, n_batters, len(unmatched),
     )
     return out_df
 

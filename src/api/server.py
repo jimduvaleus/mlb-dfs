@@ -353,17 +353,26 @@ async def projections_fetch(request: Request):
 
     async def _stream():
         source = (cfg.paths.projections_source or "rotowire").strip().lower()
-        is_dff = source == "dailyfantasyfuel"
-        primary_script = "fetch_dff_projections.py" if is_dff else "fetch_rotowire_projections.py"
-        secondary_script = "fetch_rotowire_projections.py" if is_dff else "fetch_dff_projections.py"
-        secondary_source_label = "RotoWire" if is_dff else "Daily Fantasy Fuel"
+        is_dff_preferred = source == "dailyfantasyfuel"
+        preferred_label = "Daily Fantasy Fuel" if is_dff_preferred else "RotoWire"
+        fallback_label  = "RotoWire" if is_dff_preferred else "Daily Fantasy Fuel"
 
-        python = PROJECT_ROOT / "venv" / "bin" / "python"
+        python     = PROJECT_ROOT / "venv" / "bin" / "python"
+        dff_script = PROJECT_ROOT / "scripts" / "fetch_dff_projections.py"
+        rw_script  = PROJECT_ROOT / "scripts" / "fetch_rotowire_projections.py"
+        dff_out    = proj_path.parent / "projections_dff.csv"
+        rw_out     = proj_path.parent / "projections_rw.csv"
 
-        # --- Run primary script ---
-        script = PROJECT_ROOT / "scripts" / primary_script
+        def _log(msg: str) -> str:
+            return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
+
+        # ---- Run preferred script (live-streamed) ----------------------------
+        yield _log(f"--- Fetching {preferred_label} projections ---")
+        preferred_script = dff_script if is_dff_preferred else rw_script
+        preferred_out    = dff_out    if is_dff_preferred else rw_out
+
         proc = await asyncio.create_subprocess_exec(
-            str(python), str(script),
+            str(python), str(preferred_script), "--output", str(preferred_out),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(PROJECT_ROOT),
@@ -373,69 +382,105 @@ async def projections_fetch(request: Request):
             if await request.is_disconnected():
                 proc.kill()
                 break
-            payload = {"type": "log", "line": line.decode().rstrip(), "timestamp": int(time.time() * 1000)}
-            yield f"data: {json.dumps(payload)}\n\n"
-        primary_returncode = await proc.wait()
+            yield _log(line.decode().rstrip())
+        preferred_rc = await proc.wait()
 
-        if primary_returncode != 0:
-            yield f"data: {json.dumps({'type': 'done', 'returncode': primary_returncode, 'timestamp': int(time.time() * 1000)})}\n\n"
+        if preferred_rc != 0:
+            yield f"data: {json.dumps({'type': 'done', 'returncode': preferred_rc, 'timestamp': int(time.time() * 1000)})}\n\n"
             return
 
-        # --- Run secondary script to fill in missing players ---
-        secondary_path = proj_path.parent / "projections_secondary.csv"
-        sec_script = PROJECT_ROOT / "scripts" / secondary_script
+        # ---- Run fallback script (live-streamed) -----------------------------
+        yield _log(f"--- Fetching {fallback_label} projections ---")
+        fallback_script = rw_script  if is_dff_preferred else dff_script
+        fallback_out    = rw_out     if is_dff_preferred else dff_out
 
-        yield f"data: {json.dumps({'type': 'log', 'line': f'--- Fetching secondary projections from {secondary_source_label} ---', 'timestamp': int(time.time() * 1000)})}\n\n"
-
-        sec_proc = await asyncio.create_subprocess_exec(
-            str(python), str(sec_script), "--output", str(secondary_path),
+        proc2 = await asyncio.create_subprocess_exec(
+            str(python), str(fallback_script), "--output", str(fallback_out),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
             cwd=str(PROJECT_ROOT),
         )
-        assert sec_proc.stdout is not None
-        async for line in sec_proc.stdout:
+        assert proc2.stdout is not None
+        async for line in proc2.stdout:
             if await request.is_disconnected():
-                sec_proc.kill()
+                proc2.kill()
                 break
-            payload = {"type": "log", "line": line.decode().rstrip(), "timestamp": int(time.time() * 1000)}
-            yield f"data: {json.dumps(payload)}\n\n"
-        secondary_returncode = await sec_proc.wait()
+            yield _log(line.decode().rstrip())
+        fallback_rc = await proc2.wait()
 
-        if secondary_returncode == 0 and secondary_path.exists():
-            try:
-                import pandas as pd
-                primary_df = pd.read_csv(proj_path)
-                secondary_df = pd.read_csv(secondary_path)
-                primary_ids = set(primary_df["player_id"].tolist())
-                fill_in_df = secondary_df[~secondary_df["player_id"].isin(primary_ids)]
-                if not fill_in_df.empty:
-                    merged_df = pd.concat([primary_df, fill_in_df], ignore_index=True)
-                    merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
-                    merged_df.to_csv(proj_path, index=False)
-                    merge_payload = {
-                        "type": "merge_info",
-                        "secondary_source": secondary_source_label,
-                        "count": len(fill_in_df),
-                        "players": fill_in_df["name"].tolist(),
-                        "timestamp": int(time.time() * 1000),
-                    }
-                    yield f"data: {json.dumps(merge_payload)}\n\n"
-                else:
-                    yield f"data: {json.dumps({'type': 'log', 'line': f'No additional players found in {secondary_source_label}.', 'timestamp': int(time.time() * 1000)})}\n\n"
-            except Exception as exc:
-                yield f"data: {json.dumps({'type': 'log', 'line': f'Warning: could not merge secondary projections: {exc}', 'timestamp': int(time.time() * 1000)})}\n\n"
-            finally:
+        # ---- Merge both outputs into final projections.csv ------------------
+        try:
+            import pandas as pd
+
+            dff_df = pd.read_csv(dff_out) if dff_out.exists() else pd.DataFrame()
+            rw_df  = pd.read_csv(rw_out)  if rw_out.exists()  else pd.DataFrame()
+
+            # --- Step 1: build player pool (slot/roster membership) ----------
+            # RW pool  — all starters already filtered by the fetch script
+            # DFF pool — confirmed batters only (slot_confirmed=True) + all pitchers
+            #            (DFF already excludes zero-projection pitchers in its parser)
+            rw_pool = rw_df.copy()
+
+            if not dff_df.empty and {"lineup_slot", "slot_confirmed"}.issubset(dff_df.columns):
+                dff_pitchers = dff_df[dff_df["lineup_slot"] == 10]
+                dff_batters  = dff_df[(dff_df["lineup_slot"] != 10) & dff_df["slot_confirmed"].astype(bool)]
+                dff_pool     = pd.concat([dff_batters, dff_pitchers], ignore_index=True)
+            else:
+                dff_pool = dff_df.copy()
+
+            if rw_pool.empty and dff_pool.empty:
+                yield _log("Error: both projection sources produced no usable data.")
+                yield f"data: {json.dumps({'type': 'done', 'returncode': 1, 'timestamp': int(time.time() * 1000)})}\n\n"
+                return
+
+            # Union: start with RW starters, append any DFF-pool players not in RW
+            rw_ids    = set(rw_pool["player_id"].tolist()) if not rw_pool.empty else set()
+            dff_extra = dff_pool[~dff_pool["player_id"].isin(rw_ids)] if not dff_pool.empty else pd.DataFrame()
+            pool      = pd.concat([rw_pool, dff_extra], ignore_index=True)
+
+            # --- Step 2: apply preferred source's mean/std_dev ---------------
+            # The full DFF CSV (including unconfirmed batters) and the RW CSV are
+            # both used as projection-value lookup tables.  Pool membership (step 1)
+            # and projection-value preference are independent: a RW batter enters
+            # the pool via RW but still gets DFF's fantasy-point projection if DFF
+            # is preferred and has a value for them.
+            pref_proj_df = dff_df if is_dff_preferred else rw_df
+
+            fallback_names: list[str] = []
+            if not pref_proj_df.empty and {"player_id", "mean", "std_dev"}.issubset(pref_proj_df.columns):
+                pref_lookup = (
+                    pref_proj_df.drop_duplicates("player_id")
+                    .set_index("player_id")[["mean", "std_dev"]]
+                )
+                pool = pool.merge(
+                    pref_lookup.rename(columns={"mean": "_pm", "std_dev": "_ps"}),
+                    on="player_id",
+                    how="left",
+                )
+                has_pref = pool["_pm"].notna()
+                pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
+                pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
+                pool = pool.drop(columns=["_pm", "_ps"])
+                fallback_names = pool.loc[~has_pref, "name"].tolist() if "name" in pool.columns else []
+
+            out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+            merged_df = pool[[c for c in out_cols if c in pool.columns]]
+            merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
+            merged_df.to_csv(proj_path, index=False)
+
+            if fallback_names:
+                yield f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_names), 'players': fallback_names, 'timestamp': int(time.time() * 1000)})}\n\n"
+            else:
+                yield _log(f"All player projections sourced from {preferred_label}.")
+
+        except Exception as exc:
+            yield _log(f"Warning: merge error — {exc}")
+        finally:
+            for p in (dff_out, rw_out):
                 try:
-                    secondary_path.unlink(missing_ok=True)
+                    p.unlink(missing_ok=True)
                 except Exception:
                     pass
-        else:
-            yield f"data: {json.dumps({'type': 'log', 'line': f'Secondary fetch from {secondary_source_label} failed (exit {secondary_returncode}); using primary projections only.', 'timestamp': int(time.time() * 1000)})}\n\n"
-            try:
-                secondary_path.unlink(missing_ok=True)
-            except Exception:
-                pass
 
         try:
             record_fetch_from_csv(proj_path, "auto", dk_path)
