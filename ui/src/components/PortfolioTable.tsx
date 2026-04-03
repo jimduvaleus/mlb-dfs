@@ -38,11 +38,11 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
   return (
     <div className="portfolio-table-wrap">
       <h3>Portfolio — {lineups.length} Lineups</h3>
-      {totalUnconfirmed > 0 && (
-        <div className="portfolio-unconfirmed-banner">
-          ✕ {totalUnconfirmed} unconfirmed lineup slot{totalUnconfirmed !== 1 ? 's' : ''} across portfolio
-        </div>
-      )}
+      <div className={`portfolio-unconfirmed-banner ${totalUnconfirmed === 0 ? 'portfolio-unconfirmed-banner--clear' : ''}`}>
+        {totalUnconfirmed === 0
+          ? '✓ All lineup slots confirmed'
+          : `✕ ${totalUnconfirmed} unconfirmed lineup slot${totalUnconfirmed !== 1 ? 's' : ''} across portfolio`}
+      </div>
       <div className="portfolio-cards">
         {lineups.map(lineup => {
           const sorted = sortPlayersByPosition(lineup.players)

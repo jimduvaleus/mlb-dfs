@@ -524,6 +524,12 @@ button { cursor: pointer; }
   font-weight: 500;
 }
 
+.portfolio-unconfirmed-banner--clear {
+  background: rgba(72, 187, 120, 0.15);
+  border-color: rgba(72, 187, 120, 0.4);
+  color: #48bb78;
+}
+
 .portfolio-cards {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
