@@ -142,6 +142,12 @@ export interface ErrorEvent extends SSEEvent {
 
 export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 'replacing'
 
+export interface MergeInfo {
+  secondarySource: string
+  count: number
+  players: string[]
+}
+
 // Slate game/team exclusion types
 export interface TeamStatus {
   team: string

@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useState } from 'react'
-import type { AppConfig, LineupResult, RunStatus, CompleteEvent, StoppedEvent } from './types'
+import type { AppConfig, LineupResult, MergeInfo, RunStatus, CompleteEvent, StoppedEvent } from './types'
 import { fetchConfig, fetchPortfolio, fetchUnconfirmedPlayerIds, replaceLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
@@ -55,6 +55,7 @@ const initial: State = {
 export default function App() {
   const [state, dispatch] = useReducer(reducer, initial)
   const [configError, setConfigError] = useState<string | null>(null)
+  const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
   const [stopPending, setStopPending] = useState(false)
@@ -213,7 +214,7 @@ export default function App() {
             {configError && <p className="error">{configError}</p>}
             {state.config ? (
               <>
-                <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} />
+                <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} />
                 <ConfigForm
                   config={state.config}
                   onSaved={cfg => dispatch({ type: 'set_config', config: cfg })}

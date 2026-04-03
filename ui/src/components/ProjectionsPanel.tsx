@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react'
-import type { ProjectionsStatus } from '../types'
+import type { MergeInfo, ProjectionsStatus } from '../types'
 import { fetchProjectionsStatus } from '../api'
 
 interface Props {
   disabled?: boolean
   onFetched?: () => void
+  mergeInfo: MergeInfo | null
+  onMergeInfo: (info: MergeInfo | null) => void
 }
 
 function formatET(unixSec: number): string {
@@ -18,18 +20,11 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-interface MergeInfo {
-  secondarySource: string
-  count: number
-  players: string[]
-}
-
-export function ProjectionsPanel({ disabled, onFetched }: Props) {
+export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
   const [done, setDone] = useState<{ success: boolean; code: number } | null>(null)
-  const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const esRef = useRef<EventSource | null>(null)
 
@@ -53,7 +48,7 @@ export function ProjectionsPanel({ disabled, onFetched }: Props) {
     setFetching(true)
     setLog([])
     setDone(null)
-    setMergeInfo(null)
+    onMergeInfo(null)
 
     const es = new EventSource('/api/projections/fetch')
     esRef.current = es
@@ -63,7 +58,7 @@ export function ProjectionsPanel({ disabled, onFetched }: Props) {
       if (event.type === 'log') {
         setLog(prev => [...prev, event.line])
       } else if (event.type === 'merge_info') {
-        setMergeInfo({ secondarySource: event.secondary_source, count: event.count, players: event.players })
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players: event.players })
       } else if (event.type === 'done') {
         setFetching(false)
         setDone({ success: event.returncode === 0, code: event.returncode })
