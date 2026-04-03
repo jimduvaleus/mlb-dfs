@@ -508,9 +508,20 @@ button { cursor: pointer; }
 /* ── Portfolio cards ── */
 
 .portfolio-table-wrap h3 {
-  margin: 0 0 16px;
+  margin: 0 0 10px;
   font-size: 16px;
   font-weight: 600;
+}
+
+.portfolio-unconfirmed-banner {
+  margin: 0 0 16px;
+  padding: 6px 12px;
+  background: rgba(246, 173, 85, 0.15);
+  border: 1px solid rgba(246, 173, 85, 0.4);
+  border-radius: 6px;
+  color: #f6ad55;
+  font-size: 13px;
+  font-weight: 500;
 }
 
 .portfolio-cards {

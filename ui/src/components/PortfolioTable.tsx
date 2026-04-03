@@ -30,9 +30,19 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
   if (lineups.length === 0) return null
   const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
+  const totalUnconfirmed = lineups.reduce(
+    (sum, lineup) => sum + lineup.players.filter(p => unconfirmedSet.has(p.player_id)).length,
+    0
+  )
+
   return (
     <div className="portfolio-table-wrap">
       <h3>Portfolio — {lineups.length} Lineups</h3>
+      {totalUnconfirmed > 0 && (
+        <div className="portfolio-unconfirmed-banner">
+          ✕ {totalUnconfirmed} unconfirmed lineup slot{totalUnconfirmed !== 1 ? 's' : ''} across portfolio
+        </div>
+      )}
       <div className="portfolio-cards">
         {lineups.map(lineup => {
           const sorted = sortPlayersByPosition(lineup.players)
