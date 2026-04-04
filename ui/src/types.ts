@@ -98,9 +98,13 @@ export interface SSEEvent {
 
 export interface LoadSlateEvent extends SSEEvent {
   stage: 'load_slate'
-  n_players: number
   n_teams: number
-  n_units: number
+  n_batters: number
+  n_pitchers: number
+  multi_pitcher_teams: Record<string, number>
+  n_teams_excluded: number
+  n_batters_ind_excluded: number
+  n_pitchers_ind_excluded: number
 }
 
 export interface SimulateEvent extends SSEEvent {

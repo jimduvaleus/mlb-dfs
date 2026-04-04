@@ -101,13 +101,19 @@ class PipelineRunner:
                 slate_df[["player_id", "name"]], on="player_id", how="left"
             )
 
-        players_df = self._apply_exclusions(players_df)
+        players_df, excl_stats = self._apply_exclusions(players_df)
 
-        n_units = players_df.groupby(["team", "opponent"]).ngroups
+        n_teams_loaded = players_df["team"].nunique()
+        n_batters = int((players_df["position"] != "P").sum())
+        n_pitchers = int((players_df["position"] == "P").sum())
+        pitcher_counts = players_df[players_df["position"] == "P"].groupby("team").size()
+        multi_pitcher_teams = {team: int(cnt) for team, cnt in pitcher_counts.items() if cnt > 1}
         self._cb("load_slate", {
-            "n_players": len(players_df),
-            "n_teams": n_teams,
-            "n_units": n_units,
+            "n_teams": n_teams_loaded,
+            "n_batters": n_batters,
+            "n_pitchers": n_pitchers,
+            "multi_pitcher_teams": multi_pitcher_teams,
+            **excl_stats,
         })
 
         # --- Load copula -------------------------------------------------
@@ -431,26 +437,37 @@ class PipelineRunner:
         return df[["player_id", "team", "opponent", "slot", "mean", "std_dev", "position", "salary", "game"]]
 
     @staticmethod
-    def _apply_exclusions(players_df: pd.DataFrame) -> pd.DataFrame:
-        """Filter players_df based on persisted slate exclusions."""
+    def _apply_exclusions(players_df: pd.DataFrame) -> tuple:
+        """Filter players_df based on persisted slate exclusions.
+
+        Returns (filtered_df, excl_stats) where excl_stats has:
+          n_teams_excluded, n_batters_ind_excluded, n_pitchers_ind_excluded
+        """
         from .slate_exclusions import compute_slate_id, read_exclusions
+        empty_stats: dict = {"n_teams_excluded": 0, "n_batters_ind_excluded": 0, "n_pitchers_ind_excluded": 0}
         stored = read_exclusions()
         if not stored.get("slate_id"):
-            return players_df
+            return players_df, empty_stats
 
         current_games = [g for g in players_df["game"].dropna().unique().tolist() if g]
         if compute_slate_id(current_games) != stored["slate_id"]:
             logger.warning(
                 "Slate exclusions slate_id mismatch — skipping exclusions to avoid stale filtering."
             )
-            return players_df
+            return players_df, empty_stats
 
         excluded_games = set(stored.get("excluded_games", []))
         excluded_teams = set(stored.get("excluded_teams", []))
         excluded_player_ids = set(stored.get("excluded_player_ids", []))
         if not excluded_games and not excluded_teams and not excluded_player_ids:
-            return players_df
+            return players_df, empty_stats
 
+        # Count individually excluded players by position (before team/game exclusions)
+        ind_excl_df = players_df[players_df["player_id"].isin(excluded_player_ids)]
+        n_batters_ind_excluded = int((ind_excl_df["position"] != "P").sum())
+        n_pitchers_ind_excluded = int((ind_excl_df["position"] == "P").sum())
+
+        pre_n_teams = players_df["team"].nunique()
         mask = (
             players_df["game"].isin(excluded_games) |
             players_df["team"].isin(excluded_teams) |
@@ -460,7 +477,14 @@ class PipelineRunner:
         n_removed = len(players_df) - len(filtered)
         if n_removed:
             logger.info("Exclusions removed %d players (%d remain).", n_removed, len(filtered))
-        return filtered
+
+        n_teams_excluded = pre_n_teams - filtered["team"].nunique()
+        excl_stats = {
+            "n_teams_excluded": int(n_teams_excluded),
+            "n_batters_ind_excluded": n_batters_ind_excluded,
+            "n_pitchers_ind_excluded": n_pitchers_ind_excluded,
+        }
+        return filtered, excl_stats
 
     @staticmethod
     def _best_lineup_score_distribution(
