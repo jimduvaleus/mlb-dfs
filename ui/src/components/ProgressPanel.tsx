@@ -60,7 +60,9 @@ export function ProgressPanel({ events, running }: Props) {
       )}
 
       <div className="event-list">
-        {events.filter(e => e.stage !== 'optimize_lineup').map((e, i) => (
+        {events.filter(e => e.stage !== 'optimize_lineup').filter((e, i, arr) =>
+          e.stage !== 'calibrate_beta' || arr.findIndex((x, j) => x.stage === 'calibrate_beta' && j > i) === -1
+        ).map((e, i) => (
           <div key={i} className={`event-row event-${e.stage}`}>
             <span className="event-stage">{STAGE_LABELS[e.stage] ?? e.stage}</span>
             <span className="event-detail">{renderDetail(e)}</span>
@@ -116,8 +118,8 @@ function renderDetail(e: SSEEvent): string {
         : `Target: ${ev.target.toFixed(1)} pts (manual)`
     }
     case 'calibrate_beta': {
-      const ev = e as unknown as { payout_beta: number }
-      return `Payout beta: ${ev.payout_beta}`
+      const ev = e as unknown as { payout_beta?: number; payout_cash_line?: number }
+      return ev.payout_beta != null ? `Payout beta: ${ev.payout_beta}` : 'Calibrating…'
     }
     case 'optimize_lineup': {
       const ev = e as OptimizeLineupEvent
