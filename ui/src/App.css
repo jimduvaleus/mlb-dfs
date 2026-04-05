@@ -431,6 +431,12 @@ button { cursor: pointer; }
   line-height: 1.5;
 }
 
+.merge-info-team-label {
+  color: #63b3ed;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
 /* ── Progress panel ── */
 
 .progress-panel {

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import type { MergeInfo, ProjectionsStatus } from '../types'
 import { fetchProjectionsStatus } from '../api'
 
@@ -153,7 +153,24 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo }
         <div className="merge-info-callout">
           <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback projection</strong>
           <div className="merge-info-players">
-            {mergeInfo.players.join(', ')}
+            {(() => {
+              const byTeam = mergeInfo.players.reduce<Record<string, string[]>>((acc, p) => {
+                const key = p.team || '—'
+                ;(acc[key] ??= []).push(p.name)
+                return acc
+              }, {})
+              return Object.entries(byTeam)
+                .sort(([a], [b]) => a.localeCompare(b))
+                .map(([team, names]) => (
+                  <span key={team} className="merge-info-team-group">
+                    <span className="merge-info-team-label">{team}</span>
+                    {' ('}
+                    {names.join(', ')}
+                    {')'}
+                  </span>
+                ))
+                .reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])
+            })()}
           </div>
         </div>
       )}

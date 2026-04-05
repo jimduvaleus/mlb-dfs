@@ -446,7 +446,7 @@ async def projections_fetch(request: Request):
             # is preferred and has a value for them.
             pref_proj_df = dff_df if is_dff_preferred else rw_df
 
-            fallback_names: list[str] = []
+            fallback_players: list[dict] = []
             if not pref_proj_df.empty and {"player_id", "mean", "std_dev"}.issubset(pref_proj_df.columns):
                 pref_lookup = (
                     pref_proj_df.drop_duplicates("player_id")
@@ -461,15 +461,31 @@ async def projections_fetch(request: Request):
                 pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
                 pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
                 pool = pool.drop(columns=["_pm", "_ps"])
-                fallback_names = pool.loc[~has_pref, "name"].tolist() if "name" in pool.columns else []
+                fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
+
+                # Build player list with team info from DK slate
+                if not fallback_rows.empty:
+                    id_to_team: dict = {}
+                    if dk_path is not None:
+                        try:
+                            dk_df = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
+                            id_to_team = dict(zip(dk_df["ID"], dk_df["TeamAbbrev"]))
+                        except Exception:
+                            pass
+                    for _, row in fallback_rows.iterrows():
+                        fallback_players.append({
+                            "name": row["name"],
+                            "team": id_to_team.get(int(row["player_id"]), "") if "player_id" in fallback_rows.columns else "",
+                        })
+
 
             out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
             merged_df = pool[[c for c in out_cols if c in pool.columns]]
             merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
             merged_df.to_csv(proj_path, index=False)
 
-            if fallback_names:
-                yield f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_names), 'players': fallback_names, 'timestamp': int(time.time() * 1000)})}\n\n"
+            if fallback_players:
+                yield f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players), 'players': fallback_players, 'timestamp': int(time.time() * 1000)})}\n\n"
             else:
                 yield _log(f"All player projections sourced from {preferred_label}.")
 
