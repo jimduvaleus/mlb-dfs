@@ -69,11 +69,6 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
               <div className="lineup-card-header">
                 <span className="lineup-card-num">#{lineup.lineup_index}</span>
                 <span className="lineup-card-salary">${lineup.lineup_salary.toLocaleString()}</span>
-                {lineup.upload_tag && (
-                  <span className="lineup-card-entry-info">
-                    {lineup.upload_tag}{lineup.entry_fee ? ` ${lineup.entry_fee}` : ''}{lineup.contest_name ? ` ${lineup.contest_name}` : ''}
-                  </span>
-                )}
                 <div className="lineup-card-header-right">
                   {isReplacing ? (
                     <span className="lineup-card-generating">Generating…</span>
@@ -94,6 +89,11 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
                   )}
                 </div>
               </div>
+              {lineup.upload_tag && (
+                <div className="lineup-card-entry-info">
+                  {lineup.upload_tag}{lineup.entry_fee ? ` ${lineup.entry_fee}` : ''}{lineup.contest_name ? ` ${lineup.contest_name}` : ''}
+                </div>
+              )}
               <div className="lineup-card-players">
                 {sorted.map((p, i) => (
                   <div key={i} className="lineup-player">

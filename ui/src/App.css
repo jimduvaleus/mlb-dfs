@@ -573,8 +573,10 @@ button { cursor: pointer; }
 .lineup-card-entry-info {
   font-size: 14px;
   font-weight: 600;
-  color: #68d391;
+  color: #4a7c59;
   letter-spacing: 0.02em;
+  padding: 5px 17px;
+  border-bottom: 1px solid #2d3748;
 }
 
 .lineup-card-header-right {
@@ -591,7 +593,7 @@ button { cursor: pointer; }
   color: #718096;
   padding: 2px 6px;
   border-radius: 4px;
-  font-size: 14px;
+  font-size: 17px;
   line-height: 1;
 }
 .lineup-card-delete:hover:not(:disabled) { color: #fc8181; background: rgba(252, 129, 129, 0.1); }
@@ -619,7 +621,6 @@ button { cursor: pointer; }
   font-weight: 700;
   color: #b794f4;
   font-family: monospace;
-  font-size: 14px;
   letter-spacing: 0.04em;
 }
 
@@ -691,13 +692,13 @@ button { cursor: pointer; }
   align-items: center;
   gap: 4px;
   color: #718096;
-  font-size: 14px;
+  font-size: 17px;
 }
 
 .lineup-player-sal {
   padding-right: 17px;
   color: #4a5568;
-  font-size: 14px;
+  font-size: 17px;
   min-width: 48px;
   text-align: right;
   font-variant-numeric: tabular-nums;
