@@ -58,6 +58,9 @@ class LineupResult(BaseModel):
     p_hit_target: float
     lineup_salary: int
     players: list[PlayerRow]
+    upload_tag: Optional[str] = None
+    entry_fee: Optional[str] = None
+    contest_name: Optional[str] = None
 
 
 class PortfolioResult(BaseModel):

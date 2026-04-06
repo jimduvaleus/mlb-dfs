@@ -56,6 +56,9 @@ export interface LineupResult {
   p_hit_target: number
   lineup_salary: number
   players: PlayerRow[]
+  upload_tag?: string | null
+  entry_fee?: string | null
+  contest_name?: string | null
 }
 
 export interface SlateOption {

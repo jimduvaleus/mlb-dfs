@@ -4,8 +4,10 @@ PipelineRunner — wraps the main.py pipeline with progress callbacks.
 Emits callback events at each pipeline stage so the API can forward them
 as SSE events to the browser.
 """
+import json
 import logging
 import os
+import re
 from typing import Callable, Optional
 
 import numpy as np
@@ -21,6 +23,25 @@ from src.simulation.engine import SimulationEngine
 from src.simulation.results import SimulationResults
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_upload_tag(filename: str) -> str:
+    """Extract the unique prefix from entry filenames.
+
+    'GEDKSalaries.csv' → 'GE'
+    """
+    return re.sub(r'DKEntries\.csv$', '', filename, flags=re.IGNORECASE)
+
+
+def _shorten_contest_name(name: str) -> str:
+    """Produce a display-friendly contest name.
+
+    'MLB $12K Base Hit [Single Entry]' → 'Base Hit'
+    """
+    name = re.sub(r'^MLB\s+', '', name)
+    name = re.sub(r'^\$[\d.,]+[KkMm]?\s+', '', name)
+    name = re.sub(r'\s*\[.*?\]\s*$', '', name)
+    return name.strip()
 
 
 class PipelineRunner:
@@ -255,12 +276,6 @@ class PipelineRunner:
 
         was_stopped = self._stop_check is not None and self._stop_check()
 
-        if was_stopped:
-            logger.info("Run stopped by user after %d lineups.", len(portfolio))
-            self._cb("stopped", {"portfolio": result, "n_lineups": len(result)})
-        else:
-            self._cb("complete", {"portfolio": result, "n_lineups": len(result)})
-
         # --- Save CSV ---------------------------------------------------
         os.makedirs(output_dir, exist_ok=True)
         portfolio_df = self._format_portfolio_df(portfolio, players_df)
@@ -276,6 +291,22 @@ class PipelineRunner:
                 all_file_entries, assignments, slate_df, output_dir
             )
             self._cb("upload_files", {"n_files": len(paths_written), "paths": paths_written})
+
+            entry_map = self._build_lineup_entry_map(all_file_entries, portfolio)
+            for lr in result:
+                info = entry_map.get(lr["lineup_index"])
+                if info:
+                    lr.update(info)
+            meta_path = os.path.join(output_dir, "portfolio_entries.json")
+            with open(meta_path, "w") as f:
+                json.dump({str(k): v for k, v in entry_map.items()}, f)
+
+        # --- Notify (after entry augmentation so SSE payload is complete) -
+        if was_stopped:
+            logger.info("Run stopped by user after %d lineups.", len(portfolio))
+            self._cb("stopped", {"portfolio": result, "n_lineups": len(result)})
+        else:
+            self._cb("complete", {"portfolio": result, "n_lineups": len(result)})
 
         return result
 
@@ -368,6 +399,15 @@ class PipelineRunner:
 
         if self._all_file_entries:
             self.write_upload_files()
+
+            entry_map = self._build_lineup_entry_map(self._all_file_entries, self._raw_portfolio)
+            for lr in result:
+                info = entry_map.get(lr["lineup_index"])
+                if info:
+                    lr.update(info)
+            meta_path = os.path.join(self._output_dir, "portfolio_entries.json")
+            with open(meta_path, "w") as f:
+                json.dump({str(k): v for k, v in entry_map.items()}, f)
 
         return result
 
@@ -565,6 +605,31 @@ class PipelineRunner:
                 "players": players,
             })
         return result
+
+    @staticmethod
+    def _build_lineup_entry_map(
+        all_file_entries: list,
+        portfolio: list,
+    ) -> dict[int, dict]:
+        """Return {lineup_index: {upload_tag, entry_fee, contest_name}} from entry assignments.
+
+        Uses the same fee-descending assignment order as assign_lineups_to_entries.
+        """
+        flat: list = []
+        for file_path, records in all_file_entries:
+            for rec in records:
+                flat.append((rec.entry_fee_cents, len(flat), file_path, rec))
+        flat.sort(key=lambda x: x[0], reverse=True)
+        entry_map: dict[int, dict] = {}
+        for i, (_, _, file_path, rec) in enumerate(flat):
+            if i >= len(portfolio):
+                break
+            entry_map[i + 1] = {
+                "upload_tag": _extract_upload_tag(file_path.name),
+                "entry_fee": rec.entry_fee_raw,
+                "contest_name": _shorten_contest_name(rec.contest_name),
+            }
+        return entry_map
 
     @staticmethod
     def _format_portfolio_df(

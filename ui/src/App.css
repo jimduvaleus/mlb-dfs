@@ -570,6 +570,13 @@ button { cursor: pointer; }
   color: #f6ad55;
 }
 
+.lineup-card-entry-info {
+  font-size: 14px;
+  font-weight: 600;
+  color: #68d391;
+  letter-spacing: 0.02em;
+}
+
 .lineup-card-header-right {
   margin-left: auto;
   display: flex;
@@ -612,6 +619,7 @@ button { cursor: pointer; }
   font-weight: 700;
   color: #b794f4;
   font-family: monospace;
+  font-size: 14px;
   letter-spacing: 0.04em;
 }
 

@@ -91,6 +91,15 @@ def _load_persisted_portfolio() -> None:
                 "players": players,
             })
         if portfolio:
+            meta_path = path.parent / "portfolio_entries.json"
+            if meta_path.exists():
+                import json
+                with open(meta_path) as mf:
+                    entry_meta = json.load(mf)
+                for lr in portfolio:
+                    info = entry_meta.get(str(lr["lineup_index"]))
+                    if info:
+                        lr.update(info)
             _state["portfolio"] = portfolio
             _state["status"] = "complete"
     except Exception:
