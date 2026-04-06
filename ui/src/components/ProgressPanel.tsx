@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import type { SSEEvent, OptimizeLineupEvent } from '../types'
 
 interface Props {
@@ -8,6 +9,13 @@ interface Props {
 function formatMs(ms: number): string {
   if (ms < 1000) return `${ms}ms`
   if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
+  const m = Math.floor(ms / 60000)
+  const s = Math.round((ms % 60000) / 1000)
+  return `${m}m ${s}s`
+}
+
+function formatMsWhole(ms: number): string {
+  if (ms < 60000) return `${Math.round(ms / 1000)}s`
   const m = Math.floor(ms / 60000)
   const s = Math.round((ms % 60000) / 1000)
   return `${m}m ${s}s`
@@ -25,6 +33,19 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 export function ProgressPanel({ events, running }: Props) {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (!running) return
+    const id = setInterval(() => setNow(Date.now()), 5000)
+    return () => clearInterval(id)
+  }, [running])
+
+  useEffect(() => {
+    const last = events[events.length - 1]
+    if (last?.stage === 'optimize_lineup') setNow(Date.now())
+  }, [events])
+
   if (events.length === 0 && !running) return null
 
   const first = events[0]
@@ -39,10 +60,39 @@ export function ProgressPanel({ events, running }: Props) {
   const current = latestLineup?.lineup_index ?? 0
   const pct = total > 0 ? Math.round((current / total) * 100) : 0
 
+  // ETA: use the last 3 lineup intervals (recent performance) to avoid optimism
+  // from fast early lineups skewing the average downward.
+  const lineupEvents = events.filter(e => e.stage === 'optimize_lineup') as OptimizeLineupEvent[]
+  let etaMs: number | null = null
+  if (running && current > 0 && total > current) {
+    let avgPerLineup: number
+    const recent = lineupEvents.slice(-4) // up to 4 events → 3 intervals
+    if (recent.length >= 2) {
+      const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+      avgPerLineup = recentElapsed / (recent.length - 1)
+    } else {
+      // Only one lineup done — use time since it completed as a floor
+      avgPerLineup = now - recent[0].timestamp
+    }
+    etaMs = avgPerLineup * (total - current)
+  }
+
+  const liveElapsedMs = running && first && current > 0 ? now - first.timestamp : null
+
   return (
     <div className="progress-panel">
       <h3>
         Run Progress
+        {liveElapsedMs !== null && (
+          <span className="muted" style={{ marginLeft: 8, fontWeight: 400, fontSize: '0.9em' }}>
+            {formatMsWhole(liveElapsedMs)} elapsed
+            {etaMs !== null && etaMs > 0 && (
+              <span style={{ marginLeft: 12 }}>
+                ~{formatMsWhole(etaMs)} remaining
+              </span>
+            )}
+          </span>
+        )}
         {elapsed !== null && !running && (
           <span className="muted" style={{ marginLeft: 8, fontWeight: 400, fontSize: '0.9em' }}>
             ({formatMs(elapsed)} total)
