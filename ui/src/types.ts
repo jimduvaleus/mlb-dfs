@@ -47,6 +47,8 @@ export interface PlayerRow {
   position: string
   team: string
   salary: number
+  slot?: number | null
+  slot_confirmed?: boolean
 }
 
 export interface LineupResult {

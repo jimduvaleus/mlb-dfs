@@ -95,9 +95,13 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
                     <span className="lineup-player-pos">{p.position}</span>
                     <span className="lineup-player-name">
                       {p.name}
-                      {unconfirmedSet.has(p.player_id) && (
-                        <span className="unconfirmed-icon" title="Lineup slot unconfirmed">✕</span>
-                      )}
+                      {p.position !== 'P' && (() => {
+                        const slotNum = p.slot != null && p.slot >= 1 && p.slot <= 9 ? p.slot : null
+                        if (p.slot_confirmed) {
+                          return <span className="batting-slot-bubble batting-slot-bubble--confirmed" title="Confirmed lineup slot">{slotNum ?? '?'}</span>
+                        }
+                        return <span className="batting-slot-bubble batting-slot-bubble--projected" title="Projected lineup slot">{slotNum ?? '?'}</span>
+                      })()}
                     </span>
                     <TeamBadge team={p.team} className="lineup-player-team" />
                     <span className="lineup-player-sal">${(p.salary / 1000).toFixed(1)}k</span>

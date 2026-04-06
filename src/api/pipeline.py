@@ -417,6 +417,8 @@ class PipelineRunner:
             proj_cols = ["player_id", "mean", "std_dev"]
             if "lineup_slot" in proj.columns:
                 proj_cols.append("lineup_slot")
+            if "slot_confirmed" in proj.columns:
+                proj_cols.append("slot_confirmed")
             df = df.merge(proj[proj_cols], on="player_id", how="left")
             if "lineup_slot" in df.columns:
                 before = len(df)
@@ -434,7 +436,10 @@ class PipelineRunner:
             logger.info("No projections — using salary-based heuristic.")
             df["mean"] = df["salary"] / 400.0
             df["std_dev"] = df["mean"] * 0.85
-        return df[["player_id", "team", "opponent", "slot", "mean", "std_dev", "position", "salary", "game"]]
+        base_cols = ["player_id", "team", "opponent", "slot", "mean", "std_dev", "position", "salary", "game"]
+        if "slot_confirmed" in df.columns:
+            base_cols.append("slot_confirmed")
+        return df[base_cols]
 
     @staticmethod
     def _apply_exclusions(players_df: pd.DataFrame) -> tuple:
@@ -533,6 +538,10 @@ class PipelineRunner:
         id_to_salary = dict(zip(players_df["player_id"], players_df["salary"]))
         id_to_pos = dict(zip(players_df["player_id"], players_df["position"]))
         id_to_team = dict(zip(players_df["player_id"], players_df["team"]))
+        id_to_slot = dict(zip(players_df["player_id"], players_df["slot"]))
+        id_to_confirmed: dict = {}
+        if "slot_confirmed" in players_df.columns:
+            id_to_confirmed = dict(zip(players_df["player_id"], players_df["slot_confirmed"].astype(bool)))
 
         result = []
         for i, (lineup, score) in enumerate(portfolio, start=1):
@@ -544,6 +553,8 @@ class PipelineRunner:
                     "position": id_to_pos.get(pid, ""),
                     "team": id_to_team.get(pid, ""),
                     "salary": id_to_salary.get(pid, 0),
+                    "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
+                    "slot_confirmed": bool(id_to_confirmed[pid]) if pid in id_to_confirmed else False,
                 }
                 for pid in lineup.player_ids
             ]
@@ -564,6 +575,10 @@ class PipelineRunner:
         id_to_salary = dict(zip(players_df["player_id"], players_df["salary"]))
         id_to_pos = dict(zip(players_df["player_id"], players_df["position"]))
         id_to_team = dict(zip(players_df["player_id"], players_df["team"]))
+        id_to_slot = dict(zip(players_df["player_id"], players_df["slot"]))
+        id_to_confirmed: dict = {}
+        if "slot_confirmed" in players_df.columns:
+            id_to_confirmed = dict(zip(players_df["player_id"], players_df["slot_confirmed"].astype(bool)))
         rows = []
         for i, (lineup, score) in enumerate(portfolio, start=1):
             total_salary = sum(id_to_salary.get(pid, 0) for pid in lineup.player_ids)
@@ -577,5 +592,7 @@ class PipelineRunner:
                     "team": id_to_team.get(pid, ""),
                     "salary": id_to_salary.get(pid, 0),
                     "lineup_salary": total_salary,
+                    "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
+                    "slot_confirmed": bool(id_to_confirmed[pid]) if pid in id_to_confirmed else False,
                 })
         return pd.DataFrame(rows)
