@@ -30,10 +30,26 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
   if (lineups.length === 0) return null
   const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
-  const totalUnconfirmed = lineups.reduce(
-    (sum, lineup) => sum + lineup.players.filter(p => unconfirmedSet.has(p.player_id)).length,
-    0
-  )
+  const unconfirmedByPlayer = new Map<number, { name: string; count: number }>()
+  for (const lineup of lineups) {
+    for (const p of lineup.players) {
+      if (unconfirmedSet.has(p.player_id)) {
+        const entry = unconfirmedByPlayer.get(p.player_id)
+        if (entry) {
+          entry.count++
+        } else {
+          unconfirmedByPlayer.set(p.player_id, { name: p.name, count: 1 })
+        }
+      }
+    }
+  }
+
+  const totalUnconfirmed = Array.from(unconfirmedByPlayer.values()).reduce((sum, e) => sum + e.count, 0)
+
+  const sortedUnconfirmedPlayers = Array.from(unconfirmedByPlayer.values()).sort((a, b) => b.count - a.count)
+  const breakdown = unconfirmedByPlayer.size <= 5
+    ? ' — ' + sortedUnconfirmedPlayers.map(e => `${e.count} ${e.name}`).join(', ')
+    : ''
 
   return (
     <div className="portfolio-table-wrap">
@@ -41,7 +57,7 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
       <div className={`portfolio-unconfirmed-banner ${totalUnconfirmed === 0 ? 'portfolio-unconfirmed-banner--clear' : ''}`}>
         {totalUnconfirmed === 0
           ? '✓ All lineup slots confirmed'
-          : `✕ ${totalUnconfirmed} unconfirmed lineup slot${totalUnconfirmed !== 1 ? 's' : ''} across portfolio`}
+          : `✕ ${totalUnconfirmed} unconfirmed lineup slot${totalUnconfirmed !== 1 ? 's' : ''} across portfolio${breakdown}`}
       </div>
       <div className="portfolio-cards">
         {lineups.map(lineup => {
