@@ -174,26 +174,27 @@ class PipelineRunner:
             self._cb("compute_target", {"target": target, "percentile": target_percentile})
         else:
             target = float(target)
+            target_percentile = None
             logger.info("Using configured target: %.1f DK pts", target)
             self._cb("compute_target", {"target": target, "percentile": None})
 
         # --- Resolve payout beta and cash line ----------------------------------
         objective = str(opt_cfg.get("objective", "expected_surplus"))
         payout_beta_cfg = opt_cfg.get("payout_beta")
+        _BETA_MAX = 4.0
         if objective == "marginal_payout":
-            from src.optimization.payout import calibrate_beta, load_payout_structure, get_cash_line_score
+            from src.optimization.payout import load_payout_structure, get_cash_line_score
             score_dist = self._best_lineup_score_distribution(players_df, sim_results)
             score_percentiles = np.percentile(score_dist, np.arange(1, 101))
             structure = load_payout_structure("dk_classic_gpp")
             payout_cash_line = get_cash_line_score(structure, score_percentiles)
             logger.info("Payout cash line score: %.1f DK pts", payout_cash_line)
-            self._cb("calibrate_beta", {"payout_cash_line": round(float(payout_cash_line), 1)})
-            if payout_beta_cfg is None:
-                payout_beta = calibrate_beta(structure, score_percentiles, payout_cash_line)
-                logger.info("Auto-calibrated payout beta: %.2f", payout_beta)
-                self._cb("calibrate_beta", {"payout_beta": round(payout_beta, 2), "payout_cash_line": round(float(payout_cash_line), 1)})
-            else:
-                payout_beta = float(payout_beta_cfg)
+            raw_beta = float(payout_beta_cfg) if payout_beta_cfg is not None else 2.5
+            payout_beta = min(raw_beta, _BETA_MAX)
+            if payout_beta != raw_beta:
+                logger.info("Payout beta capped from %.2f to %.2f", raw_beta, _BETA_MAX)
+            logger.info("Payout beta: %.2f", payout_beta)
+            self._cb("calibrate_beta", {"payout_beta": round(payout_beta, 2), "payout_cash_line": round(float(payout_cash_line), 1)})
         else:
             payout_cash_line = None
             payout_beta = float(payout_beta_cfg) if payout_beta_cfg is not None else 2.5
@@ -253,6 +254,8 @@ class PipelineRunner:
         def _on_lineup_complete(
             lineup_index: int, total: int, score: float,
             arg4: int, arg5: int, arg6: Optional[int] = None,
+            arg7: Optional[float] = None, arg8: Optional[float] = None,
+            arg9: Optional[float] = None,
         ) -> None:
             if objective == "marginal_payout":
                 self._cb("optimize_lineup", {
@@ -262,6 +265,10 @@ class PipelineRunner:
                     "sims_great": arg4,
                     "sims_good": arg5,
                     "sims_uncovered": arg6,
+                    "p90": round(arg7, 1) if arg7 is not None else None,
+                    "p99": round(arg8, 1) if arg8 is not None else None,
+                    "p_target": round(arg9, 1) if arg9 is not None else None,
+                    "target_percentile": target_percentile,
                     "objective": objective,
                 })
             else:
@@ -274,9 +281,52 @@ class PipelineRunner:
                     "objective": objective,
                 })
 
+        def _on_portfolio_complete(best_scores: np.ndarray) -> None:
+            n_sims = len(best_scores)
+            covered_mask = best_scores >= target
+            covered = best_scores[covered_mask]
+
+            # Build histogram across the full best_scores range (~40 buckets).
+            score_min = float(best_scores.min())
+            score_max = float(best_scores.max())
+            n_buckets = 40
+            bucket_size = (score_max - score_min) / n_buckets if score_max > score_min else 1.0
+            histogram = []
+            for k in range(n_buckets):
+                lo = score_min + k * bucket_size
+                hi = lo + bucket_size
+                count = int(((best_scores >= lo) & (best_scores < hi)).sum())
+                histogram.append({
+                    "lo": round(lo, 1),
+                    "hi": round(hi, 1),
+                    "mid": round((lo + hi) / 2, 1),
+                    "count": count,
+                })
+
+            def _pct(arr: np.ndarray, q: float) -> Optional[float]:
+                return round(float(np.percentile(arr, q)), 1) if len(arr) > 0 else None
+
+            self._cb("portfolio_stats", {
+                "target": round(target, 1),
+                "great_threshold": round(target + 15.0, 1),
+                "n_sims": n_sims,
+                "covered_count": int(covered_mask.sum()),
+                "covered_mean": round(float(covered.mean()), 1) if len(covered) > 0 else None,
+                "covered_p50": _pct(covered, 50),
+                "covered_p90": _pct(covered, 90),
+                "covered_p95": _pct(covered, 95),
+                "covered_p99": _pct(covered, 99),
+                "overall_p90": round(float(np.percentile(best_scores, 90)), 1),
+                "overall_p95": round(float(np.percentile(best_scores, 95)), 1),
+                "overall_p99": round(float(np.percentile(best_scores, 99)), 1),
+                "histogram": histogram,
+            })
+
         portfolio = constructor.construct(
             on_lineup_complete=_on_lineup_complete,
+            on_portfolio_complete=_on_portfolio_complete if objective == "marginal_payout" else None,
             stop_check=self._stop_check,
+            target_percentile=target_percentile if objective == "marginal_payout" else None,
         )
         logger.info("Portfolio complete: %d lineups.", len(portfolio))
 

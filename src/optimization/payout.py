@@ -122,14 +122,17 @@ def calibrate_beta(
     structure: dict,
     score_percentiles: np.ndarray,
     cash_line: float,
-    beta_range: Tuple[float, float] = (1.5, 4.0),
+    beta_range: Tuple[float, float] = (1.5, 8.0),
     n_steps: int = 100,
 ) -> float:
     """Find the beta that best fits a payout structure.
 
     Given a mapping from score percentiles to actual payouts, finds the
-    beta that minimizes the squared error between the power-law payout
-    curve and the actual payout curve (both normalized to [0, 1]).
+    beta that minimizes the payout-weighted squared error between the
+    power-law payout curve and the actual payout curve (both normalized
+    to [0, 1]).  Weighting by payout magnitude ensures the top-heavy
+    portion of the structure (where EV concentrates) drives the fit,
+    rather than the many low-value or zero-payout positions.
 
     Parameters
     ----------
@@ -153,18 +156,19 @@ def calibrate_beta(
     payouts_arr = payout_table_to_array(structure)
     total = len(payouts_arr)
 
-    # Map positions to normalized payouts (0 to 1 scale)
     max_payout = payouts_arr[0]
     if max_payout == 0:
         return 2.5  # fallback
     norm_payouts = payouts_arr / max_payout
 
-    # Map positions to score percentiles
-    # Position 1 = 100th percentile, position N = lowest paid percentile
+    # Weights proportional to payout magnitude so top positions dominate the fit.
+    weights = payouts_arr / payouts_arr.sum() if payouts_arr.sum() > 0 else np.ones(total) / total
+
+    # Map positions to score percentiles.
+    # Position 1 = 100th percentile, position N = lowest paid percentile.
     n_pctiles = len(score_percentiles)
     position_scores = np.zeros(total, dtype=np.float64)
     for i in range(total):
-        # Position i+1 corresponds to percentile (1 - (i+1)/total) * 100
         pctile_idx = int((1.0 - (i + 1) / total) * (n_pctiles - 1))
         pctile_idx = max(0, min(pctile_idx, n_pctiles - 1))
         position_scores[i] = score_percentiles[pctile_idx]
@@ -177,7 +181,7 @@ def calibrate_beta(
         pred = power_law_payout(position_scores, cash_line, b)
         pred_max = pred[0] if pred[0] > 0 else 1.0
         norm_pred = pred / pred_max
-        err = float(np.sum((norm_pred - norm_payouts) ** 2))
+        err = float(np.sum(weights * (norm_pred - norm_payouts) ** 2))
         if err < best_err:
             best_err = err
             best_beta = float(b)

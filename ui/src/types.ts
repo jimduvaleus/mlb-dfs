@@ -93,6 +93,7 @@ export type SSEStage =
   | 'compute_target'
   | 'calibrate_beta'
   | 'optimize_lineup'
+  | 'portfolio_stats'
   | 'upload_files'
   | 'complete'
   | 'stopped'
@@ -138,7 +139,29 @@ export interface OptimizeLineupEvent extends SSEEvent {
   sims_great?: number
   sims_good?: number
   sims_uncovered?: number
+  // marginal_payout objective — evolving portfolio score percentiles
+  p90?: number
+  p99?: number
+  p_target?: number
+  target_percentile?: number | null
   objective?: string
+}
+
+export interface PortfolioStatsEvent extends SSEEvent {
+  stage: 'portfolio_stats'
+  target: number
+  great_threshold: number
+  n_sims: number
+  covered_count: number
+  covered_mean: number | null
+  covered_p50: number | null
+  covered_p90: number | null
+  covered_p95: number | null
+  covered_p99: number | null
+  overall_p90: number
+  overall_p95: number
+  overall_p99: number
+  histogram: Array<{ lo: number; hi: number; mid: number; count: number }>
 }
 
 export interface CompleteEvent extends SSEEvent {

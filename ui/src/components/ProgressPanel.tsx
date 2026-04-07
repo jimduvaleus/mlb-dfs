@@ -154,13 +154,16 @@ export function ProgressPanel({ events, running }: Props) {
       </div>
 
       {events.some(e => e.stage === 'optimize_lineup') && (
-        <div className="event-list event-list-two-col">
-          {events.filter(e => e.stage === 'optimize_lineup').map((e, i) => (
-            <div key={i} className="event-row event-optimize_lineup">
-              <span className="event-stage">{STAGE_LABELS[e.stage] ?? e.stage}</span>
-              <span className="event-detail">{renderDetail(e)}</span>
-            </div>
-          ))}
+        <div className="event-list event-list-three-col">
+          {events.filter(e => e.stage === 'optimize_lineup').map((e, i) => {
+            const ev = e as OptimizeLineupEvent
+            return (
+              <div key={i} className="event-row event-optimize_lineup">
+                <span className="event-stage event-stage-lineup">{ev.lineup_index}/{ev.total}</span>
+                <span className="event-detail">{renderDetail(e)}</span>
+              </div>
+            )
+          })}
         </div>
       )}
     </div>
@@ -238,14 +241,11 @@ function renderDetail(e: SSEEvent): string {
     case 'optimize_lineup': {
       const ev = e as OptimizeLineupEvent
       if (ev.objective === 'marginal_payout') {
-        const n = (ev.sims_great ?? 0) + (ev.sims_good ?? 0) + (ev.sims_uncovered ?? 0)
-        if (n > 0) {
-          const pGreat = Math.round(((ev.sims_great ?? 0) / n) * 100)
-          const pGood = Math.round(((ev.sims_good ?? 0) / n) * 100)
-          const pUncovered = 100 - pGreat - pGood
-          return `Lineup ${ev.lineup_index}/${ev.total} — great: ${pGreat}%, good: ${pGood}%, uncovered: ${pUncovered}%`
-        }
-        return `Lineup ${ev.lineup_index}/${ev.total}`
+        const p90 = ev.p90 != null ? ev.p90.toFixed(1) : '—'
+        const ptLabel = ev.target_percentile != null ? `p${ev.target_percentile}` : 'target'
+        const ptVal = ev.p_target != null ? ev.p_target.toFixed(1) : '—'
+        const p99 = ev.p99 != null ? ev.p99.toFixed(1) : '—'
+        return `p90: ${p90} · ${ptLabel}: ${ptVal} · p99: ${p99}`
       }
       return `Lineup ${ev.lineup_index}/${ev.total} — ${(ev.sims_covered ?? 0).toLocaleString()} sims removed, ${(ev.sims_remaining ?? 0).toLocaleString()} remaining`
     }

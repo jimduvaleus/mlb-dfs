@@ -1,6 +1,7 @@
-import type { LineupResult, SSEEvent, OptimizeLineupEvent } from '../types'
+import type { LineupResult, SSEEvent, OptimizeLineupEvent, PortfolioStatsEvent } from '../types'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
+  LineChart, Line, Legend, ReferenceLine,
 } from 'recharts'
 import { getStackNotation } from '../utils'
 import TeamBadge from './TeamBadge'
@@ -33,6 +34,21 @@ export function MetricsPanel({ lineups, events }: Props) {
     const lineupEnd = lineupEvents[lineupEvents.length - 1].timestamp
     avgLineupMs = (lineupEnd - lineupStart) / (lineupEvents.length - 1)
   }
+
+  // --- Coverage analysis (marginal_payout objective only) ---
+  const portfolioStatsEvent = events.find(e => e.stage === 'portfolio_stats') as PortfolioStatsEvent | undefined
+
+  const payoutLineupEvents = lineupEvents.filter(e => e.objective === 'marginal_payout')
+  const coverageEvolution = payoutLineupEvents.map(ev => {
+    const n = (ev.sims_great ?? 0) + (ev.sims_good ?? 0) + (ev.sims_uncovered ?? 0)
+    if (n === 0) return null
+    return {
+      lineup: ev.lineup_index,
+      great: Math.round(((ev.sims_great ?? 0) / n) * 100),
+      good: Math.round(((ev.sims_good ?? 0) / n) * 100),
+      uncovered: Math.round(((ev.sims_uncovered ?? 0) / n) * 100),
+    }
+  }).filter(Boolean) as { lineup: number; great: number; good: number; uncovered: number }[]
 
   // --- Exposure ---
   const exposure: Record<string, { name: string; team: string; count: number }> = {}
@@ -107,6 +123,103 @@ export function MetricsPanel({ lineups, events }: Props) {
               <span className="metric-chip">Avg/lineup: {formatMs(avgLineupMs)}</span>
             )}
           </div>
+        </div>
+      )}
+
+      {/* Coverage analysis — marginal_payout objective only */}
+      {(portfolioStatsEvent || coverageEvolution.length > 0) && (
+        <div className="metrics-section">
+          <h4>Coverage Analysis</h4>
+
+          {/* Summary stats */}
+          {portfolioStatsEvent && (() => {
+            const s = portfolioStatsEvent
+            const covPct = Math.round((s.covered_count / s.n_sims) * 100)
+            const margin = (v: number | null) => v != null ? `+${(v - s.target).toFixed(1)}` : '—'
+            return (
+              <div>
+                <div className="metrics-row" style={{ marginBottom: 6 }}>
+                  <span className="metric-chip">Covered: {covPct}%</span>
+                  {s.covered_mean != null && (
+                    <span className="metric-chip">Avg margin: {margin(s.covered_mean)} pts</span>
+                  )}
+                  {s.covered_p50 != null && (
+                    <span className="metric-chip">Median margin: {margin(s.covered_p50)} pts</span>
+                  )}
+                </div>
+                <div className="metrics-row" style={{ marginBottom: 12 }}>
+                  <span className="metric-chip" style={{ opacity: 0.75 }}>Portfolio p90: {s.overall_p90} pts</span>
+                  <span className="metric-chip" style={{ opacity: 0.75 }}>p95: {s.overall_p95} pts</span>
+                  <span className="metric-chip" style={{ opacity: 0.75 }}>p99: {s.overall_p99} pts</span>
+                </div>
+
+                {/* Score distribution histogram */}
+                <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
+                  Best lineup score per simulation
+                </div>
+                <div style={{ height: 140 }}>
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={s.histogram} margin={{ top: 4, right: 4, left: 0, bottom: 4 }} barCategoryGap={1}>
+                      <XAxis
+                        dataKey="mid"
+                        type="number"
+                        domain={['dataMin', 'dataMax']}
+                        tickFormatter={(v: number) => v.toFixed(0)}
+                        tick={{ fontSize: 9 }}
+                        interval="preserveStartEnd"
+                      />
+                      <YAxis allowDecimals={false} tick={{ fontSize: 9 }} width={24} />
+                      <Tooltip
+                        formatter={(v) => [`${v} sims`, '']}
+                        labelFormatter={(mid) => `${Number(mid).toFixed(1)} pts`}
+                      />
+                      <ReferenceLine x={s.target} stroke="#fbbf24" strokeDasharray="4 2" strokeWidth={1.5} />
+                      <ReferenceLine x={s.great_threshold} stroke="#4ade80" strokeDasharray="4 2" strokeWidth={1.5} />
+                      <Bar dataKey="count" isAnimationActive={false}>
+                        {s.histogram.map((bucket, i) => (
+                          <Cell
+                            key={i}
+                            fill={
+                              bucket.mid >= s.great_threshold ? '#4ade80' :
+                              bucket.mid >= s.target ? '#fbbf24' :
+                              '#64748b'
+                            }
+                          />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+                <div style={{ display: 'flex', gap: 12, fontSize: 10, color: 'var(--text-muted)', marginTop: 4, marginBottom: 12 }}>
+                  <span style={{ color: '#64748b' }}>▌ Uncovered</span>
+                  <span style={{ color: '#fbbf24' }}>▌ Good (target – {s.great_threshold.toFixed(0)} pts)</span>
+                  <span style={{ color: '#4ade80' }}>▌ Great (≥{s.great_threshold.toFixed(0)} pts)</span>
+                </div>
+              </div>
+            )
+          })()}
+
+          {/* Coverage evolution line chart */}
+          {coverageEvolution.length > 1 && (
+            <>
+              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 4 }}>
+                Coverage by lineup added
+              </div>
+              <div style={{ height: 160 }}>
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={coverageEvolution} margin={{ top: 4, right: 4, left: 0, bottom: 4 }}>
+                    <XAxis dataKey="lineup" tick={{ fontSize: 9 }} label={{ value: 'Lineup #', position: 'insideBottomRight', offset: -4, fontSize: 9 }} />
+                    <YAxis domain={[0, 100]} tickFormatter={(v: number) => `${v}%`} tick={{ fontSize: 9 }} width={32} />
+                    <Tooltip formatter={(v) => `${v}%`} />
+                    <Legend wrapperStyle={{ fontSize: 10 }} />
+                    <Line type="monotone" dataKey="great" name="Great" stroke="#4ade80" dot={false} strokeWidth={1.5} isAnimationActive={false} />
+                    <Line type="monotone" dataKey="good" name="Good" stroke="#fbbf24" dot={false} strokeWidth={1.5} isAnimationActive={false} />
+                    <Line type="monotone" dataKey="uncovered" name="Uncovered" stroke="#64748b" dot={false} strokeWidth={1.5} isAnimationActive={false} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </>
+          )}
         </div>
       )}
 

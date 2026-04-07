@@ -93,7 +93,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
             </FieldRow>
             {draft.optimizer.objective === 'marginal_payout' && (
               <FieldRow label="Payout beta (blank = auto)">
-                <input type="number" step={0.1} min={1} max={5} value={str(draft.optimizer.payout_beta)}
+                <input type="number" step={0.1} min={1} max={8} value={str(draft.optimizer.payout_beta)}
                   onChange={e => set('optimizer', 'payout_beta', num(e.target.value))} disabled={disabled} />
               </FieldRow>
             )}

@@ -485,6 +485,18 @@ button { cursor: pointer; }
   margin-bottom: 16px;
 }
 
+.event-list-three-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+  margin-bottom: 16px;
+}
+
+.event-stage-lineup {
+  min-width: 44px;
+  font-variant-numeric: tabular-nums;
+}
+
 .progress-bar-wrap {
   position: relative;
   height: 24px;

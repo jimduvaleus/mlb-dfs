@@ -113,7 +113,9 @@ class PortfolioConstructor:
     def construct(
         self,
         on_lineup_complete=None,
+        on_portfolio_complete=None,
         stop_check: Optional[Callable[[], bool]] = None,
+        target_percentile: Optional[int] = None,
     ) -> List[Tuple[Lineup, float]]:
         """Run greedy portfolio construction.
 
@@ -127,10 +129,12 @@ class PortfolioConstructor:
 
         Parameters
         ----------
-        on_lineup_complete : callable(lineup_index, total, score, sims_covered, sims_remaining), optional
-            Called after each lineup is selected with its 1-based index,
-            total lineups requested, full-matrix score, number of simulation
-            rows consumed by this lineup, and number of rows still active.
+        on_lineup_complete : callable, optional
+            Called after each lineup is selected.
+        on_portfolio_complete : callable(best_scores), optional
+            Called once after all lineups are built (marginal_payout only).
+            Receives the final ``best_scores`` array (shape n_sims) — the best
+            score any portfolio lineup achieved in each simulation.
 
         Returns
         -------
@@ -140,7 +144,9 @@ class PortfolioConstructor:
             matrix so values are comparable across all lineups in the portfolio.
         """
         if self._payout_weighted:
-            return self._construct_payout_weighted(on_lineup_complete, stop_check)
+            return self._construct_payout_weighted(
+                on_lineup_complete, on_portfolio_complete, stop_check, target_percentile
+            )
         return self._construct_row_consumption(on_lineup_complete, stop_check)
 
     def _construct_row_consumption(
@@ -234,7 +240,9 @@ class PortfolioConstructor:
     def _construct_payout_weighted(
         self,
         on_lineup_complete=None,
+        on_portfolio_complete=None,
         stop_check: Optional[Callable[[], bool]] = None,
+        target_percentile: Optional[int] = None,
     ) -> List[Tuple[Lineup, float]]:
         """Payout-weighted portfolio construction.
 
@@ -297,7 +305,7 @@ class PortfolioConstructor:
                 portfolio.append((lineup, full_score))
                 logger.info("  Lineup %d p_hit (full): %.4f", i + 1, full_score)
 
-                # Update best_scores and compute three-tier coverage stats for the callback.
+                # Update best_scores and compute coverage stats for the callback.
                 best_scores = np.maximum(best_scores, lineup_totals)
                 great_threshold = self.target + _GREAT_COVERAGE_MARGIN
                 n_great = int((best_scores >= great_threshold).sum())
@@ -305,15 +313,21 @@ class PortfolioConstructor:
                     ((best_scores >= self.target) & (best_scores < great_threshold)).sum()
                 )
                 n_uncovered = int((best_scores < self.target).sum())
+                best_p90 = float(np.percentile(best_scores, 90))
+                best_p99 = float(np.percentile(best_scores, 99))
+                best_ptarget = (
+                    float(np.percentile(best_scores, target_percentile))
+                    if target_percentile is not None else None
+                )
                 logger.info(
-                    "  Coverage — great: %d, good: %d, uncovered: %d.",
-                    n_great, n_good, n_uncovered,
+                    "  Coverage — great: %d, good: %d, uncovered: %d. p90: %.1f, p99: %.1f",
+                    n_great, n_good, n_uncovered, best_p90, best_p99,
                 )
 
                 if on_lineup_complete is not None:
                     on_lineup_complete(
                         i + 1, self.portfolio_size, full_score,
-                        n_great, n_good, n_uncovered,
+                        n_great, n_good, n_uncovered, best_p90, best_p99, best_ptarget,
                     )
 
                 if stop_check is not None and stop_check():
@@ -321,6 +335,9 @@ class PortfolioConstructor:
                         "Stop requested — halting after %d lineups.", len(portfolio)
                     )
                     break
+
+        if on_portfolio_complete is not None:
+            on_portfolio_complete(best_scores)
 
         return portfolio
 
