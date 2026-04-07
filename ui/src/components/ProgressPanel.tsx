@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { SSEEvent, OptimizeLineupEvent } from '../types'
 
 interface Props {
@@ -32,18 +32,48 @@ const STAGE_LABELS: Record<string, string> = {
   error: 'Error',
 }
 
+const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
+
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
+  const tickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const lastLineupTimeRef = useRef<number | null>(null)
 
+  // Clear tick timer when run stops
   useEffect(() => {
-    if (!running) return
-    const id = setInterval(() => setNow(Date.now()), 5000)
-    return () => clearInterval(id)
+    if (!running && tickTimerRef.current) {
+      clearTimeout(tickTimerRef.current)
+      tickTimerRef.current = null
+    }
   }, [running])
 
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => { if (tickTimerRef.current) clearTimeout(tickTimerRef.current) }
+  }, [])
+
+  // Update now on each optimize_lineup event; schedule 30s-boundary ticks until the next lineup
   useEffect(() => {
     const last = events[events.length - 1]
-    if (last?.stage === 'optimize_lineup') setNow(Date.now())
+    if (last?.stage !== 'optimize_lineup') return
+
+    const ts = Date.now()
+    lastLineupTimeRef.current = ts
+    setNow(ts)
+
+    if (tickTimerRef.current) clearTimeout(tickTimerRef.current)
+
+    function scheduleTick() {
+      const lineupTime = lastLineupTimeRef.current!
+      const sinceLineup = Date.now() - lineupTime
+      const nextTick = Math.ceil((sinceLineup + 1) / 30000) * 30000
+      tickTimerRef.current = setTimeout(() => {
+        setNow(Date.now())
+        if (lastLineupTimeRef.current === lineupTime) scheduleTick()
+      }, nextTick - sinceLineup)
+    }
+
+    scheduleTick()
   }, [events])
 
   if (events.length === 0 && !running) return null
@@ -110,12 +140,10 @@ export function ProgressPanel({ events, running }: Props) {
       )}
 
       <div className="event-list">
-        {events.filter(e => e.stage !== 'optimize_lineup').filter((e, i, arr) =>
-          e.stage !== 'calibrate_beta' || arr.findIndex((x, j) => x.stage === 'calibrate_beta' && j > i) === -1
-        ).map((e, i) => (
-          <div key={i} className={`event-row event-${e.stage}`}>
-            <span className="event-stage">{STAGE_LABELS[e.stage] ?? e.stage}</span>
-            <span className="event-detail">{renderDetail(e)}</span>
+        {buildDisplayEvents(events).map((item, i) => (
+          <div key={i} className={`event-row event-${item.stage}`}>
+            <span className="event-stage">{item.label}</span>
+            <span className="event-detail">{item.detail}</span>
           </div>
         ))}
         {running && !latestLineup && (
@@ -137,6 +165,42 @@ export function ProgressPanel({ events, running }: Props) {
       )}
     </div>
   )
+}
+
+function buildConfigDetail(events: SSEEvent[]): string {
+  const sim = events.find(e => e.stage === 'simulate') as unknown as { n_sims: number } | undefined
+  const target = events.find(e => e.stage === 'compute_target') as unknown as { target: number; percentile: number | null } | undefined
+  const beta = [...events].reverse().find(e => e.stage === 'calibrate_beta') as unknown as { payout_beta?: number } | undefined
+
+  const parts: string[] = []
+  if (sim) parts.push(`${sim.n_sims.toLocaleString()} simulations`)
+  if (target) {
+    const tStr = target.percentile
+      ? `${target.target.toFixed(1)} pts (p${target.percentile})`
+      : `${target.target.toFixed(1)} pts (manual)`
+    parts.push(`target: ${tStr}`)
+  }
+  if (beta?.payout_beta != null) parts.push(`payout beta: ${beta.payout_beta}`)
+  return parts.join(', ')
+}
+
+function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: string; detail: string }> {
+  const result: Array<{ stage: string; label: string; detail: string }> = []
+  let configInserted = false
+
+  for (const e of events) {
+    if (e.stage === 'optimize_lineup' || e.stage === 'upload_files') continue
+    if (CONFIG_STAGES.has(e.stage)) {
+      if (!configInserted) {
+        result.push({ stage: 'config', label: 'Configuration', detail: buildConfigDetail(events) })
+        configInserted = true
+      }
+      continue
+    }
+    result.push({ stage: e.stage, label: STAGE_LABELS[e.stage] ?? e.stage, detail: renderDetail(e) })
+  }
+
+  return result
 }
 
 function renderDetail(e: SSEEvent): string {

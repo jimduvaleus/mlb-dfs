@@ -92,6 +92,7 @@ export type SSEStage =
   | 'compute_target'
   | 'calibrate_beta'
   | 'optimize_lineup'
+  | 'upload_files'
   | 'complete'
   | 'stopped'
   | 'error'
