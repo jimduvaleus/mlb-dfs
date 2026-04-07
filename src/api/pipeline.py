@@ -17,7 +17,7 @@ import yaml
 from src.ingestion.dk_slate import DraftKingsSlateIngestor
 from src.models.batter_model import BatterPCAModel
 from src.models.copula import EmpiricalCopula
-from src.optimization.lineup import ROSTER_REQUIREMENTS
+from src.optimization.lineup import ROSTER_REQUIREMENTS, SLOTS
 from src.optimization.portfolio import PortfolioConstructor
 from src.simulation.engine import SimulationEngine
 from src.simulation.results import SimulationResults
@@ -477,6 +477,8 @@ class PipelineRunner:
             df["mean"] = df["salary"] / 400.0
             df["std_dev"] = df["mean"] * 0.85
         base_cols = ["player_id", "team", "opponent", "slot", "mean", "std_dev", "position", "salary", "game"]
+        if "eligible_positions" in df.columns:
+            base_cols.append("eligible_positions")
         if "slot_confirmed" in df.columns:
             base_cols.append("slot_confirmed")
         return df[base_cols]
@@ -571,27 +573,58 @@ class PipelineRunner:
         return float(np.percentile(totals, percentile))
 
     @staticmethod
+    def _pos_label(row: pd.Series) -> str:
+        """Return DK-style position string: '3B/SS' for multi-eligible, '3B' for single."""
+        ep = row.get("eligible_positions")
+        if ep and isinstance(ep, list) and len(ep) > 1:
+            return "/".join(ep)
+        return str(row["position"])
+
+    @staticmethod
+    def _assigned_positions(lineup, player_meta: dict) -> dict:
+        """Return {player_id: roster_position} for each player in the lineup.
+
+        Uses the same bipartite matching as the optimizer so the assigned position
+        reflects the actual slot the player fills (e.g. 'SS' for a 3B/SS player
+        placed at shortstop). Falls back to primary position on failure.
+        """
+        from src.optimization.optimizer import _compute_slot_assignment
+        try:
+            _, pidx_to_slot = _compute_slot_assignment(lineup.player_ids, player_meta)
+            return {pid: SLOTS[pidx_to_slot[j]] for j, pid in enumerate(lineup.player_ids)}
+        except RuntimeError:
+            return {pid: player_meta.get(pid, {}).get('position', '') for pid in lineup.player_ids}
+
+    @staticmethod
     def _serialize_portfolio(
         portfolio: list,
         players_df: pd.DataFrame,
     ) -> list[dict]:
+        from src.optimization.optimizer import _build_player_meta
         id_to_name = dict(zip(players_df["player_id"], players_df.get("name", players_df["player_id"])))
         id_to_salary = dict(zip(players_df["player_id"], players_df["salary"]))
-        id_to_pos = dict(zip(players_df["player_id"], players_df["position"]))
+        id_to_pos = {
+            int(r["player_id"]): PipelineRunner._pos_label(r)
+            for _, r in players_df.iterrows()
+        }
         id_to_team = dict(zip(players_df["player_id"], players_df["team"]))
         id_to_slot = dict(zip(players_df["player_id"], players_df["slot"]))
         id_to_confirmed: dict = {}
         if "slot_confirmed" in players_df.columns:
             id_to_confirmed = dict(zip(players_df["player_id"], players_df["slot_confirmed"].astype(bool)))
 
+        player_meta = _build_player_meta(players_df)
+
         result = []
         for i, (lineup, score) in enumerate(portfolio, start=1):
+            pid_to_assigned = PipelineRunner._assigned_positions(lineup, player_meta)
             total_salary = sum(id_to_salary.get(pid, 0) for pid in lineup.player_ids)
             players = [
                 {
                     "player_id": pid,
                     "name": str(id_to_name.get(pid, pid)),
                     "position": id_to_pos.get(pid, ""),
+                    "assigned_position": pid_to_assigned.get(pid, id_to_pos.get(pid, "").split('/')[0]),
                     "team": id_to_team.get(pid, ""),
                     "salary": id_to_salary.get(pid, 0),
                     "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
@@ -637,16 +670,22 @@ class PipelineRunner:
         portfolio: list,
         players_df: pd.DataFrame,
     ) -> pd.DataFrame:
+        from src.optimization.optimizer import _build_player_meta
         id_to_name = dict(zip(players_df["player_id"], players_df.get("name", players_df["player_id"])))
         id_to_salary = dict(zip(players_df["player_id"], players_df["salary"]))
-        id_to_pos = dict(zip(players_df["player_id"], players_df["position"]))
+        id_to_pos = {
+            int(r["player_id"]): PipelineRunner._pos_label(r)
+            for _, r in players_df.iterrows()
+        }
         id_to_team = dict(zip(players_df["player_id"], players_df["team"]))
         id_to_slot = dict(zip(players_df["player_id"], players_df["slot"]))
         id_to_confirmed: dict = {}
         if "slot_confirmed" in players_df.columns:
             id_to_confirmed = dict(zip(players_df["player_id"], players_df["slot_confirmed"].astype(bool)))
+        player_meta = _build_player_meta(players_df)
         rows = []
         for i, (lineup, score) in enumerate(portfolio, start=1):
+            pid_to_assigned = PipelineRunner._assigned_positions(lineup, player_meta)
             total_salary = sum(id_to_salary.get(pid, 0) for pid in lineup.player_ids)
             for pid in lineup.player_ids:
                 rows.append({
@@ -655,6 +694,7 @@ class PipelineRunner:
                     "player_id": pid,
                     "name": id_to_name.get(pid, str(pid)),
                     "position": id_to_pos.get(pid, ""),
+                    "assigned_position": pid_to_assigned.get(pid, id_to_pos.get(pid, "").split('/')[0]),
                     "team": id_to_team.get(pid, ""),
                     "salary": id_to_salary.get(pid, 0),
                     "lineup_salary": total_salary,

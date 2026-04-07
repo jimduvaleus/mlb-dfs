@@ -515,6 +515,158 @@ def test_optimize_multi_pos_slate():
 
 
 # ------------------------------------------------------------------ #
+#  Pipeline _build_players_df multi-position passthrough               #
+# ------------------------------------------------------------------ #
+
+def _make_slate_df(rows, include_eligible=True):
+    """Build a minimal slate DataFrame resembling DraftKingsSlateIngestor output."""
+    df = pd.DataFrame(rows)
+    if include_eligible and 'eligible_positions' not in df.columns:
+        df['eligible_positions'] = df['position'].apply(lambda p: [p])
+    df['game'] = df.get('game', 'A@B')
+    return df
+
+
+def _make_pipeline_runner():
+    """Return a PipelineRunner instance; __init__ only stores config_path, no I/O."""
+    from src.api.pipeline import PipelineRunner
+    return PipelineRunner.__new__(PipelineRunner)
+
+
+def test_build_players_df_preserves_eligible_positions():
+    """eligible_positions from slate_df must survive _build_players_df."""
+    from src.api.pipeline import PipelineRunner
+    runner = _make_pipeline_runner()
+    rows = [
+        {'player_id': 1, 'name': 'A', 'position': '3B', 'eligible_positions': ['3B', 'SS'],
+         'salary': 5000, 'team': 'NYY', 'game': 'NYY@BOS'},
+        {'player_id': 2, 'name': 'B', 'position': 'P', 'eligible_positions': ['P'],
+         'salary': 8000, 'team': 'BOS', 'game': 'NYY@BOS'},
+    ]
+    slate_df = pd.DataFrame(rows)
+    players_df = runner._build_players_df(slate_df, proj_df=None)
+    assert 'eligible_positions' in players_df.columns
+    ep = players_df.loc[players_df['player_id'] == 1, 'eligible_positions'].iloc[0]
+    assert list(ep) == ['3B', 'SS']
+
+
+def test_build_players_df_without_eligible_positions_omits_column():
+    """Slates without eligible_positions column must not crash and omit the column."""
+    runner = _make_pipeline_runner()
+    rows = [
+        {'player_id': 1, 'name': 'A', 'position': 'SS', 'salary': 5000,
+         'team': 'NYY', 'game': 'NYY@BOS'},
+    ]
+    slate_df = pd.DataFrame(rows)
+    players_df = runner._build_players_df(slate_df, proj_df=None)
+    assert 'eligible_positions' not in players_df.columns
+
+
+def test_multipos_player_indexed_in_both_position_pools():
+    """A 3B/SS player must appear in both _players_by_pos['3B'] and ['SS']."""
+    from src.api.pipeline import PipelineRunner
+    runner = _make_pipeline_runner()
+    rows = [
+        _make_player(1,  'P',  8000, 'A', 'A@B'),
+        _make_player(2,  'P',  7500, 'C', 'C@D'),
+        _make_player(3,  'C',  4000, 'A', 'A@B'),
+        _make_player(4,  '1B', 4000, 'A', 'A@B'),
+        _make_player(5,  '2B', 4000, 'A', 'A@B'),
+        _make_player(6,  '3B', 4000, 'C', 'C@D'),
+        _make_player(7,  '3B', 4000, 'A', 'A@B'),  # will become 3B/SS
+        _make_player(8,  'OF', 4000, 'A', 'A@B'),
+        _make_player(9,  'OF', 4000, 'C', 'C@D'),
+        _make_player(10, 'OF', 4000, 'C', 'C@D'),
+    ]
+    slate_df = pd.DataFrame(rows)
+    slate_df['eligible_positions'] = slate_df['position'].apply(lambda p: [p])
+    slate_df.loc[slate_df['player_id'] == 7, 'eligible_positions'] = \
+        slate_df.loc[slate_df['player_id'] == 7, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
+
+    players_df = runner._build_players_df(slate_df, proj_df=None)
+
+    pids = players_df['player_id'].tolist()
+    rng = np.random.default_rng(0)
+    matrix = rng.uniform(0, 40, size=(200, len(pids))).astype(np.float64)
+    results = SimulationResults(player_ids=pids, results_matrix=matrix)
+
+    opt = BasinHoppingOptimizer(sim_results=results, players_df=players_df, target=100.0)
+    assert 7 in opt._players_by_pos['3B']
+    assert 7 in opt._players_by_pos['SS']
+
+
+def test_optimizer_can_place_multipos_player_at_alternate_slot():
+    """Optimizer must produce a valid lineup when the only way to fill SS is via a 3B/SS player,
+    with eligible_positions flowing through _build_players_df from a slate_df."""
+    from src.api.pipeline import PipelineRunner
+    runner = _make_pipeline_runner()
+    rows = [
+        _make_player(1,  'P',  8000, 'A', 'A@B'),
+        _make_player(2,  'P',  7500, 'C', 'C@D'),
+        _make_player(3,  'C',  4000, 'A', 'A@B'),
+        _make_player(4,  '1B', 4000, 'A', 'A@B'),
+        _make_player(5,  '2B', 4000, 'A', 'A@B'),
+        _make_player(6,  '3B', 4000, 'C', 'C@D'),
+        # Player 7: primary 3B, also eligible SS — only SS-eligible player
+        _make_player(7,  '3B', 4000, 'A', 'A@B'),
+        _make_player(8,  'OF', 4000, 'A', 'A@B'),
+        _make_player(9,  'OF', 4000, 'C', 'C@D'),
+        _make_player(10, 'OF', 4000, 'C', 'C@D'),
+    ]
+    slate_df = pd.DataFrame(rows)
+    slate_df['eligible_positions'] = slate_df['position'].apply(lambda p: [p])
+    slate_df.loc[slate_df['player_id'] == 7, 'eligible_positions'] = \
+        slate_df.loc[slate_df['player_id'] == 7, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
+
+    players_df = runner._build_players_df(slate_df, proj_df=None)
+
+    pids = players_df['player_id'].tolist()
+    rng = np.random.default_rng(3)
+    matrix = rng.uniform(0, 40, size=(300, len(pids))).astype(np.float64)
+    results = SimulationResults(player_ids=pids, results_matrix=matrix)
+
+    opt = BasinHoppingOptimizer(sim_results=results, players_df=players_df,
+                                target=100.0, n_chains=5, n_steps=20, rng_seed=0)
+    lineup, _ = opt.optimize()
+    meta = _build_player_meta(players_df)
+    assert lineup.is_valid(meta)
+    assert 7 in lineup.player_ids
+
+
+def test_multipos_player_appears_exactly_once_in_lineup():
+    """A multi-position eligible player must occupy exactly one slot (no duplicate IDs)."""
+    rows = [
+        _make_player(1,  'P',  8000, 'A', 'A@B'),
+        _make_player(2,  'P',  7500, 'C', 'C@D'),
+        _make_player(3,  'C',  4000, 'A', 'A@B'),
+        _make_player(4,  '1B', 4000, 'A', 'A@B'),
+        _make_player(5,  '2B', 4000, 'A', 'A@B'),
+        _make_player(6,  '3B', 4000, 'C', 'C@D'),
+        _make_player(7,  '3B', 4000, 'A', 'A@B'),  # 3B/SS
+        _make_player(8,  'OF', 4000, 'A', 'A@B'),
+        _make_player(9,  'OF', 4000, 'C', 'C@D'),
+        _make_player(10, 'OF', 4000, 'C', 'C@D'),
+    ]
+    df = pd.DataFrame(rows)
+    df['eligible_positions'] = df['position'].apply(lambda p: [p])
+    df.loc[df['player_id'] == 7, 'eligible_positions'] = \
+        df.loc[df['player_id'] == 7, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
+
+    pids = df['player_id'].tolist()
+    rng = np.random.default_rng(5)
+    matrix = rng.uniform(0, 40, size=(300, len(pids))).astype(np.float64)
+    results = SimulationResults(player_ids=pids, results_matrix=matrix)
+
+    opt = BasinHoppingOptimizer(sim_results=results, players_df=df,
+                                target=100.0, n_chains=5, n_steps=20, rng_seed=1)
+    lineup, _ = opt.optimize()
+
+    assert len(lineup.player_ids) == 10
+    assert len(set(lineup.player_ids)) == 10  # no duplicates
+    assert lineup.player_ids.count(7) == 1   # player 7 appears exactly once
+
+
+# ------------------------------------------------------------------ #
 #  marginal_payout objective                                           #
 # ------------------------------------------------------------------ #
 

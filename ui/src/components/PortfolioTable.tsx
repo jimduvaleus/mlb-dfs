@@ -9,15 +9,19 @@ interface Props {
   replacingLineupIndex?: number | null
 }
 
+function assignedPos(p: PlayerRow): string {
+  return p.assigned_position ?? p.position.split('/')[0]
+}
+
 function sortPlayersByPosition(players: PlayerRow[]): PlayerRow[] {
-  const pitchers = players.filter(p => p.position === 'P')
+  const pitchers = players.filter(p => assignedPos(p) === 'P')
   const posOrder = ['C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']
-  const batters = players.filter(p => p.position !== 'P')
+  const batters = players.filter(p => assignedPos(p) !== 'P')
 
   const filled: PlayerRow[] = [...pitchers]
   const remaining = [...batters]
   for (const pos of posOrder) {
-    const idx = remaining.findIndex(p => p.position === pos)
+    const idx = remaining.findIndex(p => assignedPos(p) === pos)
     if (idx >= 0) {
       filled.push(remaining.splice(idx, 1)[0])
     }
@@ -97,10 +101,10 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
               <div className="lineup-card-players">
                 {sorted.map((p, i) => (
                   <div key={i} className="lineup-player">
-                    <span className="lineup-player-pos">{p.position}</span>
+                    <span className="lineup-player-pos">{assignedPos(p)}</span>
                     <span className="lineup-player-name">
                       {p.name}
-                      {p.position !== 'P' && (() => {
+                      {assignedPos(p) !== 'P' && (() => {
                         const slotNum = p.slot != null && p.slot >= 1 && p.slot <= 9 ? p.slot : null
                         if (p.slot_confirmed) {
                           return <span className="batting-slot-bubble batting-slot-bubble--confirmed" title="Confirmed lineup slot">{slotNum ?? '?'}</span>

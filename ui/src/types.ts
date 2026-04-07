@@ -45,6 +45,7 @@ export interface PlayerRow {
   player_id: number
   name: string
   position: string
+  assigned_position?: string
   team: string
   salary: number
   slot?: number | null
