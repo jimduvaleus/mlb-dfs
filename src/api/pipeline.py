@@ -496,9 +496,10 @@ class PipelineRunner:
 
         current_games = [g for g in players_df["game"].dropna().unique().tolist() if g]
         if compute_slate_id(current_games) != stored["slate_id"]:
-            logger.warning(
-                "Slate exclusions slate_id mismatch — skipping exclusions to avoid stale filtering."
-            )
+            from .slate_exclusions import write_exclusions
+            new_slate_id = compute_slate_id(current_games)
+            write_exclusions(slate_id=new_slate_id, excluded_teams=[], excluded_games=[], excluded_player_ids=[])
+            logger.info("DKSalaries.csv slate changed — exclusions reset.")
             return players_df, empty_stats
 
         excluded_games = set(stored.get("excluded_games", []))
