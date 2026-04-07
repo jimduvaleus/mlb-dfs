@@ -131,8 +131,13 @@ export interface OptimizeLineupEvent extends SSEEvent {
   lineup_index: number
   total: number
   score: number
-  sims_covered: number
-  sims_remaining: number
+  // Non-marginal_payout objectives (p_hit, expected_surplus)
+  sims_covered?: number
+  sims_remaining?: number
+  // marginal_payout objective — three-tier coverage counts (sum to n_sims)
+  sims_great?: number
+  sims_good?: number
+  sims_uncovered?: number
   objective?: string
 }
 

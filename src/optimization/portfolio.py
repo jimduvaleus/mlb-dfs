@@ -25,6 +25,10 @@ from src.simulation.results import SimulationResults
 
 logger = logging.getLogger(__name__)
 
+# Margin above `target` distinguishing "great" from "good" coverage in progress messages.
+# DraftKings fantasy points. Display-only — not an optimization parameter.
+_GREAT_COVERAGE_MARGIN: float = 15.0
+
 
 class PortfolioConstructor:
     """Iterative greedy portfolio builder with simulation-row consumption.
@@ -293,22 +297,23 @@ class PortfolioConstructor:
                 portfolio.append((lineup, full_score))
                 logger.info("  Lineup %d p_hit (full): %.4f", i + 1, full_score)
 
-                # Update best_scores and compute coverage stats for the callback.
-                newly_covered = int(
-                    ((best_scores < self.target) & (lineup_totals >= self.target)).sum()
-                )
+                # Update best_scores and compute three-tier coverage stats for the callback.
                 best_scores = np.maximum(best_scores, lineup_totals)
-                remaining_uncovered = int((best_scores < self.target).sum())
+                great_threshold = self.target + _GREAT_COVERAGE_MARGIN
+                n_great = int((best_scores >= great_threshold).sum())
+                n_good = int(
+                    ((best_scores >= self.target) & (best_scores < great_threshold)).sum()
+                )
+                n_uncovered = int((best_scores < self.target).sum())
                 logger.info(
-                    "  Newly covered %d sims; %d still uncovered.",
-                    newly_covered,
-                    remaining_uncovered,
+                    "  Coverage — great: %d, good: %d, uncovered: %d.",
+                    n_great, n_good, n_uncovered,
                 )
 
                 if on_lineup_complete is not None:
                     on_lineup_complete(
                         i + 1, self.portfolio_size, full_score,
-                        newly_covered, remaining_uncovered,
+                        n_great, n_good, n_uncovered,
                     )
 
                 if stop_check is not None and stop_check():

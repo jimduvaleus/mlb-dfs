@@ -1,6 +1,7 @@
-- Opponent/contest modeling
+- player pool culling (include info on run tab)
+- BIG Opponent/contest modeling
 - Need weather
-- late swap?
+- BIG late swap?
 - on projections fetch, if number of changes is small, report them
-- ownership?? EV calcs, and EV objective??
+- BIG ownership?? EV calcs, and EV objective??
 - fancy prediction market-based projections

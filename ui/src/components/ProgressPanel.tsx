@@ -238,9 +238,16 @@ function renderDetail(e: SSEEvent): string {
     case 'optimize_lineup': {
       const ev = e as OptimizeLineupEvent
       if (ev.objective === 'marginal_payout') {
-        return `Lineup ${ev.lineup_index}/${ev.total} — ${ev.sims_covered.toLocaleString()} sims newly covered, ${ev.sims_remaining.toLocaleString()} still uncovered`
+        const n = (ev.sims_great ?? 0) + (ev.sims_good ?? 0) + (ev.sims_uncovered ?? 0)
+        if (n > 0) {
+          const pGreat = Math.round(((ev.sims_great ?? 0) / n) * 100)
+          const pGood = Math.round(((ev.sims_good ?? 0) / n) * 100)
+          const pUncovered = 100 - pGreat - pGood
+          return `Lineup ${ev.lineup_index}/${ev.total} — great: ${pGreat}%, good: ${pGood}%, uncovered: ${pUncovered}%`
+        }
+        return `Lineup ${ev.lineup_index}/${ev.total}`
       }
-      return `Lineup ${ev.lineup_index}/${ev.total} — ${ev.sims_covered.toLocaleString()} sims removed, ${ev.sims_remaining.toLocaleString()} remaining`
+      return `Lineup ${ev.lineup_index}/${ev.total} — ${(ev.sims_covered ?? 0).toLocaleString()} sims removed, ${(ev.sims_remaining ?? 0).toLocaleString()} remaining`
     }
     case 'complete': {
       const ev = e as unknown as { n_lineups: number }

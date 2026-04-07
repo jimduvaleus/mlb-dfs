@@ -250,15 +250,29 @@ class PipelineRunner:
             n_seed_lineups=int(opt_cfg.get("n_seed_lineups", 5)),
         )
 
-        def _on_lineup_complete(lineup_index: int, total: int, score: float, sims_covered: int, sims_remaining: int) -> None:
-            self._cb("optimize_lineup", {
-                "lineup_index": lineup_index,
-                "total": total,
-                "score": round(score, 4),
-                "sims_covered": sims_covered,
-                "sims_remaining": sims_remaining,
-                "objective": objective,
-            })
+        def _on_lineup_complete(
+            lineup_index: int, total: int, score: float,
+            arg4: int, arg5: int, arg6: Optional[int] = None,
+        ) -> None:
+            if objective == "marginal_payout":
+                self._cb("optimize_lineup", {
+                    "lineup_index": lineup_index,
+                    "total": total,
+                    "score": round(score, 4),
+                    "sims_great": arg4,
+                    "sims_good": arg5,
+                    "sims_uncovered": arg6,
+                    "objective": objective,
+                })
+            else:
+                self._cb("optimize_lineup", {
+                    "lineup_index": lineup_index,
+                    "total": total,
+                    "score": round(score, 4),
+                    "sims_covered": arg4,
+                    "sims_remaining": arg5,
+                    "objective": objective,
+                })
 
         portfolio = constructor.construct(
             on_lineup_complete=_on_lineup_complete,
