@@ -257,6 +257,7 @@ class PipelineRunner:
                 "score": round(score, 4),
                 "sims_covered": sims_covered,
                 "sims_remaining": sims_remaining,
+                "objective": objective,
             })
 
         portfolio = constructor.construct(

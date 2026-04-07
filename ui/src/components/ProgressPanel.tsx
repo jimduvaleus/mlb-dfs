@@ -237,6 +237,9 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'optimize_lineup': {
       const ev = e as OptimizeLineupEvent
+      if (ev.objective === 'marginal_payout') {
+        return `Lineup ${ev.lineup_index}/${ev.total} — ${ev.sims_covered.toLocaleString()} sims newly covered, ${ev.sims_remaining.toLocaleString()} still uncovered`
+      }
       return `Lineup ${ev.lineup_index}/${ev.total} — ${ev.sims_covered.toLocaleString()} sims removed, ${ev.sims_remaining.toLocaleString()} remaining`
     }
     case 'complete': {

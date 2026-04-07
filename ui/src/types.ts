@@ -132,6 +132,7 @@ export interface OptimizeLineupEvent extends SSEEvent {
   score: number
   sims_covered: number
   sims_remaining: number
+  objective?: string
 }
 
 export interface CompleteEvent extends SSEEvent {

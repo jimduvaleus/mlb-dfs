@@ -1,3 +1,4 @@
+- Opponent/contest modeling
 - Need weather
 - late swap?
 - on projections fetch, if number of changes is small, report them
