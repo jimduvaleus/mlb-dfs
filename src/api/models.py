@@ -51,6 +51,7 @@ class PlayerRow(BaseModel):
     position: str
     team: str
     salary: int
+    mean: Optional[float] = None
 
 
 class LineupResult(BaseModel):

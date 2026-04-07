@@ -610,6 +610,7 @@ class PipelineRunner:
         }
         id_to_team = dict(zip(players_df["player_id"], players_df["team"]))
         id_to_slot = dict(zip(players_df["player_id"], players_df["slot"]))
+        id_to_mean = dict(zip(players_df["player_id"], players_df["mean"])) if "mean" in players_df.columns else {}
         id_to_confirmed: dict = {}
         if "slot_confirmed" in players_df.columns:
             id_to_confirmed = dict(zip(players_df["player_id"], players_df["slot_confirmed"].astype(bool)))
@@ -628,6 +629,7 @@ class PipelineRunner:
                     "assigned_position": pid_to_assigned.get(pid, id_to_pos.get(pid, "").split('/')[0]),
                     "team": id_to_team.get(pid, ""),
                     "salary": id_to_salary.get(pid, 0),
+                    "mean": float(id_to_mean[pid]) if pid in id_to_mean else None,
                     "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
                     "slot_confirmed": bool(id_to_confirmed[pid]) if pid in id_to_confirmed else False,
                 }
@@ -680,6 +682,7 @@ class PipelineRunner:
         }
         id_to_team = dict(zip(players_df["player_id"], players_df["team"]))
         id_to_slot = dict(zip(players_df["player_id"], players_df["slot"]))
+        id_to_mean = dict(zip(players_df["player_id"], players_df["mean"])) if "mean" in players_df.columns else {}
         id_to_confirmed: dict = {}
         if "slot_confirmed" in players_df.columns:
             id_to_confirmed = dict(zip(players_df["player_id"], players_df["slot_confirmed"].astype(bool)))
@@ -698,6 +701,7 @@ class PipelineRunner:
                     "assigned_position": pid_to_assigned.get(pid, id_to_pos.get(pid, "").split('/')[0]),
                     "team": id_to_team.get(pid, ""),
                     "salary": id_to_salary.get(pid, 0),
+                    "mean": float(id_to_mean[pid]) if pid in id_to_mean else None,
                     "lineup_salary": total_salary,
                     "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
                     "slot_confirmed": bool(id_to_confirmed[pid]) if pid in id_to_confirmed else False,

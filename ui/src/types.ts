@@ -48,6 +48,7 @@ export interface PlayerRow {
   assigned_position?: string
   team: string
   salary: number
+  mean?: number | null
   slot?: number | null
   slot_confirmed?: boolean
 }

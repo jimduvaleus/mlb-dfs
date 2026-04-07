@@ -47,6 +47,28 @@ export function MetricsPanel({ lineups, events }: Props) {
   }
   const exposureList = Object.values(exposure).sort((a, b) => b.count - a.count)
 
+  // --- Value metrics ---
+  // value = mean / (salary / 1000), scoped to players in the portfolio
+  const pitcherValues: number[] = []
+  const batterValues: number[] = []
+  const seenPids = new Set<number>()
+  for (const lineup of lineups) {
+    for (const p of lineup.players) {
+      if (seenPids.has(p.player_id)) continue
+      seenPids.add(p.player_id)
+      if (p.mean == null || !p.salary) continue
+      const val = p.mean / (p.salary / 1000)
+      const pos = p.assigned_position ?? p.position
+      if (pos === 'P') {
+        pitcherValues.push(val)
+      } else {
+        batterValues.push(val)
+      }
+    }
+  }
+  const minPitcherValue = pitcherValues.length > 0 ? Math.min(...pitcherValues) : null
+  const minBatterValue = batterValues.length > 0 ? Math.min(...batterValues) : null
+
   // --- Salary distribution ---
   const salaries = lineups.map(l => l.lineup_salary)
   const minSal = Math.min(...salaries)
@@ -130,6 +152,21 @@ export function MetricsPanel({ lineups, events }: Props) {
           </ResponsiveContainer>
         </div>
       </div>
+
+      {/* Value metrics */}
+      {(minPitcherValue !== null || minBatterValue !== null) && (
+        <div className="metrics-section">
+          <h4>Portfolio Value</h4>
+          <div className="metrics-row">
+            {minPitcherValue !== null && (
+              <span className="metric-chip">Min P value: {minPitcherValue.toFixed(2)}</span>
+            )}
+            {minBatterValue !== null && (
+              <span className="metric-chip">Min batter value: {minBatterValue.toFixed(2)}</span>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Player exposure */}
       <div className="metrics-section">

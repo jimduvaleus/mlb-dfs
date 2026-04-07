@@ -79,6 +79,7 @@ def _load_persisted_portfolio() -> None:
                     "position": str(row["position"]),
                     "team": str(row["team"]),
                     "salary": int(row["salary"]),
+                    "mean": float(row["mean"]) if "mean" in row and pd.notna(row["mean"]) else None,
                     "slot": int(row["slot"]) if "slot" in row and pd.notna(row["slot"]) else None,
                     "slot_confirmed": bool(row["slot_confirmed"]) if "slot_confirmed" in row and pd.notna(row["slot_confirmed"]) else False,
                 }
