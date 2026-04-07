@@ -213,6 +213,7 @@ function renderDetail(e: SSEEvent): string {
         n_teams: number; n_batters: number; n_pitchers: number;
         multi_pitcher_teams: Record<string, number>;
         n_teams_excluded: number; n_batters_ind_excluded: number; n_pitchers_ind_excluded: number;
+        n_pitchers_value_excluded: number; n_batters_value_excluded: number;
       }
       const multiPitcher = ev.multi_pitcher_teams && Object.keys(ev.multi_pitcher_teams).length > 0
         ? ` (${Object.entries(ev.multi_pitcher_teams).map(([t, n]) => `${n} ${t}`).join(', ')})`
@@ -222,7 +223,12 @@ function renderDetail(e: SSEEvent): string {
       if (ev.n_teams_excluded > 0) exclParts.push(`${ev.n_teams_excluded} team${ev.n_teams_excluded !== 1 ? 's' : ''}`)
       if (ev.n_batters_ind_excluded > 0) exclParts.push(`${ev.n_batters_ind_excluded} batter${ev.n_batters_ind_excluded !== 1 ? 's' : ''}`)
       if (ev.n_pitchers_ind_excluded > 0) exclParts.push(`${ev.n_pitchers_ind_excluded} pitcher${ev.n_pitchers_ind_excluded !== 1 ? 's' : ''}`)
-      return exclParts.length > 0 ? `${loaded}. ${exclParts.join(', ')} excluded` : loaded
+      const valueParts: string[] = []
+      if (ev.n_pitchers_value_excluded > 0) valueParts.push(`${ev.n_pitchers_value_excluded} pitcher${ev.n_pitchers_value_excluded !== 1 ? 's' : ''}`)
+      if (ev.n_batters_value_excluded > 0) valueParts.push(`${ev.n_batters_value_excluded} batter${ev.n_batters_value_excluded !== 1 ? 's' : ''}`)
+      let detail = exclParts.length > 0 ? `${loaded}. ${exclParts.join(', ')} excluded` : loaded
+      if (valueParts.length > 0) detail += `. ${valueParts.join(', ')} below value cutoff`
+      return detail
     }
     case 'simulate': {
       const ev = e as unknown as { n_sims: number }

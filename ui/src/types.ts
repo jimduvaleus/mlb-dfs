@@ -26,6 +26,8 @@ export interface OptimizerConfig {
   rng_seed: number | null
   objective: string
   payout_beta: number | null
+  min_pitcher_value: number | null
+  min_batter_value: number | null
 }
 
 export interface PortfolioConfig {
@@ -114,6 +116,8 @@ export interface LoadSlateEvent extends SSEEvent {
   n_teams_excluded: number
   n_batters_ind_excluded: number
   n_pitchers_ind_excluded: number
+  n_pitchers_value_excluded: number
+  n_batters_value_excluded: number
 }
 
 export interface SimulateEvent extends SSEEvent {

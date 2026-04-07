@@ -50,6 +50,10 @@ optimizer:
   # null = disabled.  A sensible default for large slates is 47000.
   # Tighter slates (few players) may need a lower value or null.
   salary_floor: null
+  # Auto-exclude players whose projected value (mean / (salary/1000)) is below cutoff.
+  # null = disabled.  Example: min_pitcher_value: 1.8 removes pitchers projecting < 1.8x value.
+  min_pitcher_value: null
+  min_batter_value: null
 
 portfolio:
   size: 20            # Number of lineups to construct

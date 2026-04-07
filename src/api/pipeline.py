@@ -124,6 +124,24 @@ class PipelineRunner:
 
         players_df, excl_stats = self._apply_exclusions(players_df)
 
+        # --- Value cutoff filtering ------------------------------------
+        min_p_val = opt_cfg.get("min_pitcher_value")
+        min_b_val = opt_cfg.get("min_batter_value")
+        n_pitchers_value_excluded = 0
+        n_batters_value_excluded = 0
+
+        if min_p_val or min_b_val:
+            players_df["_value"] = players_df["mean"] / (players_df["salary"] / 1000.0)
+            if min_p_val:
+                mask_p = (players_df["position"] == "P") & (players_df["_value"] < min_p_val)
+                n_pitchers_value_excluded = int(mask_p.sum())
+                players_df = players_df[~mask_p]
+            if min_b_val:
+                mask_b = (players_df["position"] != "P") & (players_df["_value"] < min_b_val)
+                n_batters_value_excluded = int(mask_b.sum())
+                players_df = players_df[~mask_b]
+            players_df = players_df.drop(columns=["_value"])
+
         n_teams_loaded = players_df["team"].nunique()
         n_batters = int((players_df["position"] != "P").sum())
         n_pitchers = int((players_df["position"] == "P").sum())
@@ -134,6 +152,8 @@ class PipelineRunner:
             "n_batters": n_batters,
             "n_pitchers": n_pitchers,
             "multi_pitcher_teams": multi_pitcher_teams,
+            "n_pitchers_value_excluded": n_pitchers_value_excluded,
+            "n_batters_value_excluded": n_batters_value_excluded,
             **excl_stats,
         })
 

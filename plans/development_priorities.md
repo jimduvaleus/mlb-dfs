@@ -1,4 +1,3 @@
-- player pool culling (include info on run tab)
 - BIG Turbo button
 - BIG Opponent/contest modeling
 - BIG late swap?

@@ -135,6 +135,14 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
               <input type="number" step={500} value={str(draft.optimizer.salary_floor)}
                 onChange={e => set('optimizer', 'salary_floor', num(e.target.value))} disabled={disabled} />
             </FieldRow>
+            <FieldRow label="Min pitcher value (blank = off)">
+              <input type="number" step={0.1} min={0} value={str(draft.optimizer.min_pitcher_value)}
+                onChange={e => set('optimizer', 'min_pitcher_value', num(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Min batter value (blank = off)">
+              <input type="number" step={0.1} min={0} value={str(draft.optimizer.min_batter_value)}
+                onChange={e => set('optimizer', 'min_batter_value', num(e.target.value))} disabled={disabled} />
+            </FieldRow>
             <FieldRow label="RNG seed (blank = random)">
               <input type="number" value={str(draft.optimizer.rng_seed)}
                 onChange={e => set('optimizer', 'rng_seed', num(e.target.value))} disabled={disabled} />
