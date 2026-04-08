@@ -106,4 +106,9 @@ class Lineup:
         if pitcher_opponents & batter_teams:
             return False
 
+        # Both pitchers cannot be from the same team
+        pitcher_teams = [r['team'] for r in rows if r['position'] == 'P']
+        if len(pitcher_teams) == 2 and pitcher_teams[0] == pitcher_teams[1]:
+            return False
+
         return True

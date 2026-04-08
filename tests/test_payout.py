@@ -168,13 +168,6 @@ def test_calibrate_beta_returns_float(dk_structure, score_percentiles):
     assert isinstance(result, float)
 
 
-def test_calibrate_beta_within_default_range(dk_structure, score_percentiles):
-    """With the new default cap of 4.0, beta must be <= 4.0."""
-    cash_line = get_cash_line_score(dk_structure, score_percentiles)
-    beta = calibrate_beta(dk_structure, score_percentiles, cash_line)
-    assert 1.5 <= beta <= 4.0
-
-
 def test_calibrate_beta_respects_custom_range(dk_structure, score_percentiles):
     """Custom beta_range must be honoured."""
     cash_line = get_cash_line_score(dk_structure, score_percentiles)

@@ -132,6 +132,13 @@ def test_lineup_pitcher_opposing_batter_invalid(player_meta):
     assert not Lineup(ids).is_valid(player_meta)
 
 
+def test_lineup_two_pitchers_same_team_invalid(player_meta):
+    # P1(team B) and P3(team B) are both from team B → invalid
+    # Batters chosen from teams that neither pitcher opposes (C, D) to isolate the new constraint.
+    ids = [1, 3, 6, 8, 10, 12, 14, 17, 18, 22]
+    assert not Lineup(ids).is_valid(player_meta)
+
+
 def test_lineup_pitcher_opposing_constraint_skipped_without_opponent_info():
     # When opponent key is absent from meta the check is skipped (analogous to game check)
     positions = ['P', 'P', 'C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']
