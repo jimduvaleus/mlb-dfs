@@ -1,3 +1,4 @@
+- want to calculate % simulations above target percentile
 - BIG Turbo button
 - BIG Opponent/contest modeling
 - BIG late swap?

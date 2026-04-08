@@ -15,6 +15,7 @@ data/processed/batter_score_grid.npy
 data/raw/DKSalaries.csv
 data/processed/projections.csv
 outputs/
+archive/
 config.yaml
 .claude/settings.json
 
