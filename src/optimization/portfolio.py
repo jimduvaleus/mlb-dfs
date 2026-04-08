@@ -85,6 +85,7 @@ class PortfolioConstructor:
         n_seed_lineups: int = 5,
         ref_p90: Optional[float] = None,
         ref_p99: Optional[float] = None,
+        payout_coverage_bonus: float = 0.0,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -107,6 +108,7 @@ class PortfolioConstructor:
             objective=objective,
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
+            payout_coverage_bonus=payout_coverage_bonus,
         )
         self._base_seed = rng_seed
 

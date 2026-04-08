@@ -45,10 +45,17 @@ def payout_table_to_array(structure: dict) -> np.ndarray:
 
 
 @njit(cache=True)
-def power_law_payout(scores: np.ndarray, cash_line: float, beta: float) -> np.ndarray:
-    """Compute payout values using a power-law function.
+def power_law_payout(
+    scores: np.ndarray, cash_line: float, beta: float, coverage_bonus: float = 0.0
+) -> np.ndarray:
+    """Compute payout values using a two-component payout function.
 
-    P(s) = max(0, s - cash_line)^beta
+    P(s) = max(0, s - cash_line)^beta + coverage_bonus * 1{s > cash_line}
+
+    The first term rewards upside depth (convex for beta > 1).  The second
+    term is a flat bonus for any coverage above the cash line, creating an
+    independent breadth incentive that is not coupled to the tail exponent.
+    Setting coverage_bonus=0 recovers the original power-law behaviour.
 
     Parameters
     ----------
@@ -58,7 +65,12 @@ def power_law_payout(scores: np.ndarray, cash_line: float, beta: float) -> np.nd
         Minimum score to receive any payout (typically the target).
     beta : float
         Convexity exponent.  Higher values weight top scores more heavily.
-        Recommended range: 2.0-3.0 for typical GPPs.
+        Recommended range: 1.5-3.0 for typical GPPs.
+    coverage_bonus : float
+        Flat bonus added whenever a score exceeds cash_line.  Calibrate
+        relative to a typical surplus: e.g. if a 15-pt surplus gives
+        15^beta payout, set coverage_bonus to that value to make breadth
+        and depth equally weighted at the 15-pt margin.
 
     Returns
     -------
@@ -70,7 +82,7 @@ def power_law_payout(scores: np.ndarray, cash_line: float, beta: float) -> np.nd
     for i in range(n):
         diff = scores[i] - cash_line
         if diff > 0.0:
-            out[i] = diff ** beta
+            out[i] = diff ** beta + coverage_bonus
         else:
             out[i] = 0.0
     return out

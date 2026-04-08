@@ -26,6 +26,7 @@ export interface OptimizerConfig {
   rng_seed: number | null
   objective: string
   payout_beta: number | null
+  payout_coverage_bonus: number
   min_pitcher_value: number | null
   min_batter_value: number | null
 }

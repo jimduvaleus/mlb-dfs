@@ -272,6 +272,7 @@ class PipelineRunner:
             objective=objective,
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
+            payout_coverage_bonus=float(opt_cfg.get("payout_coverage_bonus", 0.0)),
             n_seed_lineups=int(opt_cfg.get("n_seed_lineups", 5)),
             ref_p90=fixed_ref_p90,
             ref_p99=fixed_ref_p99,

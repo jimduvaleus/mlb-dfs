@@ -126,11 +126,15 @@ def _score_swap_candidates_surplus(
 
 def _score_totals_payout(
     totals: np.ndarray, cash_line: float, best_scores: np.ndarray, beta: float,
+    coverage_bonus: float = 0.0,
 ) -> float:
-    """E[payout(max(best_scores, lineup_scores))] using power-law payout."""
+    """E[payout(max(best_scores, lineup_scores))] using two-component payout."""
     effective = np.maximum(totals, best_scores)
     diff = np.maximum(effective - cash_line, 0.0)
-    return float(np.mean(diff ** beta))
+    payout = diff ** beta
+    if coverage_bonus > 0.0:
+        payout = payout + coverage_bonus * (effective > cash_line).astype(np.float64)
+    return float(np.mean(payout))
 
 
 @njit(parallel=True, cache=True)
@@ -142,11 +146,12 @@ def _score_swap_candidates_payout(
     cash_line: float,
     best_scores: np.ndarray,
     beta: float,
+    coverage_bonus: float,
 ) -> np.ndarray:
-    """Score all swap candidates using marginal payout objective.
+    """Score all swap candidates using two-component marginal payout objective.
 
     For each candidate, computes E[P(max(best_scores, new_total))] where
-    P(s) = max(0, s - cash_line)^beta.
+    P(s) = max(0, s - cash_line)^beta + coverage_bonus * 1{s > cash_line}.
 
     Candidates are scored in parallel via Numba prange. In worker processes,
     numba thread count is capped to cpu_count // n_workers to prevent
@@ -163,7 +168,7 @@ def _score_swap_candidates_payout(
             effective = new_total if best_scores[i] <= new_total else best_scores[i]
             diff = effective - cash_line
             if diff > 0.0:
-                total_payout += diff ** beta
+                total_payout += diff ** beta + coverage_bonus
         cand_scores[j] = total_payout / n_sims
     return cand_scores
 
@@ -277,6 +282,7 @@ class _ChainRunner:
         best_scores: Optional[np.ndarray] = None,
         payout_beta: float = 2.5,
         payout_cash_line: Optional[float] = None,
+        payout_coverage_bonus: float = 0.0,
     ):
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
@@ -301,11 +307,14 @@ class _ChainRunner:
             self._best_scores = best_scores
             self._payout_beta = payout_beta
             self._payout_cash_line = payout_cash_line if payout_cash_line is not None else target
+            self._payout_coverage_bonus = payout_coverage_bonus
             self._score_totals = lambda totals, tgt: _score_totals_payout(
-                totals, self._payout_cash_line, self._best_scores, self._payout_beta
+                totals, self._payout_cash_line, self._best_scores, self._payout_beta,
+                self._payout_coverage_bonus,
             )
             self._score_swap_candidates = lambda sm, t, co, cc, tgt: _score_swap_candidates_payout(
-                sm, t, co, cc, self._payout_cash_line, self._best_scores, self._payout_beta
+                sm, t, co, cc, self._payout_cash_line, self._best_scores, self._payout_beta,
+                self._payout_coverage_bonus,
             )
         else:
             self._score_totals = _score_totals_surplus
@@ -864,7 +873,7 @@ class _ChainRunner:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, n_workers, initial_lineup = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, payout_coverage_bonus, n_workers, initial_lineup = args
     # Cap Numba intra-op threads so that n_workers processes don't collectively
     # over-subscribe the CPU.  Single-process mode (n_workers=1) leaves Numba
     # free to use all available cores for prange parallelism.
@@ -891,6 +900,7 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             best_scores=best_scores,
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
+            payout_coverage_bonus=payout_coverage_bonus,
         )
         return runner.run(seed, initial_lineup=initial_lineup)
     finally:
@@ -939,6 +949,7 @@ class BasinHoppingOptimizer:
         best_scores: Optional[np.ndarray] = None,
         payout_beta: float = 2.5,
         payout_cash_line: Optional[float] = None,
+        payout_coverage_bonus: float = 0.0,
     ):
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
@@ -966,6 +977,7 @@ class BasinHoppingOptimizer:
         self.best_scores = best_scores
         self.payout_beta = payout_beta
         self.payout_cash_line = payout_cash_line
+        self.payout_coverage_bonus = payout_coverage_bonus
 
         # Pre-group player IDs by position for fast pool queries
         self._players_by_pos: Dict[str, List[int]] = {
@@ -990,6 +1002,7 @@ class BasinHoppingOptimizer:
             best_scores=self.best_scores,
             payout_beta=self.payout_beta,
             payout_cash_line=self.payout_cash_line,
+            payout_coverage_bonus=self.payout_coverage_bonus,
         )
 
     def _run_chains(
@@ -1048,6 +1061,7 @@ class BasinHoppingOptimizer:
                     self.best_scores,
                     self.payout_beta,
                     self.payout_cash_line,
+                    self.payout_coverage_bonus,
                     self.n_workers,
                     initial,
                 ))
