@@ -83,6 +83,8 @@ class PortfolioConstructor:
         payout_beta: float = 2.5,
         payout_cash_line: Optional[float] = None,
         n_seed_lineups: int = 5,
+        ref_p90: Optional[float] = None,
+        ref_p99: Optional[float] = None,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -91,6 +93,8 @@ class PortfolioConstructor:
         self._payout_weighted = objective == "marginal_payout"
         self._payout_beta = payout_beta
         self._n_seed_lineups = n_seed_lineups
+        self._ref_p90 = ref_p90
+        self._ref_p99 = ref_p99
         self._optimizer_kwargs = dict(
             n_chains=n_chains,
             temperature=temperature,
@@ -313,21 +317,29 @@ class PortfolioConstructor:
                     ((best_scores >= self.target) & (best_scores < great_threshold)).sum()
                 )
                 n_uncovered = int((best_scores < self.target).sum())
-                best_p90 = float(np.percentile(best_scores, 90))
-                best_p99 = float(np.percentile(best_scores, 99))
-                best_ptarget = (
-                    float(np.percentile(best_scores, target_percentile))
-                    if target_percentile is not None else None
+                n_sims_total = len(best_scores)
+                pct_above_p90 = (
+                    float((best_scores >= self._ref_p90).sum()) / n_sims_total * 100
+                    if self._ref_p90 is not None else None
                 )
+                pct_above_p99 = (
+                    float((best_scores >= self._ref_p99).sum()) / n_sims_total * 100
+                    if self._ref_p99 is not None else None
+                )
+                pct_above_target = float((best_scores >= self.target).sum()) / n_sims_total * 100
                 logger.info(
-                    "  Coverage — great: %d, good: %d, uncovered: %d. p90: %.1f, p99: %.1f",
-                    n_great, n_good, n_uncovered, best_p90, best_p99,
+                    "  Coverage — great: %d, good: %d, uncovered: %d. "
+                    "%%>=p90: %.1f%%, %%>=target: %.1f%%, %%>=p99: %.1f%%",
+                    n_great, n_good, n_uncovered,
+                    pct_above_p90 if pct_above_p90 is not None else 0.0,
+                    pct_above_target,
+                    pct_above_p99 if pct_above_p99 is not None else 0.0,
                 )
 
                 if on_lineup_complete is not None:
                     on_lineup_complete(
                         i + 1, self.portfolio_size, full_score,
-                        n_great, n_good, n_uncovered, best_p90, best_p99, best_ptarget,
+                        n_great, n_good, n_uncovered, pct_above_p90, pct_above_p99, pct_above_target,
                     )
 
                 if stop_check is not None and stop_check():

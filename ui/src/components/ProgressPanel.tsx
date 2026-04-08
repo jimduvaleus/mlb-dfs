@@ -247,11 +247,9 @@ function renderDetail(e: SSEEvent): string {
     case 'optimize_lineup': {
       const ev = e as OptimizeLineupEvent
       if (ev.objective === 'marginal_payout') {
-        const p90 = ev.p90 != null ? ev.p90.toFixed(1) : '—'
+        const pctFmt = (v: number | null | undefined) => v != null ? `${v.toFixed(1)}%` : '—'
         const ptLabel = ev.target_percentile != null ? `p${ev.target_percentile}` : 'target'
-        const ptVal = ev.p_target != null ? ev.p_target.toFixed(1) : '—'
-        const p99 = ev.p99 != null ? ev.p99.toFixed(1) : '—'
-        return `p90: ${p90} · ${ptLabel}: ${ptVal} · p99: ${p99}`
+        return `p90: ${pctFmt(ev.pct_above_p90)} · ${ptLabel}: ${pctFmt(ev.pct_above_target)} · p99: ${pctFmt(ev.pct_above_p99)}`
       }
       return `Lineup ${ev.lineup_index}/${ev.total} — ${(ev.sims_covered ?? 0).toLocaleString()} sims removed, ${(ev.sims_remaining ?? 0).toLocaleString()} remaining`
     }

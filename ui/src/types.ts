@@ -143,10 +143,10 @@ export interface OptimizeLineupEvent extends SSEEvent {
   sims_great?: number
   sims_good?: number
   sims_uncovered?: number
-  // marginal_payout objective — evolving portfolio score percentiles
-  p90?: number
-  p99?: number
-  p_target?: number
+  // marginal_payout objective — portfolio coverage fractions (0–100) against fixed sim thresholds
+  pct_above_p90?: number | null
+  pct_above_p99?: number | null
+  pct_above_target?: number | null
   target_percentile?: number | null
   objective?: string
 }

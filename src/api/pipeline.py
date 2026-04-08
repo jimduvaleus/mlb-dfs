@@ -202,12 +202,16 @@ class PipelineRunner:
         objective = str(opt_cfg.get("objective", "expected_surplus"))
         payout_beta_cfg = opt_cfg.get("payout_beta")
         _BETA_MAX = 4.0
+        fixed_ref_p90: Optional[float] = None
+        fixed_ref_p99: Optional[float] = None
         if objective == "marginal_payout":
             from src.optimization.payout import load_payout_structure, get_cash_line_score
             score_dist = self._best_lineup_score_distribution(players_df, sim_results)
             score_percentiles = np.percentile(score_dist, np.arange(1, 101))
             structure = load_payout_structure("dk_classic_gpp")
             payout_cash_line = get_cash_line_score(structure, score_percentiles)
+            fixed_ref_p90 = float(np.percentile(score_dist, 90))
+            fixed_ref_p99 = float(np.percentile(score_dist, 99))
             logger.info("Payout cash line score: %.1f DK pts", payout_cash_line)
             raw_beta = float(payout_beta_cfg) if payout_beta_cfg is not None else 2.5
             payout_beta = min(raw_beta, _BETA_MAX)
@@ -269,6 +273,8 @@ class PipelineRunner:
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
             n_seed_lineups=int(opt_cfg.get("n_seed_lineups", 5)),
+            ref_p90=fixed_ref_p90,
+            ref_p99=fixed_ref_p99,
         )
 
         def _on_lineup_complete(
@@ -285,9 +291,9 @@ class PipelineRunner:
                     "sims_great": arg4,
                     "sims_good": arg5,
                     "sims_uncovered": arg6,
-                    "p90": round(arg7, 1) if arg7 is not None else None,
-                    "p99": round(arg8, 1) if arg8 is not None else None,
-                    "p_target": round(arg9, 1) if arg9 is not None else None,
+                    "pct_above_p90": round(arg7, 1) if arg7 is not None else None,
+                    "pct_above_p99": round(arg8, 1) if arg8 is not None else None,
+                    "pct_above_target": round(arg9, 1) if arg9 is not None else None,
                     "target_percentile": target_percentile,
                     "objective": objective,
                 })
