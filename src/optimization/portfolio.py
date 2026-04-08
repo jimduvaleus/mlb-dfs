@@ -164,7 +164,9 @@ class PortfolioConstructor:
         portfolio: List[Tuple[Lineup, float]] = []
         full_matrix = self.sim_results.results_matrix  # shape (n_sims, n_players)
         col_map = {pid: i for i, pid in enumerate(self.sim_results.player_ids)}
-        active_mask = np.ones(self.sim_results.n_sims, dtype=bool)
+        n_sims = self.sim_results.n_sims
+        active_mask = np.ones(n_sims, dtype=bool)
+        best_scores = np.zeros(n_sims, dtype=np.float64)
         n_workers = self._optimizer_kwargs.get('n_workers', 1)
         pending_seeds: List[Lineup] = []
 
@@ -219,6 +221,18 @@ class PortfolioConstructor:
                 portfolio.append((lineup, full_score))
                 logger.info("  Lineup %d score (full): %.4f", i + 1, full_score)
 
+                # Update best_scores and compute coverage fractions.
+                best_scores = np.maximum(best_scores, full_totals)
+                pct_above_p90 = (
+                    float((best_scores >= self._ref_p90).sum()) / n_sims * 100
+                    if self._ref_p90 is not None else None
+                )
+                pct_above_p99 = (
+                    float((best_scores >= self._ref_p99).sum()) / n_sims * 100
+                    if self._ref_p99 is not None else None
+                )
+                pct_above_target = float((best_scores >= self.target).sum()) / n_sims * 100
+
                 # Consume active rows where this lineup already hits the target.
                 active_indices = np.where(active_mask)[0]
                 active_totals = full_matrix[active_mask][:, cols].sum(axis=1)
@@ -227,13 +241,18 @@ class PortfolioConstructor:
                 active_mask[active_indices[hit_mask]] = False
                 remaining = int(active_mask.sum())
                 logger.info(
-                    "  Consumed %d rows; %d remain.",
-                    consumed,
-                    remaining,
+                    "  Consumed %d rows; %d remain. %%>=p90: %.1f%%, %%>=target: %.1f%%, %%>=p99: %.1f%%",
+                    consumed, remaining,
+                    pct_above_p90 if pct_above_p90 is not None else 0.0,
+                    pct_above_target,
+                    pct_above_p99 if pct_above_p99 is not None else 0.0,
                 )
 
                 if on_lineup_complete is not None:
-                    on_lineup_complete(i + 1, self.portfolio_size, full_score, consumed, remaining)
+                    on_lineup_complete(
+                        i + 1, self.portfolio_size, full_score,
+                        consumed, remaining, pct_above_p90, pct_above_p99, pct_above_target,
+                    )
 
                 if stop_check is not None and stop_check():
                     logger.info(
