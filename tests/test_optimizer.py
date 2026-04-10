@@ -139,6 +139,57 @@ def test_lineup_two_pitchers_same_team_invalid(player_meta):
     assert not Lineup(ids).is_valid(player_meta)
 
 
+def test_local_search_no_two_pitchers_same_team(players_df, sim_results):
+    """Local search fast path must not produce lineups with two pitchers from the same team.
+
+    The fast-path delta checker tracks constraints incrementally instead of calling
+    is_valid on every candidate.  This test verifies the same-team pitcher check is
+    enforced there by introducing a highly-valued same-team pitcher that would be
+    chosen greedily if the constraint were missing.
+    """
+    # Add an extra pitcher from team B (same as P1 and P3) with astronomically high
+    # simulated scores so that the local search is strongly tempted to swap it in.
+    # A valid starting lineup uses P20(A) + P21(C); swapping P21 → new B pitcher
+    # would violate the constraint (P20 is A, new pitcher is B — actually fine).
+    # Instead: start with P1(B) + P2(D); add extra P_B2(B) with huge scores so the
+    # local search wants to swap P2(D) → P_B2(B).  That would give two B pitchers.
+    extra_pid = 99  # second team-B pitcher
+    extra_row = pd.DataFrame([_make_player(extra_pid, 'P', 8000, 'B', 'A@B')])
+    extended_df = pd.concat([players_df, extra_row], ignore_index=True)
+
+    n_pids = len(extended_df)
+    rng_np = np.random.default_rng(0)
+    matrix = rng_np.uniform(0, 5, size=(sim_results.n_sims, n_pids)).astype(np.float64)
+    # extra_pid is the last column; give it an absurdly high score so local
+    # search always wants to include it.
+    matrix[:, -1] = 9999.0
+
+    extended_results = SimulationResults(
+        player_ids=extended_df['player_id'].tolist(),
+        results_matrix=matrix,
+    )
+    opt = BasinHoppingOptimizer(
+        sim_results=extended_results,
+        players_df=extended_df,
+        target=10000.0,  # unreachable → every marginal gain matters
+        n_chains=5,
+        n_steps=20,
+        rng_seed=3,
+    )
+    runner = opt._runner
+    pm = _build_player_meta(extended_df)
+    rng = np.random.default_rng(3)
+    for _ in range(30):
+        lineup = runner._random_valid_lineup(rng)
+        cols = [opt.col_map[pid] for pid in lineup.player_ids]
+        totals = opt.sim_matrix[:, cols].sum(axis=1)
+        result, _ = runner._local_search(lineup, totals, rng)
+        pitcher_teams = [pm[pid]['team'] for pid in result.player_ids if pm[pid]['position'] == 'P']
+        assert len(set(pitcher_teams)) == 2, (
+            f"Two pitchers from same team {pitcher_teams} in lineup {result.player_ids}"
+        )
+
+
 def test_lineup_pitcher_opposing_constraint_skipped_without_opponent_info():
     # When opponent key is absent from meta the check is skipped (analogous to game check)
     positions = ['P', 'P', 'C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']

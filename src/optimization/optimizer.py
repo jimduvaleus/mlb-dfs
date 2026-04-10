@@ -695,6 +695,11 @@ class _ChainRunner:
             if self.player_meta[pid]['position'] == 'P'
             and self.player_meta[pid].get('opponent')
         }
+        pitcher_teams: set = {
+            self.player_meta[pid]['team']
+            for pid in ids
+            if self.player_meta[pid]['position'] == 'P'
+        }
         batter_teams: set = {
             self.player_meta[pid]['team']
             for pid in ids
@@ -764,6 +769,12 @@ class _ChainRunner:
                 # 1. Team hitter cap: only check when new_team gains a hitter
                 if not new_is_pitcher and (old_is_pitcher or old_team != new_team):
                     if team_counts.get(new_team, 0) + 1 > MAX_HITTERS_PER_TEAM:
+                        continue
+
+                # 2. Two pitchers cannot be from the same team
+                if new_is_pitcher:
+                    eff_pitcher_teams = pitcher_teams - ({old_team} if old_is_pitcher else set())
+                    if new_team in eff_pitcher_teams:
                         continue
 
                 # 3. Pitcher-batter conflict
@@ -853,11 +864,12 @@ class _ChainRunner:
                 if new_game:
                     game_counts[new_game] = game_counts.get(new_game, 0) + 1
 
-                # Pitcher opponents and batter teams
+                # Pitcher opponents, pitcher teams, and batter teams
                 if old_is_pitcher:
                     old_opp = meta.get('opponent', '')
                     if old_opp:
                         pitcher_opponents.discard(old_opp)
+                    pitcher_teams.discard(old_team)
                 else:
                     if team_counts.get(old_team, 0) == 0:
                         batter_teams.discard(old_team)
@@ -865,6 +877,7 @@ class _ChainRunner:
                     new_opp = new_meta.get('opponent', '')
                     if new_opp:
                         pitcher_opponents.add(new_opp)
+                    pitcher_teams.add(new_team)
                 else:
                     batter_teams.add(new_team)
 
