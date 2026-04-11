@@ -69,6 +69,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 onChange={e => set('paths', 'projections_source', e.target.value)} disabled={disabled}>
                 <option value="rotowire">RotoWire</option>
                 <option value="dailyfantasyfuel">Daily Fantasy Fuel</option>
+                <option value="market_odds">Market Odds</option>
               </select>
             </FieldRow>
           </section>

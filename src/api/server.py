@@ -365,18 +365,145 @@ async def projections_fetch(request: Request):
 
     async def _stream():
         source = (cfg.paths.projections_source or "rotowire").strip().lower()
-        is_dff_preferred = source == "dailyfantasyfuel"
-        preferred_label = "Daily Fantasy Fuel" if is_dff_preferred else "RotoWire"
-        fallback_label  = "RotoWire" if is_dff_preferred else "Daily Fantasy Fuel"
+        is_dff_preferred    = source == "dailyfantasyfuel"
+        is_market_preferred = source == "market_odds"
+        if is_market_preferred:
+            preferred_label = "Market Odds (CrazyNinjaOdds)"
+            fallback_label  = "RotoWire"
+        elif is_dff_preferred:
+            preferred_label = "Daily Fantasy Fuel"
+            fallback_label  = "RotoWire"
+        else:
+            preferred_label = "RotoWire"
+            fallback_label  = "Daily Fantasy Fuel"
 
         python     = PROJECT_ROOT / "venv" / "bin" / "python"
         dff_script = PROJECT_ROOT / "scripts" / "fetch_dff_projections.py"
         rw_script  = PROJECT_ROOT / "scripts" / "fetch_rotowire_projections.py"
+        mo_script  = PROJECT_ROOT / "scripts" / "fetch_market_odds_projections.py"
         dff_out    = proj_path.parent / "projections_dff.csv"
         rw_out     = proj_path.parent / "projections_rw.csv"
+        mo_out     = proj_path.parent / "projections_mo.csv"
 
         def _log(msg: str) -> str:
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
+
+        # ---- Market Odds path -----------------------------------------------
+        if is_market_preferred:
+            # Step 1: RotoWire is always required (player pool + lineup slots)
+            yield _log("--- Fetching RotoWire projections (player pool) ---")
+            proc = await asyncio.create_subprocess_exec(
+                str(python), str(rw_script), "--output", str(rw_out),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(PROJECT_ROOT),
+            )
+            assert proc.stdout is not None
+            async for line in proc.stdout:
+                if await request.is_disconnected():
+                    proc.kill()
+                    break
+                yield _log(line.decode().rstrip())
+            rw_rc = await proc.wait()
+
+            if rw_rc != 0:
+                yield f"data: {json.dumps({'type': 'done', 'returncode': rw_rc, 'timestamp': int(time.time() * 1000)})}\n\n"
+                return
+
+            # Step 2: Market odds (non-fatal — fall back to RW entirely on failure)
+            yield _log("--- Fetching Market Odds (CrazyNinjaOdds) ---")
+            proc2 = await asyncio.create_subprocess_exec(
+                str(python), str(mo_script), "--output", str(mo_out),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(PROJECT_ROOT),
+            )
+            assert proc2.stdout is not None
+            async for line in proc2.stdout:
+                if await request.is_disconnected():
+                    proc2.kill()
+                    break
+                yield _log(line.decode().rstrip())
+            mo_rc = await proc2.wait()
+
+            # Step 3: Merge — RW is pool, market odds overlays values
+            try:
+                import pandas as pd
+
+                rw_df = pd.read_csv(rw_out) if rw_out.exists() else pd.DataFrame()
+                mo_df = (
+                    pd.read_csv(mo_out)
+                    if (mo_out.exists() and mo_rc == 0)
+                    else pd.DataFrame()
+                )
+
+                if rw_df.empty:
+                    yield _log("Error: RotoWire produced no usable data.")
+                    yield f"data: {json.dumps({'type': 'done', 'returncode': 1, 'timestamp': int(time.time() * 1000)})}\n\n"
+                    return
+
+                pool = rw_df.copy()
+                fallback_players: list[dict] = []
+
+                if not mo_df.empty and {"player_id", "mean", "std_dev"}.issubset(mo_df.columns):
+                    pref_lookup = (
+                        mo_df.drop_duplicates("player_id")
+                        .set_index("player_id")[["mean", "std_dev"]]
+                    )
+                    pool = pool.merge(
+                        pref_lookup.rename(columns={"mean": "_pm", "std_dev": "_ps"}),
+                        on="player_id",
+                        how="left",
+                    )
+                    has_pref = pool["_pm"].notna()
+                    pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
+                    pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
+                    pool = pool.drop(columns=["_pm", "_ps"])
+                    fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
+
+                    if not fallback_rows.empty:
+                        id_to_team: dict = {}
+                        if dk_path is not None:
+                            try:
+                                dk_df = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
+                                id_to_team = dict(zip(dk_df["ID"], dk_df["TeamAbbrev"]))
+                            except Exception:
+                                pass
+                        for _, row in fallback_rows.iterrows():
+                            fallback_players.append({
+                                "name": row["name"],
+                                "team": id_to_team.get(int(row["player_id"]), "") if "player_id" in fallback_rows.columns else "",
+                            })
+                else:
+                    yield _log(
+                        "Warning: Market odds unavailable; using RotoWire projections for all players."
+                    )
+
+                out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+                merged_df = pool[[c for c in out_cols if c in pool.columns]]
+                merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
+                merged_df.to_csv(proj_path, index=False)
+
+                if fallback_players:
+                    yield f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'timestamp': int(time.time() * 1000)})}\n\n"
+                else:
+                    yield _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
+
+            except Exception as exc:
+                yield _log(f"Warning: merge error — {exc}")
+            finally:
+                for p in (rw_out, mo_out):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+            try:
+                record_fetch_from_csv(proj_path, "auto", dk_path)
+            except Exception:
+                pass
+            yield f"data: {json.dumps({'type': 'done', 'returncode': 0, 'timestamp': int(time.time() * 1000)})}\n\n"
+            return
 
         # ---- Run preferred script (live-streamed) ----------------------------
         yield _log(f"--- Fetching {preferred_label} projections ---")
