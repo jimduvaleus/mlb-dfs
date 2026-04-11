@@ -9,8 +9,16 @@ Flow:
   4. For each matched game, navigate to the game detail page and:
      a. Set Devig Method to Liquidity-Weighted Additive/Shin
      b. For each relevant market, select All players and parse the Fair Odds table
-  5. Convert O/U fair odds to E[X] using Poisson distribution (scipy brentq solver)
-  6. Apply DK scoring formula to compute mean; derive std_dev from Poisson variance
+        Batter markets: Player Runs, Player RBIs, Player Singles, Player Doubles,
+          Player Triples, Player Home Runs, Player Stolen Bases, Player Walks
+        Pitcher markets: Player Outs Recorded, Player Pitching Strikeouts,
+          Player Record A Win, Player Hits Allowed, Player Walks Allowed,
+          Player Earned Runs Allowed
+  5. Convert O/U fair odds to E[X]:
+     - Batters: Geometric NB (r=1) closed-form solver — corrects for the heavy
+       overdispersion in per-game batter counting stats vs. the Poisson assumption
+     - Pitchers: Poisson (scipy brentq solver) — appropriate for outs/strikeouts
+  6. Apply DK scoring formula to compute mean; derive std_dev from NB/Poisson variance
   7. Match player names to DK player IDs (normalise + fuzzy match)
   8. Write projections CSV (player_id, name, mean, std_dev)
      lineup_slot is NOT set here — provided by RotoWire during server merge
@@ -67,7 +75,8 @@ GAME_URL  = "https://crazyninjaodds.com/site/browse/game.aspx?game_id={}"
 DEVIG_VALUE = "2"
 
 BATTER_MARKETS = [
-    "Player Hits + Runs + RBIs",
+    "Player Runs",
+    "Player RBIs",
     "Player Singles",
     "Player Doubles",
     "Player Triples",
@@ -86,7 +95,8 @@ PITCHER_MARKETS = [
 ]
 
 # Internal market key names
-MK_HRRI    = "h_r_rbi"
+MK_RUNS    = "runs"
+MK_RBIS    = "rbis"
 MK_SINGLES = "singles"
 MK_DOUBLES = "doubles"
 MK_TRIPLES = "triples"
@@ -101,7 +111,8 @@ MK_BBA     = "walks_allowed"
 MK_ER      = "earned_runs_allowed"
 
 MARKET_KEY_MAP: dict[str, str] = {
-    "Player Hits + Runs + RBIs":  MK_HRRI,
+    "Player Runs":                MK_RUNS,
+    "Player RBIs":                MK_RBIS,
     "Player Singles":             MK_SINGLES,
     "Player Doubles":             MK_DOUBLES,
     "Player Triples":             MK_TRIPLES,
@@ -352,12 +363,59 @@ def _fit_lambda(lines_probs: list[tuple[float, float]]) -> float | None:
     """
     Given multiple (line, p_over) tuples, return a weighted-average λ estimate.
     Weight = |p_over - 0.5| so sharper / more informative lines count more.
+    Used for pitcher stats, which are well-approximated by Poisson.
     """
     estimates, weights = [], []
     for line, p_over in lines_probs:
         lam = _poisson_lambda(line, p_over)
         if lam is not None:
             estimates.append(lam)
+            weights.append(max(abs(p_over - 0.5), 0.01))
+    if not estimates:
+        return None
+    total_w = sum(weights)
+    return sum(e * w for e, w in zip(estimates, weights)) / total_w
+
+
+# ---------------------------------------------------------------------------
+# Geometric NB O/U → E[X] conversion (for batter stats)
+# ---------------------------------------------------------------------------
+
+def _nb_mean_geometric(line: float, p_over: float, tol: float = 1e-9) -> float | None:
+    """
+    Find the mean μ of a Geometric / NB(r=1) distribution such that P(X > line) = p_over.
+
+    Batter per-game counting stats (singles, HR, runs, etc.) are far more
+    overdispersed than Poisson assumes.  The geometric distribution (NB r=1)
+    is better motivated: it models a "first-success" process where the number
+    of events in a game is 0 or 1 most of the time, with a long right tail.
+
+    Closed-form solution:
+        P(X > line) = P(X >= k+1) = (μ/(1+μ))^(k+1)  where k = floor(line)
+        → q = p_over^(1/(k+1)),  μ = q / (1 - q)
+    """
+    p_over = max(tol, min(1.0 - tol, p_over))
+    k = math.floor(line)
+    try:
+        q = p_over ** (1.0 / (k + 1))
+        if q >= 1.0 - tol:
+            return None
+        return q / (1.0 - q)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+def _fit_nb_mean(lines_probs: list[tuple[float, float]]) -> float | None:
+    """
+    Given multiple (line, p_over) tuples, return a weighted-average geometric-NB
+    mean estimate.  Weight = |p_over - 0.5| so sharper lines count more.
+    Used for batter stats in place of _fit_lambda.
+    """
+    estimates, weights = [], []
+    for line, p_over in lines_probs:
+        mu = _nb_mean_geometric(line, p_over)
+        if mu is not None:
+            estimates.append(mu)
             weights.append(max(abs(p_over - 0.5), 0.01))
     if not estimates:
         return None
@@ -798,39 +856,63 @@ def _compute_batter_projection(
     player_markets: dict[str, list[tuple[float, float]]]
 ) -> tuple[float, float] | None:
     """
-    Compute (mean_dk, std_dev_dk) for a batter from market lambda estimates.
-    Returns None if there is insufficient data to make a useful projection.
+    Compute (mean_dk, std_dev_dk) for a batter from market mean estimates.
+
+    Uses the Geometric NB (r=1) model to back-solve E[X] from O/U fair odds.
+    This corrects the systematic underestimation Poisson produces for batter
+    counting stats, which are heavily overdispersed: most games a player gets
+    0 of a given stat, but the right tail is long.
+
+    Runs and RBIs are fetched as dedicated markets rather than derived as a
+    residual from the combined Hits+Runs+RBIs market.
+
+    Returns None if either Runs or RBIs market data is absent for this player,
+    or if no hit-type data is present — the caller should use a RotoWire
+    fallback projection in that case.
     """
-    def get_lam(key: str) -> float:
+    def get_mu(key: str) -> float:
         lp = player_markets.get(key, [])
         if not lp:
             return 0.0
-        lam = _fit_lambda(lp)
-        return lam if lam is not None else 0.0
+        mu = _fit_nb_mean(lp)
+        return mu if mu is not None else 0.0
 
-    e_s    = get_lam(MK_SINGLES)
-    e_d    = get_lam(MK_DOUBLES)
-    e_t    = get_lam(MK_TRIPLES)
-    e_hr   = get_lam(MK_HR)
-    e_sb   = get_lam(MK_SB)
-    e_bb   = get_lam(MK_WALKS)
-    e_hrri = get_lam(MK_HRRI)
+    e_s   = get_mu(MK_SINGLES)
+    e_d   = get_mu(MK_DOUBLES)
+    e_t   = get_mu(MK_TRIPLES)
+    e_hr  = get_mu(MK_HR)
+    e_sb  = get_mu(MK_SB)
+    e_bb  = get_mu(MK_WALKS)
+    e_r   = get_mu(MK_RUNS)
+    e_rbi = get_mu(MK_RBIS)
 
-    if e_hrri == 0 and e_s == 0 and e_d == 0 and e_t == 0 and e_hr == 0:
-        return None  # No useful signal
+    # Require at least one hit-type market and both Runs and RBIs.
+    # A zero here means the market wasn't available for this player — fall back
+    # to RotoWire rather than silently underestimating their projection.
+    if e_s == 0 and e_d == 0 and e_t == 0 and e_hr == 0:
+        return None
+    if e_r == 0 or e_rbi == 0:
+        return None
 
-    e_hits  = e_s + e_d + e_t + e_hr
-    e_r_rbi = max(0.0, e_hrri - e_hits)  # Residual: runs + RBIs
-    e_hbp   = e_bb * HBP_PER_WALK
+    e_hbp = e_bb * HBP_PER_WALK
 
     mean = (
         e_s * 3 + e_d * 5 + e_t * 8 + e_hr * 10
-        + e_r_rbi * 2 + e_bb * 2 + e_sb * 5 + e_hbp * 2
+        + e_r * 2 + e_rbi * 2 + e_bb * 2 + e_sb * 5 + e_hbp * 2
     )
-    # Var[aX] = a² λ for Poisson(λ)
+    # Var[aX] = a² * μ(1+μ) for Geometric NB(r=1).
+    # The μ(1+μ) term (vs. Poisson's μ) captures the overdispersion inherent
+    # in batter game-log distributions and gives a more realistic std_dev.
     var = (
-        e_s * 9 + e_d * 25 + e_t * 64 + e_hr * 100
-        + e_r_rbi * 4 + e_bb * 4 + e_sb * 25 + e_hbp * 4
+        e_s   * (1 + e_s)   * 9
+        + e_d   * (1 + e_d)   * 25
+        + e_t   * (1 + e_t)   * 64
+        + e_hr  * (1 + e_hr)  * 100
+        + e_r   * (1 + e_r)   * 4
+        + e_rbi * (1 + e_rbi) * 4
+        + e_bb  * (1 + e_bb)  * 4
+        + e_sb  * (1 + e_sb)  * 25
+        + e_hbp * (1 + e_hbp) * 4
     )
     return mean, max(math.sqrt(var), 1.0)
 
