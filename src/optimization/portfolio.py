@@ -16,6 +16,8 @@ from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from typing import Callable, List, Optional, Tuple
 
+from .optimizer import _worker_init
+
 import numpy as np
 import pandas as pd
 
@@ -171,7 +173,7 @@ class PortfolioConstructor:
         pending_seeds: List[Lineup] = []
 
         with (
-            ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else nullcontext()
+            ProcessPoolExecutor(max_workers=n_workers, initializer=_worker_init) if n_workers > 1 else nullcontext()
         ) as shared_executor:
             for i in range(self.portfolio_size):
                 n_active = int(active_mask.sum())
@@ -289,7 +291,7 @@ class PortfolioConstructor:
         opt_kwargs = dict(self._optimizer_kwargs)
 
         with (
-            ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else nullcontext()
+            ProcessPoolExecutor(max_workers=n_workers, initializer=_worker_init) if n_workers > 1 else nullcontext()
         ) as shared_executor:
             for i in range(self.portfolio_size):
                 # Count sims not yet covered (best_score < target).
@@ -484,7 +486,7 @@ class BeamPortfolioConstructor:
         ]
 
         with (
-            ProcessPoolExecutor(max_workers=n_workers) if n_workers > 1 else nullcontext()
+            ProcessPoolExecutor(max_workers=n_workers, initializer=_worker_init) if n_workers > 1 else nullcontext()
         ) as shared_executor:
             for depth in range(self.portfolio_size):
                 next_candidates: List[Tuple[List[Tuple[Lineup, float]], np.ndarray, List[Lineup]]] = []

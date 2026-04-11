@@ -884,6 +884,27 @@ class _ChainRunner:
         return Lineup(ids), totals
 
 
+# Module-level initializer for ProcessPoolExecutor workers.
+# When the server's controlling terminal is closed, fds 1 and 2 point to a
+# deleted PTY. Any write to these (e.g. from TBB/OpenMP thread-pool init) raises
+# [Errno 5] Input/output error, which propagates back via fut.result(). Redirecting
+# to /dev/null makes workers safe in daemon/detached server contexts.
+def _worker_init() -> None:
+    import sys
+    try:
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, 1)
+        os.dup2(devnull_fd, 2)
+        os.close(devnull_fd)
+    except OSError:
+        pass
+    try:
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+    except OSError:
+        pass
+
+
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
     seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, payout_coverage_bonus, n_workers, initial_lineup = args
@@ -1081,7 +1102,7 @@ class BasinHoppingOptimizer:
             owned_executor = executor is None
             try:
                 if owned_executor:
-                    executor = ProcessPoolExecutor(max_workers=self.n_workers)
+                    executor = ProcessPoolExecutor(max_workers=self.n_workers, initializer=_worker_init)
                 futures: List[Future] = [executor.submit(_chain_worker, a) for a in chain_args]
                 best_so_far = -1.0
                 steps_since_improvement = 0

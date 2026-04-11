@@ -4,6 +4,7 @@ set -e
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 UI_DIR="$REPO_ROOT/ui"
 PID_FILE="$REPO_ROOT/.uvicorn.pid"
+LOG_FILE="$REPO_ROOT/server.log"
 PORT="${MLB_DFS_PORT:-8000}"
 
 # Check for existing running instance
@@ -34,7 +35,7 @@ echo "Starting MLB DFS Optimizer UI on http://localhost:$PORT"
 uvicorn src.api.server:app \
     --host 127.0.0.1 \
     --port "$PORT" \
-    --log-level warning &
+    --log-level warning >> "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PID_FILE"
 
@@ -43,8 +44,9 @@ sleep 1
 if kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "Server started (PID $SERVER_PID)"
     echo "Open http://localhost:$PORT in your browser"
+    echo "Logs: $LOG_FILE"
 else
-    echo "ERROR: Server failed to start. Check output above."
+    echo "ERROR: Server failed to start. Check $LOG_FILE for details."
     rm -f "$PID_FILE"
     exit 1
 fi
