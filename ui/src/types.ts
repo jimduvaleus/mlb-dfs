@@ -191,6 +191,7 @@ export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 
 export interface MergePlayer {
   name: string
   team: string
+  reason?: string
 }
 
 export interface MergeInfo {

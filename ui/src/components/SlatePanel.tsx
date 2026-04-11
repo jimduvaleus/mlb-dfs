@@ -4,9 +4,11 @@ import { fetchSlateGames, fetchSlatePlayers, savePlayerExclusions, saveSlateExcl
 
 interface Props {
   disabled?: boolean
+  projFetchExcluded?: string[]
+  onProjFetchFilterChange?: (excluded: string[]) => void
 }
 
-export function SlatePanel({ disabled }: Props) {
+export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
@@ -84,6 +86,19 @@ export function SlatePanel({ disabled }: Props) {
       persist(updated)
     },
     [slate, disabled, saving, persist]
+  )
+
+  const toggleProjFetch = useCallback(
+    (gameKey: string) => {
+      if (!onProjFetchFilterChange) return
+      const isExcluded = projFetchExcluded.includes(gameKey)
+      onProjFetchFilterChange(
+        isExcluded
+          ? projFetchExcluded.filter(g => g !== gameKey)
+          : [...projFetchExcluded, gameKey]
+      )
+    },
+    [projFetchExcluded, onProjFetchFilterChange]
   )
 
   const toggleTeam = useCallback(
@@ -174,20 +189,32 @@ export function SlatePanel({ disabled }: Props) {
       </div>
 
       <div className="slate-games-grid">
-        {slate.games.map(g => (
+        {slate.games.map(g => {
+          const gameKey = `${g.away}@${g.home}`
+          const fetchSkipped = projFetchExcluded.includes(gameKey)
+          return (
           <div key={g.game} className={`game-card${g.excluded ? ' game-excluded' : ''}`}>
             <div className="game-card-header">
               <span className="game-label">
                 {g.away} @ {g.home}
               </span>
-              <button
-                className={`btn-game-toggle${g.excluded ? ' btn-game-excluded' : ' btn-game-included'}`}
-                onClick={() => toggleGame(g.game)}
-                disabled={disabled || saving}
-                title={g.excluded ? 'Re-include entire game' : 'Exclude entire game'}
-              >
-                {g.excluded ? 'Excluded' : 'Included'}
-              </button>
+              <div className="game-card-actions">
+                <button
+                  className={`btn-proj-fetch${fetchSkipped ? ' btn-proj-fetch-off' : ' btn-proj-fetch-on'}`}
+                  onClick={() => toggleProjFetch(gameKey)}
+                  title={fetchSkipped ? 'Include this game in projection fetch' : 'Exclude this game from projection fetch (keeps existing projections for these players)'}
+                >
+                  {fetchSkipped ? '⊘ Proj' : '↓ Proj'}
+                </button>
+                <button
+                  className={`btn-game-toggle${g.excluded ? ' btn-game-excluded' : ' btn-game-included'}`}
+                  onClick={() => toggleGame(g.game)}
+                  disabled={disabled || saving}
+                  title={g.excluded ? 'Re-include entire game' : 'Exclude entire game'}
+                >
+                  {g.excluded ? 'Excluded' : 'Included'}
+                </button>
+              </div>
             </div>
             <div className="game-teams">
               {g.teams.map(t => (
@@ -203,7 +230,8 @@ export function SlatePanel({ disabled }: Props) {
               ))}
             </div>
           </div>
-        ))}
+        )})}
+
       </div>
 
       <div className="player-exclusions">

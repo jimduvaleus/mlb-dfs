@@ -56,6 +56,9 @@ export default function App() {
   const [state, dispatch] = useReducer(reducer, initial)
   const [configError, setConfigError] = useState<string | null>(null)
   const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
+  // Games (as "AWAY@HOME" strings) to exclude from projection fetches.
+  // Empty = fetch all games (default). Non-empty = partial fetch + merge.
+  const [projFetchExcluded, setProjFetchExcluded] = useState<string[]>([])
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
   const [stopPending, setStopPending] = useState(false)
@@ -214,7 +217,7 @@ export default function App() {
             {configError && <p className="error">{configError}</p>}
             {state.config ? (
               <>
-                <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} />
+                <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} />
                 <ConfigForm
                   config={state.config}
                   onSaved={cfg => dispatch({ type: 'set_config', config: cfg })}
@@ -228,7 +231,11 @@ export default function App() {
         )}
 
         {state.activeTab === 'slate' && (
-          <SlatePanel disabled={running} />
+          <SlatePanel
+            disabled={running}
+            projFetchExcluded={projFetchExcluded}
+            onProjFetchFilterChange={setProjFetchExcluded}
+          />
         )}
 
         {state.activeTab === 'run' && (

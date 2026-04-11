@@ -437,6 +437,25 @@ button { cursor: pointer; }
   white-space: nowrap;
 }
 
+.merge-info-reason {
+  color: #63b3ed;
+  cursor: help;
+  font-size: 0.85em;
+  opacity: 0.8;
+}
+
+.merge-info-team-group {
+  display: inline;
+}
+
+/* Partial-fetch notice below the Fetch button */
+.proj-partial-note {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  color: #63b3ed;
+  line-height: 1.4;
+}
+
 /* ── Progress panel ── */
 
 .progress-panel {
@@ -914,6 +933,13 @@ button { cursor: pointer; }
   gap: 8px;
 }
 
+.game-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
 .game-label {
   font-size: 0.82rem;
   font-weight: 600;
@@ -956,6 +982,39 @@ button { cursor: pointer; }
 .btn-game-toggle:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+
+/* Projection fetch toggle — sits alongside the include/exclude button */
+.btn-proj-fetch {
+  font-size: 0.68rem;
+  padding: 2px 6px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.12s, opacity 0.12s;
+}
+
+.btn-proj-fetch-on {
+  background: #1a3a4a;
+  color: #63b3ed;
+  border-color: #2b6cb0;
+}
+
+.btn-proj-fetch-on:hover {
+  background: #2b4a6a;
+  color: #90cdf4;
+}
+
+.btn-proj-fetch-off {
+  background: #1a202c;
+  color: #4a5568;
+  border-color: #2d3748;
+}
+
+.btn-proj-fetch-off:hover {
+  background: #2d3748;
+  color: #718096;
 }
 
 .game-teams {

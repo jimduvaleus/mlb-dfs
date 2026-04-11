@@ -349,6 +349,9 @@ async def projections_slates() -> SlateListResponse:
 
 @app.get("/api/projections/fetch")
 async def projections_fetch(request: Request):
+    import re as _re
+    import pandas as pd
+
     if _state["status"] == "running":
         raise HTTPException(409, "A pipeline run is already in progress")
 
@@ -362,6 +365,45 @@ async def projections_fetch(request: Request):
         _dp = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
         if _dp.exists():
             dk_path = _dp
+
+    # --- Parse games filter from query param ---------------------------------
+    # exclude_games=ARI@PHI,NYM@STL means "only fetch the other games and merge
+    # the result into the existing projections.csv" (partial fetch mode).
+    exclude_games_raw = request.query_params.get("exclude_games", "").strip()
+    excluded_pairs: set[tuple[str, str]] = set()
+    if exclude_games_raw:
+        for token in exclude_games_raw.split(","):
+            token = token.strip().upper()
+            if "@" in token:
+                away, home = token.split("@", 1)
+                excluded_pairs.add((away, home))
+
+    # Resolve which games are actually in this slate (from DK CSV) and which
+    # to include in the fetch.  Only used when excluded_pairs is non-empty.
+    included_pairs: set[tuple[str, str]] = set()
+    included_teams: set[str] = set()
+    included_pids:  set[int] = set()
+    id_to_team: dict[int, str] = {}
+
+    if excluded_pairs and dk_path is not None:
+        try:
+            dk_gi = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev", "Game Info"])
+            id_to_team = {int(r["ID"]): str(r["TeamAbbrev"]) for _, r in dk_gi.iterrows()}
+            all_pairs: set[tuple[str, str]] = set()
+            for gi in dk_gi["Game Info"].dropna().unique():
+                m = _re.match(r"(\w+)@(\w+)\s", str(gi).strip())
+                if m:
+                    all_pairs.add((m.group(1).upper(), m.group(2).upper()))
+            included_pairs = all_pairs - excluded_pairs
+            included_teams = {t for a, h in included_pairs for t in (a, h)}
+            included_pids  = {
+                int(r["ID"]) for _, r in dk_gi.iterrows()
+                if str(r["TeamAbbrev"]) in included_teams
+            }
+        except Exception:
+            pass  # fall back to full fetch if DK CSV parse fails
+
+    is_partial = bool(excluded_pairs) and proj_path.exists()
 
     async def _stream():
         source = (cfg.paths.projections_source or "rotowire").strip().lower()
@@ -384,16 +426,64 @@ async def projections_fetch(request: Request):
         dff_out    = proj_path.parent / "projections_dff.csv"
         rw_out     = proj_path.parent / "projections_rw.csv"
         mo_out     = proj_path.parent / "projections_mo.csv"
+        mo_sidecar = proj_path.parent / "projections_mo_fallback.json"
 
         def _log(msg: str) -> str:
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
 
         # Clean up any stale temp files left by a prior incomplete fetch.
-        for _p in (dff_out, rw_out, mo_out):
+        for _p in (dff_out, rw_out, mo_out, mo_sidecar):
             try:
                 _p.unlink(missing_ok=True)
             except Exception:
                 pass
+
+        if is_partial:
+            n_excl = len(excluded_pairs)
+            n_incl = len(included_pairs) if included_pairs else "?"
+            yield _log(
+                f"--- Partial fetch: {n_incl} game(s) included, {n_excl} excluded — "
+                f"will merge into existing projections ---"
+            )
+
+        # Helper: read fallback reasons written by the MO fetch script sidecar.
+        def _read_mo_sidecar() -> dict[int, str]:
+            if not mo_sidecar.exists():
+                return {}
+            try:
+                raw = json.loads(mo_sidecar.read_text())
+                return {int(k): v for k, v in raw.items()}
+            except Exception:
+                return {}
+
+        # Helper: build the id_to_team map if not already built (non-partial paths).
+        def _ensure_id_to_team() -> dict[int, str]:
+            if id_to_team:
+                return id_to_team
+            if dk_path is not None:
+                try:
+                    dk_df2 = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
+                    return {int(r["ID"]): str(r["TeamAbbrev"]) for _, r in dk_df2.iterrows()}
+                except Exception:
+                    pass
+            return {}
+
+        # Helper: write final merged_df to proj_path, handling partial merge.
+        def _write_proj(merged_df: "pd.DataFrame") -> None:
+            out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+            result = merged_df[[c for c in out_cols if c in merged_df.columns]]
+            if is_partial and proj_path.exists():
+                existing = pd.read_csv(proj_path)
+                # Replace rows for fetched players, keep everything else.
+                keep_ids = set(result["player_id"].tolist()) if "player_id" in result.columns else set()
+                if keep_ids and included_pids:
+                    keep_ids = keep_ids & included_pids  # only replace actually-fetched players
+                other = existing[~existing["player_id"].isin(keep_ids)] if not existing.empty else pd.DataFrame()
+                out_cols2 = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+                other = other[[c for c in out_cols2 if c in other.columns]]
+                result = pd.concat([other, result], ignore_index=True)
+            result = result.sort_values("mean", ascending=False).reset_index(drop=True)
+            result.to_csv(proj_path, index=False)
 
         # ---- Market Odds path -----------------------------------------------
         if is_market_preferred:
@@ -427,10 +517,14 @@ async def projections_fetch(request: Request):
                 if rw_rc != 0:
                     returncode = rw_rc
                 else:
-                    # Step 2: Market odds (non-fatal — fall back to RW entirely on failure)
+                    # Step 2: Market odds — pass --games filter when doing a partial fetch
                     yield _log("--- Fetching Market Odds (CrazyNinjaOdds) ---")
+                    mo_cmd = [str(python), str(mo_script), "--output", str(mo_out)]
+                    if included_pairs:
+                        games_arg = ",".join(f"{a}@{h}" for a, h in included_pairs)
+                        mo_cmd += ["--games", games_arg]
                     proc2 = await asyncio.create_subprocess_exec(
-                        str(python), str(mo_script), "--output", str(mo_out),
+                        *mo_cmd,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.STDOUT,
                         cwd=str(PROJECT_ROOT),
@@ -444,14 +538,15 @@ async def projections_fetch(request: Request):
                     mo_rc = await proc2.wait()
 
                     # Step 3: Merge — no yields from here until after finally
-                    import pandas as pd
-
                     rw_df = pd.read_csv(rw_out) if rw_out.exists() else pd.DataFrame()
                     mo_df = (
                         pd.read_csv(mo_out)
                         if (mo_out.exists() and mo_rc == 0)
                         else pd.DataFrame()
                     )
+                    # When partial: restrict the RW pool to only the included games
+                    if is_partial and included_pids and not rw_df.empty:
+                        rw_df = rw_df[rw_df["player_id"].isin(included_pids)]
 
                     if rw_df.empty:
                         returncode = 1
@@ -459,6 +554,8 @@ async def projections_fetch(request: Request):
                     else:
                         pool = rw_df.copy()
                         fallback_players: list[dict] = []
+                        mo_sidecar_reasons = _read_mo_sidecar()
+                        _itm = _ensure_id_to_team()
 
                         if not mo_df.empty and {"player_id", "mean", "std_dev"}.issubset(mo_df.columns):
                             pref_lookup = (
@@ -477,27 +574,19 @@ async def projections_fetch(request: Request):
                             fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
 
                             if not fallback_rows.empty:
-                                id_to_team: dict = {}
-                                if dk_path is not None:
-                                    try:
-                                        dk_df = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
-                                        id_to_team = dict(zip(dk_df["ID"], dk_df["TeamAbbrev"]))
-                                    except Exception:
-                                        pass
                                 for _, row in fallback_rows.iterrows():
+                                    pid_val = int(row["player_id"]) if "player_id" in fallback_rows.columns else 0
                                     fallback_players.append({
                                         "name": row["name"],
-                                        "team": id_to_team.get(int(row["player_id"]), "") if "player_id" in fallback_rows.columns else "",
+                                        "team": _itm.get(pid_val, ""),
+                                        "reason": mo_sidecar_reasons.get(pid_val, ""),
                                     })
                         else:
                             result_event = _log(
                                 "Warning: Market odds unavailable; using RotoWire projections for all players."
                             )
 
-                        out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
-                        merged_df = pool[[c for c in out_cols if c in pool.columns]]
-                        merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
-                        merged_df.to_csv(proj_path, index=False)
+                        _write_proj(pool)
                         proj_written = True
 
                         if fallback_players:
@@ -509,7 +598,7 @@ async def projections_fetch(request: Request):
                 returncode = 1
                 result_event = _log(f"Warning: merge error — {exc}")
             finally:
-                for p in (rw_out, mo_out):
+                for p in (rw_out, mo_out, mo_sidecar):
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:
@@ -571,8 +660,6 @@ async def projections_fetch(request: Request):
                 await proc2.wait()
 
                 # ---- Merge both outputs into final projections.csv (no yields) ---
-                import pandas as pd
-
                 dff_df = pd.read_csv(dff_out) if dff_out.exists() else pd.DataFrame()
                 rw_df  = pd.read_csv(rw_out)  if rw_out.exists()  else pd.DataFrame()
 
@@ -599,7 +686,8 @@ async def projections_fetch(request: Request):
                     # Apply preferred source's mean/std_dev
                     pref_proj_df = dff_df if is_dff_preferred else rw_df
 
-                    fallback_players: list[dict] = []
+                    _itm2 = _ensure_id_to_team()
+                    fallback_players2: list[dict] = []
                     if not pref_proj_df.empty and {"player_id", "mean", "std_dev"}.issubset(pref_proj_df.columns):
                         pref_lookup = (
                             pref_proj_df.drop_duplicates("player_id")
@@ -614,30 +702,30 @@ async def projections_fetch(request: Request):
                         pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
                         pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
                         pool = pool.drop(columns=["_pm", "_ps"])
-                        fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
+                        fallback_rows2 = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
 
-                        if not fallback_rows.empty:
-                            id_to_team: dict = {}
-                            if dk_path is not None:
-                                try:
-                                    dk_df = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
-                                    id_to_team = dict(zip(dk_df["ID"], dk_df["TeamAbbrev"]))
-                                except Exception:
-                                    pass
-                            for _, row in fallback_rows.iterrows():
-                                fallback_players.append({
+                        if not fallback_rows2.empty:
+                            for _, row in fallback_rows2.iterrows():
+                                pid_val = int(row["player_id"]) if "player_id" in fallback_rows2.columns else 0
+                                fallback_players2.append({
                                     "name": row["name"],
-                                    "team": id_to_team.get(int(row["player_id"]), "") if "player_id" in fallback_rows.columns else "",
+                                    "team": _itm2.get(pid_val, ""),
+                                    "reason": "",
                                 })
 
-                    out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
-                    merged_df = pool[[c for c in out_cols if c in pool.columns]]
-                    merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
-                    merged_df.to_csv(proj_path, index=False)
+                    # When partial: keep only the included games' players from this fetch
+                    if is_partial and included_pids:
+                        pool = pool[pool["player_id"].isin(included_pids)]
+                        fallback_players2 = [
+                            p for p in fallback_players2
+                            if _itm2.get(int(p.get("player_id", 0)), "") in included_teams
+                        ]
+
+                    _write_proj(pool)
                     proj_written = True
 
-                    if fallback_players:
-                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players), 'players': fallback_players, 'timestamp': int(time.time() * 1000)})}\n\n"
+                    if fallback_players2:
+                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'timestamp': int(time.time() * 1000)})}\n\n"
                     else:
                         result_event2 = _log(f"All player projections sourced from {preferred_label}.")
 

@@ -7,6 +7,7 @@ interface Props {
   onFetched?: () => void
   mergeInfo: MergeInfo | null
   onMergeInfo: (info: MergeInfo | null) => void
+  projFetchExcluded?: string[]
 }
 
 function formatET(unixSec: number): string {
@@ -20,7 +21,7 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo }: Props) {
+export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [] }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
@@ -43,6 +44,8 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo }
     }
   }, [log])
 
+  const isPartial = projFetchExcluded.length > 0
+
   const handleFetch = () => {
     if (fetching || disabled) return
     setFetching(true)
@@ -50,7 +53,10 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo }
     setDone(null)
     onMergeInfo(null)
 
-    const es = new EventSource('/api/projections/fetch')
+    const params = isPartial
+      ? `?exclude_games=${encodeURIComponent(projFetchExcluded.join(','))}`
+      : ''
+    const es = new EventSource(`/api/projections/fetch${params}`)
     esRef.current = es
 
     es.onmessage = (e) => {
@@ -133,8 +139,14 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo }
         disabled={fetching || disabled}
         className="btn-secondary"
       >
-        {fetching ? 'Fetching…' : 'Fetch New Projections'}
+        {fetching ? 'Fetching…' : isPartial ? 'Fetch Projections (partial)' : 'Fetch New Projections'}
       </button>
+      {isPartial && !fetching && (
+        <p className="proj-partial-note">
+          {projFetchExcluded.length} game{projFetchExcluded.length !== 1 ? 's' : ''} excluded —
+          will fetch the remaining games and merge into existing projections.
+        </p>
+      )}
 
       {log.length > 0 && (
         <div className="proj-log" ref={logRef}>
@@ -154,18 +166,27 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo }
           <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback projection</strong>
           <div className="merge-info-players">
             {(() => {
-              const byTeam = mergeInfo.players.reduce<Record<string, string[]>>((acc, p) => {
+              // Group by team; within each team show name + optional reason
+              const byTeam = mergeInfo.players.reduce<Record<string, typeof mergeInfo.players>>((acc, p) => {
                 const key = p.team || '—'
-                ;(acc[key] ??= []).push(p.name)
+                ;(acc[key] ??= []).push(p)
                 return acc
               }, {})
               return Object.entries(byTeam)
                 .sort(([a], [b]) => a.localeCompare(b))
-                .map(([team, names]) => (
+                .map(([team, players]) => (
                   <span key={team} className="merge-info-team-group">
                     <span className="merge-info-team-label">{team}</span>
                     {' ('}
-                    {names.join(', ')}
+                    {players.map((p, i) => (
+                      <span key={p.name}>
+                        {i > 0 && ', '}
+                        {p.name}
+                        {p.reason && (
+                          <span className="merge-info-reason" title={p.reason}> ⓘ</span>
+                        )}
+                      </span>
+                    ))}
                     {')'}
                   </span>
                 ))

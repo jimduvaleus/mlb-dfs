@@ -854,7 +854,7 @@ async def _find_game_ids(
 
 def _compute_batter_projection(
     player_markets: dict[str, list[tuple[float, float]]]
-) -> tuple[float, float] | None:
+) -> tuple[float, float] | tuple[None, str]:
     """
     Compute (mean_dk, std_dev_dk) for a batter from market mean estimates.
 
@@ -866,9 +866,9 @@ def _compute_batter_projection(
     Runs and RBIs are fetched as dedicated markets rather than derived as a
     residual from the combined Hits+Runs+RBIs market.
 
-    Returns None if either Runs or RBIs market data is absent for this player,
-    or if no hit-type data is present — the caller should use a RotoWire
-    fallback projection in that case.
+    Returns (None, reason) when key market data is absent for this player —
+    the caller should use a RotoWire fallback projection in that case.
+    Returns (mean, std_dev) on success.
     """
     def get_mu(key: str) -> float:
         lp = player_markets.get(key, [])
@@ -890,9 +890,10 @@ def _compute_batter_projection(
     # A zero here means the market wasn't available for this player — fall back
     # to RotoWire rather than silently underestimating their projection.
     if e_s == 0 and e_d == 0 and e_t == 0 and e_hr == 0:
-        return None
-    if e_r == 0 or e_rbi == 0:
-        return None
+        return None, "no hit market data (Singles/Doubles/Triples/HR all missing)"
+    missing = [name for name, val in [("Runs", e_r), ("RBIs", e_rbi)] if val == 0]
+    if missing:
+        return None, f"{' and '.join(missing)} market{'s' if len(missing) > 1 else ''} unavailable"
 
     e_hbp = e_bb * HBP_PER_WALK
 
@@ -1092,6 +1093,8 @@ def build_projections_csv(
 
     matched: list[dict] = []
     unmatched: list[str] = []
+    # player_id → reason string for batters that couldn't be projected from market data
+    fallback_reasons: dict[int, str] = {}
 
     for player_name, player_markets in all_market_data.items():
         pid = _match_name(player_name, dk_lookup)
@@ -1104,18 +1107,25 @@ def build_projections_csv(
 
         if is_pitcher:
             result = _compute_pitcher_projection(player_markets)
+            if result is None:
+                log.info(
+                    "No projection for pitcher %s (pid=%d) — markets present: %s",
+                    player_name, pid, list(player_markets.keys()) or "none",
+                )
+                continue
+            mean, std_dev = result
         else:
-            result = _compute_batter_projection(player_markets)
+            batter_result = _compute_batter_projection(player_markets)
+            if batter_result[0] is None:
+                reason = str(batter_result[1])
+                log.info(
+                    "No MO projection for %s (pid=%d) — %s; using RotoWire fallback",
+                    player_name, pid, reason,
+                )
+                fallback_reasons[pid] = reason
+                continue
+            mean, std_dev = float(batter_result[0]), float(batter_result[1])  # type: ignore[arg-type]
 
-        if result is None:
-            log.info(
-                "No projection computed for %s (pid=%d, pos=%s) — markets present: %s",
-                player_name, pid, position,
-                list(player_markets.keys()) or "none",
-            )
-            continue
-
-        mean, std_dev = result
         matched.append({
             "player_id": pid,
             "name": player_name,
@@ -1143,6 +1153,18 @@ def build_projections_csv(
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_path, index=False)
+
+    # Write sidecar JSON mapping player_id → fallback reason.
+    # The server reads this to annotate the merge_info callout in the UI.
+    _op = Path(output_path)
+    sidecar_path = _op.parent / (_op.stem + "_fallback.json")
+    try:
+        sidecar_path.write_text(
+            json.dumps({str(pid): reason for pid, reason in fallback_reasons.items()}, indent=2)
+        )
+        log.debug("Wrote fallback reasons for %d players → %s", len(fallback_reasons), sidecar_path)
+    except Exception as e:
+        log.warning("Could not write fallback sidecar: %s", e)
 
     n_pitchers = int(out_df["player_id"].map(dk_pos).apply(
         lambda pos: any(p.upper() in {"P", "SP", "RP"} for p in str(pos).split("/"))
