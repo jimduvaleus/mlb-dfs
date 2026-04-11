@@ -136,6 +136,9 @@ SEL_DEVIG  = (
     "#ContentPlaceHolderMain_ContentPlaceHolderRight_"
     "WebUserControl_FilterDevigMethod_DropDownListDevigMethod"
 )
+SEL_DEVIG_UPDATE = (
+    "#ContentPlaceHolderMain_ContentPlaceHolderRight_ButtonUpdate"
+)
 SEL_MARKET = (
     "#ContentPlaceHolderMain_ContentPlaceHolderRight_DropDownListMarket"
 )
@@ -605,6 +608,7 @@ async def _fetch_game_odds(
     # Set devig method: Liquidity-Weighted - Additive/Shin
     try:
         await page.select_option(SEL_DEVIG, value=DEVIG_VALUE)
+        await page.click(SEL_DEVIG_UPDATE)
         await _wait_for_ajax(page)
     except Exception as e:
         log.warning("Could not set devig method for game %d: %s", game_id, e)
