@@ -30,3 +30,4 @@ data/slate_exclusions.json
 data/raw/GEDKEntries.csv
 data/processed/market_odds_game_ids.json
 data/processed/projections_mo.csv
+data/processed/projections_rw.csv
