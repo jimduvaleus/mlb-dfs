@@ -388,12 +388,155 @@ async def projections_fetch(request: Request):
         def _log(msg: str) -> str:
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
 
+        # Clean up any stale temp files left by a prior incomplete fetch.
+        for _p in (dff_out, rw_out, mo_out):
+            try:
+                _p.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         # ---- Market Odds path -----------------------------------------------
         if is_market_preferred:
-            # Step 1: RotoWire is always required (player pool + lineup slots)
-            yield _log("--- Fetching RotoWire projections (player pool) ---")
+            returncode = 0
+            proj_written = False
+            result_event: str | None = None
+
+            # The entire fetch is one try/finally so that cleanup and metadata
+            # update run reliably even when the client disconnects mid-stream.
+            # GeneratorExit (thrown by aclose() on disconnect) is not caught by
+            # "except Exception", but finally always runs — that's the guarantee.
+            # No yields occur inside the merge step, so once it starts it
+            # completes atomically before the generator can be suspended again.
+            try:
+                # Step 1: RotoWire is always required (player pool + lineup slots)
+                yield _log("--- Fetching RotoWire projections (player pool) ---")
+                proc = await asyncio.create_subprocess_exec(
+                    str(python), str(rw_script), "--output", str(rw_out),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=str(PROJECT_ROOT),
+                )
+                assert proc.stdout is not None
+                async for line in proc.stdout:
+                    if await request.is_disconnected():
+                        proc.kill()
+                        break
+                    yield _log(line.decode().rstrip())
+                rw_rc = await proc.wait()
+
+                if rw_rc != 0:
+                    returncode = rw_rc
+                else:
+                    # Step 2: Market odds (non-fatal — fall back to RW entirely on failure)
+                    yield _log("--- Fetching Market Odds (CrazyNinjaOdds) ---")
+                    proc2 = await asyncio.create_subprocess_exec(
+                        str(python), str(mo_script), "--output", str(mo_out),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.STDOUT,
+                        cwd=str(PROJECT_ROOT),
+                    )
+                    assert proc2.stdout is not None
+                    async for line in proc2.stdout:
+                        if await request.is_disconnected():
+                            proc2.kill()
+                            break
+                        yield _log(line.decode().rstrip())
+                    mo_rc = await proc2.wait()
+
+                    # Step 3: Merge — no yields from here until after finally
+                    import pandas as pd
+
+                    rw_df = pd.read_csv(rw_out) if rw_out.exists() else pd.DataFrame()
+                    mo_df = (
+                        pd.read_csv(mo_out)
+                        if (mo_out.exists() and mo_rc == 0)
+                        else pd.DataFrame()
+                    )
+
+                    if rw_df.empty:
+                        returncode = 1
+                        result_event = _log("Error: RotoWire produced no usable data.")
+                    else:
+                        pool = rw_df.copy()
+                        fallback_players: list[dict] = []
+
+                        if not mo_df.empty and {"player_id", "mean", "std_dev"}.issubset(mo_df.columns):
+                            pref_lookup = (
+                                mo_df.drop_duplicates("player_id")
+                                .set_index("player_id")[["mean", "std_dev"]]
+                            )
+                            pool = pool.merge(
+                                pref_lookup.rename(columns={"mean": "_pm", "std_dev": "_ps"}),
+                                on="player_id",
+                                how="left",
+                            )
+                            has_pref = pool["_pm"].notna()
+                            pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
+                            pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
+                            pool = pool.drop(columns=["_pm", "_ps"])
+                            fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
+
+                            if not fallback_rows.empty:
+                                id_to_team: dict = {}
+                                if dk_path is not None:
+                                    try:
+                                        dk_df = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
+                                        id_to_team = dict(zip(dk_df["ID"], dk_df["TeamAbbrev"]))
+                                    except Exception:
+                                        pass
+                                for _, row in fallback_rows.iterrows():
+                                    fallback_players.append({
+                                        "name": row["name"],
+                                        "team": id_to_team.get(int(row["player_id"]), "") if "player_id" in fallback_rows.columns else "",
+                                    })
+                        else:
+                            result_event = _log(
+                                "Warning: Market odds unavailable; using RotoWire projections for all players."
+                            )
+
+                        out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+                        merged_df = pool[[c for c in out_cols if c in pool.columns]]
+                        merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
+                        merged_df.to_csv(proj_path, index=False)
+                        proj_written = True
+
+                        if fallback_players:
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'timestamp': int(time.time() * 1000)})}\n\n"
+                        elif result_event is None:
+                            result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
+
+            except Exception as exc:
+                returncode = 1
+                result_event = _log(f"Warning: merge error — {exc}")
+            finally:
+                for p in (rw_out, mo_out):
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                if proj_written:
+                    try:
+                        record_fetch_from_csv(proj_path, "auto", dk_path)
+                    except Exception:
+                        pass
+
+            if result_event:
+                yield result_event
+            yield f"data: {json.dumps({'type': 'done', 'returncode': returncode, 'timestamp': int(time.time() * 1000)})}\n\n"
+            return
+
+        # ---- Run preferred + fallback scripts (live-streamed) ---------------
+        returncode = 0
+        proj_written = False
+        result_event2: str | None = None
+
+        try:
+            yield _log(f"--- Fetching {preferred_label} projections ---")
+            preferred_script = dff_script if is_dff_preferred else rw_script
+            preferred_out    = dff_out    if is_dff_preferred else rw_out
+
             proc = await asyncio.create_subprocess_exec(
-                str(python), str(rw_script), "--output", str(rw_out),
+                str(python), str(preferred_script), "--output", str(preferred_out),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(PROJECT_ROOT),
@@ -404,244 +547,118 @@ async def projections_fetch(request: Request):
                     proc.kill()
                     break
                 yield _log(line.decode().rstrip())
-            rw_rc = await proc.wait()
+            preferred_rc = await proc.wait()
 
-            if rw_rc != 0:
-                yield f"data: {json.dumps({'type': 'done', 'returncode': rw_rc, 'timestamp': int(time.time() * 1000)})}\n\n"
-                return
+            if preferred_rc != 0:
+                returncode = preferred_rc
+            else:
+                yield _log(f"--- Fetching {fallback_label} projections ---")
+                fallback_script = rw_script  if is_dff_preferred else dff_script
+                fallback_out    = rw_out     if is_dff_preferred else dff_out
 
-            # Step 2: Market odds (non-fatal — fall back to RW entirely on failure)
-            yield _log("--- Fetching Market Odds (CrazyNinjaOdds) ---")
-            proc2 = await asyncio.create_subprocess_exec(
-                str(python), str(mo_script), "--output", str(mo_out),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                cwd=str(PROJECT_ROOT),
-            )
-            assert proc2.stdout is not None
-            async for line in proc2.stdout:
-                if await request.is_disconnected():
-                    proc2.kill()
-                    break
-                yield _log(line.decode().rstrip())
-            mo_rc = await proc2.wait()
+                proc2 = await asyncio.create_subprocess_exec(
+                    str(python), str(fallback_script), "--output", str(fallback_out),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=str(PROJECT_ROOT),
+                )
+                assert proc2.stdout is not None
+                async for line in proc2.stdout:
+                    if await request.is_disconnected():
+                        proc2.kill()
+                        break
+                    yield _log(line.decode().rstrip())
+                await proc2.wait()
 
-            # Step 3: Merge — RW is pool, market odds overlays values
-            try:
+                # ---- Merge both outputs into final projections.csv (no yields) ---
                 import pandas as pd
 
-                rw_df = pd.read_csv(rw_out) if rw_out.exists() else pd.DataFrame()
-                mo_df = (
-                    pd.read_csv(mo_out)
-                    if (mo_out.exists() and mo_rc == 0)
-                    else pd.DataFrame()
-                )
+                dff_df = pd.read_csv(dff_out) if dff_out.exists() else pd.DataFrame()
+                rw_df  = pd.read_csv(rw_out)  if rw_out.exists()  else pd.DataFrame()
 
-                if rw_df.empty:
-                    yield _log("Error: RotoWire produced no usable data.")
-                    yield f"data: {json.dumps({'type': 'done', 'returncode': 1, 'timestamp': int(time.time() * 1000)})}\n\n"
-                    return
+                # RW pool  — all starters already filtered by the fetch script
+                # DFF pool — confirmed batters only (slot_confirmed=True) + all pitchers
+                rw_pool = rw_df.copy()
 
-                pool = rw_df.copy()
-                fallback_players: list[dict] = []
-
-                if not mo_df.empty and {"player_id", "mean", "std_dev"}.issubset(mo_df.columns):
-                    pref_lookup = (
-                        mo_df.drop_duplicates("player_id")
-                        .set_index("player_id")[["mean", "std_dev"]]
-                    )
-                    pool = pool.merge(
-                        pref_lookup.rename(columns={"mean": "_pm", "std_dev": "_ps"}),
-                        on="player_id",
-                        how="left",
-                    )
-                    has_pref = pool["_pm"].notna()
-                    pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
-                    pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
-                    pool = pool.drop(columns=["_pm", "_ps"])
-                    fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
-
-                    if not fallback_rows.empty:
-                        id_to_team: dict = {}
-                        if dk_path is not None:
-                            try:
-                                dk_df = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
-                                id_to_team = dict(zip(dk_df["ID"], dk_df["TeamAbbrev"]))
-                            except Exception:
-                                pass
-                        for _, row in fallback_rows.iterrows():
-                            fallback_players.append({
-                                "name": row["name"],
-                                "team": id_to_team.get(int(row["player_id"]), "") if "player_id" in fallback_rows.columns else "",
-                            })
+                if not dff_df.empty and {"lineup_slot", "slot_confirmed"}.issubset(dff_df.columns):
+                    dff_pitchers = dff_df[dff_df["lineup_slot"] == 10]
+                    dff_batters  = dff_df[(dff_df["lineup_slot"] != 10) & dff_df["slot_confirmed"].astype(bool)]
+                    dff_pool     = pd.concat([dff_batters, dff_pitchers], ignore_index=True)
                 else:
-                    yield _log(
-                        "Warning: Market odds unavailable; using RotoWire projections for all players."
-                    )
+                    dff_pool = dff_df.copy()
 
-                out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
-                merged_df = pool[[c for c in out_cols if c in pool.columns]]
-                merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
-                merged_df.to_csv(proj_path, index=False)
-
-                if fallback_players:
-                    yield f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'timestamp': int(time.time() * 1000)})}\n\n"
+                if rw_pool.empty and dff_pool.empty:
+                    returncode = 1
+                    result_event2 = _log("Error: both projection sources produced no usable data.")
                 else:
-                    yield _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
+                    # Union: start with RW starters, append any DFF-pool players not in RW
+                    rw_ids    = set(rw_pool["player_id"].tolist()) if not rw_pool.empty else set()
+                    dff_extra = dff_pool[~dff_pool["player_id"].isin(rw_ids)] if not dff_pool.empty else pd.DataFrame()
+                    pool      = pd.concat([rw_pool, dff_extra], ignore_index=True)
 
-            except Exception as exc:
-                yield _log(f"Warning: merge error — {exc}")
-            finally:
-                for p in (rw_out, mo_out):
-                    try:
-                        p.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                    # Apply preferred source's mean/std_dev
+                    pref_proj_df = dff_df if is_dff_preferred else rw_df
 
-            try:
-                record_fetch_from_csv(proj_path, "auto", dk_path)
-            except Exception:
-                pass
-            yield f"data: {json.dumps({'type': 'done', 'returncode': 0, 'timestamp': int(time.time() * 1000)})}\n\n"
-            return
+                    fallback_players: list[dict] = []
+                    if not pref_proj_df.empty and {"player_id", "mean", "std_dev"}.issubset(pref_proj_df.columns):
+                        pref_lookup = (
+                            pref_proj_df.drop_duplicates("player_id")
+                            .set_index("player_id")[["mean", "std_dev"]]
+                        )
+                        pool = pool.merge(
+                            pref_lookup.rename(columns={"mean": "_pm", "std_dev": "_ps"}),
+                            on="player_id",
+                            how="left",
+                        )
+                        has_pref = pool["_pm"].notna()
+                        pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
+                        pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
+                        pool = pool.drop(columns=["_pm", "_ps"])
+                        fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
 
-        # ---- Run preferred script (live-streamed) ----------------------------
-        yield _log(f"--- Fetching {preferred_label} projections ---")
-        preferred_script = dff_script if is_dff_preferred else rw_script
-        preferred_out    = dff_out    if is_dff_preferred else rw_out
+                        if not fallback_rows.empty:
+                            id_to_team: dict = {}
+                            if dk_path is not None:
+                                try:
+                                    dk_df = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
+                                    id_to_team = dict(zip(dk_df["ID"], dk_df["TeamAbbrev"]))
+                                except Exception:
+                                    pass
+                            for _, row in fallback_rows.iterrows():
+                                fallback_players.append({
+                                    "name": row["name"],
+                                    "team": id_to_team.get(int(row["player_id"]), "") if "player_id" in fallback_rows.columns else "",
+                                })
 
-        proc = await asyncio.create_subprocess_exec(
-            str(python), str(preferred_script), "--output", str(preferred_out),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(PROJECT_ROOT),
-        )
-        assert proc.stdout is not None
-        async for line in proc.stdout:
-            if await request.is_disconnected():
-                proc.kill()
-                break
-            yield _log(line.decode().rstrip())
-        preferred_rc = await proc.wait()
+                    out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+                    merged_df = pool[[c for c in out_cols if c in pool.columns]]
+                    merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
+                    merged_df.to_csv(proj_path, index=False)
+                    proj_written = True
 
-        if preferred_rc != 0:
-            yield f"data: {json.dumps({'type': 'done', 'returncode': preferred_rc, 'timestamp': int(time.time() * 1000)})}\n\n"
-            return
-
-        # ---- Run fallback script (live-streamed) -----------------------------
-        yield _log(f"--- Fetching {fallback_label} projections ---")
-        fallback_script = rw_script  if is_dff_preferred else dff_script
-        fallback_out    = rw_out     if is_dff_preferred else dff_out
-
-        proc2 = await asyncio.create_subprocess_exec(
-            str(python), str(fallback_script), "--output", str(fallback_out),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(PROJECT_ROOT),
-        )
-        assert proc2.stdout is not None
-        async for line in proc2.stdout:
-            if await request.is_disconnected():
-                proc2.kill()
-                break
-            yield _log(line.decode().rstrip())
-        fallback_rc = await proc2.wait()
-
-        # ---- Merge both outputs into final projections.csv ------------------
-        try:
-            import pandas as pd
-
-            dff_df = pd.read_csv(dff_out) if dff_out.exists() else pd.DataFrame()
-            rw_df  = pd.read_csv(rw_out)  if rw_out.exists()  else pd.DataFrame()
-
-            # --- Step 1: build player pool (slot/roster membership) ----------
-            # RW pool  — all starters already filtered by the fetch script
-            # DFF pool — confirmed batters only (slot_confirmed=True) + all pitchers
-            #            (DFF already excludes zero-projection pitchers in its parser)
-            rw_pool = rw_df.copy()
-
-            if not dff_df.empty and {"lineup_slot", "slot_confirmed"}.issubset(dff_df.columns):
-                dff_pitchers = dff_df[dff_df["lineup_slot"] == 10]
-                dff_batters  = dff_df[(dff_df["lineup_slot"] != 10) & dff_df["slot_confirmed"].astype(bool)]
-                dff_pool     = pd.concat([dff_batters, dff_pitchers], ignore_index=True)
-            else:
-                dff_pool = dff_df.copy()
-
-            if rw_pool.empty and dff_pool.empty:
-                yield _log("Error: both projection sources produced no usable data.")
-                yield f"data: {json.dumps({'type': 'done', 'returncode': 1, 'timestamp': int(time.time() * 1000)})}\n\n"
-                return
-
-            # Union: start with RW starters, append any DFF-pool players not in RW
-            rw_ids    = set(rw_pool["player_id"].tolist()) if not rw_pool.empty else set()
-            dff_extra = dff_pool[~dff_pool["player_id"].isin(rw_ids)] if not dff_pool.empty else pd.DataFrame()
-            pool      = pd.concat([rw_pool, dff_extra], ignore_index=True)
-
-            # --- Step 2: apply preferred source's mean/std_dev ---------------
-            # The full DFF CSV (including unconfirmed batters) and the RW CSV are
-            # both used as projection-value lookup tables.  Pool membership (step 1)
-            # and projection-value preference are independent: a RW batter enters
-            # the pool via RW but still gets DFF's fantasy-point projection if DFF
-            # is preferred and has a value for them.
-            pref_proj_df = dff_df if is_dff_preferred else rw_df
-
-            fallback_players: list[dict] = []
-            if not pref_proj_df.empty and {"player_id", "mean", "std_dev"}.issubset(pref_proj_df.columns):
-                pref_lookup = (
-                    pref_proj_df.drop_duplicates("player_id")
-                    .set_index("player_id")[["mean", "std_dev"]]
-                )
-                pool = pool.merge(
-                    pref_lookup.rename(columns={"mean": "_pm", "std_dev": "_ps"}),
-                    on="player_id",
-                    how="left",
-                )
-                has_pref = pool["_pm"].notna()
-                pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
-                pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
-                pool = pool.drop(columns=["_pm", "_ps"])
-                fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
-
-                # Build player list with team info from DK slate
-                if not fallback_rows.empty:
-                    id_to_team: dict = {}
-                    if dk_path is not None:
-                        try:
-                            dk_df = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev"])
-                            id_to_team = dict(zip(dk_df["ID"], dk_df["TeamAbbrev"]))
-                        except Exception:
-                            pass
-                    for _, row in fallback_rows.iterrows():
-                        fallback_players.append({
-                            "name": row["name"],
-                            "team": id_to_team.get(int(row["player_id"]), "") if "player_id" in fallback_rows.columns else "",
-                        })
-
-
-            out_cols  = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
-            merged_df = pool[[c for c in out_cols if c in pool.columns]]
-            merged_df = merged_df.sort_values("mean", ascending=False).reset_index(drop=True)
-            merged_df.to_csv(proj_path, index=False)
-
-            if fallback_players:
-                yield f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players), 'players': fallback_players, 'timestamp': int(time.time() * 1000)})}\n\n"
-            else:
-                yield _log(f"All player projections sourced from {preferred_label}.")
+                    if fallback_players:
+                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players), 'players': fallback_players, 'timestamp': int(time.time() * 1000)})}\n\n"
+                    else:
+                        result_event2 = _log(f"All player projections sourced from {preferred_label}.")
 
         except Exception as exc:
-            yield _log(f"Warning: merge error — {exc}")
+            returncode = 1
+            result_event2 = _log(f"Warning: merge error — {exc}")
         finally:
             for p in (dff_out, rw_out):
                 try:
                     p.unlink(missing_ok=True)
                 except Exception:
                     pass
+            if proj_written:
+                try:
+                    record_fetch_from_csv(proj_path, "auto", dk_path)
+                except Exception:
+                    pass
 
-        try:
-            record_fetch_from_csv(proj_path, "auto", dk_path)
-        except Exception:
-            pass
-        yield f"data: {json.dumps({'type': 'done', 'returncode': 0, 'timestamp': int(time.time() * 1000)})}\n\n"
+        if result_event2:
+            yield result_event2
+        yield f"data: {json.dumps({'type': 'done', 'returncode': returncode, 'timestamp': int(time.time() * 1000)})}\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
 
