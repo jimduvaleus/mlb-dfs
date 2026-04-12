@@ -3,7 +3,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-# DraftKings Classic MLB roster requirements
+# DraftKings Classic MLB roster requirements — preserved for backward compat
+# and still used directly by BasinHoppingOptimizer (Phase 7 will wire platforms).
 ROSTER_REQUIREMENTS: Dict[str, int] = {
     'P': 2, 'C': 1, '1B': 1, '2B': 1, '3B': 1, 'SS': 1, 'OF': 3,
 }
@@ -22,7 +23,7 @@ for _pos, _cnt in ROSTER_REQUIREMENTS.items():
 
 @dataclass
 class Lineup:
-    """Represents a single DraftKings classic MLB lineup (10 players)."""
+    """Represents a single DraftKings or FanDuel classic MLB lineup."""
 
     player_ids: List[int]
 
@@ -41,29 +42,77 @@ class Lineup:
         self,
         player_meta: PlayerMeta,
         salary_floor: Optional[float] = None,
+        rules=None,        # Optional[RosterRules] — imported lazily to avoid
+        slot_eligibility=None,  # Optional[dict]    — circular import risk
     ) -> bool:
-        """Check all DraftKings Classic constraints."""
-        if len(self.player_ids) != 10 or len(set(self.player_ids)) != 10:
+        """
+        Check roster construction constraints for a lineup.
+
+        Parameters
+        ----------
+        player_meta:
+            Per-player metadata dict (player_id → dict with position,
+            eligible_positions, salary, team, opponent, game).
+        salary_floor:
+            Minimum total salary allowed (optional).
+        rules:
+            A :class:`src.platforms.base.RosterRules` instance.
+            Defaults to ``DK_ROSTER`` when not provided.
+        slot_eligibility:
+            Mapping of slot label → set of eligible player positions.
+            Required for platforms with compound slots (FD's ``C/1B``,
+            ``UTIL``).  Defaults to the DK identity mapping when not provided.
+
+        Backward compatibility
+        ---------------------
+        Existing callers that pass no ``rules`` or ``slot_eligibility`` get
+        the same DK Classic behaviour as before Phase 4.
+        """
+        # Lazy imports to avoid making every module depend on src.platforms
+        # at import time; also keeps the legacy call sites unchanged.
+        if rules is None:
+            from src.platforms.draftkings import DK_ROSTER
+            rules = DK_ROSTER
+        if slot_eligibility is None:
+            from src.platforms.registry import get_slot_eligibility
+            from src.platforms.base import Platform
+            slot_eligibility = get_slot_eligibility(Platform.DRAFTKINGS)
+
+        r = rules
+        se = slot_eligibility
+        slots = list(r.slots)
+        roster_size = r.roster_size
+
+        if len(self.player_ids) != roster_size or len(set(self.player_ids)) != roster_size:
             return False
 
         rows = [player_meta[pid] for pid in self.player_ids if pid in player_meta]
-        if len(rows) != 10:
+        if len(rows) != roster_size:
             return False
 
-        # Verify a valid slot assignment exists via bipartite matching.
-        # Each player can fill any slot whose position label is in their
-        # eligible_positions list (falls back to [position] if absent).
+        # ------------------------------------------------------------------
+        # Slot assignment via bipartite matching (Hopcroft-Karp style DFS).
+        #
+        # For DK, each slot label is an exact position name, so
+        # se.get(slot_pos, {slot_pos}) == {slot_pos} and the behaviour is
+        # identical to the pre-Phase-4 code.
+        #
+        # For FD, compound labels expand:
+        #   'C/1B'  → {'C', '1B'}
+        #   'UTIL'  → {'C', '1B', '2B', '3B', 'SS', 'OF'}
+        # ------------------------------------------------------------------
         rows_list = list(rows)
 
-        def _elig(r: Dict) -> set:
-            ep = r.get('eligible_positions')
-            return set(ep) if ep else {r['position']}
+        def _elig(r_: Dict) -> set:
+            ep = r_.get('eligible_positions')
+            return set(ep) if ep else {r_['position']}
 
-        match_slot = [-1] * len(SLOTS)
+        match_slot = [-1] * len(slots)
 
         def _try_assign(player_idx: int, elig: set, visited: set) -> bool:
-            for j, slot_pos in enumerate(SLOTS):
-                if slot_pos in elig and j not in visited:
+            for j, slot_pos in enumerate(slots):
+                slot_positions = se.get(slot_pos, {slot_pos})
+                if elig & slot_positions and j not in visited:
                     visited.add(j)
                     if match_slot[j] == -1 or _try_assign(
                         match_slot[j], _elig(rows_list[match_slot[j]]), visited
@@ -76,38 +125,43 @@ class Lineup:
             1 for i, row in enumerate(rows_list)
             if _try_assign(i, _elig(row), set())
         )
-        if matched != 10:
+        if matched != roster_size:
             return False
 
         # Salary bounds
-        total_salary = sum(r['salary'] for r in rows)
-        if total_salary > SALARY_CAP:
+        total_salary = sum(row['salary'] for row in rows)
+        if total_salary > r.salary_cap:
             return False
         if salary_floor is not None and total_salary < salary_floor:
             return False
 
-        # Max 5 hitters from one team (pitchers do not count toward this limit)
+        # Max hitters from one team (pitchers excluded from this count)
         hitter_team: Dict[str, int] = {}
-        for r in rows:
-            if r['position'] != 'P':
-                t = r['team']
+        for row in rows:
+            if row['position'] != 'P':
+                t = row['team']
                 hitter_team[t] = hitter_team.get(t, 0) + 1
-        if hitter_team and max(hitter_team.values()) > MAX_HITTERS_PER_TEAM:
+        if hitter_team and max(hitter_team.values()) > r.max_hitters_per_team:
             return False
 
-        # At least 2 different games (only enforced when game info is present)
-        games = {r.get('game', '') for r in rows if r.get('game', '')}
-        if games and len(games) < MIN_GAMES:
+        # At least min_games distinct games (only enforced when game info present)
+        games = {row.get('game', '') for row in rows if row.get('game', '')}
+        if games and len(games) < r.min_games:
             return False
 
-        # No pitcher may oppose any batter in the same lineup (negative correlation)
-        pitcher_opponents = {r['opponent'] for r in rows if r['position'] == 'P' and r.get('opponent')}
-        batter_teams = {r['team'] for r in rows if r['position'] != 'P'}
+        # No pitcher may oppose any batter in the same lineup
+        pitcher_opponents = {
+            row['opponent'] for row in rows
+            if row['position'] == 'P' and row.get('opponent')
+        }
+        batter_teams = {row['team'] for row in rows if row['position'] != 'P'}
         if pitcher_opponents & batter_teams:
             return False
 
-        # Both pitchers cannot be from the same team
-        pitcher_teams = [r['team'] for r in rows if r['position'] == 'P']
+        # Both pitchers must be from different teams (DK has 2 P slots;
+        # for FD the roster has only 1 P slot so this list has length 1
+        # and the check is naturally skipped).
+        pitcher_teams = [row['team'] for row in rows if row['position'] == 'P']
         if len(pitcher_teams) == 2 and pitcher_teams[0] == pitcher_teams[1]:
             return False
 
