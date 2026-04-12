@@ -88,6 +88,8 @@ class PortfolioConstructor:
         ref_p90: Optional[float] = None,
         ref_p99: Optional[float] = None,
         payout_coverage_bonus: float = 0.0,
+        rules=None,
+        slot_eligibility: Optional[dict] = None,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -111,6 +113,8 @@ class PortfolioConstructor:
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
             payout_coverage_bonus=payout_coverage_bonus,
+            rules=rules,
+            slot_eligibility=slot_eligibility,
         )
         self._base_seed = rng_seed
 
@@ -436,6 +440,8 @@ class BeamPortfolioConstructor:
         payout_beta: float = 2.5,
         payout_cash_line: Optional[float] = None,
         n_seed_lineups: int = 5,
+        rules=None,
+        slot_eligibility: Optional[dict] = None,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -453,6 +459,8 @@ class BeamPortfolioConstructor:
             objective=objective,
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
+            rules=rules,
+            slot_eligibility=slot_eligibility,
         )
         self._base_seed = rng_seed
 

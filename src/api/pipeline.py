@@ -14,11 +14,13 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from src.ingestion.dk_slate import DraftKingsSlateIngestor
+from src.ingestion.factory import get_ingestor
 from src.models.batter_model import BatterPCAModel
 from src.models.copula import EmpiricalCopula
 from src.optimization.lineup import ROSTER_REQUIREMENTS, SLOTS
 from src.optimization.portfolio import PortfolioConstructor
+from src.platforms.base import Platform
+from src.platforms.registry import get_roster, get_slot_eligibility
 from src.simulation.engine import SimulationEngine
 from src.simulation.results import SimulationResults
 
@@ -87,11 +89,21 @@ class PipelineRunner:
         opt_cfg = cfg.get("optimizer", {})
         port_cfg = cfg.get("portfolio", {})
 
+        # --- Platform setup ---------------------------------------------
+        platform = Platform(cfg.get("platform", "draftkings"))
+        roster_rules = get_roster(platform)
+        slot_elig = get_slot_eligibility(platform)
+        slate_path = (
+            paths["dk_slate"] if platform == Platform.DRAFTKINGS
+            else paths.get("fd_slate", "")
+        )
+
         # --- Entry file discovery ----------------------------------------
-        from src.api.dk_entries import parse_entry_file, scan_entry_files
-        raw_dir = os.path.dirname(paths["dk_slate"])
-        entry_files = scan_entry_files(raw_dir)
-        all_file_entries = [(ef, parse_entry_file(ef)) for ef in entry_files]
+        from src.api.entries_factory import get_entry_handlers
+        entry_handlers = get_entry_handlers(platform)
+        raw_dir = os.path.dirname(slate_path) if slate_path else ""
+        entry_files = entry_handlers["scan"](raw_dir) if raw_dir else []
+        all_file_entries = [(ef, entry_handlers["parse"](ef)) for ef in entry_files]
         total_entries = sum(len(recs) for _, recs in all_file_entries)
         output_dir = paths.get("output_dir", "outputs")
         if total_entries > 0:
@@ -101,9 +113,8 @@ class PipelineRunner:
             )
 
         # --- Load slate --------------------------------------------------
-        dk_path = paths["dk_slate"]
-        logger.info("Loading DK slate: %s", dk_path)
-        ingestor = DraftKingsSlateIngestor(dk_path)
+        logger.info("Loading %s slate: %s", platform.value, slate_path)
+        ingestor = get_ingestor(platform, slate_path)
         slate_df = ingestor.get_slate_dataframe()
         n_teams = slate_df["team"].nunique()
         logger.info("Slate loaded: %d players, %d teams", len(slate_df), n_teams)
@@ -239,6 +250,8 @@ class PipelineRunner:
             objective=objective,
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
+            rules=roster_rules,
+            slot_eligibility=slot_elig,
         )
 
         # --- Construct portfolio ----------------------------------------
@@ -274,6 +287,8 @@ class PipelineRunner:
             n_seed_lineups=int(opt_cfg.get("n_seed_lineups", 5)),
             ref_p90=fixed_ref_p90,
             ref_p99=fixed_ref_p99,
+            rules=roster_rules,
+            slot_eligibility=slot_elig,
         )
 
         def _on_lineup_complete(
@@ -362,6 +377,7 @@ class PipelineRunner:
         # Store raw artifacts for on-demand upload file writing.
         self._raw_portfolio = portfolio
         self._all_file_entries = all_file_entries
+        self._entry_handlers = entry_handlers
         self._slate_df = slate_df
         self._output_dir = output_dir
 
@@ -377,11 +393,10 @@ class PipelineRunner:
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Portfolio saved to %s", output_path)
 
-        # --- Generate DK upload files (skipped when stopped) -------------
+        # --- Generate upload files (skipped when stopped) ----------------
         if not was_stopped and all_file_entries:
-            from src.api.dk_entries import assign_lineups_to_entries, write_upload_files
-            assignments = assign_lineups_to_entries(all_file_entries, portfolio)
-            paths_written = write_upload_files(
+            assignments = entry_handlers["assign"](all_file_entries, portfolio)
+            paths_written = entry_handlers["write"](
                 all_file_entries, assignments, slate_df, output_dir
             )
             self._cb("upload_files", {"n_files": len(paths_written), "paths": paths_written})
@@ -405,7 +420,7 @@ class PipelineRunner:
         return result
 
     def write_upload_files(self) -> list[str]:
-        """Write DK upload CSVs using the portfolio from the last run.
+        """Write upload CSVs using the portfolio from the last run.
 
         Returns list of file paths written. Raises RuntimeError if no run
         artifacts are available.
@@ -414,9 +429,8 @@ class PipelineRunner:
             raise RuntimeError("No pipeline run artifacts available.")
         if not self._all_file_entries:
             return []
-        from src.api.dk_entries import assign_lineups_to_entries, write_upload_files
-        assignments = assign_lineups_to_entries(self._all_file_entries, self._raw_portfolio)
-        return write_upload_files(
+        assignments = self._entry_handlers["assign"](self._all_file_entries, self._raw_portfolio)
+        return self._entry_handlers["write"](
             self._all_file_entries, assignments, self._slate_df, self._output_dir
         )
 

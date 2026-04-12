@@ -127,16 +127,21 @@ def post_config(cfg: AppConfig) -> AppConfig:
 # ---------------------------------------------------------------------------
 
 def _load_slate_df():
-    """Parse the configured DK slate CSV and return a DataFrame (or None)."""
+    """Parse the configured slate CSV and return a DataFrame (or None)."""
     cfg = read_config()
-    dk_path = cfg.paths.dk_slate
-    if not dk_path:
+    from src.platforms.base import Platform
+    from src.ingestion.factory import get_ingestor
+    platform = cfg.platform if hasattr(cfg, 'platform') else Platform.DRAFTKINGS
+    if platform == Platform.FANDUEL:
+        slate_path = cfg.paths.fd_slate
+    else:
+        slate_path = cfg.paths.dk_slate
+    if not slate_path:
         return None
-    p = PROJECT_ROOT / dk_path if not Path(dk_path).is_absolute() else Path(dk_path)
+    p = PROJECT_ROOT / slate_path if not Path(slate_path).is_absolute() else Path(slate_path)
     if not p.exists():
         return None
-    from src.ingestion.dk_slate import DraftKingsSlateIngestor
-    return DraftKingsSlateIngestor(str(p)).get_slate_dataframe()
+    return get_ingestor(platform, str(p)).get_slate_dataframe()
 
 
 def _load_slate_games() -> list[str]:

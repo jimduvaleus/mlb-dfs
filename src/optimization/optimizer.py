@@ -180,25 +180,29 @@ def _score_swap_candidates_payout(
 def _compute_slot_assignment(
     ids: List[int],
     player_meta: PlayerMeta,
+    slots: Optional[List[str]] = None,
+    slot_eligibility: Optional[Dict[str, set]] = None,
 ) -> Tuple[List[int], List[int]]:
     """Compute a valid player→slot bipartite matching via augmenting-path DFS.
 
     Returns ``(slot_to_pidx, pidx_to_slot)`` where:
-      ``slot_to_pidx[j]`` = index into *ids* matched to SLOTS[j]  (-1 = free)
+      ``slot_to_pidx[j]`` = index into *ids* matched to slots[j]  (-1 = free)
       ``pidx_to_slot[i]`` = slot index matched to ids[i]          (-1 = unmatched)
 
     Raises RuntimeError if no full matching exists — only call with lineups
     that have already passed Lineup.is_valid().
     """
+    _slots = slots if slots is not None else SLOTS
+    _se: Dict[str, set] = slot_eligibility if slot_eligibility is not None else {}
     n = len(ids)
-    slot_to_pidx: List[int] = [-1] * len(SLOTS)
+    slot_to_pidx: List[int] = [-1] * len(_slots)
     pidx_to_slot: List[int] = [-1] * n
 
     def _elig(pidx: int) -> List[int]:
         meta = player_meta[ids[pidx]]
         ep = meta.get('eligible_positions') or [meta['position']]
         ep_set = set(ep)
-        return [j for j, s in enumerate(SLOTS) if s in ep_set]
+        return [j for j, s in enumerate(_slots) if ep_set & _se.get(s, {s})]
 
     def _dfs(pidx: int, visited: set) -> bool:
         for j in _elig(pidx):
@@ -226,6 +230,8 @@ def _try_augment_swap(
     player_meta: PlayerMeta,
     slot_to_pidx: List[int],
     pidx_to_slot: List[int],
+    slots: Optional[List[str]] = None,
+    slot_eligibility: Optional[Dict[str, set]] = None,
 ) -> bool:
     """Attempt to place the player at *pidx* into a slot via one augmenting-path DFS.
 
@@ -236,11 +242,14 @@ def _try_augment_swap(
     Modifies *slot_to_pidx* and *pidx_to_slot* in-place on success only
     (a failed DFS leaves them unchanged). Returns True iff placement succeeded.
     """
+    _slots = slots if slots is not None else SLOTS
+    _se: Dict[str, set] = slot_eligibility if slot_eligibility is not None else {}
+
     def _elig(p: int) -> List[int]:
         meta = player_meta[ids[p]]
         ep = meta.get('eligible_positions') or [meta['position']]
         ep_set = set(ep)
-        return [j for j, s in enumerate(SLOTS) if s in ep_set]
+        return [j for j, s in enumerate(_slots) if ep_set & _se.get(s, {s})]
 
     def _dfs(p: int, visited: set) -> bool:
         for j in _elig(p):
@@ -283,6 +292,8 @@ class _ChainRunner:
         payout_beta: float = 2.5,
         payout_cash_line: Optional[float] = None,
         payout_coverage_bonus: float = 0.0,
+        rules=None,
+        slot_eligibility: Optional[Dict[str, set]] = None,
     ):
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
@@ -296,6 +307,18 @@ class _ChainRunner:
         self.niter_success = niter_success
         self.salary_floor = salary_floor
         self.objective = objective
+
+        # Platform rules — default to DK if not provided.
+        if rules is None:
+            from src.platforms.draftkings import DK_ROSTER
+            rules = DK_ROSTER
+        if slot_eligibility is None:
+            from src.platforms.registry import get_slot_eligibility
+            from src.platforms.base import Platform
+            slot_eligibility = get_slot_eligibility(Platform.DRAFTKINGS)
+        self.rules = rules
+        self.slot_eligibility = slot_eligibility
+        self._slots: List[str] = list(rules.slots)
 
         # Bind the right scoring functions based on objective
         if objective == "p_hit":
@@ -391,14 +414,21 @@ class _ChainRunner:
     def _unstacked_lineup(
         self, rng: np.random.Generator, max_attempts: int = 1000
     ) -> Lineup:
-        """Sample a random valid lineup by filling positions greedily."""
+        """Sample a random valid lineup by filling one player per slot."""
         for _ in range(max_attempts):
             player_ids: List[int] = []
             used: set = set()
             ok = True
-            for pos, count in ROSTER_REQUIREMENTS.items():
-                pool = [p for p in self.players_by_pos[pos] if p not in used]
-                if len(pool) < count:
+            for slot in self._slots:
+                eligible_positions = self.slot_eligibility.get(slot, {slot})
+                # Build pool from all positions eligible for this slot.
+                pool_set: Dict[int, None] = {}  # ordered dedup via dict
+                for pos in eligible_positions:
+                    for p in self.players_by_pos.get(pos, []):
+                        if p not in used:
+                            pool_set[p] = None
+                pool = list(pool_set.keys())
+                if not pool:
                     ok = False
                     break
                 if self.salary_floor is not None:
@@ -406,14 +436,20 @@ class _ChainRunner:
                         [self.player_meta[p]['salary'] for p in pool], dtype=float
                     )
                     weights /= weights.sum()
-                    chosen = rng.choice(pool, size=count, replace=False, p=weights).tolist()
+                    idx = int(rng.choice(len(pool), p=weights))
                 else:
-                    chosen = rng.choice(pool, size=count, replace=False).tolist()
-                player_ids.extend(chosen)
-                used.update(chosen)
+                    idx = int(rng.integers(len(pool)))
+                chosen = pool[idx]
+                player_ids.append(chosen)
+                used.add(chosen)
             if ok:
                 lineup = Lineup(player_ids)
-                if lineup.is_valid(self.player_meta, salary_floor=self.salary_floor):
+                if lineup.is_valid(
+                    self.player_meta,
+                    salary_floor=self.salary_floor,
+                    rules=self.rules,
+                    slot_eligibility=self.slot_eligibility,
+                ):
                     return lineup
         raise RuntimeError(
             f"Could not build a valid lineup after {max_attempts} attempts. "
@@ -533,7 +569,12 @@ class _ChainRunner:
                 continue
 
             lineup = Lineup(all_ids)
-            if lineup.is_valid(self.player_meta, salary_floor=self.salary_floor):
+            if lineup.is_valid(
+                self.player_meta,
+                salary_floor=self.salary_floor,
+                rules=self.rules,
+                slot_eligibility=self.slot_eligibility,
+            ):
                 return lineup
 
         return None
@@ -584,7 +625,12 @@ class _ChainRunner:
 
             if ok:
                 cand = Lineup(new_ids)
-                if cand.is_valid(self.player_meta, salary_floor=self.salary_floor):
+                if cand.is_valid(
+                    self.player_meta,
+                    salary_floor=self.salary_floor,
+                    rules=self.rules,
+                    slot_eligibility=self.slot_eligibility,
+                ):
                     return cand
 
         return lineup  # fallback: return original if no valid mutation found
@@ -640,7 +686,12 @@ class _ChainRunner:
                 continue
 
             cand = Lineup(new_ids)
-            if cand.is_valid(self.player_meta, salary_floor=self.salary_floor):
+            if cand.is_valid(
+                self.player_meta,
+                salary_floor=self.salary_floor,
+                rules=self.rules,
+                slot_eligibility=self.slot_eligibility,
+            ):
                 return cand
 
         return None
@@ -672,7 +723,9 @@ class _ChainRunner:
         current_score = self._score_totals(totals, self.target)
 
         # ── incremental validity state ──────────────────────────────── #
-        slot_to_pidx, pidx_to_slot = _compute_slot_assignment(ids, self.player_meta)
+        slot_to_pidx, pidx_to_slot = _compute_slot_assignment(
+            ids, self.player_meta, self._slots, self.slot_eligibility
+        )
 
         running_salary: float = sum(self.player_meta[pid]['salary'] for pid in ids)
 
@@ -718,7 +771,7 @@ class _ChainRunner:
             old_is_pitcher = meta['position'] == 'P'
 
             # Salary window for this slot.
-            sal_max = SALARY_CAP - running_salary + old_salary
+            sal_max = self.rules.salary_cap - running_salary + old_salary
             sal_min = (
                 (self.salary_floor - running_salary + old_salary)
                 if self.salary_floor is not None else 0.0
@@ -768,7 +821,7 @@ class _ChainRunner:
 
                 # 1. Team hitter cap: only check when new_team gains a hitter
                 if not new_is_pitcher and (old_is_pitcher or old_team != new_team):
-                    if team_counts.get(new_team, 0) + 1 > MAX_HITTERS_PER_TEAM:
+                    if team_counts.get(new_team, 0) + 1 > self.rules.max_hitters_per_team:
                         continue
 
                 # 2. Two pitchers cannot be from the same team
@@ -806,7 +859,7 @@ class _ChainRunner:
                     )
                     if new_game and new_game not in game_counts:
                         n_games_after += 1
-                    if n_games_after < MIN_GAMES:
+                    if n_games_after < self.rules.min_games:
                         continue
 
                 # 5. Position eligibility: incremental augmenting-path on copies.
@@ -820,7 +873,10 @@ class _ChainRunner:
                 ids_test = list(ids)
                 ids_test[idx] = new_id
 
-                if not _try_augment_swap(idx, ids_test, self.player_meta, st_copy, ps_copy):
+                if not _try_augment_swap(
+                    idx, ids_test, self.player_meta, st_copy, ps_copy,
+                    self._slots, self.slot_eligibility,
+                ):
                     continue
 
                 # Valid swap — commit
@@ -907,7 +963,7 @@ def _worker_init() -> None:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, payout_coverage_bonus, n_workers, initial_lineup = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, payout_coverage_bonus, n_workers, rules, slot_eligibility, initial_lineup = args
     # Cap Numba intra-op threads so that n_workers processes don't collectively
     # over-subscribe the CPU.  Single-process mode (n_workers=1) leaves Numba
     # free to use all available cores for prange parallelism.
@@ -935,6 +991,8 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
             payout_coverage_bonus=payout_coverage_bonus,
+            rules=rules,
+            slot_eligibility=slot_eligibility,
         )
         return runner.run(seed, initial_lineup=initial_lineup)
     finally:
@@ -984,9 +1042,22 @@ class BasinHoppingOptimizer:
         payout_beta: float = 2.5,
         payout_cash_line: Optional[float] = None,
         payout_coverage_bonus: float = 0.0,
+        rules=None,
+        slot_eligibility: Optional[Dict[str, set]] = None,
     ):
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
+
+        # Resolve platform rules — default to DK if not provided.
+        if rules is None:
+            from src.platforms.draftkings import DK_ROSTER
+            rules = DK_ROSTER
+        if slot_eligibility is None:
+            from src.platforms.registry import get_slot_eligibility
+            from src.platforms.base import Platform
+            slot_eligibility = get_slot_eligibility(Platform.DRAFTKINGS)
+        self.rules = rules
+        self.slot_eligibility = slot_eligibility
 
         # Restrict to players that appear in the simulation results
         sim_ids = set(sim_results.player_ids)
@@ -1013,10 +1084,13 @@ class BasinHoppingOptimizer:
         self.payout_cash_line = payout_cash_line
         self.payout_coverage_bonus = payout_coverage_bonus
 
-        # Pre-group player IDs by position for fast pool queries
-        self._players_by_pos: Dict[str, List[int]] = {
-            pos: [] for pos in ROSTER_REQUIREMENTS
-        }
+        # Pre-group player IDs by position for fast pool queries.
+        # Derive the set of individual positions from slot_eligibility values
+        # so both DK (P,C,1B,...) and FD (C/1B,UTIL,...) are handled uniformly.
+        all_positions: set = set()
+        for elig_set in slot_eligibility.values():
+            all_positions.update(elig_set)
+        self._players_by_pos: Dict[str, List[int]] = {pos: [] for pos in all_positions}
         for pid, meta in self.player_meta.items():
             for pos in meta['eligible_positions']:
                 if pos in self._players_by_pos:
@@ -1037,6 +1111,8 @@ class BasinHoppingOptimizer:
             payout_beta=self.payout_beta,
             payout_cash_line=self.payout_cash_line,
             payout_coverage_bonus=self.payout_coverage_bonus,
+            rules=self.rules,
+            slot_eligibility=self.slot_eligibility,
         )
 
     def _run_chains(
@@ -1097,6 +1173,8 @@ class BasinHoppingOptimizer:
                     self.payout_cash_line,
                     self.payout_coverage_bonus,
                     self.n_workers,
+                    self.rules,
+                    self.slot_eligibility,
                     initial,
                 ))
             owned_executor = executor is None
