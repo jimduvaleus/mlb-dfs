@@ -1,5 +1,26 @@
 """
 DraftKings MLB Scoring Constants and Functions.
+
+# HISTORICAL PIPELINE WARNING
+#
+# The constants in this module are imported directly by
+# src/ingestion/retrosheet_parser.py to compute DK fantasy points that are
+# stored in data/processed/historical_logs.parquet.  That parquet file is the
+# training source for the empirical copula (build_copula.py) and the batter PCA
+# model (fit_batter_pca.py).
+#
+# Changing ANY constant here — even a single decimal — silently corrupts the
+# copula and all downstream simulation results without raising an error.
+#
+# RULES:
+#   1. Do NOT modify these constants for FanDuel support.  FD scoring lives in
+#      src/platforms/fanduel.py and must never touch this file until Phase 9
+#      of the FanDuel Platform Plan.
+#   2. tests/test_scoring_contract.py pins every constant to its exact value.
+#      If that test fails, you have introduced a breaking change to the
+#      historical pipeline.
+#   3. If you need to add a new platform's scoring, create a new module under
+#      src/platforms/ and do NOT import from this file.
 """
 
 # Batter Scoring
