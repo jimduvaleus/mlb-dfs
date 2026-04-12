@@ -59,6 +59,7 @@ export default function App() {
   // Games (as "AWAY@HOME" strings) to exclude from projection fetches.
   // Empty = fetch all games (default). Non-empty = partial fetch + merge.
   const [projFetchExcluded, setProjFetchExcluded] = useState<string[]>([])
+  const [projFetching, setProjFetching] = useState(false)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
   const [stopPending, setStopPending] = useState(false)
@@ -203,6 +204,7 @@ export default function App() {
             disabled={tabDisabled(tab)}
           >
             {tab.charAt(0).toUpperCase() + tab.slice(1)}
+            {tab === 'config' && projFetching && <span className="tab-dot" />}
             {tab === 'run' && running && <span className="tab-dot" />}
             {tab === 'portfolio' && state.portfolio.length > 0 && (
               <span className="tab-count">{state.portfolio.length}</span>
@@ -212,23 +214,22 @@ export default function App() {
       </nav>
 
       <main className="app-main">
-        {state.activeTab === 'config' && (
-          <div>
-            {configError && <p className="error">{configError}</p>}
-            {state.config ? (
-              <>
-                <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} />
-                <ConfigForm
-                  config={state.config}
-                  onSaved={cfg => dispatch({ type: 'set_config', config: cfg })}
-                  disabled={running}
-                />
-              </>
-            ) : (
-              <p className="muted">Loading config…</p>
-            )}
-          </div>
-        )}
+        {/* Always mounted so the projection fetch EventSource survives tab switches */}
+        <div style={{ display: state.activeTab === 'config' ? undefined : 'none' }}>
+          {configError && <p className="error">{configError}</p>}
+          {state.config ? (
+            <>
+              <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} />
+              <ConfigForm
+                config={state.config}
+                onSaved={cfg => dispatch({ type: 'set_config', config: cfg })}
+                disabled={running}
+              />
+            </>
+          ) : (
+            <p className="muted">Loading config…</p>
+          )}
+        </div>
 
         {state.activeTab === 'slate' && (
           <SlatePanel

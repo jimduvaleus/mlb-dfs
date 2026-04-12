@@ -50,6 +50,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.platforms.base import Platform
 from src.ingestion.factory import get_ingestor
 

@@ -573,7 +573,8 @@ async def projections_fetch(request: Request):
                 else:
                     # Step 2: Market odds — pass --games filter when doing a partial fetch
                     yield _log("--- Fetching Market Odds (CrazyNinjaOdds) ---")
-                    mo_cmd = [str(python), str(mo_script), "--output", str(mo_out)]
+                    mo_cmd = [str(python), str(mo_script), "--output", str(mo_out),
+                              "--rw-output", str(rw_out)]
                     if included_pairs:
                         games_arg = ",".join(f"{a}@{h}" for a, h in included_pairs)
                         mo_cmd += ["--games", games_arg]
@@ -598,6 +599,10 @@ async def projections_fetch(request: Request):
                         if (mo_out.exists() and mo_rc == 0)
                         else pd.DataFrame()
                     )
+                    # Normalize player_id to int64 — pandas 3 may infer str dtype
+                    for _df in (rw_df, mo_df):
+                        if not _df.empty and "player_id" in _df.columns:
+                            _df["player_id"] = pd.to_numeric(_df["player_id"], errors="coerce").astype("Int64")
                     # When partial: restrict the RW pool to only the included games
                     if is_partial and included_pids and not rw_df.empty:
                         rw_df = rw_df[rw_df["player_id"].isin(included_pids)]
@@ -718,6 +723,10 @@ async def projections_fetch(request: Request):
                 # ---- Merge both outputs into final projections.csv (no yields) ---
                 dff_df = pd.read_csv(dff_out) if dff_out.exists() else pd.DataFrame()
                 rw_df  = pd.read_csv(rw_out)  if rw_out.exists()  else pd.DataFrame()
+                # Normalize player_id to int64 — pandas 3 may infer str dtype
+                for _df in (dff_df, rw_df):
+                    if not _df.empty and "player_id" in _df.columns:
+                        _df["player_id"] = pd.to_numeric(_df["player_id"], errors="coerce").astype("Int64")
 
                 # RW pool  — all starters already filtered by the fetch script
                 # DFF pool — confirmed batters only (slot_confirmed=True) + all pitchers

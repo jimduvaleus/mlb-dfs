@@ -8,6 +8,7 @@ interface Props {
   mergeInfo: MergeInfo | null
   onMergeInfo: (info: MergeInfo | null) => void
   projFetchExcluded?: string[]
+  onFetchingChange?: (fetching: boolean) => void
 }
 
 function formatET(unixSec: number): string {
@@ -21,7 +22,7 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [] }: Props) {
+export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
@@ -49,6 +50,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
   const handleFetch = () => {
     if (fetching || disabled) return
     setFetching(true)
+    onFetchingChange?.(true)
     setLog([])
     setDone(null)
     onMergeInfo(null)
@@ -67,6 +69,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players: event.players })
       } else if (event.type === 'done') {
         setFetching(false)
+        onFetchingChange?.(false)
         setDone({ success: event.returncode === 0, code: event.returncode })
         es.close()
         esRef.current = null
@@ -77,6 +80,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
 
     es.onerror = () => {
       setFetching(false)
+      onFetchingChange?.(false)
       es.close()
       esRef.current = null
     }

@@ -1101,10 +1101,15 @@ def build_projections_csv(
     name_map: dict[str, str] | None = None,
     debug: bool = False,
     games_filter: set[tuple[str, str]] | None = None,
+    rw_player_ids: set[int] | None = None,
 ) -> pd.DataFrame:
     """
     Fetch market odds and produce projections CSV.
     Output columns: player_id, name, mean, std_dev  (no lineup_slot).
+
+    rw_player_ids: if provided, only compute projections for players whose
+        DK player_id appears in this set (i.e. players with a RotoWire lineup
+        slot).  Players not in the set are silently skipped.
 
     games_filter: if provided, only fetch these (away, home) matchups.
     """
@@ -1150,6 +1155,10 @@ def build_projections_csv(
             unmatched.append(player_name)
             continue
 
+        if rw_player_ids is not None and pid not in rw_player_ids:
+            log.debug("Skipping %s (pid=%d) — not in RotoWire lineup pool", player_name, pid)
+            continue
+
         position = dk_pos.get(pid, "")
         is_pitcher = any(p.upper() in {"P", "SP", "RP"} for p in position.split("/"))
 
@@ -1189,6 +1198,8 @@ def build_projections_csv(
         pid = _match_name(player_name, dk_lookup)
         if pid is None:
             continue  # not on this DK slate — ignore
+        if rw_player_ids is not None and pid not in rw_player_ids:
+            continue  # not in RotoWire lineup pool — skip fallback reason too
         position = dk_pos.get(pid, "")
         is_pitcher = any(p.upper() in {"P", "SP", "RP"} for p in position.split("/"))
         if is_pitcher:
@@ -1292,6 +1303,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--rw-output",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Path to the RotoWire projections CSV produced by fetch_rotowire_projections.py. "
+            "When provided, only players with a RotoWire lineup slot are projected; "
+            "all other players in the market odds data are skipped."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging (prints raw table rows and per-market data counts)",
@@ -1311,12 +1332,22 @@ def main() -> None:
             away, home = token.split("@", 1)
             games_filter.add((away, home))
 
+    rw_player_ids: set[int] | None = None
+    if args.rw_output:
+        try:
+            rw_df = pd.read_csv(args.rw_output)
+            rw_player_ids = set(int(x) for x in rw_df["player_id"].dropna())
+            log.info("RotoWire player pool: %d players with lineup slots", len(rw_player_ids))
+        except Exception as exc:
+            log.warning("Could not load RotoWire output %s: %s — projecting all players", args.rw_output, exc)
+
     build_projections_csv(
         dk_path=args.dk_slate,
         output_path=args.output,
         name_map=_load_name_map(args.name_map),
         debug=args.debug,
         games_filter=games_filter,
+        rw_player_ids=rw_player_ids,
     )
 
 
