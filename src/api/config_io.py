@@ -12,6 +12,7 @@ def read_config() -> AppConfig:
     with open(CONFIG_PATH) as f:
         raw = yaml.safe_load(f) or {}
     return AppConfig(
+        platform=raw.get("platform", "draftkings"),
         paths=raw.get("paths", {}),
         simulation=raw.get("simulation", {}),
         optimizer=raw.get("optimizer", {}),
@@ -21,6 +22,8 @@ def read_config() -> AppConfig:
 
 def write_config(cfg: AppConfig) -> None:
     data = cfg.model_dump(exclude_none=False)
+    # Serialize Platform enum to its string value for YAML round-trips.
+    data["platform"] = cfg.platform.value
     # Represent None values as empty strings for paths, omit optional nones
     paths = data["paths"]
     for key in ("projections", "batter_pca_model", "batter_score_grid"):

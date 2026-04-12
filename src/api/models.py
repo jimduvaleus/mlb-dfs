@@ -2,9 +2,12 @@
 from typing import Optional
 from pydantic import BaseModel
 
+from src.platforms.base import Platform
+
 
 class PathsConfig(BaseModel):
     dk_slate: str = ""
+    fd_slate: str = ""
     copula: str = ""
     output_dir: str = "outputs"
     projections: Optional[str] = None
@@ -42,6 +45,7 @@ class PortfolioConfig(BaseModel):
 
 
 class AppConfig(BaseModel):
+    platform: Platform = Platform.DRAFTKINGS
     paths: PathsConfig = PathsConfig()
     simulation: SimulationConfig = SimulationConfig()
     optimizer: OptimizerConfig = OptimizerConfig()
