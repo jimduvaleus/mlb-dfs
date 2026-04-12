@@ -474,11 +474,14 @@ async def projections_fetch(request: Request):
             result = merged_df[[c for c in out_cols if c in merged_df.columns]]
             if is_partial and proj_path.exists():
                 existing = pd.read_csv(proj_path)
-                # Replace rows for fetched players, keep everything else.
-                keep_ids = set(result["player_id"].tolist()) if "player_id" in result.columns else set()
-                if keep_ids and included_pids:
-                    keep_ids = keep_ids & included_pids  # only replace actually-fetched players
-                other = existing[~existing["player_id"].isin(keep_ids)] if not existing.empty else pd.DataFrame()
+                # Purge ALL players from the fetched games before merging in the new
+                # result.  Using only result["player_id"] would leave stale rows for
+                # players who dropped out of the lineup since the last fetch (e.g. a
+                # player whose slot is now unconfirmed and absent from the new result).
+                purge_ids = included_pids or (
+                    set(result["player_id"].tolist()) if "player_id" in result.columns else set()
+                )
+                other = existing[~existing["player_id"].isin(purge_ids)] if not existing.empty else pd.DataFrame()
                 out_cols2 = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
                 other = other[[c for c in out_cols2 if c in other.columns]]
                 result = pd.concat([other, result], ignore_index=True)

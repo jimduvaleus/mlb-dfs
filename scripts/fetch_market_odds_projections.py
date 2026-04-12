@@ -82,7 +82,7 @@ BATTER_MARKETS = [
     "Player Triples",
     "Player Home Runs",
     "Player Stolen Bases",
-    "Player Walks",
+    "Player Batting Walks",
 ]
 
 PITCHER_MARKETS = [
@@ -118,7 +118,7 @@ MARKET_KEY_MAP: dict[str, str] = {
     "Player Triples":             MK_TRIPLES,
     "Player Home Runs":           MK_HR,
     "Player Stolen Bases":        MK_SB,
-    "Player Walks":               MK_WALKS,
+    "Player Batting Walks":       MK_WALKS,
     "Player Outs Recorded":       MK_OUTS,
     "Player Pitching Strikeouts": MK_K,
     "Player Record A Win":        MK_WIN,
@@ -614,6 +614,7 @@ async def _fetch_game_odds(
         log.warning("Could not set devig method for game %d: %s", game_id, e)
 
     market_data: dict[str, dict[str, list[tuple[float, float]]]] = {}
+    seen_players: set[str] = set()
     _validated = False
 
     for market_name in markets:
@@ -661,10 +662,13 @@ async def _fetch_game_odds(
 
         # Collect Over and Under odds separately, keyed by (player, line).
         # Both sides are needed so we can normalize implied probabilities to sum to 1.
-        # Rows whose Fair Odds cell contains ⚠️ are skipped — the site uses this icon
-        # to flag odds devigged from a one-way line with estimated juice, making them
-        # less reliable.
+        # Rows whose Fair Odds cell contains ⚠️ were devigged from a one-way line.
+        # We save ⚠️-flagged 0.5-line odds in a separate dict and use them as a
+        # fallback for any player who has no valid (non-⚠️) 0.5 data for this market.
+        # The one-way devigged odds are treated as fair: P(Over) = implied_prob(Over).
+        # Flagged lines above 0.5 are always discarded.
         raw: dict[tuple[str, float], dict[str, float]] = {}
+        flagged_half: dict[str, dict[str, float]] = {}  # player → {outcome: prob}
         for row in rows:
             if len(row) <= _FAIR_ODDS_COL:
                 continue
@@ -672,8 +676,15 @@ async def _fetch_game_odds(
             if parsed is None:
                 continue
             player_name, outcome, line = parsed
+            seen_players.add(player_name)  # track before ⚠️ skip
             odds_cell = row[_FAIR_ODDS_COL]
-            if "\u26a0" in odds_cell:   # ⚠️ — estimated juice, skip
+            if "\u26a0" in odds_cell:   # ⚠️ — one-way devigged odds
+                if line == 0.5:
+                    # Strip the flag character and parse the numeric odds
+                    odds_str = odds_cell.split("\u26a0")[0].strip()
+                    prob = _parse_fair_odds(odds_str)
+                    if prob is not None:
+                        flagged_half.setdefault(player_name, {})[outcome] = prob
                 log.debug("Skipping flagged odds row: %s %s", player_name, odds_cell)
                 continue
             prob = _parse_fair_odds(odds_cell.strip())
@@ -697,6 +708,30 @@ async def _fetch_game_odds(
                 (line, p_over)
             )
 
+        # Flagged-0.5 fallback: for each player whose 0.5 line had no valid odds,
+        # add the flagged 0.5 odds so they aren't silently projected with a missing
+        # market.  Players with valid 1.5/2.5 data but flagged 0.5 also benefit —
+        # the 0.5 point is the most informative line and improves the μ estimate.
+        for player_name, sides in flagged_half.items():
+            if (player_name, 0.5) in raw:
+                continue  # valid 0.5 already present — don't mix in flagged data
+            p_over_raw = sides.get("over")
+            if p_over_raw is None:
+                continue  # no Over side available
+            p_under_raw = sides.get("under")
+            if p_under_raw is not None:
+                total = p_over_raw + p_under_raw
+                p_over = p_over_raw / total if total > 0 else p_over_raw
+            else:
+                p_over = p_over_raw
+            market_data.setdefault(player_name, {}).setdefault(market_key, []).append(
+                (0.5, p_over)
+            )
+            log.debug(
+                "game_id=%d: %s — using flagged 0.5 odds for %s (p_over=%.4f)",
+                game_id, market_name, player_name, p_over,
+            )
+
     if debug:
         for mkt in markets:
             mk = MARKET_KEY_MAP.get(mkt)
@@ -706,7 +741,7 @@ async def _fetch_game_odds(
     log.info(
         "game_id=%d: collected market data for %d players", game_id, len(market_data)
     )
-    return market_data
+    return market_data, seen_players
 
 
 async def _find_game_ids(
@@ -890,12 +925,18 @@ def _compute_batter_projection(
     e_r   = get_mu(MK_RUNS)
     e_rbi = get_mu(MK_RBIS)
 
-    # Require at least one hit-type market and both Runs and RBIs.
-    # A zero here means the market wasn't available for this player — fall back
-    # to RotoWire rather than silently underestimating their projection.
+    # Require at least one hit-type market and all three rate markets (Runs, RBIs,
+    # Batting Walks).  A zero here means the market wasn't available for this
+    # player — fall back to RotoWire rather than silently underestimating their
+    # projection.  Triples and Stolen Bases are legitimately absent for many
+    # players and are not required.
     if e_s == 0 and e_d == 0 and e_t == 0 and e_hr == 0:
         return None, "no hit market data (Singles/Doubles/Triples/HR all missing)"
-    missing = [name for name, val in [("Runs", e_r), ("RBIs", e_rbi)] if val == 0]
+    missing = [
+        name for name, val in [
+            ("Runs", e_r), ("RBIs", e_rbi), ("Batting Walks", e_bb)
+        ] if val == 0
+    ]
     if missing:
         return None, f"{' and '.join(missing)} market{'s' if len(missing) > 1 else ''} unavailable"
 
@@ -1005,6 +1046,7 @@ async def _run_playwright(
 
     all_markets = BATTER_MARKETS + PITCHER_MARKETS
     all_market_data: dict[str, dict[str, list[tuple[float, float]]]] = {}
+    all_seen_players: set[str] = set()
 
     cache_key   = _game_id_cache_key(slate_date, slate_games)
     game_id_map = _load_game_id_cache(cache_key)
@@ -1018,7 +1060,7 @@ async def _run_playwright(
             if not game_id_map:
                 log.error("No slate games matched on CrazyNinjaOdds.")
                 await browser.close()
-                return {}
+                return {}, set()
             _save_game_id_cache(cache_key, game_id_map)
         else:
             log.info("Skipping games.aspx — using %d cached game IDs.", len(game_id_map))
@@ -1027,7 +1069,7 @@ async def _run_playwright(
         for (away, home), game_id in game_id_map.items():
             log.info("Fetching odds for %s@%s (game_id=%d)", away, home, game_id)
             try:
-                game_data = await _fetch_game_odds(
+                game_data, seen_players = await _fetch_game_odds(
                     page, game_id, all_markets, debug=debug,
                     validate_columns=first_game,
                 )
@@ -1037,6 +1079,8 @@ async def _run_playwright(
                     entry = all_market_data.setdefault(mapped, {})
                     for mk, lp in markets.items():
                         entry.setdefault(mk, []).extend(lp)
+                for player_name in seen_players:
+                    all_seen_players.add(name_map.get(player_name, player_name))
             except Exception as e:
                 log.warning(
                     "Error fetching game %d (%s@%s): %s", game_id, away, home, e
@@ -1044,7 +1088,7 @@ async def _run_playwright(
 
         await browser.close()
 
-    return all_market_data
+    return all_market_data, all_seen_players
 
 
 # ---------------------------------------------------------------------------
@@ -1085,7 +1129,7 @@ def build_projections_csv(
         dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
 
     # Fetch market data
-    all_market_data = asyncio.run(
+    all_market_data, all_seen_players = asyncio.run(
         _run_playwright(dk_path, name_map, debug=debug, games_filter=games_filter)
     )
 
@@ -1136,6 +1180,29 @@ def build_projections_csv(
             "mean": round(mean, 4),
             "std_dev": round(std_dev, 4),
         })
+
+    # Players who appeared in odds tables but had every line ⚠️-flagged never entered
+    # all_market_data, so the loop above silently skipped them.  Detect and warn here
+    # so the log is explicit and the UI can show a reason for the RotoWire fallback.
+    all_flagged_names = all_seen_players - set(all_market_data.keys())
+    for player_name in sorted(all_flagged_names):
+        pid = _match_name(player_name, dk_lookup)
+        if pid is None:
+            continue  # not on this DK slate — ignore
+        position = dk_pos.get(pid, "")
+        is_pitcher = any(p.upper() in {"P", "SP", "RP"} for p in position.split("/"))
+        if is_pitcher:
+            log.debug(
+                "No MO projection for pitcher %s (pid=%d) — all market odds lines flagged (⚠️)",
+                player_name, pid,
+            )
+            continue
+        reason = "all market odds lines flagged (\u26a0\ufe0f)"
+        log.info(
+            "No MO projection for %s (pid=%d) — %s; using RotoWire fallback",
+            player_name, pid, reason,
+        )
+        fallback_reasons[pid] = reason
 
     if unmatched:
         log.warning(

@@ -1,7 +1,7 @@
+- BIG FanDuel
 - BIG Turbo button
 - BIG Opponent/contest modeling
 - BIG late swap?
 - on projections fetch, if number of changes is small, report them
 - BIG ownership?? EV calcs, and EV objective??
-- fancy prediction market-based projections
 - Need weather
