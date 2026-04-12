@@ -1,6 +1,7 @@
 import pandas as pd
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 @dataclass
 class Player:
@@ -10,11 +11,25 @@ class Player:
     eligible_positions: List[str] = field(default_factory=list)
     salary: float = 0.0
     team: str = ""
+    opponent: str = ""
     roster_position: str = ""
     game: str = ""
+    fd_player_id: str = ""  # FD-specific: full "slate_id-player_id" string for upload
 
 
-class DraftKingsSlateIngestor:
+class BaseSlateIngestor(ABC):
+    @abstractmethod
+    def get_slate_dataframe(self) -> pd.DataFrame:
+        """Return a standardized player DataFrame for this slate."""
+        ...
+
+    @abstractmethod
+    def get_players(self) -> List[Player]:
+        """Return a list of Player objects for this slate."""
+        ...
+
+
+class DraftKingsSlateIngestor(BaseSlateIngestor):
     def __init__(self, csv_filepath: str):
         self.csv_filepath = csv_filepath
         self.slate_df = self._load_and_parse_csv()
@@ -80,7 +95,9 @@ class DraftKingsSlateIngestor:
         else:
             df['game'] = ""
 
-        return df[['player_id', 'name', 'position', 'eligible_positions', 'roster_position', 'salary', 'team', 'game']]
+        df['opponent'] = ""
+
+        return df[['player_id', 'name', 'position', 'eligible_positions', 'roster_position', 'salary', 'team', 'opponent', 'game']]
 
     def get_players(self) -> List[Player]:
         players = []
@@ -92,6 +109,7 @@ class DraftKingsSlateIngestor:
                 eligible_positions=row['eligible_positions'],
                 salary=row['salary'],
                 team=row['team'],
+                opponent=row.get('opponent', ''),
                 roster_position=row['roster_position'],
                 game=row['game'],
             ))
