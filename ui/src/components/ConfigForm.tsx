@@ -43,10 +43,13 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
   const handlePlatformChange = (p: PlatformType) => {
     setDraft(d => {
       const floor = d.optimizer.salary_floor
-      // Auto-adjust salary floor only when it looks like the other platform's default
-      const newFloor = (floor === 48500 && p === 'fanduel') ? 30000
-        : (floor === 30000 && p === 'draftkings') ? 48500
-        : floor
+      // Auto-adjust salary floor when the current value is invalid or clearly wrong for the target platform
+      let newFloor = floor
+      if (p === 'fanduel' && floor != null && floor > 35000) {
+        newFloor = 30000
+      } else if (p === 'draftkings' && floor != null && floor <= 35000) {
+        newFloor = 48500
+      }
       return { ...d, platform: p, optimizer: { ...d.optimizer, salary_floor: newFloor } }
     })
     setSaved(false)
