@@ -40,6 +40,9 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from src.platforms.base import Platform
+from src.ingestion.factory import get_ingestor
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -54,6 +57,7 @@ SLATE_LIST_URL = f"{BASE_URL}/slate-list.php"
 PLAYERS_URL = f"{BASE_URL}/players.php"
 
 DRAFTKINGS_SITE_ID = 1  # confirmed from JS bundle: siteID=1 → DraftKings
+FANDUEL_SITE_ID    = 2  # TODO: confirm from RotoWire JS bundle
 
 HEADERS = {
     "User-Agent": (
@@ -201,8 +205,8 @@ def _extract_date_from_dk(dk_path: str) -> str | None:
     return None
 
 
-def fetch_slate_list(debug: bool = False) -> list[dict]:
-    data = _get(SLATE_LIST_URL, params={"siteID": DRAFTKINGS_SITE_ID}, debug=debug)
+def fetch_slate_list(site_id: int = DRAFTKINGS_SITE_ID, debug: bool = False) -> list[dict]:
+    data = _get(SLATE_LIST_URL, params={"siteID": site_id}, debug=debug)
     slates = data.get("slates", [])
     if isinstance(slates, str):
         return []
@@ -274,6 +278,38 @@ def _dk_teams(dk_path: str) -> set[str]:
     return teams
 
 
+def _slate_df_teams(slate_df: pd.DataFrame) -> set[str]:
+    """Return all team abbreviations from a pre-loaded slate DataFrame.
+
+    Works for both DK (team column + game column "ARI@PHI") and FD (team +
+    opponent columns).
+    """
+    teams: set[str] = set()
+    for col in ("team", "opponent"):
+        if col in slate_df.columns:
+            teams.update(
+                t.upper()
+                for t in slate_df[col].dropna().unique()
+                if t and str(t).strip()
+            )
+    if "game" in slate_df.columns:
+        for game in slate_df["game"].dropna().unique():
+            m = re.match(r"(\w+)@(\w+)", str(game))
+            if m:
+                teams.add(m.group(1).upper())
+                teams.add(m.group(2).upper())
+    return teams
+
+
+_FD_DATE_IN_PATH_RE = re.compile(r"FanDuel-MLB-(\d{4}-\d{2}-\d{2})-")
+
+
+def _extract_date_from_fd_path(path: str) -> str | None:
+    """Extract 'YYYY-MM-DD' from a FanDuel salary CSV filename, or None."""
+    m = _FD_DATE_IN_PATH_RE.search(Path(path).name)
+    return m.group(1) if m else None
+
+
 def _teams_from_records(records: list[dict]) -> set[str]:
     """Extract team abbreviations from RotoWire player records.
 
@@ -298,25 +334,29 @@ def _teams_from_records(records: list[dict]) -> set[str]:
 def find_best_slate(
     slates: list[dict],
     target_date: str | None,
-    dk_path: str | None = None,
+    slate_teams: set[str] | None = None,
     debug: bool = False,
 ) -> tuple[dict | None, list[dict] | None]:
     """
-    Return (slate, records) where *slate* is the Classic DK slate that best
-    matches the game set in *dk_path* and *records* are the player records
-    fetched for that slate during scoring (to avoid a redundant fetch later).
-    *records* is None when the team set was served from cache or only one
-    candidate existed — the caller should fetch records itself in that case.
+    Return (slate, records) where *slate* is the Classic slate that best
+    matches the game set represented by *slate_teams* and *records* are the
+    player records fetched for that slate during scoring (to avoid a redundant
+    fetch later).  *records* is None when the team set was served from cache
+    or only one candidate existed — the caller should fetch records itself.
+
+    *slate_teams* is a set of team abbreviations extracted from the user's
+    salary CSV (via ``_slate_df_teams(slate_df)``).  Works for both DK and FD.
 
     When multiple Classic slates share the same date (e.g. Early / Afternoon /
     Night / All), fetches player records for each uncached candidate and picks
-    the one whose team set most closely matches the DK salary file's teams.
+    the one whose team set most closely matches *slate_teams*.
 
     Scoring (higher = better):
-      primary:   fewest DK teams absent from the slate
-      secondary: fewest extra slate teams not in DK (avoids "All" over sub-slates)
+      primary:   fewest salary-file teams absent from the RW slate
+      secondary: fewest extra RW-slate teams not in salary file
+                 (avoids "All" over sub-slates)
 
-    Falls back to defaultSlate flag if the DK file is unavailable or no team
+    Falls back to defaultSlate flag if slate_teams is unavailable or no team
     data can be extracted from the player records.
     """
     def _matches_date(s: dict) -> bool:
@@ -332,38 +372,36 @@ def find_best_slate(
         return candidates[0], None
 
     # Multiple candidates on the same date — score by game-set overlap.
-    if dk_path:
-        dk_team_set = _dk_teams(dk_path)
-        if dk_team_set:
-            cache = _load_slate_teams_cache()
-            # scored entries: (score_primary, score_secondary, slate, fetched_records)
-            scored: list[tuple] = []
-            for s in candidates:
-                sid = str(s["slateID"])
-                fetched_records: list[dict] | None = None
-                try:
-                    if sid in cache:
-                        slate_teams = set(cache[sid])
-                        log.debug("Slate %s (%s): using cached team set", sid, s.get("slateName"))
-                    else:
-                        fetched_records = fetch_players(s["slateID"], debug=debug)
-                        slate_teams = _teams_from_records(fetched_records)
-                        if slate_teams:
-                            _save_slate_teams_cache(sid, list(slate_teams))
-                    if slate_teams:
-                        missing = len(dk_team_set - slate_teams)
-                        extra   = len(slate_teams - dk_team_set)
-                        scored.append((-missing, -extra, s, fetched_records))
-                        log.info(
-                            "Slate %s (%s): %d teams, missing=%d, extra=%d",
-                            s["slateID"], s.get("slateName"),
-                            len(slate_teams), missing, extra,
-                        )
-                except Exception as exc:
-                    log.debug("Could not score slate %s: %s", s.get("slateID"), exc)
-            if scored:
-                scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
-                return scored[0][2], scored[0][3]
+    if slate_teams:
+        cache = _load_slate_teams_cache()
+        # scored entries: (score_primary, score_secondary, slate, fetched_records)
+        scored: list[tuple] = []
+        for s in candidates:
+            sid = str(s["slateID"])
+            fetched_records: list[dict] | None = None
+            try:
+                if sid in cache:
+                    rw_teams = set(cache[sid])
+                    log.debug("Slate %s (%s): using cached team set", sid, s.get("slateName"))
+                else:
+                    fetched_records = fetch_players(s["slateID"], debug=debug)
+                    rw_teams = _teams_from_records(fetched_records)
+                    if rw_teams:
+                        _save_slate_teams_cache(sid, list(rw_teams))
+                if rw_teams:
+                    missing = len(slate_teams - rw_teams)
+                    extra   = len(rw_teams - slate_teams)
+                    scored.append((-missing, -extra, s, fetched_records))
+                    log.info(
+                        "Slate %s (%s): %d teams, missing=%d, extra=%d",
+                        s["slateID"], s.get("slateName"),
+                        len(rw_teams), missing, extra,
+                    )
+            except Exception as exc:
+                log.debug("Could not score slate %s: %s", s.get("slateID"), exc)
+        if scored:
+            scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+            return scored[0][2], scored[0][3]
 
     # Fallback: prefer defaultSlate among candidates, then first.
     for s in candidates:
@@ -450,29 +488,28 @@ def parse_players(records: list[dict]) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_projections_csv(
-    dk_path: str,
+    slate_df: pd.DataFrame,
     slate_id: int | str,
     output_path: str,
+    site_id: int = DRAFTKINGS_SITE_ID,
     name_map: dict[str, str] | None = None,
     debug: bool = False,
     prefetched_records: list[dict] | None = None,
 ) -> pd.DataFrame:
-    # --- Load DK salary file ------------------------------------------------
-    log.info("Loading DK salary file: %s", dk_path)
-    dk_df = pd.read_csv(dk_path)
-    dk_df.rename(columns={"ID": "player_id", "Name": "name", "Salary": "salary"}, inplace=True)
-
-    # Build normalised-name → [(player_id, salary)] lookup
-    dk_lookup: dict[str, list[tuple[int, float]]] = {}
-    for _, row in dk_df.iterrows():
+    # --- Build player lookup from pre-loaded slate DataFrame ----------------
+    # slate_df is produced by DraftKingsSlateIngestor or FanDuelSlateIngestor;
+    # both expose the same standardised columns: player_id, name, salary, position.
+    log.info("Building player lookup from slate (siteID=%d, %d players).", site_id, len(slate_df))
+    name_lookup: dict[str, list[tuple[int, float]]] = {}
+    for _, row in slate_df.iterrows():
         key = _normalise(str(row["name"]))
         pid = int(row["player_id"])
         sal = float(row["salary"])
-        dk_lookup.setdefault(key, []).append((pid, sal))
+        name_lookup.setdefault(key, []).append((pid, sal))
 
-    dk_pos: dict[int, str] = {}
-    if "Position" in dk_df.columns:
-        dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
+    pos_map: dict[int, str] = {}
+    if "position" in slate_df.columns:
+        pos_map = {int(r["player_id"]): str(r["position"]) for _, r in slate_df.iterrows()}
 
     # --- Fetch RotoWire players ---------------------------------------------
     if prefetched_records is not None:
@@ -507,7 +544,7 @@ def build_projections_csv(
             len(unconfirmed),
         )
 
-    # --- Match to DK player IDs ---------------------------------------------
+    # --- Match to platform player IDs --------------------------------------
     name_map = name_map or {}
     matched, unmatched = [], []
     for _, row in proj_df.iterrows():
@@ -516,14 +553,14 @@ def build_projections_csv(
         rw_name = name_map.get(row["rw_name"], row["rw_name"])
         if rw_name != row["rw_name"]:
             log.debug("Name map: %r → %r", row["rw_name"], rw_name)
-        pid = _match_name(rw_name, dk_lookup, rw_salary=row["rw_salary"])
+        pid = _match_name(rw_name, name_lookup, rw_salary=row["rw_salary"])
         if pid is not None:
             matched.append(
                 {
                     "player_id": pid,
                     "name": rw_name,
                     "mean": row["projected_fpts"],
-                    "position": dk_pos.get(pid, row["position"]),
+                    "position": pos_map.get(pid, row["position"]),
                     "lineup_slot": row["lineup_slot"],
                     "slot_confirmed": row["slot_confirmed"],
                 }
@@ -590,15 +627,27 @@ def build_projections_csv(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch RotoWire MLB projections and match to a DK salary file.",
+        description="Fetch RotoWire MLB projections and match to a salary file.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+    )
+    parser.add_argument(
+        "--platform",
+        choices=["draftkings", "fanduel"],
+        default="draftkings",
+        help="Platform to fetch projections for (default: draftkings)",
     )
     parser.add_argument(
         "--dk-slate",
         default=str(PROJECT_ROOT / "data" / "raw" / "DKSalaries.csv"),
         metavar="PATH",
         help="DraftKings salary CSV (default: data/raw/DKSalaries.csv)",
+    )
+    parser.add_argument(
+        "--fd-slate",
+        default="",
+        metavar="PATH",
+        help="FanDuel salary CSV (default: auto-discovered in data/raw/)",
     )
     parser.add_argument(
         "--output",
@@ -615,13 +664,13 @@ def main() -> None:
     parser.add_argument(
         "--list-slates",
         action="store_true",
-        help="Print available DraftKings slates and exit",
+        help="Print available slates for the selected platform and exit",
     )
     parser.add_argument(
         "--name-map",
         default=str(DEFAULT_NAME_MAP_PATH),
         metavar="PATH",
-        help="JSON file mapping RotoWire names to DK canonical names "
+        help="JSON file mapping RotoWire names to canonical names "
              "(default: data/name_map.json; silently ignored if absent)",
     )
     parser.add_argument(
@@ -634,11 +683,21 @@ def main() -> None:
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
+    # --- Resolve platform ---------------------------------------------------
+    if args.platform == "fanduel":
+        platform = Platform.FANDUEL
+        site_id  = FANDUEL_SITE_ID
+        slate_path = args.fd_slate  # may be "" → auto-discovered by factory
+    else:
+        platform = Platform.DRAFTKINGS
+        site_id  = DRAFTKINGS_SITE_ID
+        slate_path = args.dk_slate
+
     # --- List slates mode ---------------------------------------------------
     if args.list_slates:
-        slates = fetch_slate_list(debug=args.debug)
+        slates = fetch_slate_list(site_id=site_id, debug=args.debug)
         if not slates:
-            print("No slates available (siteID=1 returned empty list).")
+            print(f"No slates available (siteID={site_id} returned empty list).")
             return
         print(f"\n{'ID':<8} {'Type':<10} {'Date':<12} {'Default':<8} Name")
         print("-" * 55)
@@ -652,21 +711,37 @@ def main() -> None:
             )
         return
 
+    # --- Load slate DataFrame -----------------------------------------------
+    try:
+        ingestor = get_ingestor(platform, slate_path)
+        slate_df = ingestor.get_slate_dataframe()
+    except (FileNotFoundError, ValueError) as exc:
+        log.error("Could not load slate: %s", exc)
+        sys.exit(1)
+
+    # --- Extract target date ------------------------------------------------
+    if platform == Platform.FANDUEL:
+        fd_path = getattr(ingestor, "csv_filepath", "") or slate_path
+        target_date = _extract_date_from_fd_path(fd_path)
+    else:
+        target_date = _extract_date_from_dk(slate_path)
+    if target_date:
+        log.info("Target date: %s", target_date)
+
     # --- Resolve slate ID ---------------------------------------------------
     slate_id = args.slate_id
     if not slate_id:
-        target_date = _extract_date_from_dk(args.dk_slate)
-        if target_date:
-            log.info("Target date from DK file: %s", target_date)
-        slates = fetch_slate_list(debug=args.debug)
+        slates = fetch_slate_list(site_id=site_id, debug=args.debug)
         if not slates:
             log.error(
-                "Slate list is empty (siteID=1 returned no slates). "
-                "Try --slate-id to override."
+                "Slate list is empty (siteID=%d returned no slates). "
+                "Try --slate-id to override.",
+                site_id,
             )
             sys.exit(1)
+        slate_teams = _slate_df_teams(slate_df)
         slate, prefetched_records = find_best_slate(
-            slates, target_date, dk_path=args.dk_slate, debug=args.debug
+            slates, target_date, slate_teams=slate_teams, debug=args.debug
         )
         if not slate:
             log.error("No matching slate found. Run --list-slates to see options.")
@@ -684,9 +759,10 @@ def main() -> None:
 
     # --- Build projections CSV ----------------------------------------------
     build_projections_csv(
-        dk_path=args.dk_slate,
+        slate_df=slate_df,
         slate_id=slate_id,
         output_path=args.output,
+        site_id=site_id,
         name_map=_load_name_map(args.name_map),
         debug=args.debug,
         prefetched_records=prefetched_records,

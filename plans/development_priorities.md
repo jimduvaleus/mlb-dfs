@@ -1,4 +1,5 @@
 - BIG FanDuel
+- How to handle FanDuel Market Odds Fetch for QS?
 - BIG Turbo button
 - BIG Opponent/contest modeling
 - BIG late swap?

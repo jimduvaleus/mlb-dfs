@@ -50,6 +50,9 @@ from pathlib import Path
 import pandas as pd
 import requests
 
+from src.platforms.base import Platform
+from src.ingestion.factory import get_ingestor
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -60,8 +63,13 @@ DEFAULT_NAME_MAP_PATH = PROJECT_ROOT / "data" / "name_map.json"
 _METADATA_PATH = PROJECT_ROOT / "data" / "processed" / "projection_metadata.json"
 
 BASE_URL = "https://www.dailyfantasyfuel.com"
-SLATE_LIST_URL = f"{BASE_URL}/data/slates/recent/mlb/draftkings"
-PROJECTIONS_BASE = f"{BASE_URL}/mlb/projections/draftkings"
+
+DK_URL_SEGMENT = "draftkings"
+FD_URL_SEGMENT = "fanduel"  # TODO: verify FD DFF column structure matches DK
+
+# DraftKings defaults (unchanged for backward compatibility)
+SLATE_LIST_URL  = f"{BASE_URL}/data/slates/recent/mlb/{DK_URL_SEGMENT}"
+PROJECTIONS_BASE = f"{BASE_URL}/mlb/projections/{DK_URL_SEGMENT}"
 
 _JSON_HEADERS = {
     "User-Agent": (
@@ -192,12 +200,59 @@ def _dk_teams(dk_path: str) -> set[str]:
 # Playwright helpers
 # ---------------------------------------------------------------------------
 
-_SLATE_LINK_RE = re.compile(
-    r"/mlb/projections/draftkings/(\d{4}-\d{2}-\d{2})\?slate=(\w+)"
-)
-_DATE_LINK_RE = re.compile(
-    r"/mlb/projections/draftkings/(\d{4}-\d{2}-\d{2})/$"
-)
+def _make_slate_link_re(url_segment: str) -> re.Pattern:
+    """Regex that matches DFF slate links for a given platform URL segment."""
+    return re.compile(
+        rf"/mlb/projections/{re.escape(url_segment)}/(\d{{4}}-\d{{2}}-\d{{2}})\?slate=(\w+)"
+    )
+
+
+def _make_date_link_re(url_segment: str) -> re.Pattern:
+    """Regex that matches DFF date-level links for a given platform URL segment."""
+    return re.compile(
+        rf"/mlb/projections/{re.escape(url_segment)}/(\d{{4}}-\d{{2}}-\d{{2}})/$"
+    )
+
+
+# DraftKings defaults — kept for any callers that import these directly
+_SLATE_LINK_RE = _make_slate_link_re(DK_URL_SEGMENT)
+_DATE_LINK_RE  = _make_date_link_re(DK_URL_SEGMENT)
+
+
+def _projections_base(url_segment: str) -> str:
+    return f"{BASE_URL}/mlb/projections/{url_segment}"
+
+
+def _slate_list_url(url_segment: str) -> str:
+    return f"{BASE_URL}/data/slates/recent/mlb/{url_segment}"
+
+
+_FD_DATE_IN_PATH_RE = re.compile(r"FanDuel-MLB-(\d{4}-\d{2}-\d{2})-")
+
+
+def _extract_date_from_fd_path(path: str) -> str | None:
+    """Extract 'YYYY-MM-DD' from a FanDuel salary CSV filename, or None."""
+    m = _FD_DATE_IN_PATH_RE.search(Path(path).name)
+    return m.group(1) if m else None
+
+
+def _slate_df_teams(slate_df: pd.DataFrame) -> set[str]:
+    """Return all team abbreviations from a pre-loaded slate DataFrame."""
+    teams: set[str] = set()
+    for col in ("team", "opponent"):
+        if col in slate_df.columns:
+            teams.update(
+                t.upper()
+                for t in slate_df[col].dropna().unique()
+                if t and str(t).strip()
+            )
+    if "game" in slate_df.columns:
+        for game in slate_df["game"].dropna().unique():
+            m = re.match(r"(\w+)@(\w+)", str(game))
+            if m:
+                teams.add(m.group(1).upper())
+                teams.add(m.group(2).upper())
+    return teams
 
 
 def _parse_game_count(text: str) -> int:
@@ -206,26 +261,29 @@ def _parse_game_count(text: str) -> int:
     return int(m.group(1)) if m else 0
 
 
-async def _get_trigger_links(page) -> list[dict]:
+async def _get_trigger_links(page, url_segment: str = DK_URL_SEGMENT) -> list[dict]:
     """
-    Click .projections-links-trigger and return all DK non-showdown slate/date
-    links as a list of {"href": ..., "text": ..., "date": ..., "slate_id": ...} dicts.
+    Click .projections-links-trigger and return all non-showdown slate/date
+    links for *url_segment* as a list of dicts.
     """
     await page.click(".projections-links-trigger")
     await page.wait_for_timeout(600)
 
     raw = await page.evaluate(
-        """() => Array.from(document.querySelectorAll(
-                "a[href*='/mlb/projections/draftkings']"
-           )).map(a => ({href: a.getAttribute("href"), text: a.innerText.trim()}))"""
+        f"""() => Array.from(document.querySelectorAll(
+                "a[href*='/mlb/projections/{url_segment}']"
+           )).map(a => ({{href: a.getAttribute("href"), text: a.innerText.trim()}}))"""
     )
+
+    slate_link_re = _make_slate_link_re(url_segment)
+    date_link_re  = _make_date_link_re(url_segment)
 
     results = []
     for item in raw:
         href = item["href"] or ""
         text = item["text"]
-        m_slate = _SLATE_LINK_RE.search(href)
-        m_date  = _DATE_LINK_RE.search(href)
+        m_slate = slate_link_re.search(href)
+        m_date  = date_link_re.search(href)
         if m_slate:
             results.append({
                 "href": href,
@@ -245,13 +303,18 @@ async def _get_trigger_links(page) -> list[dict]:
     return results
 
 
-async def _navigate_to_slate(page, target_date: str | None, dk_game_count: int) -> None:
+async def _navigate_to_slate(
+    page,
+    target_date: str | None,
+    game_count: int,
+    url_segment: str = DK_URL_SEGMENT,
+) -> None:
     """
     Use the projections-links-trigger UI to navigate to the best-matching slate
     for *target_date*.  Clicks the date link first if slate links for *target_date*
-    are not yet visible, then picks by game_count closest to *dk_game_count*.
+    are not yet visible, then picks by game_count closest to *game_count*.
     """
-    links = await _get_trigger_links(page)
+    links = await _get_trigger_links(page, url_segment=url_segment)
 
     slate_links = [l for l in links if l["slate_id"] and l["date"] == target_date]
 
@@ -262,7 +325,7 @@ async def _navigate_to_slate(page, target_date: str | None, dk_game_count: int) 
             log.info("Clicking date link for %s", target_date)
             await page.click(f"a[href='{date_link['href']}']")
             await page.wait_for_selector("tr.projections-listing", timeout=20000)
-            links = await _get_trigger_links(page)
+            links = await _get_trigger_links(page, url_segment=url_segment)
             slate_links = [l for l in links if l["slate_id"] and l["date"] == target_date]
         else:
             log.warning("No date link found for %s; using whatever is loaded.", target_date)
@@ -272,10 +335,10 @@ async def _navigate_to_slate(page, target_date: str | None, dk_game_count: int) 
         log.warning("No slate links found for %s after navigation.", target_date)
         return
 
-    # Pick slate with game_count closest to dk_game_count; break ties by most games
+    # Pick slate with game_count closest to requested count; break ties by most games
     best = min(
         slate_links,
-        key=lambda l: (abs((l["game_count"] or 0) - dk_game_count), -(l["game_count"] or 0)),
+        key=lambda l: (abs((l["game_count"] or 0) - game_count), -(l["game_count"] or 0)),
     )
     label = best["text"].split("\n")[0]
     log.info("Selecting DFF slate: %s  (%s)", best["href"], label)
@@ -286,32 +349,38 @@ async def _navigate_to_slate(page, target_date: str | None, dk_game_count: int) 
 
 async def _fetch_rows_playwright(
     target_date: str | None,
-    dk_game_count: int,
+    game_count: int,
     slate_override: str | None = None,
+    url_segment: str = DK_URL_SEGMENT,
     debug: bool = False,
 ) -> list[dict]:
     """
     Launch headless Chromium, navigate to the correct DFF slate, and return all
     <tr class="projections-listing"> rows as attribute dicts.
 
+    *url_segment* selects the platform — "draftkings" or "fanduel".
     If *slate_override* is given (a DFF slate ID like '235A9'), navigation goes
-    directly to /mlb/projections/draftkings/{target_date}?slate={slate_override}.
-    Otherwise the projections-links-trigger UI is used to find the best-matching slate.
+    directly to /mlb/projections/{url_segment}/{target_date}?slate={slate_override}.
+
+    # TODO: verify FD DFF column structure matches DK when url_segment="fanduel"
+    #       (data-pos, data-salary, data-ppg_proj, data-depth_rank, data-starter_flag)
     """
     from playwright.async_api import async_playwright
+
+    proj_base = _projections_base(url_segment)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page()
 
         if slate_override and target_date:
-            nav_url = f"{PROJECTIONS_BASE}/{target_date}?slate={slate_override}"
+            nav_url = f"{proj_base}/{target_date}?slate={slate_override}"
             log.info("Playwright: navigating directly to %s", nav_url)
             await page.goto(nav_url, wait_until="domcontentloaded")
             await page.wait_for_selector("tr.projections-listing", timeout=20000)
         else:
-            log.info("Playwright: loading %s", PROJECTIONS_BASE)
-            await page.goto(PROJECTIONS_BASE, wait_until="domcontentloaded")
+            log.info("Playwright: loading %s", proj_base)
+            await page.goto(proj_base, wait_until="domcontentloaded")
             await page.wait_for_selector("tr.projections-listing", timeout=20000)
 
             if target_date:
@@ -323,16 +392,16 @@ async def _fetch_rows_playwright(
                         "Default page shows %s; navigating to %s via UI.",
                         loaded_date, target_date,
                     )
-                    await _navigate_to_slate(page, target_date, dk_game_count)
+                    await _navigate_to_slate(page, target_date, game_count, url_segment)
                 else:
                     # Correct date already loaded — still pick the best sub-slate
-                    await _navigate_to_slate(page, target_date, dk_game_count)
+                    await _navigate_to_slate(page, target_date, game_count, url_segment)
 
         # Verify final loaded date
         final_date: str | None = await page.evaluate("() => window.url_start_date || null")
         if final_date and target_date and final_date != target_date:
             log.warning(
-                "DFF loaded date %s but DK file is for %s. "
+                "DFF loaded date %s but salary file is for %s. "
                 "Projections may not align with the salary file.",
                 final_date, target_date,
             )
@@ -359,13 +428,14 @@ async def _fetch_rows_playwright(
 
 def fetch_player_rows(
     target_date: str | None,
-    dk_game_count: int,
+    game_count: int,
     slate_override: str | None = None,
+    url_segment: str = DK_URL_SEGMENT,
     debug: bool = False,
 ) -> list[dict]:
     """Synchronous entry point for Playwright-based player data fetch."""
     return asyncio.run(
-        _fetch_rows_playwright(target_date, dk_game_count, slate_override, debug)
+        _fetch_rows_playwright(target_date, game_count, slate_override, url_segment, debug)
     )
 
 
@@ -429,17 +499,22 @@ def parse_players(rows: list[dict]) -> pd.DataFrame:
 # Slate listing (--list-slates mode, uses Playwright)
 # ---------------------------------------------------------------------------
 
-async def _list_slates_playwright(target_date: str | None) -> list[dict]:
+async def _list_slates_playwright(
+    target_date: str | None,
+    url_segment: str = DK_URL_SEGMENT,
+) -> list[dict]:
     """Navigate the DFF page and collect all slate links for *target_date*."""
     from playwright.async_api import async_playwright
+
+    proj_base = _projections_base(url_segment)
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
         page = await browser.new_page()
-        await page.goto(PROJECTIONS_BASE, wait_until="domcontentloaded")
+        await page.goto(proj_base, wait_until="domcontentloaded")
         await page.wait_for_selector("tr.projections-listing", timeout=20000)
 
-        links = await _get_trigger_links(page)
+        links = await _get_trigger_links(page, url_segment=url_segment)
 
         # If no slate links for target_date, click the date link
         slate_links = [l for l in links if l["slate_id"] and l["date"] == target_date]
@@ -448,7 +523,7 @@ async def _list_slates_playwright(target_date: str | None) -> list[dict]:
             if date_link:
                 await page.click(f"a[href='{date_link['href']}']")
                 await page.wait_for_selector("tr.projections-listing", timeout=20000)
-                links = await _get_trigger_links(page)
+                links = await _get_trigger_links(page, url_segment=url_segment)
                 slate_links = [l for l in links if l["slate_id"] and l["date"] == target_date]
 
         await browser.close()
@@ -461,36 +536,38 @@ async def _list_slates_playwright(target_date: str | None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def build_projections_csv(
-    dk_path: str,
+    slate_df: pd.DataFrame,
     target_date: str | None,
     output_path: str,
+    url_segment: str = DK_URL_SEGMENT,
     name_map: dict[str, str] | None = None,
     slate_override: str | None = None,
     debug: bool = False,
 ) -> pd.DataFrame:
-    # --- Load DK salary file -------------------------------------------------
-    log.info("Loading DK salary file: %s", dk_path)
-    dk_df = pd.read_csv(dk_path)
-    dk_df.rename(columns={"ID": "player_id", "Name": "name", "Salary": "salary"}, inplace=True)
-
-    dk_lookup: dict[str, list[tuple[int, float]]] = {}
-    for _, row in dk_df.iterrows():
+    # --- Build player lookup from pre-loaded slate DataFrame ----------------
+    # slate_df is produced by DraftKingsSlateIngestor or FanDuelSlateIngestor;
+    # both expose: player_id (int), name, salary, position.
+    log.info("Building player lookup from slate (%d players).", len(slate_df))
+    name_lookup: dict[str, list[tuple[int, float]]] = {}
+    for _, row in slate_df.iterrows():
         key = _normalise(str(row["name"]))
         pid = int(row["player_id"])
         sal = float(row["salary"])
-        dk_lookup.setdefault(key, []).append((pid, sal))
+        name_lookup.setdefault(key, []).append((pid, sal))
 
-    dk_pos: dict[int, str] = {}
-    if "Position" in dk_df.columns:
-        dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
+    pos_map: dict[int, str] = {}
+    if "position" in slate_df.columns:
+        pos_map = {int(r["player_id"]): str(r["position"]) for _, r in slate_df.iterrows()}
 
-    dk_game_count = len(_dk_teams(dk_path)) // 2
+    # Estimate game count from unique teams / 2
+    game_count = len(_slate_df_teams(slate_df)) // 2
 
     # --- Fetch DFF player rows via Playwright --------------------------------
     raw_rows = fetch_player_rows(
         target_date=target_date,
-        dk_game_count=dk_game_count,
+        game_count=game_count,
         slate_override=slate_override,
+        url_segment=url_segment,
         debug=debug,
     )
 
@@ -517,7 +594,7 @@ def build_projections_csv(
             len(unconfirmed),
         )
 
-    # --- Match to DK player IDs ----------------------------------------------
+    # --- Match to platform player IDs ----------------------------------------
     name_map = name_map or {}
     matched, unmatched = [], []
     for _, row in proj_df.iterrows():
@@ -526,14 +603,14 @@ def build_projections_csv(
         dff_name = name_map.get(row["dff_name"], row["dff_name"])
         if dff_name != row["dff_name"]:
             log.debug("Name map: %r → %r", row["dff_name"], dff_name)
-        pid = _match_name(dff_name, dk_lookup, dff_salary=row["dff_salary"])
+        pid = _match_name(dff_name, name_lookup, dff_salary=row["dff_salary"])
         if pid is not None:
             matched.append(
                 {
                     "player_id": pid,
                     "name": dff_name,
                     "mean": row["projected_fpts"],
-                    "position": dk_pos.get(pid, row["position"]),
+                    "position": pos_map.get(pid, row["position"]),
                     "lineup_slot": row["lineup_slot"],
                     "slot_confirmed": row["slot_confirmed"],
                 }
@@ -589,15 +666,27 @@ def build_projections_csv(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch Daily Fantasy Fuel MLB projections and match to a DK salary file.",
+        description="Fetch Daily Fantasy Fuel MLB projections and match to a salary file.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
+    )
+    parser.add_argument(
+        "--platform",
+        choices=["draftkings", "fanduel"],
+        default="draftkings",
+        help="Platform to fetch projections for (default: draftkings)",
     )
     parser.add_argument(
         "--dk-slate",
         default=str(PROJECT_ROOT / "data" / "raw" / "DKSalaries.csv"),
         metavar="PATH",
         help="DraftKings salary CSV (default: data/raw/DKSalaries.csv)",
+    )
+    parser.add_argument(
+        "--fd-slate",
+        default="",
+        metavar="PATH",
+        help="FanDuel salary CSV (default: auto-discovered in data/raw/)",
     )
     parser.add_argument(
         "--output",
@@ -615,13 +704,13 @@ def main() -> None:
     parser.add_argument(
         "--list-slates",
         action="store_true",
-        help="Print available DFF slates for the DK file's date and exit",
+        help="Print available DFF slates for the salary file's date and exit",
     )
     parser.add_argument(
         "--name-map",
         default=str(DEFAULT_NAME_MAP_PATH),
         metavar="PATH",
-        help="JSON file mapping DFF names to DK canonical names "
+        help="JSON file mapping DFF names to canonical names "
              "(default: data/name_map.json; silently ignored if absent)",
     )
     parser.add_argument(
@@ -634,15 +723,41 @@ def main() -> None:
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    target_date = _extract_date_from_dk(args.dk_slate)
-    if target_date:
-        log.info("Target date from DK file: %s", target_date)
+    # --- Resolve platform ---------------------------------------------------
+    if args.platform == "fanduel":
+        platform    = Platform.FANDUEL
+        url_segment = FD_URL_SEGMENT
+        slate_path  = args.fd_slate  # may be "" → auto-discovered by factory
     else:
-        log.warning("Could not extract date from DK salary file.")
+        platform    = Platform.DRAFTKINGS
+        url_segment = DK_URL_SEGMENT
+        slate_path  = args.dk_slate
 
-    # --- List slates mode ----------------------------------------------------
+    # --- Load slate DataFrame -----------------------------------------------
+    try:
+        ingestor  = get_ingestor(platform, slate_path)
+        slate_df  = ingestor.get_slate_dataframe()
+    except (FileNotFoundError, ValueError) as exc:
+        log.error("Could not load slate: %s", exc)
+        sys.exit(1)
+
+    # --- Extract target date ------------------------------------------------
+    if platform == Platform.FANDUEL:
+        fd_path     = getattr(ingestor, "csv_filepath", "") or slate_path
+        target_date = _extract_date_from_fd_path(fd_path)
+    else:
+        target_date = _extract_date_from_dk(slate_path)
+
+    if target_date:
+        log.info("Target date: %s", target_date)
+    else:
+        log.warning("Could not extract date from salary file.")
+
+    # --- List slates mode ---------------------------------------------------
     if args.list_slates:
-        slate_links = asyncio.run(_list_slates_playwright(target_date))
+        slate_links = asyncio.run(
+            _list_slates_playwright(target_date, url_segment=url_segment)
+        )
         if not slate_links:
             print("No slates found for date %s." % (target_date or "today"))
             return
@@ -655,9 +770,10 @@ def main() -> None:
 
     # --- Build projections CSV -----------------------------------------------
     build_projections_csv(
-        dk_path=args.dk_slate,
+        slate_df=slate_df,
         target_date=target_date,
         output_path=args.output,
+        url_segment=url_segment,
         name_map=_load_name_map(args.name_map),
         slate_override=args.slate,
         debug=args.debug,

@@ -259,14 +259,22 @@ def projections_status() -> ProjectionsStatus:
     cfg = read_config()
     proj_path = cfg.paths.projections
     extra = get_status_fields()
+    platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
 
-    # Resolve DK path for freshness check
-    dk_raw = cfg.paths.dk_slate
-    dk_path: Path | None = None
-    if dk_raw:
-        dk_path = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
-        if not dk_path.exists():
-            dk_path = None
+    # Resolve platform-appropriate slate path for freshness check
+    slate_path: Path | None = None
+    if platform_val == "fanduel":
+        fd_raw = cfg.paths.fd_slate if hasattr(cfg.paths, "fd_slate") else ""
+        if fd_raw:
+            _fp = PROJECT_ROOT / fd_raw if not Path(fd_raw).is_absolute() else Path(fd_raw)
+            if _fp.exists():
+                slate_path = _fp
+    else:
+        dk_raw = cfg.paths.dk_slate
+        if dk_raw:
+            _dp = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
+            if _dp.exists():
+                slate_path = _dp
 
     if not proj_path:
         return ProjectionsStatus(exists=False, **extra)
@@ -286,7 +294,11 @@ def projections_status() -> ProjectionsStatus:
     except Exception:
         pass
 
-    is_fresh = compute_freshness(dk_path, p) if dk_path is not None else None
+    is_fresh = (
+        compute_freshness(slate_path, p, platform=platform_val)
+        if slate_path is not None
+        else None
+    )
 
     return ProjectionsStatus(
         exists=True,
@@ -322,14 +334,23 @@ def projections_unconfirmed():
 @app.get("/api/projections/slates")
 async def projections_slates() -> SlateListResponse:
     cfg = read_config()
-    dk_raw = cfg.paths.dk_slate
-    if not dk_raw:
+    platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+    site_id = 2 if platform_val == "fanduel" else 1  # 1=DK, 2=FD
+
+    # Resolve platform-appropriate slate path
+    slate_raw: str = ""
+    if platform_val == "fanduel":
+        slate_raw = cfg.paths.fd_slate if hasattr(cfg.paths, "fd_slate") else ""
+    else:
+        slate_raw = cfg.paths.dk_slate
+
+    if not slate_raw:
         return SlateListResponse(date=None, slates=[])
-    dk_path = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
-    if not dk_path.exists():
+    slate_path = PROJECT_ROOT / slate_raw if not Path(slate_raw).is_absolute() else Path(slate_raw)
+    if not slate_path.exists():
         return SlateListResponse(date=None, slates=[])
 
-    cached = get_cached_slates(dk_path)
+    cached = get_cached_slates(slate_path, site_id=site_id, platform=platform_val)
     if cached is not None:
         return SlateListResponse(
             date=None,
@@ -337,12 +358,14 @@ async def projections_slates() -> SlateListResponse:
         )
 
     try:
-        dk_date, options = fetch_and_cache_slates(dk_path)
+        slate_date, options = fetch_and_cache_slates(
+            slate_path, site_id=site_id, platform=platform_val
+        )
     except Exception:
         return SlateListResponse(date=None, slates=[])
 
     return SlateListResponse(
-        date=dk_date,
+        date=slate_date,
         slates=[SlateOption(**s) for s in options],
     )
 
@@ -359,12 +382,39 @@ async def projections_fetch(request: Request):
     proj_path_str = cfg.paths.projections or "data/processed/projections.csv"
     proj_path = PROJECT_ROOT / proj_path_str if not Path(proj_path_str).is_absolute() else Path(proj_path_str)
 
+    platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+
+    # Resolve DK path (used for partial-fetch game filtering — DK only for now)
     dk_raw = cfg.paths.dk_slate
     dk_path: Path | None = None
     if dk_raw:
         _dp = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
         if _dp.exists():
             dk_path = _dp
+
+    # Resolve the canonical slate path for metadata recording
+    if platform_val == "fanduel":
+        fd_raw = cfg.paths.fd_slate if hasattr(cfg.paths, "fd_slate") else ""
+        _slate_path_for_meta: Path | None = None
+        if fd_raw:
+            _fp2 = PROJECT_ROOT / fd_raw if not Path(fd_raw).is_absolute() else Path(fd_raw)
+            if _fp2.exists():
+                _slate_path_for_meta = _fp2
+    else:
+        _slate_path_for_meta = dk_path
+
+    # Build platform-specific args appended to every script subprocess call.
+    # For FD: --platform fanduel [--fd-slate PATH]
+    # For DK: --platform draftkings  (default DKSalaries.csv path used by scripts)
+    _platform_args: list[str] = ["--platform", platform_val]
+    if platform_val == "fanduel":
+        fd_raw2 = cfg.paths.fd_slate if hasattr(cfg.paths, "fd_slate") else ""
+        if fd_raw2:
+            _platform_args += ["--fd-slate", str(
+                PROJECT_ROOT / fd_raw2 if not Path(fd_raw2).is_absolute() else Path(fd_raw2)
+            )]
+    elif dk_path is not None:
+        _platform_args += ["--dk-slate", str(dk_path)]
 
     # --- Parse games filter from query param ---------------------------------
     # exclude_games=ARI@PHI,NYM@STL means "only fetch the other games and merge
@@ -505,6 +555,7 @@ async def projections_fetch(request: Request):
                 yield _log("--- Fetching RotoWire projections (player pool) ---")
                 proc = await asyncio.create_subprocess_exec(
                     str(python), str(rw_script), "--output", str(rw_out),
+                    *_platform_args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=str(PROJECT_ROOT),
@@ -608,7 +659,7 @@ async def projections_fetch(request: Request):
                         pass
                 if proj_written:
                     try:
-                        record_fetch_from_csv(proj_path, "auto", dk_path)
+                        record_fetch_from_csv(proj_path, "auto", _slate_path_for_meta)
                     except Exception:
                         pass
 
@@ -629,6 +680,7 @@ async def projections_fetch(request: Request):
 
             proc = await asyncio.create_subprocess_exec(
                 str(python), str(preferred_script), "--output", str(preferred_out),
+                *_platform_args,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=str(PROJECT_ROOT),
@@ -650,6 +702,7 @@ async def projections_fetch(request: Request):
 
                 proc2 = await asyncio.create_subprocess_exec(
                     str(python), str(fallback_script), "--output", str(fallback_out),
+                    *_platform_args,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=str(PROJECT_ROOT),
@@ -743,7 +796,7 @@ async def projections_fetch(request: Request):
                     pass
             if proj_written:
                 try:
-                    record_fetch_from_csv(proj_path, "auto", dk_path)
+                    record_fetch_from_csv(proj_path, "auto", _slate_path_for_meta)
                 except Exception:
                     pass
 

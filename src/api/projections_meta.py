@@ -39,6 +39,7 @@ METADATA_PATH = PROJECT_ROOT / "data" / "processed" / "projection_metadata.json"
 _BASE_URL = "https://www.rotowire.com/daily/mlb/api"
 _SLATE_LIST_URL = f"{_BASE_URL}/slate-list.php"
 _DRAFTKINGS_SITE_ID = 1
+_FANDUEL_SITE_ID    = 2  # TODO: confirm from RotoWire JS bundle
 
 _HEADERS = {
     "User-Agent": (
@@ -77,6 +78,9 @@ def save_metadata(data: dict) -> None:
 # DK date extraction (mirrors logic in fetch_rotowire_projections.py)
 # ---------------------------------------------------------------------------
 
+_FD_DATE_IN_PATH_RE = re.compile(r"FanDuel-MLB-(\d{4}-\d{2}-\d{2})-")
+
+
 def _extract_dk_date(dk_path: Path) -> Optional[str]:
     """Return 'YYYY-MM-DD' parsed from the Game Info column of a DK salary CSV."""
     try:
@@ -89,6 +93,19 @@ def _extract_dk_date(dk_path: Path) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _extract_fd_date(fd_path: Path) -> Optional[str]:
+    """Return 'YYYY-MM-DD' extracted from a FanDuel salary CSV filename."""
+    m = _FD_DATE_IN_PATH_RE.search(fd_path.name)
+    return m.group(1) if m else None
+
+
+def _extract_slate_date(slate_path: Path, platform: str = "draftkings") -> Optional[str]:
+    """Return the slate date for *slate_path*, dispatching on *platform*."""
+    if platform == "fanduel":
+        return _extract_fd_date(slate_path)
+    return _extract_dk_date(slate_path)
 
 
 def _extract_dk_game_set(dk_path: Path) -> list[str]:
@@ -119,11 +136,11 @@ def _hash_game_set(games: list[str]) -> str:
 # Slate fetching & caching
 # ---------------------------------------------------------------------------
 
-def _fetch_slate_list_from_rw() -> list[dict]:
-    """Fetch the full slate list from RotoWire (DraftKings, siteID=1)."""
+def _fetch_slate_list_from_rw(site_id: int = _DRAFTKINGS_SITE_ID) -> list[dict]:
+    """Fetch the full slate list from RotoWire for *site_id*."""
     resp = requests.get(
         _SLATE_LIST_URL,
-        params={"siteID": _DRAFTKINGS_SITE_ID},
+        params={"siteID": site_id},
         headers=_HEADERS,
         timeout=15,
     )
@@ -173,41 +190,56 @@ def _build_slate_options(slates: list[dict], target_date: Optional[str]) -> list
     ]
 
 
-def get_cached_slates(dk_path: Path) -> Optional[list[dict]]:
+def get_cached_slates(
+    slate_path: Path,
+    site_id: int = _DRAFTKINGS_SITE_ID,
+    platform: str = "draftkings",
+) -> Optional[list[dict]]:
     """
-    Return cached slates for the current DK date, or None if stale / not cached.
-    Caller should then fetch from RotoWire and call cache_slates().
+    Return cached slates for the current slate date and site_id, or None if
+    stale / not cached.  Caller should then fetch from RotoWire and call
+    fetch_and_cache_slates().
     """
-    dk_date = _extract_dk_date(dk_path)
+    slate_date = _extract_slate_date(slate_path, platform)
     meta = load_metadata()
-    if meta.get("date") == dk_date and meta.get("slates_fetched_at") and meta.get("slates"):
+    if (
+        meta.get("date") == slate_date
+        and meta.get("slates_fetched_at")
+        and meta.get("slates")
+        and meta.get("site_id", _DRAFTKINGS_SITE_ID) == site_id
+    ):
         return meta["slates"]
     return None
 
 
-def fetch_and_cache_slates(dk_path: Path) -> tuple[Optional[str], list[dict]]:
+def fetch_and_cache_slates(
+    slate_path: Path,
+    site_id: int = _DRAFTKINGS_SITE_ID,
+    platform: str = "draftkings",
+) -> tuple[Optional[str], list[dict]]:
     """
-    Fetch slates from RotoWire, cache them keyed to the DK CSV date.
-    Returns (dk_date, slate_options).
+    Fetch slates from RotoWire for *site_id*, cache them keyed to the slate date.
+    Returns (slate_date, slate_options).
     Raises requests.RequestException on HTTP failure.
     """
-    dk_date = _extract_dk_date(dk_path)
-    raw_slates = _fetch_slate_list_from_rw()
-    options = _build_slate_options(raw_slates, dk_date)
+    slate_date = _extract_slate_date(slate_path, platform)
+    raw_slates = _fetch_slate_list_from_rw(site_id=site_id)
+    options = _build_slate_options(raw_slates, slate_date)
 
     meta = load_metadata()
-    # Reset date-specific fields if date changed, but preserve slate_teams
-    # (game sets are immutable so the cache is valid indefinitely).
-    if meta.get("date") != dk_date:
+    # Reset date-specific fields if date or platform changed, but preserve
+    # slate_teams (game sets are immutable so the cache is valid indefinitely).
+    if meta.get("date") != slate_date or meta.get("site_id", _DRAFTKINGS_SITE_ID) != site_id:
         slate_teams = meta.get("slate_teams", {})
         meta = dict(_EMPTY_META)
         meta["slate_teams"] = slate_teams
-    meta["date"] = dk_date
+    meta["date"] = slate_date
+    meta["site_id"] = site_id
     meta["slates_fetched_at"] = time.time()
     meta["slates"] = options
     save_metadata(meta)
 
-    return dk_date, options
+    return slate_date, options
 
 
 # ---------------------------------------------------------------------------
@@ -272,23 +304,34 @@ def record_fetch_from_csv(proj_path: Path, slate_id: str, dk_path: Optional[Path
 # Status field derivation
 # ---------------------------------------------------------------------------
 
-def compute_freshness(dk_path: Path, proj_path: Path) -> Optional[bool]:
+def compute_freshness(
+    slate_path: Path,
+    proj_path: Path,
+    platform: str = "draftkings",
+) -> Optional[bool]:
     """
-    Check whether projections.csv is consistent with DKSalaries.csv by comparing
+    Check whether projections.csv is consistent with the salary file by comparing
     player IDs directly.  Returns True if ≥90 % of projection player IDs appear in
-    the DK salary file, False if not, None if either file cannot be read.
+    the salary file, False if not, None if either file cannot be read.
 
-    This catches both "DK file was swapped" and "wrong RotoWire slate was fetched"
-    without requiring any stored state.
+    For DraftKings, reads the "ID" column from DKSalaries.csv.
+    For FanDuel, extracts player IDs via FanDuelSlateIngestor (numeric suffix of
+    the FD player ID, matching what the projection fetch scripts produce).
     """
     try:
         proj_ids = set(pd.read_csv(str(proj_path), usecols=["player_id"])["player_id"])
-        dk_ids   = set(pd.read_csv(str(dk_path),   usecols=["ID"])["ID"])
-        # A complete projection has at least ~10 starters per game; fewer than 20
-        # means the file is broken or nearly empty — treat as stale.
         if len(proj_ids) < 20:
             return False
-        overlap = len(proj_ids & dk_ids) / len(proj_ids)
+
+        if platform == "fanduel":
+            from src.ingestion.fd_slate import FanDuelSlateIngestor
+            slate_ids = set(
+                FanDuelSlateIngestor(str(slate_path)).get_slate_dataframe()["player_id"]
+            )
+        else:
+            slate_ids = set(pd.read_csv(str(slate_path), usecols=["ID"])["ID"])
+
+        overlap = len(proj_ids & slate_ids) / len(proj_ids)
         return overlap >= 0.9
     except Exception:
         return None
