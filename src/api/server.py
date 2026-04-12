@@ -635,10 +635,13 @@ async def projections_fetch(request: Request):
                             if not fallback_rows.empty:
                                 for _, row in fallback_rows.iterrows():
                                     pid_val = int(row["player_id"]) if "player_id" in fallback_rows.columns else 0
+                                    is_pitcher = bool(row.get("lineup_slot") == 10) if "lineup_slot" in fallback_rows.columns else False
                                     fallback_players.append({
                                         "name": row["name"],
                                         "team": _itm.get(pid_val, ""),
                                         "reason": mo_sidecar_reasons.get(pid_val, ""),
+                                        "player_id": pid_val,
+                                        "is_pitcher": is_pitcher,
                                     })
                         else:
                             result_event = _log(
@@ -772,10 +775,13 @@ async def projections_fetch(request: Request):
                         if not fallback_rows2.empty:
                             for _, row in fallback_rows2.iterrows():
                                 pid_val = int(row["player_id"]) if "player_id" in fallback_rows2.columns else 0
+                                is_pitcher2 = bool(row.get("lineup_slot") == 10) if "lineup_slot" in fallback_rows2.columns else False
                                 fallback_players2.append({
                                     "name": row["name"],
                                     "team": _itm2.get(pid_val, ""),
                                     "reason": "",
+                                    "player_id": pid_val,
+                                    "is_pitcher": is_pitcher2,
                                 })
 
                     # When partial: keep only the included games' players from this fetch

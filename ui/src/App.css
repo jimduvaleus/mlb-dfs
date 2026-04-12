@@ -444,6 +444,18 @@ button { cursor: pointer; }
   opacity: 0.8;
 }
 
+.merge-info-pitcher-icon {
+  color: #f6ad55;
+  cursor: help;
+  font-size: 0.85em;
+}
+
+.merge-info-pitcher-warning {
+  color: #f6ad55;
+  font-size: 0.82em;
+  margin: 4px 0 6px;
+}
+
 .merge-info-team-group {
   display: inline;
 }

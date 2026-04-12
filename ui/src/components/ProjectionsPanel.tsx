@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import type { MergeInfo, ProjectionsStatus } from '../types'
-import { fetchProjectionsStatus } from '../api'
+import { fetchProjectionsStatus, fetchSlatePlayers, savePlayerExclusions } from '../api'
 
 interface Props {
   disabled?: boolean
@@ -66,7 +66,21 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       if (event.type === 'log') {
         setLog(prev => [...prev, event.line])
       } else if (event.type === 'merge_info') {
-        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players: event.players })
+        const players = event.players as Array<{ name: string; team: string; reason?: string; player_id?: number; is_pitcher?: boolean }>
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players })
+        // Auto-exclude pitchers that fell back to RotoWire — missing MO pitcher
+        // projections are a significant problem for portfolio quality.
+        const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
+        if (pitcherIds.length > 0) {
+          fetchSlatePlayers().then(slate => {
+            const alreadyExcluded = slate.players.filter(p => p.excluded).map(p => p.player_id)
+            const newExcluded = [...new Set([...alreadyExcluded, ...pitcherIds])]
+            if (newExcluded.length > alreadyExcluded.length) {
+              savePlayerExclusions({ slate_id: slate.slate_id, excluded_player_ids: newExcluded })
+                .catch(console.error)
+            }
+          }).catch(console.error)
+        }
       } else if (event.type === 'done') {
         setFetching(false)
         onFetchingChange?.(false)
@@ -168,9 +182,14 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       {mergeInfo && (
         <div className="merge-info-callout">
           <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback projection</strong>
+          {mergeInfo.players.some(p => p.is_pitcher) && (
+            <div className="merge-info-pitcher-warning">
+              ⚠ Pitcher(s) without market odds projections have been automatically added to Player Exclusions.
+            </div>
+          )}
           <div className="merge-info-players">
             {(() => {
-              // Group by team; within each team show name + optional reason
+              // Group by team; within each team show name + optional icon
               const byTeam = mergeInfo.players.reduce<Record<string, typeof mergeInfo.players>>((acc, p) => {
                 const key = p.team || '—'
                 ;(acc[key] ??= []).push(p)
@@ -186,9 +205,12 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
                       <span key={p.name}>
                         {i > 0 && ', '}
                         {p.name}
-                        {p.reason && (
-                          <span className="merge-info-reason" title={p.reason}> ⓘ</span>
-                        )}
+                        {p.is_pitcher
+                          ? <span className="merge-info-pitcher-icon" title="Pitcher excluded — no market odds projection available"> ⚠</span>
+                          : p.reason
+                            ? <span className="merge-info-reason" title={p.reason}> ⓘ</span>
+                            : null
+                        }
                       </span>
                     ))}
                     {')'}

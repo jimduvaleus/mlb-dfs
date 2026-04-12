@@ -192,6 +192,8 @@ export interface MergePlayer {
   name: string
   team: string
   reason?: string
+  player_id?: number
+  is_pitcher?: boolean
 }
 
 export interface MergeInfo {
