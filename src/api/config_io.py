@@ -26,7 +26,7 @@ def write_config(cfg: AppConfig) -> None:
     data["platform"] = cfg.platform.value
     # Represent None values as empty strings for paths, omit optional nones
     paths = data["paths"]
-    for key in ("projections", "batter_pca_model", "batter_score_grid"):
+    for key in ("projections", "fd_projections", "batter_pca_model", "batter_score_grid"):
         if paths[key] is None:
             paths[key] = ""
     with open(CONFIG_PATH, "w") as f:

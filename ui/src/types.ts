@@ -1,10 +1,14 @@
 // Mirrors Pydantic models from src/api/models.py
 
+export type PlatformType = 'draftkings' | 'fanduel'
+
 export interface PathsConfig {
   dk_slate: string
+  fd_slate: string
   copula: string
   output_dir: string
   projections: string | null
+  fd_projections: string | null
   batter_pca_model: string | null
   batter_score_grid: string | null
   projections_source: string
@@ -38,6 +42,7 @@ export interface PortfolioConfig {
 }
 
 export interface AppConfig {
+  platform: PlatformType
   paths: PathsConfig
   simulation: SimulationConfig
   optimizer: OptimizerConfig

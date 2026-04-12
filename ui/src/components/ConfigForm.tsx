@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import type { AppConfig } from '../types'
+import type { AppConfig, PlatformType } from '../types'
 import { saveConfig } from '../api'
 
 interface Props {
@@ -40,6 +40,18 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
     setSaved(false)
   }
 
+  const handlePlatformChange = (p: PlatformType) => {
+    setDraft(d => {
+      const floor = d.optimizer.salary_floor
+      // Auto-adjust salary floor only when it looks like the other platform's default
+      const newFloor = (floor === 48500 && p === 'fanduel') ? 30000
+        : (floor === 30000 && p === 'draftkings') ? 48500
+        : floor
+      return { ...d, platform: p, optimizer: { ...d.optimizer, salary_floor: newFloor } }
+    })
+    setSaved(false)
+  }
+
   const str = (v: unknown) => (v == null ? '' : String(v))
   const num = (v: unknown) => (v == null || v === '' ? null : Number(v))
 
@@ -62,6 +74,28 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
     <form className="config-form" onSubmit={handleSubmit}>
       <div className="config-form-grid">
         <div>
+          <section>
+            <h3>Platform</h3>
+            <FieldRow label="Platform">
+              <select value={draft.platform}
+                onChange={e => handlePlatformChange(e.target.value as PlatformType)} disabled={disabled}>
+                <option value="draftkings">DraftKings</option>
+                <option value="fanduel">FanDuel</option>
+              </select>
+            </FieldRow>
+            <FieldRow label={draft.platform === 'fanduel' ? 'FD Slate CSV' : 'DK Slate CSV'}>
+              {draft.platform === 'fanduel' ? (
+                <input type="text" value={draft.paths.fd_slate ?? ''}
+                  onChange={e => set('paths', 'fd_slate', e.target.value)} disabled={disabled}
+                  placeholder="data/raw/FanDuel-MLB-….csv" />
+              ) : (
+                <input type="text" value={draft.paths.dk_slate ?? ''}
+                  onChange={e => set('paths', 'dk_slate', e.target.value)} disabled={disabled}
+                  placeholder="data/raw/DKSalaries.csv" />
+              )}
+            </FieldRow>
+          </section>
+
           <section>
             <h3>Projections</h3>
             <FieldRow label="Source">

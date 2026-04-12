@@ -121,7 +121,10 @@ class PipelineRunner:
 
         # --- Projections (optional) --------------------------------------
         proj_df = None
-        proj_path = paths.get("projections")
+        if platform == Platform.FANDUEL:
+            proj_path = paths.get("fd_projections") or "data/processed/projections_fd.csv"
+        else:
+            proj_path = paths.get("projections") or "data/processed/projections_dk.csv"
         if proj_path and os.path.exists(proj_path):
             logger.info("Loading projections: %s", proj_path)
             proj_df = pd.read_csv(proj_path)

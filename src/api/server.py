@@ -126,6 +126,16 @@ def post_config(cfg: AppConfig) -> AppConfig:
 # Slate game/team exclusion endpoints
 # ---------------------------------------------------------------------------
 
+def _resolve_proj_path(cfg: AppConfig) -> Path:
+    """Return the platform-appropriate projections CSV path."""
+    platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+    if platform_val == "fanduel":
+        path_str = (getattr(cfg.paths, "fd_projections", None) or "data/processed/projections_fd.csv")
+    else:
+        path_str = cfg.paths.projections or "data/processed/projections_dk.csv"
+    return PROJECT_ROOT / path_str if not Path(path_str).is_absolute() else Path(path_str)
+
+
 def _load_slate_df():
     """Parse the configured slate CSV and return a DataFrame (or None)."""
     cfg = read_config()
@@ -262,7 +272,7 @@ def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersRespon
 @app.get("/api/projections/status")
 def projections_status() -> ProjectionsStatus:
     cfg = read_config()
-    proj_path = cfg.paths.projections
+    p = _resolve_proj_path(cfg)
     extra = get_status_fields()
     platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
 
@@ -281,12 +291,8 @@ def projections_status() -> ProjectionsStatus:
             if _dp.exists():
                 slate_path = _dp
 
-    if not proj_path:
-        return ProjectionsStatus(exists=False, **extra)
-
-    p = PROJECT_ROOT / proj_path if not Path(proj_path).is_absolute() else Path(proj_path)
     if not p.exists():
-        return ProjectionsStatus(exists=False, path=str(proj_path), **extra)
+        return ProjectionsStatus(exists=False, path=str(p.relative_to(PROJECT_ROOT)), **extra)
 
     stat = p.stat()
     age = time.time() - stat.st_mtime
@@ -307,7 +313,7 @@ def projections_status() -> ProjectionsStatus:
 
     return ProjectionsStatus(
         exists=True,
-        path=str(proj_path),
+        path=str(p.relative_to(PROJECT_ROOT)),
         last_modified=stat.st_mtime,
         age_seconds=age,
         row_count=row_count,
@@ -319,10 +325,7 @@ def projections_status() -> ProjectionsStatus:
 @app.get("/api/projections/unconfirmed")
 def projections_unconfirmed():
     cfg = read_config()
-    proj_path_str = cfg.paths.projections
-    if not proj_path_str:
-        return {"player_ids": []}
-    p = PROJECT_ROOT / proj_path_str if not Path(proj_path_str).is_absolute() else Path(proj_path_str)
+    p = _resolve_proj_path(cfg)
     if not p.exists():
         return {"player_ids": []}
     try:
@@ -384,9 +387,7 @@ async def projections_fetch(request: Request):
         raise HTTPException(409, "A pipeline run is already in progress")
 
     cfg = read_config()
-    proj_path_str = cfg.paths.projections or "data/processed/projections.csv"
-    proj_path = PROJECT_ROOT / proj_path_str if not Path(proj_path_str).is_absolute() else Path(proj_path_str)
-
+    proj_path = _resolve_proj_path(cfg)
     platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
 
     # Resolve DK path (used for partial-fetch game filtering — DK only for now)

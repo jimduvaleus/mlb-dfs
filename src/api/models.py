@@ -11,6 +11,7 @@ class PathsConfig(BaseModel):
     copula: str = ""
     output_dir: str = "outputs"
     projections: Optional[str] = None
+    fd_projections: Optional[str] = None
     batter_pca_model: Optional[str] = None
     batter_score_grid: Optional[str] = None
     projections_source: str = "rotowire"  # "rotowire" or "dailyfantasyfuel"

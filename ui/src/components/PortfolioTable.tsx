@@ -1,4 +1,4 @@
-import type { LineupResult, PlayerRow } from '../types'
+import type { LineupResult, PlatformType, PlayerRow } from '../types'
 import { getStackNotation } from '../utils'
 import TeamBadge from './TeamBadge'
 
@@ -7,15 +7,18 @@ interface Props {
   unconfirmedPlayerIds?: number[]
   onDeleteLineup?: (lineupIndex: number) => void
   replacingLineupIndex?: number | null
+  platform?: PlatformType
 }
 
 function assignedPos(p: PlayerRow): string {
   return p.assigned_position ?? p.position.split('/')[0]
 }
 
-function sortPlayersByPosition(players: PlayerRow[]): PlayerRow[] {
+function sortPlayersByPosition(players: PlayerRow[], platform?: PlatformType): PlayerRow[] {
   const pitchers = players.filter(p => assignedPos(p) === 'P')
-  const posOrder = ['C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']
+  const posOrder = platform === 'fanduel'
+    ? ['C/1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF', 'UTIL']
+    : ['C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']
   const batters = players.filter(p => assignedPos(p) !== 'P')
 
   const filled: PlayerRow[] = [...pitchers]
@@ -30,7 +33,7 @@ function sortPlayersByPosition(players: PlayerRow[]): PlayerRow[] {
   return filled
 }
 
-export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex }: Props) {
+export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
   if (lineups.length === 0) return null
   const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
@@ -65,7 +68,7 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
       </div>
       <div className="portfolio-cards">
         {lineups.map(lineup => {
-          const sorted = sortPlayersByPosition(lineup.players)
+          const sorted = sortPlayersByPosition(lineup.players, platform)
           const stack = getStackNotation(lineup.players)
           const isReplacing = replacingLineupIndex === lineup.lineup_index
           return (

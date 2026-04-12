@@ -236,6 +236,7 @@ export default function App() {
             disabled={running}
             projFetchExcluded={projFetchExcluded}
             onProjFetchFilterChange={setProjFetchExcluded}
+            platform={state.config?.platform}
           />
         )}
 
@@ -249,6 +250,7 @@ export default function App() {
             unconfirmedPlayerIds={state.unconfirmedPlayerIds}
             onDeleteLineup={state.runStatus === 'complete' ? handleDeleteLineup : undefined}
             replacingLineupIndex={replacingIndex}
+            platform={state.config?.platform}
           />
         )}
 

@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, SlateGamesResponse, SlatePlayersResponse } from '../types'
+import type { ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PlatformType, SlateGamesResponse, SlatePlayersResponse } from '../types'
 import { fetchSlateGames, fetchSlatePlayers, savePlayerExclusions, saveSlateExclusions } from '../api'
 
 interface Props {
   disabled?: boolean
   projFetchExcluded?: string[]
   onProjFetchFilterChange?: (excluded: string[]) => void
+  platform?: PlatformType
 }
 
-export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange }: Props) {
+export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings' }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
@@ -18,13 +19,16 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
   const searchRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
+    setSlate(null)
+    setPlayers(null)
+    setError(null)
     fetchSlateGames()
       .then(data => { setSlate(data) })
       .catch(e => setError(String(e)))
     fetchSlatePlayers()
       .then(setPlayers)
       .catch(e => setError(String(e)))
-  }, [])
+  }, [platform])
 
   // Close search dropdown when clicking outside
   useEffect(() => {
@@ -163,7 +167,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
   if (error) return <p className="slate-error">{error}</p>
   if (!slate) return <p className="slate-muted">Loading slate…</p>
   if (slate.games.length === 0)
-    return <p className="slate-muted">No slate loaded. Set the DK Slate path in Config.</p>
+    return <p className="slate-muted">No slate loaded. Set the {platform === 'fanduel' ? 'FD' : 'DK'} Slate CSV path in Config.</p>
 
   const totalTeams = slate.games.length * 2
   const activeTeams = slate.games.reduce(
