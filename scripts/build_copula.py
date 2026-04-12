@@ -52,10 +52,29 @@ def build_copula(input_path="data/processed/historical_logs.parquet", output_pat
     copula_matrix.to_parquet(output_path)
     print(f"Saved empirical copula with shape {copula_matrix.shape} to {output_path}")
 
+HISTORICAL_LOGS_BY_PLATFORM = {
+    "draftkings": "data/processed/historical_logs.parquet",
+    "fanduel":    "data/processed/historical_logs_fd.parquet",
+}
+
+COPULA_BY_PLATFORM = {
+    "draftkings": "data/processed/empirical_copula.parquet",
+    "fanduel":    "data/processed/empirical_copula_fd.parquet",
+}
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build empirical copula from historical data.")
-    parser.add_argument("--input", default="data/processed/historical_logs.parquet", help="Path to historical logs")
-    parser.add_argument("--output", default="data/processed/empirical_copula.parquet", help="Path to save copula matrix")
+    parser.add_argument(
+        "--platform",
+        choices=["draftkings", "fanduel"],
+        default="draftkings",
+        help="Platform to build copula for (sets default --input / --output paths).",
+    )
+    parser.add_argument("--input", default=None, help="Override path to historical logs parquet")
+    parser.add_argument("--output", default=None, help="Override path to save copula matrix")
     args = parser.parse_args()
-    
-    build_copula(args.input, args.output)
+
+    input_path = args.input or HISTORICAL_LOGS_BY_PLATFORM[args.platform]
+    output_path = args.output or COPULA_BY_PLATFORM[args.platform]
+
+    build_copula(input_path, output_path)

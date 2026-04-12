@@ -34,9 +34,25 @@ from src.models.batter_model import BatterPCAModel, fit_mixture_params
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
 
-HISTORICAL_PATH = project_root / "data" / "processed" / "historical_logs.parquet"
-PCA_MODEL_PATH = project_root / "data" / "processed" / "batter_pca_model.npz"
-SCORE_GRID_PATH = project_root / "data" / "processed" / "batter_score_grid.npy"
+HISTORICAL_PATH_BY_PLATFORM = {
+    "draftkings": project_root / "data" / "processed" / "historical_logs.parquet",
+    "fanduel":    project_root / "data" / "processed" / "historical_logs_fd.parquet",
+}
+
+PCA_MODEL_PATH_BY_PLATFORM = {
+    "draftkings": project_root / "data" / "processed" / "batter_pca_model.npz",
+    "fanduel":    project_root / "data" / "processed" / "batter_pca_model_fd.npz",
+}
+
+SCORE_GRID_PATH_BY_PLATFORM = {
+    "draftkings": project_root / "data" / "processed" / "batter_score_grid.npy",
+    "fanduel":    project_root / "data" / "processed" / "batter_score_grid_fd.npy",
+}
+
+# Default paths (DraftKings) — kept for backward compat with code that imports these names.
+HISTORICAL_PATH = HISTORICAL_PATH_BY_PLATFORM["draftkings"]
+PCA_MODEL_PATH = PCA_MODEL_PATH_BY_PLATFORM["draftkings"]
+SCORE_GRID_PATH = SCORE_GRID_PATH_BY_PLATFORM["draftkings"]
 
 
 def _load_batter_logs(path: Path) -> pd.DataFrame:
@@ -90,14 +106,19 @@ def _fit_all_players(batters: pd.DataFrame, min_games: int) -> np.ndarray:
     return np.array(params_list, dtype=float)
 
 
-def main(min_games: int = 30) -> None:
-    if not HISTORICAL_PATH.exists():
-        log.error("historical_logs.parquet not found at %s. "
-                  "Run scripts/process_historical.py first.", HISTORICAL_PATH)
+def main(min_games: int = 30, platform: str = "draftkings") -> None:
+    historical_path = HISTORICAL_PATH_BY_PLATFORM[platform]
+    pca_model_path = PCA_MODEL_PATH_BY_PLATFORM[platform]
+    score_grid_path = SCORE_GRID_PATH_BY_PLATFORM[platform]
+
+    if not historical_path.exists():
+        log.error("%s not found at %s. "
+                  "Run scripts/process_historical.py --platform %s first.",
+                  historical_path.name, historical_path, platform)
         sys.exit(1)
 
     # --- Load data ---
-    batters = _load_batter_logs(HISTORICAL_PATH)
+    batters = _load_batter_logs(historical_path)
 
     # --- Score grid ---
     score_grid = _build_score_grid(batters["dk_points"])
@@ -119,12 +140,12 @@ def main(min_games: int = 30) -> None:
     log.info("Top-2 PCs explain %.1f%% of normalised variance.", top2_var)
 
     # --- Save outputs ---
-    PCA_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
-    pca_model.save(str(PCA_MODEL_PATH))
-    np.save(str(SCORE_GRID_PATH), score_grid)
+    pca_model_path.parent.mkdir(parents=True, exist_ok=True)
+    pca_model.save(str(pca_model_path))
+    np.save(str(score_grid_path), score_grid)
 
-    log.info("PCA model saved to %s", PCA_MODEL_PATH)
-    log.info("Score grid saved to %s", SCORE_GRID_PATH)
+    log.info("PCA model saved to %s", pca_model_path)
+    log.info("Score grid saved to %s", score_grid_path)
 
 
 if __name__ == "__main__":
@@ -135,5 +156,11 @@ if __name__ == "__main__":
         default=30,
         help="Minimum game appearances required to include a player in PCA fitting.",
     )
+    parser.add_argument(
+        "--platform",
+        choices=["draftkings", "fanduel"],
+        default="draftkings",
+        help="Platform to fit model for (sets default input/output paths).",
+    )
     args = parser.parse_args()
-    main(min_games=args.min_games)
+    main(min_games=args.min_games, platform=args.platform)

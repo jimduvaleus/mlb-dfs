@@ -7,6 +7,12 @@ from src.ingestion.retrosheet_parser import RetrosheetParser
 RETROSHEET_DIR = "data/raw/retrosheet"
 PROCESSED_DIR = "data/processed"
 
+# Output filenames by platform
+HISTORICAL_LOGS_BY_PLATFORM = {
+    "draftkings": "historical_logs.parquet",
+    "fanduel":    "historical_logs_fd.parquet",
+}
+
 
 def run_chadwick_cwdaily(year, input_dir):
     """
@@ -126,7 +132,22 @@ if __name__ == "__main__":
         nargs="+",
         help="One or more years to process (e.g., 2022 2023 2024 2025)",
     )
+    parser.add_argument(
+        "--platform",
+        choices=["draftkings", "fanduel"],
+        default="draftkings",
+        help="Platform to score for (default: draftkings). "
+             "FanDuel outputs historical_logs_fd.parquet.",
+    )
     args = parser.parse_args()
+
+    # Resolve platform-specific scoring rules
+    if args.platform == "fanduel":
+        from src.platforms.fanduel import FD_SCORING as scoring_rules
+    else:
+        scoring_rules = None  # RetrosheetParser falls back to DK constants
+
+    output_filename = HISTORICAL_LOGS_BY_PLATFORM[args.platform]
 
     all_logs = []
     for year in args.years:
@@ -141,10 +162,12 @@ if __name__ == "__main__":
         daily_df = pd.read_csv(daily_file)
 
         batting_df = _prep_batting_df(daily_df)
-        batting_df = RetrosheetParser.process_batting_stats(batting_df)
+        batting_df = RetrosheetParser.process_batting_stats(batting_df, rules=scoring_rules)
 
         pitching_df = _prep_pitching_df(daily_df)
-        pitching_df = RetrosheetParser.process_pitching_stats(pitching_df, starters_only=True)
+        pitching_df = RetrosheetParser.process_pitching_stats(
+            pitching_df, starters_only=True, rules=scoring_rules
+        )
 
         logs = assign_slots(batting_df, pitching_df)
         print(f"  {year}: {len(logs)} rows")
@@ -155,6 +178,6 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     combined = pd.concat(all_logs, ignore_index=True)
-    output_path = os.path.join(PROCESSED_DIR, "historical_logs.parquet")
+    output_path = os.path.join(PROCESSED_DIR, output_filename)
     combined.to_parquet(output_path, index=False)
     print(f"\nHistorical logs ({len(combined)} rows across {len(all_logs)} year(s)) saved to {output_path}")

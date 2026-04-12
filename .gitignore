@@ -34,3 +34,7 @@ data/processed/market_odds_game_ids.json
 data/processed/projections_mo.csv
 data/processed/projections_rw.csv
 data/processed/projections_mo_fallback.json
+data/processed/batter_pca_model_fd.npz
+data/processed/batter_score_grid_fd.npy
+data/processed/empirical_copula_fd.parquet
+data/processed/historical_logs_fd.parquet
