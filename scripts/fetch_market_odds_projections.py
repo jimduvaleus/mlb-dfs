@@ -223,53 +223,68 @@ def _normalise(name: str) -> str:
 def _match_name(
     source_name: str,
     dk_lookup: dict[str, list[tuple[int, float, str]]],  # norm_name → [(player_id, salary, team)]
-    source_team: str | None = None,
+    source_teams: set[str] | None = None,
     cutoff: float = 0.82,
 ) -> int | None:
     """
     Return a DK player_id for *source_name*, or None if no confident match.
 
-    When *source_team* is provided, it is used as the primary disambiguation
-    signal for players who share the same normalised name in the DK file.
-    Falls back to difflib fuzzy matching.
+    *source_teams* is the set of team abbreviations for the game the player
+    appeared in (i.e. {away, home}).  When provided, DK candidates are filtered
+    to only players on those teams before any further disambiguation, which
+    resolves same-name players in different games (e.g. Max Muncy LAD vs ATH).
+
+    Falls back to difflib fuzzy matching within the same team set.
     """
     key = _normalise(source_name)
     all_keys = list(dk_lookup.keys())
 
-    def _pick_from(candidates: list[tuple[int, float, str]]) -> int:
-        if len(candidates) == 1:
-            return candidates[0][0]
-        if source_team:
-            team_matches = [c for c in candidates if c[2].upper() == source_team.upper()]
-            if len(team_matches) == 1:
-                return team_matches[0][0]
-            if team_matches:
-                return team_matches[0][0]
-        return candidates[0][0]
+    def _team_filter(candidates: list[tuple[int, float, str]]) -> list[tuple[int, float, str]]:
+        """Filter candidates to those on a game team; returns [] on no match (no fallback)."""
+        if not source_teams:
+            return candidates
+        return [c for c in candidates if c[2].upper() in source_teams]
+
+    def _fuzzy_within_teams() -> int | None:
+        """Try fuzzy name match restricted to source_teams; return pid or None."""
+        fuzzy = difflib.get_close_matches(key, all_keys, n=5, cutoff=cutoff)
+        for fkey in fuzzy:
+            if fkey == key:
+                continue
+            hits = _team_filter(dk_lookup[fkey])
+            if hits:
+                return hits[0][0]
+        return None
 
     if key in dk_lookup:
         candidates = dk_lookup[key]
-        if len(candidates) == 1 and source_team and candidates[0][2]:
-            if candidates[0][2].upper() != source_team.upper():
-                # Exact name but wrong team — try fuzzy within correct team.
-                fuzzy = difflib.get_close_matches(key, all_keys, n=5, cutoff=cutoff)
-                for fkey in fuzzy:
-                    if fkey == key:
-                        continue
-                    for c in dk_lookup[fkey]:
-                        if c[2].upper() == source_team.upper():
-                            return c[0]
-        return _pick_from(candidates)
+        filtered = _team_filter(candidates)
 
+        if filtered:
+            # At least one exact-name candidate is on a game team.
+            return filtered[0][0] if len(filtered) == 1 else filtered[0][0]
+
+        if source_teams:
+            # Exact name match exists but no candidate is on a game team.
+            # Try a fuzzy name variant that IS on a game team
+            # (e.g. CrazyNinja "Luis Garcia" → DK "Luis Garcia Jr." WSH).
+            hit = _fuzzy_within_teams()
+            if hit is not None:
+                return hit
+
+        # No team info or fuzzy found nothing — accept the exact match as-is.
+        return candidates[0][0]
+
+    # No exact name match — fuzzy search, preferring game-team candidates.
     matches = difflib.get_close_matches(key, all_keys, n=3, cutoff=cutoff)
     if not matches:
         return None
-    if source_team:
+    if source_teams:
         for fkey in matches:
-            team_matches = [c for c in dk_lookup[fkey] if c[2].upper() == source_team.upper()]
-            if team_matches:
-                return _pick_from(team_matches)
-    return _pick_from(dk_lookup[matches[0]])
+            hits = _team_filter(dk_lookup[fkey])
+            if hits:
+                return hits[0][0]
+    return dk_lookup[matches[0]][0]
 
 
 def _load_name_map(path: str | Path | None) -> dict[str, str]:
@@ -1169,6 +1184,17 @@ async def _run_playwright(
     cache_key   = _game_id_cache_key(slate_date, slate_games)
     game_id_map = _load_game_id_cache(cache_key)
 
+    # Discard a partial cache — if any slate game is missing a game ID the
+    # cache was built before a previous match failure was resolved.
+    if game_id_map is not None:
+        missing = [k for k in slate_games if k not in game_id_map]
+        if missing:
+            log.info(
+                "Cached game IDs are incomplete (%d missing); re-scraping.",
+                len(missing),
+            )
+            game_id_map = None
+
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
 
@@ -1225,6 +1251,9 @@ async def _run_playwright(
         await browser.close()
 
     # Merge results and flag potential rate-limiting via consecutive empty games.
+    # player_game_map tracks which (away, home) game each player appeared in so
+    # that _match_name can restrict DK candidates to players actually in that game.
+    player_game_map: dict[str, set[tuple[str, str]]] = {}
     consecutive_empty = 0
     for i, ((away, home), _) in enumerate(game_entries):
         game_data, seen_players = results[i]
@@ -1244,10 +1273,13 @@ async def _run_playwright(
             entry = all_market_data.setdefault(mapped, {})
             for mk, lp in markets.items():
                 entry.setdefault(mk, []).extend(lp)
+            player_game_map.setdefault(mapped, set()).add((away, home))
         for player_name in seen_players:
-            all_seen_players.add(name_map.get(player_name, player_name))
+            mapped = name_map.get(player_name, player_name)
+            all_seen_players.add(mapped)
+            player_game_map.setdefault(mapped, set()).add((away, home))
 
-    return all_market_data, all_seen_players
+    return all_market_data, all_seen_players, player_game_map
 
 
 # ---------------------------------------------------------------------------
@@ -1294,7 +1326,7 @@ def build_projections_csv(
         dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
 
     # Fetch market data
-    all_market_data, all_seen_players = asyncio.run(
+    all_market_data, all_seen_players, player_game_map = asyncio.run(
         _run_playwright(dk_path, name_map, debug=debug, games_filter=games_filter)
     )
 
@@ -1310,7 +1342,9 @@ def build_projections_csv(
     fallback_reasons: dict[int, str] = {}
 
     for player_name, player_markets in all_market_data.items():
-        pid = _match_name(player_name, dk_lookup)
+        games = player_game_map.get(player_name, set())
+        source_teams = {team for (away, home) in games for team in (away, home)} or None
+        pid = _match_name(player_name, dk_lookup, source_teams=source_teams)
         if pid is None:
             unmatched.append(player_name)
             continue
@@ -1355,7 +1389,9 @@ def build_projections_csv(
     # so the log is explicit and the UI can show a reason for the RotoWire fallback.
     all_flagged_names = all_seen_players - set(all_market_data.keys())
     for player_name in sorted(all_flagged_names):
-        pid = _match_name(player_name, dk_lookup)
+        games = player_game_map.get(player_name, set())
+        source_teams = {team for (away, home) in games for team in (away, home)} or None
+        pid = _match_name(player_name, dk_lookup, source_teams=source_teams)
         if pid is None:
             continue  # not on this DK slate — ignore
         if rw_player_ids is not None and pid not in rw_player_ids:
