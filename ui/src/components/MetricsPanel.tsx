@@ -51,17 +51,21 @@ export function MetricsPanel({ lineups, events }: Props) {
   }).filter(Boolean) as { lineup: number; great: number; good: number; uncovered: number }[]
 
   // --- Exposure ---
-  const exposure: Record<string, { name: string; team: string; count: number }> = {}
+  const pitcherExposure: Record<string, { name: string; team: string; count: number }> = {}
+  const batterExposure: Record<string, { name: string; team: string; count: number }> = {}
   for (const lineup of lineups) {
     for (const p of lineup.players) {
       const key = String(p.player_id)
-      if (!exposure[key]) {
-        exposure[key] = { name: p.name, team: p.team, count: 0 }
+      const pos = p.assigned_position ?? p.position
+      const bucket = pos === 'P' ? pitcherExposure : batterExposure
+      if (!bucket[key]) {
+        bucket[key] = { name: p.name, team: p.team, count: 0 }
       }
-      exposure[key].count++
+      bucket[key].count++
     }
   }
-  const exposureList = Object.values(exposure).sort((a, b) => b.count - a.count)
+  const pitcherExposureList = Object.values(pitcherExposure).sort((a, b) => b.count - a.count)
+  const batterExposureList = Object.values(batterExposure).sort((a, b) => b.count - a.count)
 
   // --- Value metrics ---
   // value = mean / (salary / 1000), scoped to players in the portfolio
@@ -281,25 +285,49 @@ export function MetricsPanel({ lineups, events }: Props) {
         </div>
       )}
 
-      {/* Player exposure */}
-      <div className="metrics-section">
-        <h4>Player Exposure</h4>
-        <div className="exposure-list">
-          {exposureList.map(({ name, team, count }) => (
-            <div key={name} className="exposure-row">
-              <span className="exposure-name">{name}</span>
-              <TeamBadge team={team} className="exposure-team" />
-              <span className="exposure-bar-wrap">
-                <span
-                  className="exposure-bar"
-                  style={{ width: `${(count / lineups.length) * 100}%` }}
-                />
-              </span>
-              <span className="exposure-count">{count}/{lineups.length}</span>
-            </div>
-          ))}
+      {/* Pitcher exposure */}
+      {pitcherExposureList.length > 0 && (
+        <div className="metrics-section">
+          <h4>Pitcher Exposure</h4>
+          <div className="exposure-list">
+            {pitcherExposureList.map(({ name, team, count }) => (
+              <div key={name} className="exposure-row">
+                <span className="exposure-name">{name}</span>
+                <TeamBadge team={team} className="exposure-team" />
+                <span className="exposure-bar-wrap">
+                  <span
+                    className="exposure-bar"
+                    style={{ width: `${(count / lineups.length) * 100}%` }}
+                  />
+                </span>
+                <span className="exposure-count">{count}/{lineups.length}</span>
+              </div>
+            ))}
+          </div>
         </div>
-      </div>
+      )}
+
+      {/* Batter exposure */}
+      {batterExposureList.length > 0 && (
+        <div className="metrics-section">
+          <h4>Batter Exposure</h4>
+          <div className="exposure-list">
+            {batterExposureList.map(({ name, team, count }) => (
+              <div key={name} className="exposure-row">
+                <span className="exposure-name">{name}</span>
+                <TeamBadge team={team} className="exposure-team" />
+                <span className="exposure-bar-wrap">
+                  <span
+                    className="exposure-bar"
+                    style={{ width: `${(count / lineups.length) * 100}%` }}
+                  />
+                </span>
+                <span className="exposure-count">{count}/{lineups.length}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
