@@ -191,6 +191,10 @@ TEAM_FULL_NAME: dict[str, str] = {
 
 FULL_NAME_TO_ABBR: dict[str, str] = {v: k for k, v in TEAM_FULL_NAME.items()}
 
+# Override legacy/alias site names that differ from the current DK abbreviation.
+# CrazyNinjaOdds still uses "Oakland Athletics" even after relocation; DK uses ATH.
+FULL_NAME_TO_ABBR["Oakland Athletics"] = "ATH"
+
 # Nickname → abbreviation: last word of each team name (e.g. "Athletics" → "ATH").
 # Used as a fallback when the odds site uses a shortened city-less team name.
 # Single-word entries (no city) take priority over multi-word entries so that
