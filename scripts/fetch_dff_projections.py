@@ -80,6 +80,20 @@ _JSON_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
+# DFF team abbreviation → DK canonical abbreviation.
+# Add entries here whenever DFF uses a non-standard abbreviation.
+_DFF_TEAM_MAP: dict[str, str] = {
+    "OAK": "ATH",   # Athletics (DFF keeps legacy Oakland abbr; DK uses ATH)
+    "WAS": "WSH",   # Washington Nationals
+}
+
+
+def _normalise_dff_team(raw: str) -> str:
+    """Map a DFF team abbreviation to the DK canonical abbreviation."""
+    upper = raw.strip().upper()
+    return _DFF_TEAM_MAP.get(upper, upper)
+
+
 # std_dev estimation — same linear model as fetch_rotowire_projections.py
 _BATTER_STD_INTERCEPT = 4.0
 _BATTER_STD_SLOPE     = 0.40
@@ -135,33 +149,61 @@ def _normalise(name: str) -> str:
 
 def _match_name(
     dff_name: str,
-    dk_lookup: dict[str, list[tuple[int, float]]],
+    dk_lookup: dict[str, list[tuple[int, float, str]]],  # norm_name → [(player_id, salary, team)]
     dff_salary: float | None = None,
+    dff_team: str | None = None,
     cutoff: float = 0.82,
 ) -> int | None:
     """
     Return a DK player_id for *dff_name*, or None if no confident match.
-    Exact normalised name first; salary-disambiguates duplicates; fuzzy fallback.
+
+    Disambiguation priority:
+      1. Exact name + same team → immediate win.
+      2. Exact name + team mismatch (single candidate) → fuzzy-search within
+         *dff_team* to catch suffix differences (e.g. "Luis Garcia" vs "Luis Garcia Jr.").
+      3. Multiple exact-name candidates → prefer same team, then closest salary.
+      4. Fuzzy fallback → prefer same-team result, then closest salary.
     """
     key = _normalise(dff_name)
+    all_keys = list(dk_lookup.keys())
 
-    if key in dk_lookup:
-        candidates = dk_lookup[key]
+    def _pick_from(candidates: list[tuple[int, float, str]]) -> int:
         if len(candidates) == 1:
             return candidates[0][0]
+        if dff_team:
+            team_matches = [c for c in candidates if c[2].upper() == dff_team.upper()]
+            if len(team_matches) == 1:
+                return team_matches[0][0]
+            if team_matches:
+                if dff_salary is not None:
+                    return min(team_matches, key=lambda c: abs(c[1] - dff_salary))[0]
+                return team_matches[0][0]
         if dff_salary is not None:
             return min(candidates, key=lambda c: abs(c[1] - dff_salary))[0]
         return candidates[0][0]
 
-    all_keys = list(dk_lookup.keys())
-    matches = difflib.get_close_matches(key, all_keys, n=1, cutoff=cutoff)
-    if matches:
-        candidates = dk_lookup[matches[0]]
-        if dff_salary is not None and len(candidates) > 1:
-            return min(candidates, key=lambda c: abs(c[1] - dff_salary))[0]
-        return candidates[0][0]
+    if key in dk_lookup:
+        candidates = dk_lookup[key]
+        if len(candidates) == 1 and dff_team and candidates[0][2]:
+            if candidates[0][2].upper() != dff_team.upper():
+                fuzzy = difflib.get_close_matches(key, all_keys, n=5, cutoff=cutoff)
+                for fkey in fuzzy:
+                    if fkey == key:
+                        continue
+                    for c in dk_lookup[fkey]:
+                        if c[2].upper() == dff_team.upper():
+                            return c[0]
+        return _pick_from(candidates)
 
-    return None
+    matches = difflib.get_close_matches(key, all_keys, n=3, cutoff=cutoff)
+    if not matches:
+        return None
+    if dff_team:
+        for fkey in matches:
+            team_matches = [c for c in dk_lookup[fkey] if c[2].upper() == dff_team.upper()]
+            if team_matches:
+                return _pick_from(team_matches)
+    return _pick_from(dk_lookup[matches[0]])
 
 
 # ---------------------------------------------------------------------------
@@ -483,10 +525,13 @@ def parse_players(rows: list[dict]) -> pd.DataFrame:
                 lineup_slot = None
             slot_confirmed = starter_flag == "1"
 
+        dff_team = _normalise_dff_team(row.get("data-team") or "")
+
         records.append(
             {
                 "dff_name": name,
                 "dff_salary": salary,
+                "dff_team": dff_team,
                 "position": pos,
                 "projected_fpts": pts,
                 "lineup_slot": lineup_slot,
@@ -549,12 +594,13 @@ def build_projections_csv(
     # slate_df is produced by DraftKingsSlateIngestor or FanDuelSlateIngestor;
     # both expose: player_id (int), name, salary, position.
     log.info("Building player lookup from slate (%d players).", len(slate_df))
-    name_lookup: dict[str, list[tuple[int, float]]] = {}
+    name_lookup: dict[str, list[tuple[int, float, str]]] = {}
     for _, row in slate_df.iterrows():
         key = _normalise(str(row["name"]))
         pid = int(row["player_id"])
         sal = float(row["salary"])
-        name_lookup.setdefault(key, []).append((pid, sal))
+        team = str(row["team"]).upper() if "team" in slate_df.columns else ""
+        name_lookup.setdefault(key, []).append((pid, sal, team))
 
     pos_map: dict[int, str] = {}
     if "position" in slate_df.columns:
@@ -604,7 +650,7 @@ def build_projections_csv(
         dff_name = name_map.get(row["dff_name"], row["dff_name"])
         if dff_name != row["dff_name"]:
             log.debug("Name map: %r → %r", row["dff_name"], dff_name)
-        pid = _match_name(dff_name, name_lookup, dff_salary=row["dff_salary"])
+        pid = _match_name(dff_name, name_lookup, dff_salary=row["dff_salary"], dff_team=row.get("dff_team") or None)
         if pid is not None:
             matched.append(
                 {

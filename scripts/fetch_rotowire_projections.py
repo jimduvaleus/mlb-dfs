@@ -154,38 +154,71 @@ def _normalise(name: str) -> str:
 
 def _match_name(
     rw_name: str,
-    dk_lookup: dict[str, list[tuple[int, float]]],  # norm_name → [(player_id, salary)]
+    dk_lookup: dict[str, list[tuple[int, float, str]]],  # norm_name → [(player_id, salary, team)]
     rw_salary: float | None = None,
+    rw_team: str | None = None,
     cutoff: float = 0.82,
 ) -> int | None:
     """
     Return a DK player_id for *rw_name*, or None if no confident match.
 
-    Uses exact normalised name first.  If there are multiple DK players with
-    the same normalised name, disambiguates by comparing *rw_salary* to the
-    DK salary.  Falls back to difflib fuzzy matching.
+    Disambiguation priority:
+      1. Exact normalised name + same team  → single match wins immediately.
+      2. Exact normalised name + team mismatch (single candidate) → fuzzy-search
+         within *rw_team* to handle suffix differences like "Luis Garcia" (WSH,
+         RotoWire) vs "Luis Garcia Jr." (WSH, DK).
+      3. Multiple exact-name candidates → prefer same team, then closest salary.
+      4. Fuzzy fallback → prefer same-team result, then closest salary.
     """
     key = _normalise(rw_name)
+    all_keys = list(dk_lookup.keys())
 
-    if key in dk_lookup:
-        candidates = dk_lookup[key]
+    def _pick_from(candidates: list[tuple[int, float, str]]) -> int:
+        """Return player_id from candidates, preferring same team then salary."""
         if len(candidates) == 1:
             return candidates[0][0]
-        # Multiple DK players share the same normalised name — pick closest salary
+        if rw_team:
+            team_matches = [c for c in candidates if c[2].upper() == rw_team.upper()]
+            if len(team_matches) == 1:
+                return team_matches[0][0]
+            if team_matches:
+                if rw_salary is not None:
+                    return min(team_matches, key=lambda c: abs(c[1] - rw_salary))[0]
+                return team_matches[0][0]
         if rw_salary is not None:
             return min(candidates, key=lambda c: abs(c[1] - rw_salary))[0]
         return candidates[0][0]
 
-    # Fuzzy fallback
-    all_keys = list(dk_lookup.keys())
-    matches = difflib.get_close_matches(key, all_keys, n=1, cutoff=cutoff)
-    if matches:
-        candidates = dk_lookup[matches[0]]
-        if rw_salary is not None and len(candidates) > 1:
-            return min(candidates, key=lambda c: abs(c[1] - rw_salary))[0]
-        return candidates[0][0]
+    if key in dk_lookup:
+        candidates = dk_lookup[key]
+        # Single exact-name candidate: check for team mismatch before accepting.
+        if len(candidates) == 1 and rw_team and candidates[0][2]:
+            if candidates[0][2].upper() != rw_team.upper():
+                # Name matches but team is wrong — try fuzzy within the correct
+                # team (e.g. RW "Luis Garcia" WSH → DK "Luis Garcia Jr." WSH).
+                fuzzy = difflib.get_close_matches(key, all_keys, n=5, cutoff=cutoff)
+                for fkey in fuzzy:
+                    if fkey == key:
+                        continue
+                    for c in dk_lookup[fkey]:
+                        if c[2].upper() == rw_team.upper():
+                            log.debug(
+                                "Team-aware override: %r (RW team=%s) → DK %r (team=%s)",
+                                rw_name, rw_team, fkey, c[2],
+                            )
+                            return c[0]
+        return _pick_from(candidates)
 
-    return None
+    # Fuzzy fallback — prefer any candidate on the same team.
+    matches = difflib.get_close_matches(key, all_keys, n=3, cutoff=cutoff)
+    if not matches:
+        return None
+    if rw_team:
+        for fkey in matches:
+            team_matches = [c for c in dk_lookup[fkey] if c[2].upper() == rw_team.upper()]
+            if team_matches:
+                return _pick_from(team_matches)
+    return _pick_from(dk_lookup[matches[0]])
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +477,7 @@ def _parse_slot(raw: str | None) -> int | None:
 def parse_players(records: list[dict]) -> pd.DataFrame:
     """
     Flatten RotoWire player records into a DataFrame with columns:
-        rw_name, rw_salary, position, projected_fpts, lineup_slot, slot_confirmed
+        rw_name, rw_salary, rw_team, position, projected_fpts, lineup_slot, slot_confirmed
     """
     rows = []
     for r in records:
@@ -471,10 +504,16 @@ def parse_players(records: list[dict]) -> pd.DataFrame:
         slot = _parse_slot(lineup.get("slot"))
         confirmed = bool(lineup.get("isConfirmed"))
 
+        team_obj = r.get("team")
+        rw_team = ""
+        if isinstance(team_obj, dict):
+            rw_team = (team_obj.get("abbr") or "").upper()
+
         rows.append(
             {
                 "rw_name": name,
                 "rw_salary": salary,
+                "rw_team": rw_team,
                 "position": pos,
                 "projected_fpts": pts,
                 "lineup_slot": slot,
@@ -501,12 +540,13 @@ def build_projections_csv(
     # slate_df is produced by DraftKingsSlateIngestor or FanDuelSlateIngestor;
     # both expose the same standardised columns: player_id, name, salary, position.
     log.info("Building player lookup from slate (siteID=%d, %d players).", site_id, len(slate_df))
-    name_lookup: dict[str, list[tuple[int, float]]] = {}
+    name_lookup: dict[str, list[tuple[int, float, str]]] = {}
     for _, row in slate_df.iterrows():
         key = _normalise(str(row["name"]))
         pid = int(row["player_id"])
         sal = float(row["salary"])
-        name_lookup.setdefault(key, []).append((pid, sal))
+        team = str(row["team"]).upper() if "team" in slate_df.columns else ""
+        name_lookup.setdefault(key, []).append((pid, sal, team))
 
     pos_map: dict[int, str] = {}
     if "position" in slate_df.columns:
@@ -554,7 +594,7 @@ def build_projections_csv(
         rw_name = name_map.get(row["rw_name"], row["rw_name"])
         if rw_name != row["rw_name"]:
             log.debug("Name map: %r → %r", row["rw_name"], rw_name)
-        pid = _match_name(rw_name, name_lookup, rw_salary=row["rw_salary"])
+        pid = _match_name(rw_name, name_lookup, rw_salary=row["rw_salary"], rw_team=row.get("rw_team") or None)
         if pid is not None:
             matched.append(
                 {

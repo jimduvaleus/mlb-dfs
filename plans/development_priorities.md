@@ -1,3 +1,4 @@
+- UI run tab to 4-wide, metrics tab to SP and batter split out
 - How to handle FanDuel Market Odds Fetch for QS?
 - BIG Turbo button
 - BIG Opponent/contest modeling

@@ -131,6 +131,10 @@ MARKET_KEY_MAP: dict[str, str] = {
 HBP_PER_WALK            = 0.11   # batter: E[HBP] = E[BB] * this
 HBP_PER_INNING_PITCHER  = 0.039  # pitcher: E[HBP] = E[IP] * this
 
+# Max browser pages open simultaneously while fetching game odds.
+# Tune down to 1-2 if the site starts returning empty tables or HTTP 429s.
+_MAX_CONCURRENT_GAMES = 4
+
 # Playwright selector IDs (verified from page inspection)
 SEL_DEVIG  = (
     "#ContentPlaceHolderMain_ContentPlaceHolderRight_"
@@ -214,20 +218,54 @@ def _normalise(name: str) -> str:
 
 def _match_name(
     source_name: str,
-    dk_lookup: dict[str, list[tuple[int, float]]],
+    dk_lookup: dict[str, list[tuple[int, float, str]]],  # norm_name → [(player_id, salary, team)]
+    source_team: str | None = None,
     cutoff: float = 0.82,
 ) -> int | None:
+    """
+    Return a DK player_id for *source_name*, or None if no confident match.
+
+    When *source_team* is provided, it is used as the primary disambiguation
+    signal for players who share the same normalised name in the DK file.
+    Falls back to difflib fuzzy matching.
+    """
     key = _normalise(source_name)
-    if key in dk_lookup:
-        candidates = dk_lookup[key]
+    all_keys = list(dk_lookup.keys())
+
+    def _pick_from(candidates: list[tuple[int, float, str]]) -> int:
         if len(candidates) == 1:
             return candidates[0][0]
+        if source_team:
+            team_matches = [c for c in candidates if c[2].upper() == source_team.upper()]
+            if len(team_matches) == 1:
+                return team_matches[0][0]
+            if team_matches:
+                return team_matches[0][0]
         return candidates[0][0]
-    all_keys = list(dk_lookup.keys())
-    matches = difflib.get_close_matches(key, all_keys, n=1, cutoff=cutoff)
-    if matches:
-        return dk_lookup[matches[0]][0]
-    return None
+
+    if key in dk_lookup:
+        candidates = dk_lookup[key]
+        if len(candidates) == 1 and source_team and candidates[0][2]:
+            if candidates[0][2].upper() != source_team.upper():
+                # Exact name but wrong team — try fuzzy within correct team.
+                fuzzy = difflib.get_close_matches(key, all_keys, n=5, cutoff=cutoff)
+                for fkey in fuzzy:
+                    if fkey == key:
+                        continue
+                    for c in dk_lookup[fkey]:
+                        if c[2].upper() == source_team.upper():
+                            return c[0]
+        return _pick_from(candidates)
+
+    matches = difflib.get_close_matches(key, all_keys, n=3, cutoff=cutoff)
+    if not matches:
+        return None
+    if source_team:
+        for fkey in matches:
+            team_matches = [c for c in dk_lookup[fkey] if c[2].upper() == source_team.upper()]
+            if team_matches:
+                return _pick_from(team_matches)
+    return _pick_from(dk_lookup[matches[0]])
 
 
 def _load_name_map(path: str | Path | None) -> dict[str, str]:
@@ -561,8 +599,8 @@ def _validate_table_columns(rows: list[list[str]], market_name: str) -> None:
 
 async def _wait_for_ajax(page, timeout: int = 15_000) -> None:
     """Wait for ASP.NET AJAX postback to complete after a dropdown change."""
-    # Give the onChange handler 150 ms to fire and disable the market dropdown.
-    await page.wait_for_timeout(150)
+    # Give the onChange handler 50 ms to fire and disable the market dropdown.
+    await page.wait_for_timeout(50)
     # Then wait for the market dropdown to be re-enabled (AJAX complete).
     try:
         await page.wait_for_function(
@@ -574,7 +612,57 @@ async def _wait_for_ajax(page, timeout: int = 15_000) -> None:
         )
     except Exception:
         # Fallback: fixed delay if function-wait fails
-        await page.wait_for_timeout(2500)
+        await page.wait_for_timeout(1200)
+
+
+async def _wait_and_read_table(page, timeout: int = 15_000) -> list[list[str]]:
+    """
+    Wait for an ASP.NET AJAX postback to complete and return the GridView table
+    rows in a single browser round-trip.
+
+    Polls a JS function that returns null while the market dropdown is disabled
+    (postback in-flight) and returns the table rows array once it is re-enabled.
+    This replaces the separate _wait_for_ajax() + page.evaluate() pattern,
+    saving one browser ↔ Python round-trip per market per game.
+
+    Falls back to a fixed delay + direct evaluate() if the poll times out.
+    """
+    # 50 ms so the onChange handler has time to fire and disable the dropdown.
+    await page.wait_for_timeout(50)
+    try:
+        handle = await page.wait_for_function(
+            f"""() => {{
+                const el = document.querySelector('{SEL_MARKET}');
+                if (!el || el.disabled) return null;
+                const table = document.querySelector('[id*="GridView1"]');
+                if (!table) return [];
+                const out = [];
+                for (const tr of table.querySelectorAll('tr')) {{
+                    const cells = Array.from(tr.querySelectorAll('td'))
+                                       .map(c => c.innerText.trim());
+                    if (cells.length > 0) out.push(cells);
+                }}
+                return out;
+            }}""",
+            timeout=timeout,
+        )
+        return await handle.json_value()
+    except Exception:
+        # Fallback: fixed delay then direct evaluate
+        await page.wait_for_timeout(1200)
+        return await page.evaluate(
+            """() => {
+                const table = document.querySelector('[id*="GridView1"]');
+                if (!table) return [];
+                const out = [];
+                for (const tr of table.querySelectorAll('tr')) {
+                    const cells = Array.from(tr.querySelectorAll('td'))
+                                       .map(c => c.innerText.trim());
+                    if (cells.length > 0) out.push(cells);
+                }
+                return out;
+            }"""
+        )
 
 
 async def _fetch_game_odds(
@@ -597,13 +685,18 @@ async def _fetch_game_odds(
     log.info("Fetching game odds: %s", url)
     await page.goto(url, wait_until="domcontentloaded")
 
-    # Wait for the initial AJAX load (timer fires automatically on page load)
-    await page.wait_for_timeout(2000)
+    # Wait for the ASP.NET timer to fire and populate the GridView.
+    # No fixed sleep: wait_for_selector polls efficiently until the table appears.
     try:
         await page.wait_for_selector('[id*="GridView1"] tr', timeout=20_000)
     except Exception:
-        log.warning("Game page table did not load for game_id=%d", game_id)
-        return {}
+        log.warning(
+            "Game page table did not load for game_id=%d — "
+            "possible rate-limit, redirect, or site change. "
+            "Check for HTTP 429/403 warnings above.",
+            game_id,
+        )
+        return {}, set()
 
     # Set devig method: Liquidity-Weighted - Additive/Shin
     try:
@@ -630,27 +723,13 @@ async def _fetch_game_odds(
             continue
         await _wait_for_ajax(page)
 
-        # Select All players (value="0")
+        # Select All players (value="0"), then combined-wait + table read in one
+        # round-trip via _wait_and_read_table (saves a separate evaluate() call).
         try:
             await page.select_option(SEL_PLAYER, value="0")
-            await _wait_for_ajax(page)
         except Exception as e:
             log.debug("Could not select All players for '%s': %s", market_name, e)
-
-        # Parse the GridView1 table
-        rows: list[list[str]] = await page.evaluate(
-            """() => {
-                const table = document.querySelector('[id*="GridView1"]');
-                if (!table) return [];
-                const out = [];
-                for (const tr of table.querySelectorAll('tr')) {
-                    const cells = Array.from(tr.querySelectorAll('td'))
-                                       .map(c => c.innerText.trim());
-                    if (cells.length > 0) out.push(cells);
-                }
-                return out;
-            }"""
-        )
+        rows: list[list[str]] = await _wait_and_read_table(page)
 
         if debug and rows:
             log.debug("Market '%s' raw rows (first 4): %s", market_name, rows[:4])
@@ -1005,6 +1084,39 @@ def _compute_pitcher_projection(
 # Playwright orchestration
 # ---------------------------------------------------------------------------
 
+def _install_rate_limit_handler(page, label: str) -> None:
+    """
+    Install a response listener on a Playwright page that logs HTTP status
+    codes indicative of rate-limiting or IP blocks from crazyninjaodds.com.
+    Call once per page immediately after creation.
+    """
+    async def _on_response(response) -> None:
+        if "crazyninjaodds" not in response.url:
+            return
+        status = response.status
+        if status == 429:
+            log.warning(
+                "RATE LIMIT (HTTP 429) [%s] — %s. "
+                "Reduce _MAX_CONCURRENT_GAMES (currently %d) or add delays.",
+                label, response.url, _MAX_CONCURRENT_GAMES,
+            )
+        elif status == 403:
+            log.warning(
+                "HTTP 403 Forbidden [%s] — %s. Possible IP block or rate limit.",
+                label, response.url,
+            )
+        elif status == 503:
+            log.warning(
+                "HTTP 503 Service Unavailable [%s] — %s. "
+                "Possible rate limit or server overload.",
+                label, response.url,
+            )
+        elif status >= 400:
+            log.debug("HTTP %d [%s] — %s", status, label, response.url)
+
+    page.on("response", _on_response)
+
+
 async def _run_playwright(
     dk_path: str,
     name_map: dict[str, str],
@@ -1013,7 +1125,9 @@ async def _run_playwright(
 ) -> dict[str, dict[str, list[tuple[float, float]]]]:
     """
     Launch headless Chromium, find slate games on CrazyNinjaOdds, and scrape
-    all relevant markets. Returns raw market data keyed by player name.
+    all relevant markets. Games are fetched in parallel (up to
+    _MAX_CONCURRENT_GAMES simultaneous pages). Returns raw market data keyed
+    by player name.
 
     games_filter: if provided, only fetch these (away, home) matchups.
     """
@@ -1053,10 +1167,15 @@ async def _run_playwright(
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
-        page = await browser.new_page()
 
+        # Phase 1: game ID discovery uses a single dedicated page.
         if game_id_map is None:
-            game_id_map = await _find_game_ids(page, slate_games, slate_date, debug=debug)
+            lookup_page = await browser.new_page()
+            _install_rate_limit_handler(lookup_page, "games.aspx")
+            game_id_map = await _find_game_ids(
+                lookup_page, slate_games, slate_date, debug=debug
+            )
+            await lookup_page.close()
             if not game_id_map:
                 log.error("No slate games matched on CrazyNinjaOdds.")
                 await browser.close()
@@ -1065,28 +1184,64 @@ async def _run_playwright(
         else:
             log.info("Skipping games.aspx — using %d cached game IDs.", len(game_id_map))
 
-        first_game = True
-        for (away, home), game_id in game_id_map.items():
-            log.info("Fetching odds for %s@%s (game_id=%d)", away, home, game_id)
-            try:
-                game_data, seen_players = await _fetch_game_odds(
-                    page, game_id, all_markets, debug=debug,
-                    validate_columns=first_game,
-                )
-                first_game = False
-                for player_name, markets in game_data.items():
-                    mapped = name_map.get(player_name, player_name)
-                    entry = all_market_data.setdefault(mapped, {})
-                    for mk, lp in markets.items():
-                        entry.setdefault(mk, []).extend(lp)
-                for player_name in seen_players:
-                    all_seen_players.add(name_map.get(player_name, player_name))
-            except Exception as e:
-                log.warning(
-                    "Error fetching game %d (%s@%s): %s", game_id, away, home, e
-                )
+        # Phase 2: fetch all games in parallel, capped by _MAX_CONCURRENT_GAMES.
+        game_entries = list(game_id_map.items())
+        log.info(
+            "Fetching %d game(s) with up to %d concurrent pages.",
+            len(game_entries), _MAX_CONCURRENT_GAMES,
+        )
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GAMES)
+
+        async def _fetch_one(
+            away: str, home: str, game_id: int, validate: bool
+        ) -> tuple[dict, set]:
+            async with semaphore:
+                page = await browser.new_page()
+                _install_rate_limit_handler(page, f"{away}@{home}")
+                log.info("Fetching odds for %s@%s (game_id=%d)", away, home, game_id)
+                try:
+                    return await _fetch_game_odds(
+                        page, game_id, all_markets, debug=debug,
+                        validate_columns=validate,
+                    )
+                except Exception as e:
+                    log.warning(
+                        "Error fetching game %d (%s@%s): %s", game_id, away, home, e
+                    )
+                    return {}, set()
+                finally:
+                    await page.close()
+
+        tasks = [
+            _fetch_one(away, home, game_id, validate=(i == 0))
+            for i, ((away, home), game_id) in enumerate(game_entries)
+        ]
+        results = await asyncio.gather(*tasks)
 
         await browser.close()
+
+    # Merge results and flag potential rate-limiting via consecutive empty games.
+    consecutive_empty = 0
+    for i, ((away, home), _) in enumerate(game_entries):
+        game_data, seen_players = results[i]
+        if not game_data:
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                log.warning(
+                    "≥2 consecutive games returned no market data (%s@%s and prior) — "
+                    "possible rate-limiting. Check for HTTP 429/403 warnings above. "
+                    "Consider reducing _MAX_CONCURRENT_GAMES (currently %d).",
+                    away, home, _MAX_CONCURRENT_GAMES,
+                )
+        else:
+            consecutive_empty = 0
+        for player_name, markets in game_data.items():
+            mapped = name_map.get(player_name, player_name)
+            entry = all_market_data.setdefault(mapped, {})
+            for mk, lp in markets.items():
+                entry.setdefault(mk, []).extend(lp)
+        for player_name in seen_players:
+            all_seen_players.add(name_map.get(player_name, player_name))
 
     return all_market_data, all_seen_players
 
@@ -1122,12 +1277,13 @@ def build_projections_csv(
         inplace=True,
     )
 
-    dk_lookup: dict[str, list[tuple[int, float]]] = {}
+    dk_lookup: dict[str, list[tuple[int, float, str]]] = {}
     for _, row in dk_df.iterrows():
         key = _normalise(str(row["name"]))
         pid = int(row["player_id"])
         sal = float(row["salary"])
-        dk_lookup.setdefault(key, []).append((pid, sal))
+        team = str(row.get("TeamAbbrev", "")).upper()
+        dk_lookup.setdefault(key, []).append((pid, sal, team))
 
     dk_pos: dict[int, str] = {}
     if "Position" in dk_df.columns:
