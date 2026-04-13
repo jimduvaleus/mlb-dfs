@@ -9,6 +9,7 @@ interface Props {
   onMergeInfo: (info: MergeInfo | null) => void
   projFetchExcluded?: string[]
   onFetchingChange?: (fetching: boolean) => void
+  projectionsSource?: string
 }
 
 function formatET(unixSec: number): string {
@@ -22,7 +23,7 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange }: Props) {
+export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange, projectionsSource }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
@@ -68,9 +69,12 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       } else if (event.type === 'merge_info') {
         const players = event.players as Array<{ name: string; team: string; reason?: string; player_id?: number; is_pitcher?: boolean }>
         onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players })
-        // Auto-exclude pitchers that fell back to RotoWire — missing MO pitcher
-        // projections are a significant problem for portfolio quality.
-        const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
+        // Auto-exclude pitchers that fell back to RotoWire — only when Market Odds
+        // is the primary source, since missing MO pitcher projections cause the
+        // largest quality gap. Other sources degrade more gracefully.
+        const pitcherIds = projectionsSource === 'market_odds'
+          ? players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
+          : []
         if (pitcherIds.length > 0) {
           fetchSlatePlayers().then(slate => {
             const alreadyExcluded = slate.players.filter(p => p.excluded).map(p => p.player_id)

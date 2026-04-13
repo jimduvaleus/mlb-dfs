@@ -10,6 +10,17 @@ interface Props {
   platform?: PlatformType
 }
 
+function formatFdEntryInfo(entryFee?: string | null, contestName?: string | null): string {
+  const fee = entryFee ? `$${entryFee}` : ''
+  let name = contestName ?? ''
+  // Strip everything up to and including "MLB " (e.g. "Sun MLB " → "")
+  const mlbIdx = name.indexOf('MLB')
+  if (mlbIdx >= 0) name = name.slice(mlbIdx + 3).trimStart()
+  // Strip trailing parenthetical (e.g. " (150 Entries Max)")
+  name = name.replace(/\s*\([^)]*\)\s*$/, '').trimEnd()
+  return [fee, name].filter(Boolean).join(' ')
+}
+
 function assignedPos(p: PlayerRow): string {
   return p.assigned_position ?? p.position.split('/')[0]
 }
@@ -98,7 +109,9 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
               </div>
               {lineup.upload_tag && (
                 <div className="lineup-card-entry-info">
-                  {lineup.upload_tag}{lineup.entry_fee ? ` ${lineup.entry_fee}` : ''}{lineup.contest_name ? ` ${lineup.contest_name}` : ''}
+                  {platform === 'fanduel'
+                    ? formatFdEntryInfo(lineup.entry_fee, lineup.contest_name)
+                    : `${lineup.upload_tag}${lineup.entry_fee ? ` ${lineup.entry_fee}` : ''}${lineup.contest_name ? ` ${lineup.contest_name}` : ''}`}
                 </div>
               )}
               <div className="lineup-card-players">

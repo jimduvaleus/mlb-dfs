@@ -140,10 +140,19 @@ def _load_slate_df():
     """Parse the configured slate CSV and return a DataFrame (or None)."""
     cfg = read_config()
     from src.platforms.base import Platform
-    from src.ingestion.factory import get_ingestor
+    from src.ingestion.factory import find_fd_slate, get_ingestor
     platform = cfg.platform if hasattr(cfg, 'platform') else Platform.DRAFTKINGS
     if platform == Platform.FANDUEL:
         slate_path = cfg.paths.fd_slate
+        if not slate_path:
+            discovered = find_fd_slate(str(PROJECT_ROOT / "data/raw"))
+            if discovered:
+                try:
+                    slate_path = str(Path(discovered).relative_to(PROJECT_ROOT))
+                except ValueError:
+                    slate_path = discovered
+                cfg.paths.fd_slate = slate_path
+                write_config(cfg)
     else:
         slate_path = cfg.paths.dk_slate
     if not slate_path:
