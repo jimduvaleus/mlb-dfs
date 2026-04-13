@@ -10,7 +10,7 @@ Flow:
      a. Set Devig Method to Liquidity-Weighted Additive/Shin
      b. For each relevant market, select All players and parse the Fair Odds table
         Batter markets: Player Runs, Player RBIs, Player Singles, Player Doubles,
-          Player Triples, Player Home Runs, Player Stolen Bases, Player Walks
+          Player Triples, Player Home Runs, Player Stolen Bases, Player Batting Walks
         Pitcher markets: Player Outs Recorded, Player Pitching Strikeouts,
           Player Record A Win, Player Hits Allowed, Player Walks Allowed,
           Player Earned Runs Allowed
