@@ -618,9 +618,23 @@ def _validate_table_columns(rows: list[list[str]], market_name: str) -> None:
 
 async def _wait_for_ajax(page, timeout: int = 15_000) -> None:
     """Wait for ASP.NET AJAX postback to complete after a dropdown change."""
-    # Give the onChange handler 50 ms to fire and disable the market dropdown.
-    await page.wait_for_timeout(50)
-    # Then wait for the market dropdown to be re-enabled (AJAX complete).
+    # Phase 1: wait for the market dropdown to become disabled, confirming the
+    # postback has actually started.  Use a short timeout — it should happen in
+    # well under a second.  If it times out (e.g. no postback was triggered),
+    # fall through so Phase 2 still guards the read.
+    try:
+        await page.wait_for_function(
+            f"""() => {{
+                const el = document.querySelector('{SEL_MARKET}');
+                return !el || el.disabled;
+            }}""",
+            timeout=2000,
+        )
+    except Exception:
+        pass  # postback may have already completed or was not triggered
+
+    # Phase 2: wait for the market dropdown to be re-enabled (AJAX complete,
+    # table values updated with the new devig method).
     try:
         await page.wait_for_function(
             f"""() => {{
@@ -646,8 +660,19 @@ async def _wait_and_read_table(page, timeout: int = 15_000) -> list[list[str]]:
 
     Falls back to a fixed delay + direct evaluate() if the poll times out.
     """
-    # 50 ms so the onChange handler has time to fire and disable the dropdown.
-    await page.wait_for_timeout(50)
+    # Phase 1: wait for the market dropdown to become disabled (postback started).
+    try:
+        await page.wait_for_function(
+            f"""() => {{
+                const el = document.querySelector('{SEL_MARKET}');
+                return !el || el.disabled;
+            }}""",
+            timeout=2000,
+        )
+    except Exception:
+        pass  # postback may have already completed or was not triggered
+
+    # Phase 2: once the dropdown is re-enabled, the table contains updated values.
     try:
         handle = await page.wait_for_function(
             f"""() => {{
@@ -1141,12 +1166,19 @@ async def _run_playwright(
     name_map: dict[str, str],
     debug: bool = False,
     games_filter: set[tuple[str, str]] | None = None,
-) -> dict[str, dict[str, list[tuple[float, float]]]]:
+) -> tuple[
+    dict[tuple[str, str, str], dict[str, list[tuple[float, float]]]],
+    set[tuple[str, str, str]],
+]:
     """
     Launch headless Chromium, find slate games on CrazyNinjaOdds, and scrape
     all relevant markets. Games are fetched in parallel (up to
-    _MAX_CONCURRENT_GAMES simultaneous pages). Returns raw market data keyed
-    by player name.
+    _MAX_CONCURRENT_GAMES simultaneous pages).
+
+    Returns (all_market_data, all_seen_players) where both are keyed/tagged by
+    (player_name, away_team, home_team) so that same-name players in different
+    games (e.g. Max Muncy on LAD and ATH) are kept as separate entries and
+    matched to the correct DK player_id at projection time.
 
     games_filter: if provided, only fetch these (away, home) matchups.
     """
@@ -1155,13 +1187,13 @@ async def _run_playwright(
     slate_date = _extract_date_from_dk(dk_path)
     if not slate_date:
         log.error("Could not extract date from DK file.")
-        return {}
+        return {}, set()
     log.info("Slate date: %s", slate_date)
 
     slate_games = _extract_game_info_from_dk(dk_path)
     if not slate_games:
         log.error("Could not extract games from DK file.")
-        return {}
+        return {}, set()
 
     if games_filter:
         unknown = games_filter - slate_games.keys()
@@ -1173,7 +1205,7 @@ async def _run_playwright(
         slate_games = {k: v for k, v in slate_games.items() if k in games_filter}
         if not slate_games:
             log.error("No requested games found in DK slate.")
-            return {}
+            return {}, set()
 
     log.info("Fetching for games: %s", [f"{a}@{h}" for a, h in slate_games.keys()])
 
@@ -1250,10 +1282,11 @@ async def _run_playwright(
 
         await browser.close()
 
-    # Merge results and flag potential rate-limiting via consecutive empty games.
-    # player_game_map tracks which (away, home) game each player appeared in so
-    # that _match_name can restrict DK candidates to players actually in that game.
-    player_game_map: dict[str, set[tuple[str, str]]] = {}
+    # Merge results, keeping market data separate per (player_name, away, home) so
+    # that same-name players in different games (e.g. Max Muncy on both LAD and ATH)
+    # remain distinct entries and can each be matched to the correct DK player_id.
+    all_market_data: dict[tuple[str, str, str], dict[str, list[tuple[float, float]]]] = {}
+    all_seen_players: set[tuple[str, str, str]] = set()
     consecutive_empty = 0
     for i, ((away, home), _) in enumerate(game_entries):
         game_data, seen_players = results[i]
@@ -1270,16 +1303,15 @@ async def _run_playwright(
             consecutive_empty = 0
         for player_name, markets in game_data.items():
             mapped = name_map.get(player_name, player_name)
-            entry = all_market_data.setdefault(mapped, {})
+            game_key = (mapped, away, home)
+            entry = all_market_data.setdefault(game_key, {})
             for mk, lp in markets.items():
                 entry.setdefault(mk, []).extend(lp)
-            player_game_map.setdefault(mapped, set()).add((away, home))
         for player_name in seen_players:
             mapped = name_map.get(player_name, player_name)
-            all_seen_players.add(mapped)
-            player_game_map.setdefault(mapped, set()).add((away, home))
+            all_seen_players.add((mapped, away, home))
 
-    return all_market_data, all_seen_players, player_game_map
+    return all_market_data, all_seen_players
 
 
 # ---------------------------------------------------------------------------
@@ -1326,7 +1358,7 @@ def build_projections_csv(
         dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
 
     # Fetch market data
-    all_market_data, all_seen_players, player_game_map = asyncio.run(
+    all_market_data, all_seen_players = asyncio.run(
         _run_playwright(dk_path, name_map, debug=debug, games_filter=games_filter)
     )
 
@@ -1334,16 +1366,15 @@ def build_projections_csv(
         log.error("No market data fetched.")
         sys.exit(1)
 
-    log.info("Market data collected for %d players.", len(all_market_data))
+    log.info("Market data collected for %d player-game entries.", len(all_market_data))
 
     matched: list[dict] = []
     unmatched: list[str] = []
     # player_id → reason string for batters that couldn't be projected from market data
     fallback_reasons: dict[int, str] = {}
 
-    for player_name, player_markets in all_market_data.items():
-        games = player_game_map.get(player_name, set())
-        source_teams = {team for (away, home) in games for team in (away, home)} or None
+    for (player_name, away, home), player_markets in all_market_data.items():
+        source_teams = {away, home}
         pid = _match_name(player_name, dk_lookup, source_teams=source_teams)
         if pid is None:
             unmatched.append(player_name)
@@ -1387,10 +1418,9 @@ def build_projections_csv(
     # Players who appeared in odds tables but had every line ⚠️-flagged never entered
     # all_market_data, so the loop above silently skipped them.  Detect and warn here
     # so the log is explicit and the UI can show a reason for the RotoWire fallback.
-    all_flagged_names = all_seen_players - set(all_market_data.keys())
-    for player_name in sorted(all_flagged_names):
-        games = player_game_map.get(player_name, set())
-        source_teams = {team for (away, home) in games for team in (away, home)} or None
+    all_flagged_keys = all_seen_players - set(all_market_data.keys())
+    for (player_name, away, home) in sorted(all_flagged_keys):
+        source_teams = {away, home}
         pid = _match_name(player_name, dk_lookup, source_teams=source_teams)
         if pid is None:
             continue  # not on this DK slate — ignore
