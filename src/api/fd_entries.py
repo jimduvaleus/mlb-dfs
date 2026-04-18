@@ -302,7 +302,7 @@ def write_fd_upload_files(
             )
             continue
 
-        upload_path = out / f"upload_{file_path.name}"
+        upload_path = out / "upload_FanDuel.csv"
         rows = []
         for entry, lineup in file_assignments:
             try:

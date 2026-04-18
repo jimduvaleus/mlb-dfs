@@ -21,27 +21,89 @@ function formatFdEntryInfo(entryFee?: string | null, contestName?: string | null
   return [fee, name].filter(Boolean).join(' ')
 }
 
-function assignedPos(p: PlayerRow): string {
-  return p.assigned_position ?? p.position.split('/')[0]
+// Maps each slot label to the set of player positions that may fill it.
+// DK slots are exact-match; FD adds compound labels (C/1B, UTIL).
+const SLOT_ELIGIBILITY: Record<string, ReadonlySet<string>> = {
+  'P':    new Set(['P']),
+  'C':    new Set(['C']),
+  '1B':   new Set(['1B']),
+  '2B':   new Set(['2B']),
+  '3B':   new Set(['3B']),
+  'SS':   new Set(['SS']),
+  'OF':   new Set(['OF']),
+  'C/1B': new Set(['C', '1B']),
+  'UTIL': new Set(['C', '1B', '2B', '3B', 'SS', 'OF']),
 }
 
-function sortPlayersByPosition(players: PlayerRow[], platform?: PlatformType): PlayerRow[] {
-  const pitchers = players.filter(p => assignedPos(p) === 'P')
+// Compute a canonical slot assignment for display, guaranteeing each DK/FD
+// roster slot appears exactly once and in the correct order.
+//
+// We parse eligible positions from p.position (the slash-joined display string,
+// e.g. "2B/SS") and run a bipartite-matching DFS with most-constrained-first
+// ordering so single-position players always claim their natural slot first.
+function sortAndAssignPositions(
+  players: PlayerRow[],
+  platform?: PlatformType,
+): Array<{ player: PlayerRow; displayPos: string }> {
+  const pitchers = players.filter(p => p.position === 'P')
+  const batters  = players.filter(p => p.position !== 'P')
+
   const posOrder = platform === 'fanduel'
     ? ['C/1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF', 'UTIL']
     : ['C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']
-  const batters = players.filter(p => assignedPos(p) !== 'P')
 
-  const filled: PlayerRow[] = [...pitchers]
-  const remaining = [...batters]
-  for (const pos of posOrder) {
-    const idx = remaining.findIndex(p => assignedPos(p) === pos)
-    if (idx >= 0) {
-      filled.push(remaining.splice(idx, 1)[0])
+  // Most-constrained first → canonical, stable assignment
+  const sortedBatters = [...batters].sort(
+    (a, b) => a.position.split('/').length - b.position.split('/').length
+  )
+
+  const slotToPlayer: (PlayerRow | null)[] = new Array(posOrder.length).fill(null)
+
+  function canFill(player: PlayerRow, slotIdx: number): boolean {
+    const elig = player.position.split('/')
+    const accepts = SLOT_ELIGIBILITY[posOrder[slotIdx]] ?? new Set([posOrder[slotIdx]])
+    return elig.some(pos => accepts.has(pos))
+  }
+
+  function tryAssign(player: PlayerRow, visited: Set<number>): boolean {
+    for (let j = 0; j < posOrder.length; j++) {
+      if (!visited.has(j) && canFill(player, j)) {
+        visited.add(j)
+        const occ = slotToPlayer[j]
+        if (occ === null || tryAssign(occ, visited)) {
+          slotToPlayer[j] = player
+          return true
+        }
+      }
+    }
+    return false
+  }
+
+  for (const batter of sortedBatters) {
+    tryAssign(batter, new Set())
+  }
+
+  const result: Array<{ player: PlayerRow; displayPos: string }> = [
+    ...pitchers.map(p => ({ player: p, displayPos: 'P' })),
+  ]
+
+  const matched = new Set<PlayerRow>()
+  for (let j = 0; j < posOrder.length; j++) {
+    const player = slotToPlayer[j]
+    if (player !== null) {
+      result.push({ player, displayPos: posOrder[j] })
+      matched.add(player)
     }
   }
-  filled.push(...remaining)
-  return filled
+
+  // Safety valve: any unmatched batters go at the end (shouldn't occur for valid lineups)
+  for (const batter of batters) {
+    if (!matched.has(batter)) {
+      result.push({ player: batter, displayPos: batter.position.split('/')[0] })
+    }
+  }
+
+  return result
 }
 
 export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
@@ -79,7 +141,7 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
       </div>
       <div className="portfolio-cards">
         {lineups.map(lineup => {
-          const sorted = sortPlayersByPosition(lineup.players, platform)
+          const sorted = sortAndAssignPositions(lineup.players, platform)
           const stack = getStackNotation(lineup.players)
           const isReplacing = replacingLineupIndex === lineup.lineup_index
           return (
@@ -115,12 +177,12 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
                 </div>
               )}
               <div className="lineup-card-players">
-                {sorted.map((p, i) => (
+                {sorted.map(({ player: p, displayPos }, i) => (
                   <div key={i} className="lineup-player">
-                    <span className="lineup-player-pos">{assignedPos(p)}</span>
+                    <span className="lineup-player-pos">{displayPos}</span>
                     <span className="lineup-player-name">
                       {p.name}
-                      {assignedPos(p) !== 'P' && (() => {
+                      {displayPos !== 'P' && (() => {
                         const slotNum = p.slot != null && p.slot >= 1 && p.slot <= 9 ? p.slot : null
                         if (p.slot_confirmed) {
                           return <span className="batting-slot-bubble batting-slot-bubble--confirmed" title="Confirmed lineup slot">{slotNum ?? '?'}</span>

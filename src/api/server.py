@@ -136,23 +136,42 @@ def _resolve_proj_path(cfg: AppConfig) -> Path:
     return PROJECT_ROOT / path_str if not Path(path_str).is_absolute() else Path(path_str)
 
 
+def _resolve_fd_slate_path(cfg: AppConfig) -> str:
+    """Return the fd_slate path, auto-discovering a newer file if the configured one is missing.
+
+    If the configured path is absent or points to a non-existent file, scans
+    data/raw/ for the most-recent FanDuel-MLB-*.csv and updates config.yaml so
+    the new path persists for subsequent calls.  Returns an empty string if no
+    FD CSV is found at all.
+    """
+    from src.ingestion.factory import find_fd_slate
+    raw = getattr(cfg.paths, "fd_slate", "") or ""
+    if raw:
+        p = PROJECT_ROOT / raw if not Path(raw).is_absolute() else Path(raw)
+        if p.exists():
+            return raw  # configured path is valid — nothing to do
+    # Either empty or stale — try auto-discovery.
+    discovered = find_fd_slate(str(PROJECT_ROOT / "data/raw"))
+    if not discovered:
+        return ""
+    try:
+        rel = str(Path(discovered).relative_to(PROJECT_ROOT))
+    except ValueError:
+        rel = discovered
+    if rel != raw:
+        cfg.paths.fd_slate = rel
+        write_config(cfg)
+    return rel
+
+
 def _load_slate_df():
     """Parse the configured slate CSV and return a DataFrame (or None)."""
     cfg = read_config()
     from src.platforms.base import Platform
-    from src.ingestion.factory import find_fd_slate, get_ingestor
+    from src.ingestion.factory import get_ingestor
     platform = cfg.platform if hasattr(cfg, 'platform') else Platform.DRAFTKINGS
     if platform == Platform.FANDUEL:
-        slate_path = cfg.paths.fd_slate
-        if not slate_path:
-            discovered = find_fd_slate(str(PROJECT_ROOT / "data/raw"))
-            if discovered:
-                try:
-                    slate_path = str(Path(discovered).relative_to(PROJECT_ROOT))
-                except ValueError:
-                    slate_path = discovered
-                cfg.paths.fd_slate = slate_path
-                write_config(cfg)
+        slate_path = _resolve_fd_slate_path(cfg)
     else:
         slate_path = cfg.paths.dk_slate
     if not slate_path:
@@ -288,7 +307,7 @@ def projections_status() -> ProjectionsStatus:
     # Resolve platform-appropriate slate path for freshness check
     slate_path: Path | None = None
     if platform_val == "fanduel":
-        fd_raw = cfg.paths.fd_slate if hasattr(cfg.paths, "fd_slate") else ""
+        fd_raw = _resolve_fd_slate_path(cfg)
         if fd_raw:
             _fp = PROJECT_ROOT / fd_raw if not Path(fd_raw).is_absolute() else Path(fd_raw)
             if _fp.exists():
@@ -357,7 +376,7 @@ async def projections_slates() -> SlateListResponse:
     # Resolve platform-appropriate slate path
     slate_raw: str = ""
     if platform_val == "fanduel":
-        slate_raw = cfg.paths.fd_slate if hasattr(cfg.paths, "fd_slate") else ""
+        slate_raw = _resolve_fd_slate_path(cfg)
     else:
         slate_raw = cfg.paths.dk_slate
 
@@ -409,7 +428,7 @@ async def projections_fetch(request: Request):
 
     # Resolve the canonical slate path for metadata recording
     if platform_val == "fanduel":
-        fd_raw = cfg.paths.fd_slate if hasattr(cfg.paths, "fd_slate") else ""
+        fd_raw = _resolve_fd_slate_path(cfg)
         _slate_path_for_meta: Path | None = None
         if fd_raw:
             _fp2 = PROJECT_ROOT / fd_raw if not Path(fd_raw).is_absolute() else Path(fd_raw)
@@ -423,7 +442,7 @@ async def projections_fetch(request: Request):
     # For DK: --platform draftkings  (default DKSalaries.csv path used by scripts)
     _platform_args: list[str] = ["--platform", platform_val]
     if platform_val == "fanduel":
-        fd_raw2 = cfg.paths.fd_slate if hasattr(cfg.paths, "fd_slate") else ""
+        fd_raw2 = fd_raw  # already resolved above
         if fd_raw2:
             _platform_args += ["--fd-slate", str(
                 PROJECT_ROOT / fd_raw2 if not Path(fd_raw2).is_absolute() else Path(fd_raw2)

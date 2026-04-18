@@ -93,10 +93,26 @@ class PipelineRunner:
         platform = Platform(cfg.get("platform", "draftkings"))
         roster_rules = get_roster(platform)
         slot_elig = get_slot_eligibility(platform)
-        slate_path = (
-            paths["dk_slate"] if platform == Platform.DRAFTKINGS
-            else paths.get("fd_slate", "")
-        )
+        if platform == Platform.DRAFTKINGS:
+            slate_path = paths["dk_slate"]
+        else:
+            from pathlib import Path as _Path
+            from src.ingestion.factory import find_fd_slate
+            slate_path = paths.get("fd_slate", "")
+            _root = _Path(self._config_path).resolve().parent
+            _abs = (_root / slate_path) if slate_path else None
+            if _abs is None or not _abs.exists():
+                raw_dir = str(_abs.parent) if _abs else str(_root / "data" / "raw")
+                discovered = find_fd_slate(raw_dir)
+                if discovered:
+                    try:
+                        slate_path = str(_Path(discovered).relative_to(_root))
+                    except ValueError:
+                        slate_path = discovered
+                    cfg["paths"]["fd_slate"] = slate_path
+                    import yaml as _yaml
+                    with open(self._config_path, "w") as _f:
+                        _yaml.dump(cfg, _f, default_flow_style=False, sort_keys=False)
 
         # --- Entry file discovery ----------------------------------------
         from src.api.entries_factory import get_entry_handlers
@@ -698,11 +714,21 @@ class PipelineRunner:
         Uses the same bipartite matching as the optimizer so the assigned position
         reflects the actual slot the player fills (e.g. 'SS' for a 3B/SS player
         placed at shortstop). Falls back to primary position on failure.
+
+        Players are sorted by number of eligible positions ascending (most
+        constrained first) so that single-position players always claim their
+        natural slot before multi-eligible players fill in around them.  This
+        produces a canonical assignment for display — e.g. a pure 2B player
+        always gets the 2B slot even when a 2B/3B teammate is also in the lineup.
         """
         from src.optimization.optimizer import _compute_slot_assignment
         try:
-            _, pidx_to_slot = _compute_slot_assignment(lineup.player_ids, player_meta)
-            return {pid: SLOTS[pidx_to_slot[j]] for j, pid in enumerate(lineup.player_ids)}
+            ids = sorted(
+                lineup.player_ids,
+                key=lambda pid: len(player_meta.get(pid, {}).get('eligible_positions') or ['']),
+            )
+            _, pidx_to_slot = _compute_slot_assignment(ids, player_meta)
+            return {pid: SLOTS[pidx_to_slot[j]] for j, pid in enumerate(ids)}
         except RuntimeError:
             return {pid: player_meta.get(pid, {}).get('position', '') for pid in lineup.player_ids}
 
