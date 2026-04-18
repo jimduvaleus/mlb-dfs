@@ -217,9 +217,12 @@ class PipelineRunner:
         target = port_cfg.get("target_score")
         if target is None:
             target_percentile = int(port_cfg.get("target_percentile", 90))
-            target = self._compute_auto_target(players_df, sim_results, target_percentile)
+            target = self._compute_auto_target(
+                players_df, sim_results, target_percentile,
+                rules=roster_rules, slot_eligibility=slot_elig,
+            )
             logger.info(
-                "Auto-computed target: %.1f DK pts (p%d)", target, target_percentile
+                "Auto-computed target: %.1f pts (p%d)", target, target_percentile
             )
             self._cb("compute_target", {"target": target, "percentile": target_percentile})
         else:
@@ -232,7 +235,9 @@ class PipelineRunner:
         objective = str(opt_cfg.get("objective", "expected_surplus"))
         payout_beta_cfg = opt_cfg.get("payout_beta")
         _BETA_MAX = 4.0
-        score_dist = self._best_lineup_score_distribution(players_df, sim_results)
+        score_dist = self._best_lineup_score_distribution(
+            players_df, sim_results, rules=roster_rules, slot_eligibility=slot_elig
+        )
         fixed_ref_p90 = float(np.percentile(score_dist, 90))
         fixed_ref_p99 = float(np.percentile(score_dist, 99))
         if objective == "marginal_payout":
@@ -665,38 +670,70 @@ class PipelineRunner:
     def _best_lineup_score_distribution(
         players_df: pd.DataFrame,
         sim_results: "SimulationResults",
+        rules=None,
+        slot_eligibility: Optional[dict] = None,
     ) -> np.ndarray:
         """Compute the per-sim score totals for the top-mean lineup.
 
         Returns an (n_sims,) array of lineup totals — one per simulation.
         Used for both auto-target computation and payout beta calibration.
+
+        When ``rules`` is provided the reference lineup is built by greedily
+        filling each roster slot (in order) with the highest-mean eligible
+        player not yet selected.  This correctly handles platform-specific
+        roster sizes and compound slots (e.g. FD's C/1B and UTIL).
+        When ``rules`` is None the legacy DK-hardcoded logic is used.
         """
         col_map = {pid: i for i, pid in enumerate(sim_results.player_ids)}
         sorted_df = players_df.sort_values("mean", ascending=False)
-        counts: dict[str, int] = {pos: 0 for pos in ROSTER_REQUIREMENTS}
-        selected: list[int] = []
-        for _, row in sorted_df.iterrows():
-            pos = str(row["position"])
-            if pos in counts and counts[pos] < ROSTER_REQUIREMENTS[pos]:
-                selected.append(int(row["player_id"]))
-                counts[pos] += 1
-            if len(selected) == 10:
-                break
-        if len(selected) == 10:
+
+        if rules is not None:
+            pid_list = sorted_df["player_id"].tolist()
+            pos_map = dict(zip(sorted_df["player_id"], sorted_df["position"]))
+            _slot_elig = slot_eligibility or {}
+            used: set[int] = set()
+            selected: list[int] = []
+            for slot in rules.slots:
+                eligible_positions = _slot_elig.get(slot, {slot})
+                for pid in pid_list:
+                    if pid in used:
+                        continue
+                    if pos_map.get(pid, "") in eligible_positions:
+                        selected.append(pid)
+                        used.add(pid)
+                        break
+            roster_size = rules.roster_size
+        else:
+            counts: dict[str, int] = {pos: 0 for pos in ROSTER_REQUIREMENTS}
+            selected = []
+            for _, row in sorted_df.iterrows():
+                pos = str(row["position"])
+                if pos in counts and counts[pos] < ROSTER_REQUIREMENTS[pos]:
+                    selected.append(int(row["player_id"]))
+                    counts[pos] += 1
+                if len(selected) == 10:
+                    break
+            roster_size = 10
+
+        if len(selected) == roster_size:
             cols = [col_map[pid] for pid in selected if pid in col_map]
-            if len(cols) == 10:
+            if len(cols) == roster_size:
                 return sim_results.results_matrix[:, cols].sum(axis=1)
         n = len(players_df)
         row_sums = sim_results.results_matrix.sum(axis=1)
-        return row_sums * 10.0 / n
+        return row_sums * float(roster_size) / n
 
     @staticmethod
     def _compute_auto_target(
         players_df: pd.DataFrame,
         sim_results: "SimulationResults",
         percentile: int,
+        rules=None,
+        slot_eligibility: Optional[dict] = None,
     ) -> float:
-        totals = PipelineRunner._best_lineup_score_distribution(players_df, sim_results)
+        totals = PipelineRunner._best_lineup_score_distribution(
+            players_df, sim_results, rules=rules, slot_eligibility=slot_eligibility
+        )
         return float(np.percentile(totals, percentile))
 
     @staticmethod
