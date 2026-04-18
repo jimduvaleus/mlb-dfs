@@ -608,7 +608,7 @@ async def projections_fetch(request: Request):
                     # Step 2: Market odds — pass --games filter when doing a partial fetch
                     yield _log("--- Fetching Market Odds (CrazyNinjaOdds) ---")
                     mo_cmd = [str(python), str(mo_script), "--output", str(mo_out),
-                              "--rw-output", str(rw_out)]
+                              "--rw-output", str(rw_out), *_platform_args]
                     if included_pairs:
                         games_arg = ",".join(f"{a}@{h}" for a, h in included_pairs)
                         mo_cmd += ["--games", games_arg]

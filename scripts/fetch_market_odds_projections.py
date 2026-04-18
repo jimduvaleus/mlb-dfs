@@ -56,6 +56,8 @@ from datetime import datetime
 from datetime import time as dtime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import pandas as pd
 from scipy.optimize import brentq
 from scipy.stats import poisson as scipy_poisson
@@ -130,6 +132,24 @@ MARKET_KEY_MAP: dict[str, str] = {
 # HBP heuristics (league-average constants)
 HBP_PER_WALK            = 0.11   # batter: E[HBP] = E[BB] * this
 HBP_PER_INNING_PITCHER  = 0.039  # pitcher: E[HBP] = E[IP] * this
+
+# Scoring coefficients keyed by platform
+# Batter: keys match the E[X] variable names used in _compute_batter_projection
+_DK_BATTER = dict(single=3.0, double=5.0, triple=8.0, home_run=10.0,
+                  run=2.0, rbi=2.0, walk=2.0, hbp=2.0, sb=5.0)
+_FD_BATTER = dict(single=3.0, double=6.0, triple=9.0, home_run=12.0,
+                  run=3.2, rbi=3.5, walk=3.0, hbp=3.0, sb=6.0)
+
+# Pitcher: 'out' is per out recorded (DK: 0.75/out = 2.25/IP; FD: 1.0/out = 3.0/IP)
+# 'h', 'bb', 'hbp' are 0 on FD (no penalty for allowing baserunners).
+_DK_PITCHER = dict(out=0.75, k=2.0, win=4.0, qs=0.0,
+                   er=-2.0, h=-0.6, bb=-0.6, hbp=-0.6)
+_FD_PITCHER = dict(out=1.0,  k=3.0, win=6.0, qs=4.0,
+                   er=-3.0,  h=0.0,  bb=0.0,  hbp=0.0)
+
+# P(ER ≤ 3 | IP ≥ 6, no ER market) — historical MLB league-average fallback used
+# when the Earned Runs market is unavailable for a pitcher.
+_QS_ER_FALLBACK_PROB = 0.60
 
 # Max browser pages open simultaneously while fetching game odds.
 # Tune down to 1-2 if the site starts returning empty tables or HTTP 429s.
@@ -314,7 +334,7 @@ def _extract_date_from_dk(dk_path: str) -> str | None:
     return None
 
 
-def _extract_game_info_from_dk(dk_path: str) -> dict[tuple[str, str], dtime]:
+def _extract_game_info_from_dk(dk_path: str) -> dict[tuple[str, str], dtime | None]:
     """
     Parse DK Game Info column → {(away_abbr, home_abbr): game_time_ET}.
     Example Game Info: "ARI@PHI 04/11/2026 01:05PM ET"
@@ -341,10 +361,75 @@ def _extract_game_info_from_dk(dk_path: str) -> dict[tuple[str, str], dtime]:
 
 
 # ---------------------------------------------------------------------------
+# FanDuel slate helpers
+# ---------------------------------------------------------------------------
+
+_FD_DATE_IN_PATH_RE = re.compile(r"FanDuel-MLB-(\d{4}-\d{2}-\d{2})-")
+
+
+def _extract_date_from_fd_path(path: str) -> str | None:
+    """
+    Extract 'YYYY-MM-DD' from a FanDuel salary CSV filename.
+    FD filenames follow the pattern: FanDuel-MLB-YYYY-MM-DD-*.csv
+    Returns None if the pattern is not found.
+    """
+    m = _FD_DATE_IN_PATH_RE.search(Path(path).name)
+    return m.group(1) if m else None
+
+
+def _extract_game_info_from_fd(fd_path: str) -> dict[tuple[str, str], dtime | None]:
+    """
+    Parse FanDuel salary CSV → {(away_abbr, home_abbr): game_time_ET_or_None}.
+
+    FD's "Game" column contains only "AWAY@HOME" (no date/time), so game_time
+    is always None.  The time-match step in _find_game_ids skips the tolerance
+    check when the slate time is None (matching on team pairs only).
+    """
+    from src.ingestion.fd_slate import FanDuelSlateIngestor
+
+    games: dict[tuple[str, str], dtime | None] = {}
+    try:
+        df = FanDuelSlateIngestor(fd_path).get_slate_dataframe()
+        for raw in df["game"].dropna().unique():
+            m = re.match(r"(\w+)@(\w+)", str(raw).strip())
+            if m:
+                away, home = m.group(1).upper(), m.group(2).upper()
+                games[(away, home)] = None  # no time info in FD CSV
+    except Exception as e:
+        log.warning("Could not extract game info from FD file: %s", e)
+    return games
+
+
+def _build_fd_player_lookup(
+    fd_path: str,
+) -> tuple[dict[str, list[tuple[int, float, str]]], dict[int, str]]:
+    """
+    Build player lookup dicts from a FanDuel salary CSV via FanDuelSlateIngestor.
+
+    Returns:
+        (lookup, pos_map) matching the DK equivalents built in build_projections_csv:
+        lookup  — {normalised_name: [(player_id, salary, team_abbr), ...]}
+        pos_map — {player_id: position_string}
+    """
+    from src.ingestion.fd_slate import FanDuelSlateIngestor
+
+    df = FanDuelSlateIngestor(fd_path).get_slate_dataframe()
+    lookup: dict[str, list[tuple[int, float, str]]] = {}
+    for _, row in df.iterrows():
+        key = _normalise(str(row["name"]))
+        pid = int(row["player_id"])
+        sal = float(row["salary"])
+        team = str(row["team"]).upper()
+        lookup.setdefault(key, []).append((pid, sal, team))
+    pos_map: dict[int, str] = {int(r["player_id"]): str(r["position"]) for _, r in df.iterrows()}
+    return lookup, pos_map
+
+
+# ---------------------------------------------------------------------------
 # Game ID cache
 # ---------------------------------------------------------------------------
 
-def _game_id_cache_key(slate_date: str, slate_games: dict[tuple[str, str], dtime]) -> str:
+def _game_id_cache_key(slate_date: str, slate_games: dict[tuple[str, str], dtime | None]) -> str:
     """Stable cache key: date + sorted game matchups."""
     games_str = "|".join(sorted(f"{a}@{h}" for a, h in slate_games.keys()))
     return f"{slate_date}|{games_str}"
@@ -869,13 +954,15 @@ async def _fetch_game_odds(
 
 async def _find_game_ids(
     page,
-    slate_games: dict[tuple[str, str], dtime],
+    slate_games: dict[tuple[str, str], dtime | None],
     slate_date: str,
     debug: bool = False,
 ) -> dict[tuple[str, str], int]:
     """
     Navigate to games.aspx and return game_ids matching slate games.
     Matches by: league=MLB, date=slate_date, team pair, game time ±30 min.
+    When slate_time is None (e.g. FD CSV has no time info), the time check
+    is skipped and any game on the correct date with matching teams is accepted.
     """
     log.info("Loading games list: %s", GAMES_URL)
     await page.goto(GAMES_URL, wait_until="domcontentloaded")
@@ -989,19 +1076,24 @@ async def _find_game_ids(
 
         game_away, game_home = found_abbrs[0], found_abbrs[1]
 
-        # Match to slate game by team pair + time tolerance ±30 min
+        # Match to slate game by team pair + optional time tolerance ±30 min.
+        # When slate_time is None (e.g. FD CSV has no game time), match on
+        # team pairs only — any CrazyNinjaOdds game on the correct date with
+        # the same two teams is accepted.
         for (slate_away, slate_home), slate_time in slate_games.items():
             if {game_away, game_home} == {slate_away, slate_home}:
-                delta = abs(
-                    (game_time.hour * 60 + game_time.minute)
-                    - (slate_time.hour * 60 + slate_time.minute)
-                )
-                if delta <= 30:
-                    game_id_map[(slate_away, slate_home)] = game_id
-                    log.info(
-                        "Matched %s@%s → game_id=%d", slate_away, slate_home, game_id
+                if slate_time is not None:
+                    delta = abs(
+                        (game_time.hour * 60 + game_time.minute)
+                        - (slate_time.hour * 60 + slate_time.minute)
                     )
-                    break
+                    if delta > 30:
+                        continue
+                game_id_map[(slate_away, slate_home)] = game_id
+                log.info(
+                    "Matched %s@%s → game_id=%d", slate_away, slate_home, game_id
+                )
+                break
 
     for key in slate_games:
         if key not in game_id_map:
@@ -1014,11 +1106,37 @@ async def _find_game_ids(
 # Projection calculation
 # ---------------------------------------------------------------------------
 
+def _compute_qs_probability(e_outs: float, e_er: float) -> float:
+    """
+    Estimate P(Quality Start) from Poisson market-odds estimates.
+
+    A Quality Start is IP ≥ 6.0 AND ER ≤ 3.  Both dimensions are modelled as
+    independent Poisson random variables using the λ values back-solved from
+    the Outs Recorded and Earned Runs Allowed market odds.
+
+    P(QS) ≈ P(Outs ≥ 18 | λ_outs) × P(ER ≤ 3 | λ_er)
+
+    The independence assumption slightly overestimates P(QS) (high-ER games
+    tend to be shorter), but the ER market already captures that signal
+    through p_er3.  When ER market data is absent (e_er == 0), we fall back
+    to the historical league-average P(ER ≤ 3 | IP ≥ 6) ≈ 0.60.
+    """
+    if e_outs <= 0:
+        return 0.0
+    p_ip6 = 1.0 - float(scipy_poisson.cdf(17, e_outs))       # P(Outs ≥ 18)
+    if e_er > 0:
+        p_er3 = float(scipy_poisson.cdf(3, e_er))             # P(ER ≤ 3)
+    else:
+        p_er3 = _QS_ER_FALLBACK_PROB
+    return p_ip6 * p_er3
+
+
 def _compute_batter_projection(
-    player_markets: dict[str, list[tuple[float, float]]]
+    player_markets: dict[str, list[tuple[float, float]]],
+    platform: str = "draftkings",
 ) -> tuple[float, float] | tuple[None, str]:
     """
-    Compute (mean_dk, std_dev_dk) for a batter from market mean estimates.
+    Compute (mean, std_dev) for a batter from market mean estimates.
 
     Uses the Geometric NB (r=1) model to back-solve E[X] from O/U fair odds.
     This corrects the systematic underestimation Poisson produces for batter
@@ -1032,6 +1150,8 @@ def _compute_batter_projection(
     the caller should use a RotoWire fallback projection in that case.
     Returns (mean, std_dev) on success.
     """
+    c = _FD_BATTER if platform == "fanduel" else _DK_BATTER
+
     def get_mu(key: str) -> float:
         lp = player_markets.get(key, [])
         if not lp:
@@ -1066,33 +1186,42 @@ def _compute_batter_projection(
     e_hbp = e_bb * HBP_PER_WALK
 
     mean = (
-        e_s * 3 + e_d * 5 + e_t * 8 + e_hr * 10
-        + e_r * 2 + e_rbi * 2 + e_bb * 2 + e_sb * 5 + e_hbp * 2
+        e_s * c["single"] + e_d * c["double"] + e_t * c["triple"] + e_hr * c["home_run"]
+        + e_r * c["run"] + e_rbi * c["rbi"] + e_bb * c["walk"] + e_sb * c["sb"]
+        + e_hbp * c["hbp"]
     )
     # Var[aX] = a² * μ(1+μ) for Geometric NB(r=1).
     # The μ(1+μ) term (vs. Poisson's μ) captures the overdispersion inherent
     # in batter game-log distributions and gives a more realistic std_dev.
     var = (
-        e_s   * (1 + e_s)   * 9
-        + e_d   * (1 + e_d)   * 25
-        + e_t   * (1 + e_t)   * 64
-        + e_hr  * (1 + e_hr)  * 100
-        + e_r   * (1 + e_r)   * 4
-        + e_rbi * (1 + e_rbi) * 4
-        + e_bb  * (1 + e_bb)  * 4
-        + e_sb  * (1 + e_sb)  * 25
-        + e_hbp * (1 + e_hbp) * 4
+        e_s   * (1 + e_s)   * c["single"]   ** 2
+        + e_d   * (1 + e_d)   * c["double"]   ** 2
+        + e_t   * (1 + e_t)   * c["triple"]   ** 2
+        + e_hr  * (1 + e_hr)  * c["home_run"] ** 2
+        + e_r   * (1 + e_r)   * c["run"]      ** 2
+        + e_rbi * (1 + e_rbi) * c["rbi"]      ** 2
+        + e_bb  * (1 + e_bb)  * c["walk"]     ** 2
+        + e_sb  * (1 + e_sb)  * c["sb"]       ** 2
+        + e_hbp * (1 + e_hbp) * c["hbp"]      ** 2
     )
     return mean, max(math.sqrt(var), 1.0)
 
 
 def _compute_pitcher_projection(
-    player_markets: dict[str, list[tuple[float, float]]]
+    player_markets: dict[str, list[tuple[float, float]]],
+    platform: str = "draftkings",
 ) -> tuple[float, float] | None:
     """
-    Compute (mean_dk, std_dev_dk) for a pitcher from market lambda estimates.
+    Compute (mean, std_dev) for a pitcher from market lambda estimates.
     Returns None if there is insufficient data.
+
+    For FanDuel, a Quality Start bonus (4 pts) is included.  P(QS) is
+    estimated from the Outs Recorded and Earned Runs Allowed Poisson lambdas
+    via _compute_qs_probability.  When ER market data is absent, a
+    league-average fallback of P(ER ≤ 3 | IP ≥ 6) ≈ 0.60 is used.
     """
+    c = _FD_PITCHER if platform == "fanduel" else _DK_PITCHER
+
     def get_lam(key: str) -> float:
         lp = player_markets.get(key, [])
         if not lp:
@@ -1113,13 +1242,24 @@ def _compute_pitcher_projection(
     e_ip  = e_outs / 3.0
     e_hbp = e_ip * HBP_PER_INNING_PITCHER
 
+    # QS: only meaningful for FD (qs coef = 0 on DK); treat QS indicator as
+    # Bernoulli(p_qs) — E[QS] = p_qs, Var[QS] = p_qs*(1-p_qs).
+    p_qs = _compute_qs_probability(e_outs, e_er) if platform == "fanduel" else 0.0
+
     mean = (
-        e_outs * 0.75 + e_k * 2.0 + e_win * 4.0
-        + e_er * (-2.0) + e_ha * (-0.6) + e_bba * (-0.6) + e_hbp * (-0.6)
+        e_outs * c["out"] + e_k * c["k"] + e_win * c["win"] + p_qs * c["qs"]
+        + e_er  * c["er"]
+        + e_ha  * c["h"] + e_bba * c["bb"] + e_hbp * c["hbp"]
     )
     var = (
-        e_outs * 0.5625 + e_k * 4.0 + e_win * 16.0
-        + e_er * 4.0 + e_ha * 0.36 + e_bba * 0.36 + e_hbp * 0.36
+        e_outs * c["out"] ** 2
+        + e_k   * c["k"]   ** 2
+        + e_win * c["win"] ** 2
+        + e_er  * c["er"]  ** 2
+        + e_ha  * c["h"]   ** 2
+        + e_bba * c["bb"]  ** 2
+        + e_hbp * c["hbp"] ** 2
+        + p_qs * (1.0 - p_qs) * c["qs"] ** 2  # Bernoulli QS variance
     )
     return mean, max(math.sqrt(var), 1.0)
 
@@ -1162,10 +1302,11 @@ def _install_rate_limit_handler(page, label: str) -> None:
 
 
 async def _run_playwright(
-    dk_path: str,
+    slate_path: str,
     name_map: dict[str, str],
     debug: bool = False,
     games_filter: set[tuple[str, str]] | None = None,
+    platform: str = "draftkings",
 ) -> tuple[
     dict[tuple[str, str, str], dict[str, list[tuple[float, float]]]],
     set[tuple[str, str, str]],
@@ -1181,18 +1322,28 @@ async def _run_playwright(
     matched to the correct DK player_id at projection time.
 
     games_filter: if provided, only fetch these (away, home) matchups.
+    platform: 'draftkings' or 'fanduel' — controls date/game extraction path.
     """
     from playwright.async_api import async_playwright
 
-    slate_date = _extract_date_from_dk(dk_path)
-    if not slate_date:
-        log.error("Could not extract date from DK file.")
-        return {}, set()
+    if platform == "fanduel":
+        slate_date = _extract_date_from_fd_path(slate_path)
+        if not slate_date:
+            log.error("Could not extract date from FD filename: %s", Path(slate_path).name)
+            return {}, set()
+    else:
+        slate_date = _extract_date_from_dk(slate_path)
+        if not slate_date:
+            log.error("Could not extract date from DK file.")
+            return {}, set()
     log.info("Slate date: %s", slate_date)
 
-    slate_games = _extract_game_info_from_dk(dk_path)
+    if platform == "fanduel":
+        slate_games = _extract_game_info_from_fd(slate_path)
+    else:
+        slate_games = _extract_game_info_from_dk(slate_path)
     if not slate_games:
-        log.error("Could not extract games from DK file.")
+        log.error("Could not extract games from %s file.", platform.upper())
         return {}, set()
 
     if games_filter:
@@ -1325,41 +1476,57 @@ def build_projections_csv(
     debug: bool = False,
     games_filter: set[tuple[str, str]] | None = None,
     rw_player_ids: set[int] | None = None,
+    platform: str = "draftkings",
+    fd_path: str | None = None,
 ) -> pd.DataFrame:
     """
     Fetch market odds and produce projections CSV.
     Output columns: player_id, name, mean, std_dev  (no lineup_slot).
 
     rw_player_ids: if provided, only compute projections for players whose
-        DK player_id appears in this set (i.e. players with a RotoWire lineup
+        player_id appears in this set (i.e. players with a RotoWire lineup
         slot).  Players not in the set are silently skipped.
 
     games_filter: if provided, only fetch these (away, home) matchups.
+
+    platform: 'draftkings' (default) or 'fanduel'.
+    fd_path: path to FanDuel salary CSV (required when platform='fanduel').
     """
     name_map = name_map or {}
 
-    log.info("Loading DK salary file: %s", dk_path)
-    dk_df = pd.read_csv(dk_path)
-    dk_df.rename(
-        columns={"ID": "player_id", "Name": "name", "Salary": "salary"},
-        inplace=True,
-    )
-
-    dk_lookup: dict[str, list[tuple[int, float, str]]] = {}
-    for _, row in dk_df.iterrows():
-        key = _normalise(str(row["name"]))
-        pid = int(row["player_id"])
-        sal = float(row["salary"])
-        team = str(row.get("TeamAbbrev", "")).upper()
-        dk_lookup.setdefault(key, []).append((pid, sal, team))
-
-    dk_pos: dict[int, str] = {}
-    if "Position" in dk_df.columns:
-        dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
+    # Build player lookup (name → [(player_id, salary, team)]) and position map.
+    if platform == "fanduel":
+        if not fd_path:
+            log.error("--fd-slate is required when --platform fanduel")
+            sys.exit(1)
+        log.info("Loading FD salary file: %s", fd_path)
+        dk_lookup, dk_pos = _build_fd_player_lookup(fd_path)
+        slate_path = fd_path
+    else:
+        log.info("Loading DK salary file: %s", dk_path)
+        dk_df = pd.read_csv(dk_path)
+        dk_df.rename(
+            columns={"ID": "player_id", "Name": "name", "Salary": "salary"},
+            inplace=True,
+        )
+        dk_lookup: dict[str, list[tuple[int, float, str]]] = {}
+        for _, row in dk_df.iterrows():
+            key = _normalise(str(row["name"]))
+            pid = int(row["player_id"])
+            sal = float(row["salary"])
+            team = str(row.get("TeamAbbrev", "")).upper()
+            dk_lookup.setdefault(key, []).append((pid, sal, team))
+        dk_pos: dict[int, str] = {}
+        if "Position" in dk_df.columns:
+            dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
+        slate_path = dk_path
 
     # Fetch market data
     all_market_data, all_seen_players = asyncio.run(
-        _run_playwright(dk_path, name_map, debug=debug, games_filter=games_filter)
+        _run_playwright(
+            slate_path, name_map, debug=debug,
+            games_filter=games_filter, platform=platform,
+        )
     )
 
     if not all_market_data:
@@ -1388,7 +1555,7 @@ def build_projections_csv(
         is_pitcher = any(p.upper() in {"P", "SP", "RP"} for p in position.split("/"))
 
         if is_pitcher:
-            result = _compute_pitcher_projection(player_markets)
+            result = _compute_pitcher_projection(player_markets, platform=platform)
             if result is None:
                 log.info(
                     "No projection for pitcher %s (pid=%d) — markets present: %s",
@@ -1397,7 +1564,7 @@ def build_projections_csv(
                 continue
             mean, std_dev = result
         else:
-            batter_result = _compute_batter_projection(player_markets)
+            batter_result = _compute_batter_projection(player_markets, platform=platform)
             if batter_result[0] is None:
                 reason = str(batter_result[1])
                 log.info(
@@ -1498,10 +1665,26 @@ def main() -> None:
         epilog=__doc__,
     )
     parser.add_argument(
+        "--platform",
+        choices=["draftkings", "fanduel"],
+        default="draftkings",
+        help="DFS platform (default: draftkings)",
+    )
+    parser.add_argument(
         "--dk-slate",
         default=str(PROJECT_ROOT / "data" / "raw" / "DKSalaries.csv"),
         metavar="PATH",
         help="DraftKings salary CSV (default: data/raw/DKSalaries.csv)",
+    )
+    parser.add_argument(
+        "--fd-slate",
+        default=None,
+        metavar="PATH",
+        help=(
+            "FanDuel salary CSV (required when --platform fanduel). "
+            "Filename must follow the FanDuel-MLB-YYYY-MM-DD-*.csv convention "
+            "so the slate date can be extracted from it."
+        ),
     )
     parser.add_argument(
         "--output",
@@ -1574,6 +1757,8 @@ def main() -> None:
         debug=args.debug,
         games_filter=games_filter,
         rw_player_ids=rw_player_ids,
+        platform=args.platform,
+        fd_path=args.fd_slate,
     )
 
 
