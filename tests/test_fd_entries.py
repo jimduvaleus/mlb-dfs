@@ -482,7 +482,7 @@ class TestWriteFdUploadFiles:
         entries = [(path, [entry])]
         assignments = {path: [(entry, lineup)]}
         write_fd_upload_files(entries, assignments, slate_df, str(tmp_path))
-        upload_path = tmp_path / f"upload_{path.name}"
+        upload_path = tmp_path / "upload_FanDuel.csv"
         with open(upload_path, newline="") as f:
             header = next(csv.reader(f))
         assert header == FD_UPLOAD_HEADER
@@ -495,7 +495,7 @@ class TestWriteFdUploadFiles:
         entries = [(path, [entry])]
         assignments = {path: [(entry, lineup)]}
         write_fd_upload_files(entries, assignments, slate_df, str(tmp_path))
-        upload_path = tmp_path / f"upload_{path.name}"
+        upload_path = tmp_path / "upload_FanDuel.csv"
         with open(upload_path, newline="") as f:
             rows = list(csv.reader(f))
         # header + 1 data row
@@ -510,7 +510,7 @@ class TestWriteFdUploadFiles:
         entries = [(path, [entry])]
         assignments = {path: [(entry, lineup)]}
         write_fd_upload_files(entries, assignments, slate_df, str(tmp_path))
-        upload_path = tmp_path / f"upload_{path.name}"
+        upload_path = tmp_path / "upload_FanDuel.csv"
         with open(upload_path, newline="") as f:
             rows = list(csv.reader(f))
         data_row = rows[1]
@@ -527,7 +527,7 @@ class TestWriteFdUploadFiles:
         entries = [(path, [entry])]
         assignments = {path: [(entry, lineup)]}
         write_fd_upload_files(entries, assignments, slate_df, str(tmp_path))
-        upload_path = tmp_path / f"upload_{path.name}"
+        upload_path = tmp_path / "upload_FanDuel.csv"
         with open(upload_path, newline="") as f:
             rows = list(csv.reader(f))
         data_row = rows[1]
@@ -552,7 +552,7 @@ class TestWriteFdUploadFiles:
         entries = [(path, [entry])]
         assignments = {path: [(entry, lineup)]}
         written = write_fd_upload_files(entries, assignments, slate_df, str(tmp_path))
-        assert Path(written[0]).name == f"upload_{fname}"
+        assert Path(written[0]).name == "upload_FanDuel.csv"
 
 
 # ---------------------------------------------------------------------------
