@@ -30,6 +30,8 @@ Table column layout (verified):
 
 Over/Under rows are collected in pairs per (player, line) and the two implied
 probabilities are normalized so they sum to 1 before being used as P(Over).
+Flagged (⚠️) Over lines > 0.5 are accepted directly into the NB fit without
+normalization; flagged 0.5 lines remain a fallback-only path.
 
 If the table layout changes, adjust _BET_NAME_COL and _FAIR_ODDS_COL below.
 
@@ -526,46 +528,47 @@ def _fit_lambda(lines_probs: list[tuple[float, float]]) -> float | None:
 # Geometric NB O/U → E[X] conversion (for batter stats)
 # ---------------------------------------------------------------------------
 
-def _nb_mean_geometric(line: float, p_over: float, tol: float = 1e-9) -> float | None:
+def _fit_nb_mean(lines_probs: list[tuple[float, float]], tol: float = 1e-9) -> float | None:
     """
-    Find the mean μ of a Geometric / NB(r=1) distribution such that P(X > line) = p_over.
+    Fit Geometric NB(r=1) mean via weighted log-linear regression across all
+    available (line, p_over) pairs.
 
-    Batter per-game counting stats (singles, HR, runs, etc.) are far more
-    overdispersed than Poisson assumes.  The geometric distribution (NB r=1)
-    is better motivated: it models a "first-success" process where the number
-    of events in a game is 0 or 1 most of the time, with a long right tail.
+    Under NB(r=1): P(X > k) = q^(k+1)  where q = μ/(1+μ) ∈ (0,1).
+    Taking logs:   log P(X > k) = (k+1) · θ  (θ = log q < 0).
 
-    Closed-form solution:
-        P(X > line) = P(X >= k+1) = (μ/(1+μ))^(k+1)  where k = floor(line)
-        → q = p_over^(1/(k+1)),  μ = q / (1 - q)
+    Estimate θ by weighted least squares through the origin:
+
+        θ = Σ[w_i · (k_i+1) · log p_i] / Σ[w_i · (k_i+1)²]
+
+    where w_i = max(|p_i − 0.5|, 0.01) (sharper lines carry more information)
+    and k_i = floor(line_i).
+
+    Higher lines contribute with weight proportional to (k+1)², so a 1.5-line
+    constrains the tail of the distribution more strongly than a 0.5-line.
+    This prevents the estimate from exploding when p_over on the 0.5 line is
+    high but no higher line is available to anchor the tail.
+
+    For a single line the estimator reduces to the previous closed-form:
+        θ = log(p_over) / 1  →  q = p_over  →  μ = p_over / (1 − p_over).
     """
-    p_over = max(tol, min(1.0 - tol, p_over))
-    k = math.floor(line)
-    try:
-        q = p_over ** (1.0 / (k + 1))
-        if q >= 1.0 - tol:
-            return None
-        return q / (1.0 - q)
-    except (ValueError, ZeroDivisionError):
-        return None
-
-
-def _fit_nb_mean(lines_probs: list[tuple[float, float]]) -> float | None:
-    """
-    Given multiple (line, p_over) tuples, return a weighted-average geometric-NB
-    mean estimate.  Weight = |p_over - 0.5| so sharper lines count more.
-    Used for batter stats in place of _fit_lambda.
-    """
-    estimates, weights = [], []
+    numerator = 0.0
+    denominator = 0.0
     for line, p_over in lines_probs:
-        mu = _nb_mean_geometric(line, p_over)
-        if mu is not None:
-            estimates.append(mu)
-            weights.append(max(abs(p_over - 0.5), 0.01))
-    if not estimates:
+        p = max(tol, min(1.0 - tol, p_over))
+        k = math.floor(line)
+        w = max(abs(p - 0.5), 0.01)
+        x = float(k + 1)
+        numerator += w * x * math.log(p)
+        denominator += w * x * x
+    if denominator == 0.0:
         return None
-    total_w = sum(weights)
-    return sum(e * w for e, w in zip(estimates, weights)) / total_w
+    theta = numerator / denominator
+    if theta >= 0.0:
+        return None  # degenerate: q must be in (0,1) so log(q) must be negative
+    q = math.exp(theta)
+    if q >= 1.0 - tol:
+        return None
+    return q / (1.0 - q)
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +877,10 @@ async def _fetch_game_odds(
         # We save ⚠️-flagged 0.5-line odds in a separate dict and use them as a
         # fallback for any player who has no valid (non-⚠️) 0.5 data for this market.
         # The one-way devigged odds are treated as fair: P(Over) = implied_prob(Over).
-        # Flagged lines above 0.5 are always discarded.
+        # Flagged 0.5 lines are stored in flagged_half for fallback.
+        # Flagged Over lines > 0.5 are accepted directly into raw — the one-way
+        # devig introduces some bias, but these lines still anchor the tail of the
+        # NB fit and prevent the model from exploding on a single high-p 0.5 line.
         raw: dict[tuple[str, float], dict[str, float]] = {}
         flagged_half: dict[str, dict[str, float]] = {}  # player → {outcome: prob}
         for row in rows:
@@ -887,13 +893,25 @@ async def _fetch_game_odds(
             seen_players.add(player_name)  # track before ⚠️ skip
             odds_cell = row[_FAIR_ODDS_COL]
             if "\u26a0" in odds_cell:   # ⚠️ — one-way devigged odds
-                if line == 0.5:
-                    # Strip the flag character and parse the numeric odds
-                    odds_str = odds_cell.split("\u26a0")[0].strip()
-                    prob = _parse_fair_odds(odds_str)
-                    if prob is not None:
+                odds_str = odds_cell.split("\u26a0")[0].strip()
+                prob = _parse_fair_odds(odds_str)
+                if prob is not None:
+                    if line == 0.5:
+                        # Store for flagged-0.5 fallback (existing logic)
                         flagged_half.setdefault(player_name, {})[outcome] = prob
-                log.debug("Skipping flagged odds row: %s %s", player_name, odds_cell)
+                    elif outcome == "over":
+                        # Accept flagged Over lines > 0.5 into raw so the NB
+                        # regression can use them as tail constraints.  No Under
+                        # side is available so p_over is used without normalization.
+                        raw.setdefault((player_name, line), {})["over"] = prob
+                        log.debug(
+                            "Accepting flagged over %.1f odds for %s (p_over=%.4f)",
+                            line, player_name, prob,
+                        )
+                    else:
+                        log.debug("Skipping flagged odds row: %s %s", player_name, odds_cell)
+                else:
+                    log.debug("Skipping flagged odds row: %s %s", player_name, odds_cell)
                 continue
             prob = _parse_fair_odds(odds_cell.strip())
             if prob is None:
