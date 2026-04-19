@@ -69,12 +69,9 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       } else if (event.type === 'merge_info') {
         const players = event.players as Array<{ name: string; team: string; reason?: string; player_id?: number; is_pitcher?: boolean }>
         onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players })
-        // Auto-exclude pitchers that fell back to RotoWire — only when Market Odds
-        // is the primary source, since missing MO pitcher projections cause the
-        // largest quality gap. Other sources degrade more gracefully.
-        const pitcherIds = projectionsSource === 'market_odds'
-          ? players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
-          : []
+        // Auto-exclude pitchers that fell back to a secondary source — their
+        // projections are lower quality regardless of which primary source was used.
+        const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
         if (pitcherIds.length > 0) {
           fetchSlatePlayers().then(slate => {
             const alreadyExcluded = slate.players.filter(p => p.excluded).map(p => p.player_id)
@@ -188,7 +185,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
           <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback projection</strong>
           {mergeInfo.players.some(p => p.is_pitcher) && (
             <div className="merge-info-pitcher-warning">
-              ⚠ Pitcher(s) without market odds projections have been automatically added to Player Exclusions.
+              ⚠ Pitcher(s) using {mergeInfo.secondarySource} fallback projections have been automatically added to Player Exclusions.
             </div>
           )}
           <div className="merge-info-players">
