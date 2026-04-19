@@ -71,37 +71,58 @@ HEADERS = {
 }
 
 # std_dev estimation: no source provides this directly, so we estimate via a
-# linear model fitted to empirical DK score distributions across player types.
+# linear model fitted to empirical score distributions across player types.
 #
 # A flat σ/μ ratio systematically over-estimates variance for weak players and
 # under-estimates it for strong ones.  A linear model captures the floor effect:
 # variance has a baseline component that does not scale with projected output.
 #
-# Coefficients derived from career DK score distributions for a range of player
-# types (6 batters from poor to all-time great; 5 pitchers from average to elite):
+# DraftKings coefficients derived from career DK score distributions for a range
+# of player types (6 batters from poor to all-time great; 5 pitchers from
+# average to elite):
 #
-#   Batters:  std ≈ 4.0 + 0.40 × mean
+#   DK Batters:  std ≈ 4.0 + 0.40 × mean
 #     σ/μ ≈ 0.97 at mean= 7,  0.84 at mean=10,  0.76 at mean=13
 #     The BatterMixtureMarginal handles zero-inflation at runtime when the PCA
 #     model is available; std_dev here seeds that projection.
 #
-#   Pitchers: std ≈ 7.2 + 0.23 × mean
+#   DK Pitchers: std ≈ 7.2 + 0.23 × mean
 #     σ/μ ≈ 0.71 at mean=15,  0.59 at mean=20,  0.52 at mean=25
 #     Pitcher distributions are approximately Gaussian (no zero-inflation spike);
 #     negative DK scores are possible (bad starts) and preserved in simulation.
 #
-# Note: fit on a small sample of historical players skewed toward greats.
-# Long-term improvement: refit coefficients from historical_logs.parquet.
-_BATTER_STD_INTERCEPT = 4.0
-_BATTER_STD_SLOPE     = 0.40
-_PITCHER_STD_INTERCEPT = 7.2
-_PITCHER_STD_SLOPE     = 0.23
+# FanDuel intercepts are scaled by the observed FD/DK per-player mean ratio
+# (batters ≈ 1.5×, pitchers ≈ 1.75×).  The slopes are unchanged — they reflect
+# proportional variability that is platform-independent.  The intercepts should
+# be re-calibrated once historical_logs_fd.parquet has been built and analysed.
+#
+# Note: DK fit on a small sample of historical players skewed toward greats.
+# Long-term improvement: refit all coefficients from historical_logs*.parquet.
+_DK_BATTER_STD_INTERCEPT  = 4.0
+_DK_BATTER_STD_SLOPE      = 0.40
+_DK_PITCHER_STD_INTERCEPT = 7.2
+_DK_PITCHER_STD_SLOPE     = 0.23
+
+_FD_BATTER_STD_INTERCEPT  = 6.0   # 4.0 × 1.5 (FD/DK batter scoring ratio)
+_FD_BATTER_STD_SLOPE      = 0.40
+_FD_PITCHER_STD_INTERCEPT = 12.6  # 7.2 × 1.75 (FD/DK pitcher scoring ratio)
+_FD_PITCHER_STD_SLOPE     = 0.23
+
+# Keep module-level aliases for backward compatibility (DK defaults).
+_BATTER_STD_INTERCEPT  = _DK_BATTER_STD_INTERCEPT
+_BATTER_STD_SLOPE      = _DK_BATTER_STD_SLOPE
+_PITCHER_STD_INTERCEPT = _DK_PITCHER_STD_INTERCEPT
+_PITCHER_STD_SLOPE     = _DK_PITCHER_STD_SLOPE
 
 
-def _estimate_std_dev(mean: float, position: str) -> float:
+def _estimate_std_dev(mean: float, position: str, platform: str = "draftkings") -> float:
+    if platform == "fanduel":
+        if position == "P":
+            return max(_FD_PITCHER_STD_INTERCEPT + _FD_PITCHER_STD_SLOPE * mean, 1.0)
+        return max(_FD_BATTER_STD_INTERCEPT + _FD_BATTER_STD_SLOPE * mean, 1.0)
     if position == "P":
-        return max(_PITCHER_STD_INTERCEPT + _PITCHER_STD_SLOPE * mean, 1.0)
-    return max(_BATTER_STD_INTERCEPT + _BATTER_STD_SLOPE * mean, 1.0)
+        return max(_DK_PITCHER_STD_INTERCEPT + _DK_PITCHER_STD_SLOPE * mean, 1.0)
+    return max(_DK_BATTER_STD_INTERCEPT + _DK_BATTER_STD_SLOPE * mean, 1.0)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -535,6 +556,7 @@ def build_projections_csv(
     name_map: dict[str, str] | None = None,
     debug: bool = False,
     prefetched_records: list[dict] | None = None,
+    platform: str = "draftkings",
 ) -> pd.DataFrame:
     # --- Build player lookup from pre-loaded slate DataFrame ----------------
     # slate_df is produced by DraftKingsSlateIngestor or FanDuelSlateIngestor;
@@ -638,7 +660,7 @@ def build_projections_csv(
 
     # --- Estimate std_dev ---------------------------------------------------
     out_df["std_dev"] = out_df.apply(
-        lambda r: _estimate_std_dev(float(r["mean"]), str(r["position"])),
+        lambda r: _estimate_std_dev(float(r["mean"]), str(r["position"]), platform),
         axis=1,
     )
 
@@ -807,6 +829,7 @@ def main() -> None:
         name_map=_load_name_map(args.name_map),
         debug=args.debug,
         prefetched_records=prefetched_records,
+        platform=args.platform,
     )
 
 

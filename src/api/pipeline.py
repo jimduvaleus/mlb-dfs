@@ -193,10 +193,20 @@ class PipelineRunner:
         copula = EmpiricalCopula(copula_path)
 
         # --- Load batter PCA model (optional) ----------------------------
+        # Select platform-specific model and score grid paths.
+        # FanDuel uses artifacts built from FD-scored historical data
+        # (historical_logs_fd.parquet → fit_batter_pca.py --platform fanduel).
         pca_model: Optional[BatterPCAModel] = None
         score_grid: Optional[np.ndarray] = None
-        pca_path = paths.get("batter_pca_model")
-        grid_path = paths.get("batter_score_grid")
+        if platform == Platform.FANDUEL:
+            pca_path = (paths.get("batter_pca_model_fd")
+                        or "data/processed/batter_pca_model_fd.npz")
+            grid_path = (paths.get("batter_score_grid_fd")
+                         or "data/processed/batter_score_grid_fd.npy")
+        else:
+            pca_path = paths.get("batter_pca_model") or "data/processed/batter_pca_model.npz"
+            grid_path = (paths.get("batter_score_grid")
+                         or "data/processed/batter_score_grid.npy")
         if (pca_path and os.path.exists(pca_path)
                 and grid_path and os.path.exists(grid_path)):
             logger.info("Loading batter PCA model: %s", pca_path)

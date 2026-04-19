@@ -94,17 +94,33 @@ def _normalise_dff_team(raw: str) -> str:
     return _DFF_TEAM_MAP.get(upper, upper)
 
 
-# std_dev estimation — same linear model as fetch_rotowire_projections.py
-_BATTER_STD_INTERCEPT = 4.0
-_BATTER_STD_SLOPE     = 0.40
-_PITCHER_STD_INTERCEPT = 7.2
-_PITCHER_STD_SLOPE     = 0.23
+# std_dev estimation — same linear model as fetch_rotowire_projections.py.
+# See that file for derivation and calibration notes.
+_DK_BATTER_STD_INTERCEPT  = 4.0
+_DK_BATTER_STD_SLOPE      = 0.40
+_DK_PITCHER_STD_INTERCEPT = 7.2
+_DK_PITCHER_STD_SLOPE     = 0.23
+
+_FD_BATTER_STD_INTERCEPT  = 6.0   # 4.0 × 1.5 (FD/DK batter scoring ratio)
+_FD_BATTER_STD_SLOPE      = 0.40
+_FD_PITCHER_STD_INTERCEPT = 12.6  # 7.2 × 1.75 (FD/DK pitcher scoring ratio)
+_FD_PITCHER_STD_SLOPE     = 0.23
+
+# Keep module-level aliases for backward compatibility (DK defaults).
+_BATTER_STD_INTERCEPT  = _DK_BATTER_STD_INTERCEPT
+_BATTER_STD_SLOPE      = _DK_BATTER_STD_SLOPE
+_PITCHER_STD_INTERCEPT = _DK_PITCHER_STD_INTERCEPT
+_PITCHER_STD_SLOPE     = _DK_PITCHER_STD_SLOPE
 
 
-def _estimate_std_dev(mean: float, position: str) -> float:
+def _estimate_std_dev(mean: float, position: str, platform: str = "draftkings") -> float:
+    if platform == "fanduel":
+        if position == "P":
+            return max(_FD_PITCHER_STD_INTERCEPT + _FD_PITCHER_STD_SLOPE * mean, 1.0)
+        return max(_FD_BATTER_STD_INTERCEPT + _FD_BATTER_STD_SLOPE * mean, 1.0)
     if position == "P":
-        return max(_PITCHER_STD_INTERCEPT + _PITCHER_STD_SLOPE * mean, 1.0)
-    return max(_BATTER_STD_INTERCEPT + _BATTER_STD_SLOPE * mean, 1.0)
+        return max(_DK_PITCHER_STD_INTERCEPT + _DK_PITCHER_STD_SLOPE * mean, 1.0)
+    return max(_DK_BATTER_STD_INTERCEPT + _DK_BATTER_STD_SLOPE * mean, 1.0)
 
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -589,6 +605,7 @@ def build_projections_csv(
     name_map: dict[str, str] | None = None,
     slate_override: str | None = None,
     debug: bool = False,
+    platform: str = "draftkings",
 ) -> pd.DataFrame:
     # --- Build player lookup from pre-loaded slate DataFrame ----------------
     # slate_df is produced by DraftKingsSlateIngestor or FanDuelSlateIngestor;
@@ -687,7 +704,7 @@ def build_projections_csv(
 
     # --- Estimate std_dev ----------------------------------------------------
     out_df["std_dev"] = out_df.apply(
-        lambda r: _estimate_std_dev(float(r["mean"]), str(r["position"])),
+        lambda r: _estimate_std_dev(float(r["mean"]), str(r["position"]), platform),
         axis=1,
     )
 
@@ -824,6 +841,7 @@ def main() -> None:
         name_map=_load_name_map(args.name_map),
         slate_override=args.slate,
         debug=args.debug,
+        platform=args.platform,
     )
 
 
