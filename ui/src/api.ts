@@ -38,8 +38,9 @@ export async function fetchProjectionSlates(): Promise<SlateListResponse> {
   return res.json()
 }
 
-export async function fetchPortfolio(): Promise<LineupResult[]> {
-  const res = await fetch('/api/portfolio')
+export async function fetchPortfolio(platform?: string): Promise<LineupResult[]> {
+  const url = platform ? `/api/portfolio?platform=${encodeURIComponent(platform)}` : '/api/portfolio'
+  const res = await fetch(url)
   if (res.status === 404) return []
   if (!res.ok) throw new Error(`Failed to load portfolio: ${res.statusText}`)
   const data = await res.json()

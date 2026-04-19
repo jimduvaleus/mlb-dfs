@@ -414,6 +414,7 @@ class PipelineRunner:
         self._entry_handlers = entry_handlers
         self._slate_df = slate_df
         self._output_dir = output_dir
+        self._platform = platform
 
         # --- Serialize --------------------------------------------------
         result = self._serialize_portfolio(portfolio, players_df)
@@ -423,7 +424,7 @@ class PipelineRunner:
         # --- Save CSV ---------------------------------------------------
         os.makedirs(output_dir, exist_ok=True)
         portfolio_df = self._format_portfolio_df(portfolio, players_df)
-        output_path = os.path.join(output_dir, "portfolio.csv")
+        output_path = os.path.join(output_dir, f"portfolio_{platform.value}.csv")
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Portfolio saved to %s", output_path)
 
@@ -440,7 +441,7 @@ class PipelineRunner:
                 info = entry_map.get(lr["lineup_index"])
                 if info:
                     lr.update(info)
-            meta_path = os.path.join(output_dir, "portfolio_entries.json")
+            meta_path = os.path.join(output_dir, f"portfolio_entries_{platform.value}.json")
             with open(meta_path, "w") as f:
                 json.dump({str(k): v for k, v in entry_map.items()}, f)
 
@@ -535,7 +536,8 @@ class PipelineRunner:
 
         os.makedirs(self._output_dir, exist_ok=True)
         portfolio_df = self._format_portfolio_df(self._raw_portfolio, self._players_df)
-        output_path = os.path.join(self._output_dir, "portfolio.csv")
+        platform_val = self._platform.value if hasattr(self, "_platform") else "draftkings"
+        output_path = os.path.join(self._output_dir, f"portfolio_{platform_val}.csv")
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Updated portfolio saved to %s", output_path)
 
@@ -547,7 +549,7 @@ class PipelineRunner:
                 info = entry_map.get(lr["lineup_index"])
                 if info:
                     lr.update(info)
-            meta_path = os.path.join(self._output_dir, "portfolio_entries.json")
+            meta_path = os.path.join(self._output_dir, f"portfolio_entries_{platform_val}.json")
             with open(meta_path, "w") as f:
                 json.dump({str(k): v for k, v in entry_map.items()}, f)
 

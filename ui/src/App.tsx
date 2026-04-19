@@ -78,16 +78,18 @@ export default function App() {
   // Load config, existing portfolio, and unconfirmed player IDs on mount
   useEffect(() => {
     fetchConfig()
-      .then(cfg => dispatch({ type: 'set_config', config: cfg }))
-      .catch(e => setConfigError(String(e)))
-    fetchPortfolio()
+      .then(cfg => {
+        dispatch({ type: 'set_config', config: cfg })
+        // Load the platform-specific portfolio for the current platform
+        return fetchPortfolio(cfg.platform)
+      })
       .then(portfolio => {
         if (portfolio.length > 0) {
           dispatch({ type: 'set_portfolio', portfolio })
           dispatch({ type: 'set_run_status', status: 'complete' })
         }
       })
-      .catch(() => {})
+      .catch(e => setConfigError(String(e)))
     refreshUnconfirmed()
   }, [])
 
@@ -222,7 +224,22 @@ export default function App() {
               <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} />
               <ConfigForm
                 config={state.config}
-                onSaved={cfg => dispatch({ type: 'set_config', config: cfg })}
+                onSaved={cfg => {
+                  const prevPlatform = state.config?.platform
+                  dispatch({ type: 'set_config', config: cfg })
+                  if (cfg.platform !== prevPlatform) {
+                    // Platform changed — load the portfolio for the new platform (may be empty)
+                    fetchPortfolio(cfg.platform)
+                      .then(portfolio => {
+                        dispatch({ type: 'set_portfolio', portfolio })
+                        dispatch({ type: 'set_run_status', status: portfolio.length > 0 ? 'complete' : 'idle' })
+                      })
+                      .catch(() => {
+                        dispatch({ type: 'set_portfolio', portfolio: [] })
+                        dispatch({ type: 'set_run_status', status: 'idle' })
+                      })
+                  }
+                }}
                 disabled={running}
               />
             </>

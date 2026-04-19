@@ -52,22 +52,32 @@ _state: dict = {
 _stop_event = threading.Event()
 
 
-def _portfolio_csv_path() -> Path:
+def _portfolio_csv_path(platform_val: str | None = None) -> Path:
     cfg = read_config()
+    if platform_val is None:
+        platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
     output_dir = cfg.paths.output_dir or "outputs"
     base = PROJECT_ROOT / output_dir if not Path(output_dir).is_absolute() else Path(output_dir)
-    return base / "portfolio.csv"
+    return base / f"portfolio_{platform_val}.csv"
 
 
-@app.on_event("startup")
-def _load_persisted_portfolio() -> None:
-    """Restore the last portfolio from portfolio.csv so the UI shows it after restart."""
+def _portfolio_entries_path(platform_val: str | None = None) -> Path:
+    cfg = read_config()
+    if platform_val is None:
+        platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+    output_dir = cfg.paths.output_dir or "outputs"
+    base = PROJECT_ROOT / output_dir if not Path(output_dir).is_absolute() else Path(output_dir)
+    return base / f"portfolio_entries_{platform_val}.json"
+
+
+def _load_portfolio_from_csv(platform_val: str) -> list[dict] | None:
+    """Load a persisted portfolio from a platform-specific CSV. Returns None if unavailable."""
     import pandas as pd
 
     try:
-        path = _portfolio_csv_path()
+        path = _portfolio_csv_path(platform_val)
         if not path.exists():
-            return
+            return None
         df = pd.read_csv(path)
         portfolio: list[dict] = []
         for lineup_idx, group in df.groupby("lineup", sort=True):
@@ -91,20 +101,33 @@ def _load_persisted_portfolio() -> None:
                 "lineup_salary": int(first["lineup_salary"]),
                 "players": players,
             })
+        if not portfolio:
+            return None
+        meta_path = _portfolio_entries_path(platform_val)
+        if meta_path.exists():
+            with open(meta_path) as mf:
+                entry_meta = json.load(mf)
+            for lr in portfolio:
+                info = entry_meta.get(str(lr["lineup_index"]))
+                if info:
+                    lr.update(info)
+        return portfolio
+    except Exception:
+        return None  # corrupt or missing CSV — return nothing
+
+
+@app.on_event("startup")
+def _load_persisted_portfolio() -> None:
+    """Restore the last portfolio from the current-platform CSV so the UI shows it after restart."""
+    try:
+        cfg = read_config()
+        platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+        portfolio = _load_portfolio_from_csv(platform_val)
         if portfolio:
-            meta_path = path.parent / "portfolio_entries.json"
-            if meta_path.exists():
-                import json
-                with open(meta_path) as mf:
-                    entry_meta = json.load(mf)
-                for lr in portfolio:
-                    info = entry_meta.get(str(lr["lineup_index"]))
-                    if info:
-                        lr.update(info)
             _state["portfolio"] = portfolio
             _state["status"] = "complete"
     except Exception:
-        pass  # corrupt or missing CSV — start fresh
+        pass  # corrupt or missing config/CSV — start fresh
 
 
 # ---------------------------------------------------------------------------
@@ -971,7 +994,14 @@ async def replace_lineup_endpoint(lineup_index: int):
 
 
 @app.get("/api/portfolio")
-def get_portfolio():
+def get_portfolio(platform: str | None = None):
+    if platform is not None:
+        # Platform explicitly requested — load directly from the platform-specific CSV.
+        portfolio = _load_portfolio_from_csv(platform)
+        if portfolio is None:
+            raise HTTPException(404, f"No portfolio available for platform '{platform}'")
+        return portfolio
+    # No platform param — fall back to the in-memory portfolio from the last run.
     if _state["portfolio"] is None:
         raise HTTPException(404, "No portfolio available")
     return _state["portfolio"]
