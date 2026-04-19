@@ -219,7 +219,7 @@ export default function App() {
           {configError && <p className="error">{configError}</p>}
           {state.config ? (
             <>
-              <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} projectionsSource={state.config.paths.projections_source} />
+              <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} />
               <ConfigForm
                 config={state.config}
                 onSaved={cfg => dispatch({ type: 'set_config', config: cfg })}

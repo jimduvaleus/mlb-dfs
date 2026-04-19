@@ -9,7 +9,6 @@ interface Props {
   onMergeInfo: (info: MergeInfo | null) => void
   projFetchExcluded?: string[]
   onFetchingChange?: (fetching: boolean) => void
-  projectionsSource?: string
 }
 
 function formatET(unixSec: number): string {
@@ -23,7 +22,7 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange, projectionsSource }: Props) {
+export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
