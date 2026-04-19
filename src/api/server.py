@@ -31,7 +31,7 @@ from .projections_meta import (
     get_status_fields,
     record_fetch_from_csv,
 )
-from .slate_exclusions import get_slate_games_with_status, get_slate_players_with_status, prune_player_exclusions, read_exclusions, write_exclusions
+from .slate_exclusions import compute_file_fingerprint, get_slate_games_with_status, get_slate_players_with_status, prune_player_exclusions, read_exclusions, write_exclusions
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 UI_DIST = PROJECT_ROOT / "ui" / "dist"
@@ -164,11 +164,10 @@ def _resolve_fd_slate_path(cfg: AppConfig) -> str:
     return rel
 
 
-def _load_slate_df():
-    """Parse the configured slate CSV and return a DataFrame (or None)."""
+def _get_slate_file_path() -> Path | None:
+    """Return the resolved Path of the current slate CSV, or None if not configured/found."""
     cfg = read_config()
     from src.platforms.base import Platform
-    from src.ingestion.factory import get_ingestor
     platform = cfg.platform if hasattr(cfg, 'platform') else Platform.DRAFTKINGS
     if platform == Platform.FANDUEL:
         slate_path = _resolve_fd_slate_path(cfg)
@@ -177,13 +176,23 @@ def _load_slate_df():
     if not slate_path:
         return None
     p = PROJECT_ROOT / slate_path if not Path(slate_path).is_absolute() else Path(slate_path)
-    if not p.exists():
+    return p if p.exists() else None
+
+
+def _load_slate_df():
+    """Parse the configured slate CSV and return a DataFrame (or None)."""
+    p = _get_slate_file_path()
+    if p is None:
         return None
+    cfg = read_config()
+    from src.platforms.base import Platform
+    from src.ingestion.factory import get_ingestor
+    platform = cfg.platform if hasattr(cfg, 'platform') else Platform.DRAFTKINGS
     return get_ingestor(platform, str(p)).get_slate_dataframe()
 
 
 def _load_slate_games() -> list[str]:
-    """Parse the configured DK slate CSV and return unique game strings."""
+    """Parse the configured slate CSV and return unique game strings."""
     df = _load_slate_df()
     if df is None:
         return []
@@ -195,7 +204,8 @@ def get_slate_games() -> SlateGamesResponse:
     games = _load_slate_games()
     if not games:
         return SlateGamesResponse(slate_id="", games=[], excluded_player_ids=[])
-    slate_id, game_dicts, excluded_player_ids = get_slate_games_with_status(games)
+    fingerprint = compute_file_fingerprint(_get_slate_file_path())
+    slate_id, game_dicts, excluded_player_ids = get_slate_games_with_status(games, fingerprint)
     return SlateGamesResponse(
         slate_id=slate_id,
         games=[GameStatus(**g) for g in game_dicts],
@@ -205,11 +215,11 @@ def get_slate_games() -> SlateGamesResponse:
 
 @app.post("/api/slate/exclusions")
 def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
+    fingerprint = compute_file_fingerprint(_get_slate_file_path())
+
     # Load existing player exclusions so we can prune them
-    stored = read_exclusions()
-    existing_player_ids: list[int] = []
-    if stored.get("slate_id") == update.slate_id:
-        existing_player_ids = stored.get("excluded_player_ids", [])
+    stored = read_exclusions(update.slate_id, fingerprint)
+    existing_player_ids: list[int] = stored.get("excluded_player_ids", [])
 
     # Prune player exclusions now covered by team/game exclusions
     df = _load_slate_df()
@@ -227,6 +237,7 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
 
     write_exclusions(
         slate_id=update.slate_id,
+        file_fingerprint=fingerprint,
         excluded_teams=update.excluded_teams,
         excluded_games=update.excluded_games,
         excluded_player_ids=existing_player_ids,
@@ -234,7 +245,7 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
     games = _load_slate_games()
     if not games:
         return SlateGamesResponse(slate_id=update.slate_id, games=[], excluded_player_ids=[])
-    slate_id, game_dicts, excluded_player_ids = get_slate_games_with_status(games)
+    slate_id, game_dicts, excluded_player_ids = get_slate_games_with_status(games, fingerprint)
     return SlateGamesResponse(
         slate_id=slate_id,
         games=[GameStatus(**g) for g in game_dicts],
@@ -252,7 +263,8 @@ def get_slate_players() -> SlatePlayersResponse:
         return SlatePlayersResponse(slate_id="", players=[])
     from .slate_exclusions import compute_slate_id
     slate_id = compute_slate_id(games)
-    player_dicts = get_slate_players_with_status(df, slate_id)
+    fingerprint = compute_file_fingerprint(_get_slate_file_path())
+    player_dicts = get_slate_players_with_status(df, slate_id, fingerprint)
     return SlatePlayersResponse(
         slate_id=slate_id,
         players=[PlayerExclusionStatus(**p) for p in player_dicts],
@@ -261,12 +273,11 @@ def get_slate_players() -> SlatePlayersResponse:
 
 @app.post("/api/slate/player-exclusions")
 def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersResponse:
-    stored = read_exclusions()
-    excluded_teams: list[str] = []
-    excluded_games: list[str] = []
-    if stored.get("slate_id") == update.slate_id:
-        excluded_teams = stored.get("excluded_teams", [])
-        excluded_games = stored.get("excluded_games", [])
+    fingerprint = compute_file_fingerprint(_get_slate_file_path())
+
+    stored = read_exclusions(update.slate_id, fingerprint)
+    excluded_teams: list[str] = stored.get("excluded_teams", [])
+    excluded_games: list[str] = stored.get("excluded_games", [])
 
     df = _load_slate_df()
     pruned_ids = update.excluded_player_ids
@@ -279,6 +290,7 @@ def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersRespon
 
     write_exclusions(
         slate_id=update.slate_id,
+        file_fingerprint=fingerprint,
         excluded_teams=excluded_teams,
         excluded_games=excluded_games,
         excluded_player_ids=pruned_ids,
@@ -286,7 +298,7 @@ def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersRespon
 
     if df is None or df.empty:
         return SlatePlayersResponse(slate_id=update.slate_id, players=[])
-    player_dicts = get_slate_players_with_status(df, update.slate_id)
+    player_dicts = get_slate_players_with_status(df, update.slate_id, fingerprint)
     return SlatePlayersResponse(
         slate_id=update.slate_id,
         players=[PlayerExclusionStatus(**p) for p in player_dicts],

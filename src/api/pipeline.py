@@ -152,7 +152,7 @@ class PipelineRunner:
                 slate_df[["player_id", "name"]], on="player_id", how="left"
             )
 
-        players_df, excl_stats = self._apply_exclusions(players_df)
+        players_df, excl_stats = self._apply_exclusions(players_df, slate_path=slate_path)
 
         # --- Value cutoff filtering ------------------------------------
         min_p_val = opt_cfg.get("min_pitcher_value")
@@ -616,25 +616,24 @@ class PipelineRunner:
         return df[base_cols]
 
     @staticmethod
-    def _apply_exclusions(players_df: pd.DataFrame) -> tuple:
+    def _apply_exclusions(players_df: pd.DataFrame, slate_path: str = "") -> tuple:
         """Filter players_df based on persisted slate exclusions.
 
         Returns (filtered_df, excl_stats) where excl_stats has:
           n_teams_excluded, n_batters_ind_excluded, n_pitchers_ind_excluded
         """
-        from .slate_exclusions import compute_slate_id, read_exclusions
+        from pathlib import Path as _Path
+        from .slate_exclusions import compute_file_fingerprint, compute_slate_id, read_exclusions
         empty_stats: dict = {"n_teams_excluded": 0, "n_batters_ind_excluded": 0, "n_pitchers_ind_excluded": 0}
-        stored = read_exclusions()
-        if not stored.get("slate_id"):
-            return players_df, empty_stats
 
         current_games = [g for g in players_df["game"].dropna().unique().tolist() if g]
-        if compute_slate_id(current_games) != stored["slate_id"]:
-            from .slate_exclusions import write_exclusions
-            new_slate_id = compute_slate_id(current_games)
-            write_exclusions(slate_id=new_slate_id, excluded_teams=[], excluded_games=[], excluded_player_ids=[])
-            logger.info("DKSalaries.csv slate changed — exclusions reset.")
+        if not current_games:
             return players_df, empty_stats
+
+        slate_file = _Path(slate_path) if slate_path else None
+        fingerprint = compute_file_fingerprint(slate_file)
+        slate_id = compute_slate_id(current_games)
+        stored = read_exclusions(slate_id, fingerprint)
 
         excluded_games = set(stored.get("excluded_games", []))
         excluded_teams = set(stored.get("excluded_teams", []))
