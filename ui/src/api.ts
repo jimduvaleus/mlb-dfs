@@ -1,4 +1,4 @@
-import type { AppConfig, ExclusionsUpdate, PlayerExclusionsUpdate, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse } from './types'
+import type { AppConfig, ExclusionsUpdate, PlayerExclusionsUpdate, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -115,4 +115,14 @@ export async function savePlayerExclusions(update: PlayerExclusionsUpdate): Prom
     throw new Error(`Failed to save player exclusions: ${detail}`)
   }
   return res.json()
+}
+
+export async function fetchNotifications(): Promise<TwitterNotification[]> {
+  const res = await fetch('/api/notifications')
+  if (!res.ok) return []
+  return res.json()
+}
+
+export async function dismissNotification(id: string): Promise<void> {
+  await fetch(`/api/notifications/${encodeURIComponent(id)}`, { method: 'DELETE' })
 }

@@ -252,3 +252,11 @@ export interface PlayerExclusionsUpdate {
   slate_id: string
   excluded_player_ids: number[]
 }
+
+export interface TwitterNotification {
+  id: string
+  summary: string
+  body: string
+  app_name: string
+  captured_at: number
+}

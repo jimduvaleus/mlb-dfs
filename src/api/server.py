@@ -14,8 +14,12 @@ Endpoints:
 import asyncio
 import json
 import os
+import re
+import subprocess
 import threading
 import time
+import uuid
+from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -50,6 +54,98 @@ _state: dict = {
 }
 
 _stop_event = threading.Event()
+
+# ---------------------------------------------------------------------------
+# X/Twitter notification store
+# ---------------------------------------------------------------------------
+
+_notifications: deque = deque(maxlen=25)
+_notifications_lock = threading.Lock()
+
+_CHROME_APPS = {'chrome', 'chromium', 'google-chrome', 'chromium-browser', 'Google Chrome'}
+_TWITTER_RE = re.compile(
+    r'(@\w+|liked your|replied to|retweeted|mentioned you|'
+    r'Direct Message|new post|followed you|quote tweeted|X\.com|twitter\.com)',
+    re.IGNORECASE,
+)
+_NOTIFY_HEADER_RE = re.compile(r'member=Notify\b')
+_STRING_START_RE = re.compile(r'^\s+string\s+"(.*)$')
+
+
+def _maybe_commit_notification(str_args: list[str]) -> None:
+    if len(str_args) < 4:
+        return
+    app_name, _icon, summary, body = str_args[0], str_args[1], str_args[2], str_args[3]
+    if app_name in _CHROME_APPS and _TWITTER_RE.search(summary + ' ' + body):
+        notif = {
+            'id': str(uuid.uuid4()),
+            'summary': summary,
+            'body': body,
+            'app_name': app_name,
+            'captured_at': time.time(),
+        }
+        with _notifications_lock:
+            _notifications.append(notif)
+
+
+def _dbus_monitor_loop() -> None:
+    while True:
+        try:
+            proc = subprocess.Popen(
+                [
+                    'dbus-monitor', '--session', '--monitor',
+                    "type='method_call',interface='org.freedesktop.Notifications',member='Notify'",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            in_notify = False
+            str_args: list[str] = []
+            in_multiline: bool = False
+            multiline_buf: list[str] = []
+
+            for line in proc.stdout:
+                line_s = line.rstrip('\n')
+
+                # Accumulate multi-line string values
+                if in_multiline:
+                    if line_s.endswith('"'):
+                        multiline_buf.append(line_s[:-1])
+                        val = '\n'.join(multiline_buf)
+                        in_multiline = False
+                        if len(str_args) < 4:
+                            str_args.append(val)
+                            if len(str_args) == 4:
+                                _maybe_commit_notification(str_args)
+                                str_args = []
+                                in_notify = False
+                    else:
+                        multiline_buf.append(line_s)
+                    continue
+
+                if not in_notify:
+                    if _NOTIFY_HEADER_RE.search(line_s):
+                        in_notify = True
+                        str_args = []
+                    continue
+
+                m = _STRING_START_RE.match(line_s)
+                if m and len(str_args) < 4:
+                    content = m.group(1)
+                    if content.endswith('"'):
+                        # Single-line string
+                        str_args.append(content[:-1])
+                        if len(str_args) == 4:
+                            _maybe_commit_notification(str_args)
+                            str_args = []
+                            in_notify = False
+                    else:
+                        # Start of multi-line string
+                        in_multiline = True
+                        multiline_buf = [content]
+        except Exception:
+            time.sleep(5)
 
 
 def _portfolio_csv_path(platform_val: str | None = None) -> Path:
@@ -130,6 +226,11 @@ def _load_persisted_portfolio() -> None:
         pass  # corrupt or missing config/CSV — start fresh
 
 
+@app.on_event("startup")
+def _start_dbus_monitor() -> None:
+    threading.Thread(target=_dbus_monitor_loop, daemon=True).start()
+
+
 # ---------------------------------------------------------------------------
 # Config endpoints
 # ---------------------------------------------------------------------------
@@ -143,6 +244,30 @@ def get_config() -> AppConfig:
 def post_config(cfg: AppConfig) -> AppConfig:
     write_config(cfg)
     return cfg
+
+
+# ---------------------------------------------------------------------------
+# Notification endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/notifications")
+def get_notifications():
+    with _notifications_lock:
+        items = list(_notifications)
+    items.sort(key=lambda n: n['captured_at'], reverse=True)
+    return items
+
+
+@app.delete("/api/notifications/{notification_id}")
+def delete_notification(notification_id: str):
+    with _notifications_lock:
+        before = len(_notifications)
+        keep = [n for n in _notifications if n['id'] != notification_id]
+        _notifications.clear()
+        _notifications.extend(keep)
+    if len(keep) == before:
+        raise HTTPException(404, detail="Not found")
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------

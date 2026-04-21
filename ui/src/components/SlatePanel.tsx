@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PlatformType, SlateGamesResponse, SlatePlayersResponse } from '../types'
+import type { ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PlatformType, SlateGamesResponse, SlatePlayersResponse, TwitterNotification } from '../types'
 import { fetchSlateGames, fetchSlatePlayers, savePlayerExclusions, saveSlateExclusions } from '../api'
 
 interface Props {
@@ -7,9 +7,11 @@ interface Props {
   projFetchExcluded?: string[]
   onProjFetchFilterChange?: (excluded: string[]) => void
   platform?: PlatformType
+  notifications?: TwitterNotification[]
+  onDismissNotification?: (id: string) => void
 }
 
-export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings' }: Props) {
+export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
@@ -295,6 +297,36 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
           </div>
         )}
       </div>
+
+      {notifications.length > 0 && (
+        <div className="twitter-notifications">
+          <div className="twitter-notifications-header">
+            <h3 className="slate-title">X Notifications</h3>
+            <span className="slate-summary">{notifications.length} unread</span>
+          </div>
+          <div className="twitter-notifications-list">
+            {notifications.map(n => (
+              <div key={n.id} className="twitter-notif-item">
+                <div className="twitter-notif-body">
+                  <div className="twitter-notif-header">
+                    <span className="twitter-notif-summary">{n.summary}</span>
+                    <span className="twitter-notif-time">{new Date(n.captured_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                  </div>
+                  {n.body && <span className="twitter-notif-text">{n.body}</span>}
+                </div>
+                <button
+                  className="twitter-notif-dismiss"
+                  onClick={() => onDismissNotification?.(n.id)}
+                  title="Dismiss"
+                  aria-label="Dismiss notification"
+                >
+                  ✕
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

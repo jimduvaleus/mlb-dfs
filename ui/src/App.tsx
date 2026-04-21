@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useState } from 'react'
-import type { AppConfig, LineupResult, MergeInfo, RunStatus, CompleteEvent, StoppedEvent } from './types'
-import { fetchConfig, fetchPortfolio, fetchUnconfirmedPlayerIds, replaceLineup, stopRun, writeUploadFiles } from './api'
+import type { AppConfig, LineupResult, MergeInfo, RunStatus, CompleteEvent, StoppedEvent, TwitterNotification } from './types'
+import { dismissNotification, fetchConfig, fetchNotifications, fetchPortfolio, fetchUnconfirmedPlayerIds, replaceLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -20,6 +20,7 @@ interface State {
   runStatus: RunStatus
   activeTab: Tab
   unconfirmedPlayerIds: number[]
+  notifications: TwitterNotification[]
 }
 
 type Action =
@@ -28,6 +29,7 @@ type Action =
   | { type: 'set_run_status'; status: RunStatus }
   | { type: 'set_tab'; tab: Tab }
   | { type: 'set_unconfirmed'; ids: number[] }
+  | { type: 'set_notifications'; notifications: TwitterNotification[] }
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -41,6 +43,8 @@ function reducer(state: State, action: Action): State {
       return { ...state, activeTab: action.tab }
     case 'set_unconfirmed':
       return { ...state, unconfirmedPlayerIds: action.ids }
+    case 'set_notifications':
+      return { ...state, notifications: action.notifications }
   }
 }
 
@@ -50,6 +54,7 @@ const initial: State = {
   runStatus: 'idle',
   activeTab: 'config',
   unconfirmedPlayerIds: [],
+  notifications: [],
 }
 
 export default function App() {
@@ -91,6 +96,18 @@ export default function App() {
       })
       .catch(e => setConfigError(String(e)))
     refreshUnconfirmed()
+  }, [])
+
+  // Poll for X/Twitter notifications every 5 seconds
+  useEffect(() => {
+    const poll = () => {
+      fetchNotifications()
+        .then(notifications => dispatch({ type: 'set_notifications', notifications }))
+        .catch(() => {})
+    }
+    poll()
+    const id = setInterval(poll, 5000)
+    return () => clearInterval(id)
   }, [])
 
   // React to SSE events
@@ -211,6 +228,9 @@ export default function App() {
             {tab === 'portfolio' && state.portfolio.length > 0 && (
               <span className="tab-count">{state.portfolio.length}</span>
             )}
+            {tab === 'slate' && state.notifications.length > 0 && (
+              <span className="tab-count">{state.notifications.length}</span>
+            )}
           </button>
         ))}
       </nav>
@@ -254,6 +274,11 @@ export default function App() {
             projFetchExcluded={projFetchExcluded}
             onProjFetchFilterChange={setProjFetchExcluded}
             platform={state.config?.platform}
+            notifications={state.notifications}
+            onDismissNotification={(id) => {
+              dismissNotification(id)
+              dispatch({ type: 'set_notifications', notifications: state.notifications.filter(n => n.id !== id) })
+            }}
           />
         )}
 

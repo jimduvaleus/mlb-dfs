@@ -1226,3 +1226,87 @@ button { cursor: pointer; }
   opacity: 0.3;
   cursor: not-allowed;
 }
+
+/* ── X / Twitter Notifications ── */
+
+.twitter-notifications {
+  margin-top: 28px;
+}
+
+.twitter-notifications-header {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.twitter-notifications-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 560px;
+}
+
+.twitter-notif-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  background: #161b27;
+  border: 1px solid #2d3748;
+  border-left: 3px solid #1da1f2;
+  border-radius: 6px;
+  font-size: 0.84rem;
+}
+
+.twitter-notif-body {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.twitter-notif-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.twitter-notif-summary {
+  color: #e2e8f0;
+  font-weight: 500;
+}
+
+.twitter-notif-time {
+  color: #718096;
+  font-size: 0.75rem;
+  flex-shrink: 0;
+}
+
+.twitter-notif-text {
+  color: #a0aec0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.twitter-notif-dismiss {
+  background: transparent;
+  border: none;
+  color: #718096;
+  cursor: pointer;
+  font-size: 0.7rem;
+  padding: 0 2px;
+  line-height: 1;
+  opacity: 0.7;
+  flex-shrink: 0;
+  margin-top: 1px;
+  transition: opacity 0.1s, color 0.1s;
+}
+
+.twitter-notif-dismiss:hover {
+  opacity: 1;
+  color: #fc8181;
+}

@@ -143,3 +143,11 @@ class SlatePlayersResponse(BaseModel):
 class PlayerExclusionsUpdate(BaseModel):
     slate_id: str
     excluded_player_ids: list[int]
+
+
+class TwitterNotification(BaseModel):
+    id: str
+    summary: str
+    body: str
+    app_name: str
+    captured_at: float  # Unix timestamp

@@ -1,8 +1,8 @@
-- UI run tab to 4-wide, metrics tab to SP and batter split out
-- How to handle FanDuel Market Odds Fetch for QS?
+- improvement for CNO devig dropdown flow
+- Grab notifications from Roth/Underdog (grab via dbus??)
+- UI run tab to 4-wide
 - BIG Turbo button
 - BIG Opponent/contest modeling
 - BIG late swap?
 - on projections fetch, if number of changes is small, report them
 - BIG ownership?? EV calcs, and EV objective??
-- Need weather
