@@ -1,5 +1,3 @@
-- improvement for CNO devig dropdown flow
-- Grab notifications from Roth/Underdog (grab via dbus??)
 - UI run tab to 4-wide
 - BIG Turbo button
 - BIG Opponent/contest modeling
