@@ -98,6 +98,12 @@ export default function App() {
     refreshUnconfirmed()
   }, [])
 
+  // Update browser tab title with unread notification count
+  useEffect(() => {
+    const count = state.notifications.length
+    document.title = count > 0 ? `MLB Portfolio Tool (${count})` : 'MLB Portfolio Tool'
+  }, [state.notifications.length])
+
   // Poll for X/Twitter notifications every 5 seconds
   useEffect(() => {
     const poll = () => {
@@ -189,6 +195,7 @@ export default function App() {
 
   return (
     <div className="app">
+      <div className="sticky-top">
       <header className="app-header">
         <h1>MLB DFS Optimizer</h1>
         <div className="header-actions">
@@ -234,6 +241,7 @@ export default function App() {
           </button>
         ))}
       </nav>
+      </div>
 
       <main className="app-main">
         {/* Always mounted so the projection fetch EventSource survives tab switches */}

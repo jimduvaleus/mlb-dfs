@@ -21,6 +21,12 @@ body {
   min-height: 100vh;
 }
 
+.sticky-top {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
 .app-header {
   display: flex;
   align-items: center;
@@ -28,9 +34,6 @@ body {
   padding: 12px 24px;
   background: #161b27;
   border-bottom: 1px solid #2d3748;
-  position: sticky;
-  top: 0;
-  z-index: 10;
 }
 
 .app-header h1 {
