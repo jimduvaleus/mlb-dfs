@@ -219,6 +219,7 @@ export interface GameStatus {
   home: string
   excluded: boolean
   teams: TeamStatus[]
+  game_start_time?: string | null
 }
 
 export interface SlateGamesResponse {

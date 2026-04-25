@@ -173,6 +173,8 @@ class FanDuelSlateIngestor(BaseSlateIngestor):
         # 'C/1B/UTIL', 'P') is preserved as-is for Phase-5 upload use.
         player_section["roster_position"] = player_section["fd_roster_position"]
 
+        player_section["game_start_time"] = ""
+
         return player_section[[
             "player_id",
             "fd_player_id",
@@ -184,6 +186,7 @@ class FanDuelSlateIngestor(BaseSlateIngestor):
             "team",
             "opponent",
             "game",
+            "game_start_time",
         ]]
 
     # ------------------------------------------------------------------

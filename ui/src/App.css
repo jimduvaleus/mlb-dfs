@@ -1032,10 +1032,23 @@ button { cursor: pointer; }
   flex-shrink: 0;
 }
 
+.game-label-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
 .game-label {
   font-size: 0.82rem;
   font-weight: 600;
   color: #cbd5e0;
+  white-space: nowrap;
+}
+
+.game-time {
+  font-size: 0.7rem;
+  color: #718096;
   white-space: nowrap;
 }
 

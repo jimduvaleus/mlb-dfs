@@ -106,16 +106,18 @@ def prune_player_exclusions(
 
 
 def get_slate_games_with_status(
-    games: list[str],
+    game_times: dict[str, str],
     file_fingerprint: str = "",
 ) -> tuple[str, list[dict], list[int]]:
     """
-    Given the unique game strings from the current slate, compute the slate_id,
-    load persisted exclusions (scoped to this slate + file fingerprint), and
-    return (slate_id, list_of_game_status_dicts, excluded_player_ids).
+    Given a mapping of game_id → ISO start time string from the current slate,
+    compute the slate_id, load persisted exclusions (scoped to this slate + file
+    fingerprint), and return (slate_id, list_of_game_status_dicts, excluded_player_ids).
 
-    Each game dict has keys: game, away, home, excluded, teams (list of {team, excluded}).
+    Each game dict has keys: game, away, home, excluded, game_start_time, teams.
+    Games are returned sorted by start time (ascending), then alphabetically.
     """
+    games = list(game_times.keys())
     slate_id = compute_slate_id(games)
     stored = read_exclusions(slate_id, file_fingerprint)
 
@@ -127,7 +129,7 @@ def get_slate_games_with_status(
     excluded_games_set = set(excluded_games)
 
     result = []
-    for game in sorted(set(games)):
+    for game in sorted(game_times, key=lambda g: (game_times[g] or "", g)):
         parts = game.split("@")
         away = parts[0] if len(parts) == 2 else game
         home = parts[1] if len(parts) == 2 else ""
@@ -138,6 +140,7 @@ def get_slate_games_with_status(
                 "away": away,
                 "home": home,
                 "excluded": game_excluded,
+                "game_start_time": game_times[game] or None,
                 "teams": [
                     {"team": away, "excluded": game_excluded or away in excluded_teams_set},
                     {"team": home, "excluded": game_excluded or home in excluded_teams_set},

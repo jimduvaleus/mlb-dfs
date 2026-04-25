@@ -14,6 +14,17 @@ interface Props {
   onDismissTwitterLineup?: (team: string) => void
 }
 
+function formatGameTime(iso: string | null | undefined): string {
+  if (!iso) return ''
+  const timePart = iso.substring(11, 16)
+  const [hStr, mStr] = timePart.split(':')
+  const h = parseInt(hStr, 10)
+  if (isNaN(h)) return ''
+  const period = h >= 12 ? 'PM' : 'AM'
+  const h12 = h % 12 || 12
+  return `${h12}:${mStr} ${period} ET`
+}
+
 export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
@@ -204,9 +215,12 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
           return (
           <div key={g.game} className={`game-card${g.excluded ? ' game-excluded' : ''}`}>
             <div className="game-card-header">
-              <span className="game-label">
-                {g.away} @ {g.home}
-              </span>
+              <div className="game-label-group">
+                <span className="game-label">{g.away} @ {g.home}</span>
+                {formatGameTime(g.game_start_time) && (
+                  <span className="game-time">{formatGameTime(g.game_start_time)}</span>
+                )}
+              </div>
               <div className="game-card-actions">
                 <button
                   className={`btn-proj-fetch${fetchSkipped ? ' btn-proj-fetch-off' : ' btn-proj-fetch-on'}`}

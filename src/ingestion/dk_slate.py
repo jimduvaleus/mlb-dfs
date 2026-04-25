@@ -1,6 +1,7 @@
 import pandas as pd
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import List, Optional
 
 @dataclass
@@ -76,28 +77,41 @@ class DraftKingsSlateIngestor(BaseSlateIngestor):
         if not df['position'].apply(lambda x: x in valid_positions).all():
             raise ValueError("Unexpected position strings found in CSV.")
 
-        # Extract game ID from "Game Info" column.
-        # Handles both "LAD @ SD 03/20/2026 ..." and "DET@SD 03/27/2026 ..." formats.
+        # Extract game ID and start time from "Game Info" column.
+        # Handles both "LAD @ SD 03/20/2026 04:10PM ET" and "DET@SD 03/27/2026 04:10PM ET" formats.
         if 'game_info' in df.columns:
-            def _extract_game(info: str) -> str:
+            def _extract_game_and_time(info: str) -> tuple:
                 tokens = str(info).split()
                 if not tokens:
-                    return ""
+                    return "", ""
                 first = tokens[0]
                 if '@' in first:
-                    # Format: "DET@SD 03/27/2026 ..."
-                    return first
-                if len(tokens) >= 3 and tokens[1] == '@':
-                    # Format: "LAD @ SD 03/20/2026 ..."
-                    return f"{tokens[0]}@{tokens[2]}"
-                return ""
-            df['game'] = df['game_info'].apply(_extract_game)
+                    game = first
+                    time_tokens = tokens[1:]
+                elif len(tokens) >= 3 and tokens[1] == '@':
+                    game = f"{tokens[0]}@{tokens[2]}"
+                    time_tokens = tokens[3:]
+                else:
+                    return "", ""
+                iso_time = ""
+                if len(time_tokens) >= 2:
+                    try:
+                        dt = datetime.strptime(f"{time_tokens[0]} {time_tokens[1]}", "%m/%d/%Y %I:%M%p")
+                        iso_time = dt.isoformat()
+                    except ValueError:
+                        pass
+                return game, iso_time
+
+            parsed = df['game_info'].apply(_extract_game_and_time)
+            df['game'] = parsed.apply(lambda t: t[0])
+            df['game_start_time'] = parsed.apply(lambda t: t[1])
         else:
             df['game'] = ""
+            df['game_start_time'] = ""
 
         df['opponent'] = ""
 
-        return df[['player_id', 'name', 'position', 'eligible_positions', 'roster_position', 'salary', 'team', 'opponent', 'game']]
+        return df[['player_id', 'name', 'position', 'eligible_positions', 'roster_position', 'salary', 'team', 'opponent', 'game', 'game_start_time']]
 
     def get_players(self) -> List[Player]:
         players = []

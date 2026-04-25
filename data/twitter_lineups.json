@@ -1,0 +1,54 @@
+[
+  {
+    "team": "WSH",
+    "notification_id": "e2f6f23f-f767-4909-826b-5a3945fc4f62",
+    "confirmed_at": 1777138388.6138928,
+    "slots": [
+      {
+        "slot": 1,
+        "player_id": 42748892,
+        "name": "J. Wood"
+      },
+      {
+        "slot": 2,
+        "player_id": 42748961,
+        "name": "C. Mead"
+      },
+      {
+        "slot": 3,
+        "player_id": 42749130,
+        "name": "A. Chaparro"
+      },
+      {
+        "slot": 4,
+        "player_id": 42748993,
+        "name": "B. House"
+      },
+      {
+        "slot": 5,
+        "player_id": 42748911,
+        "name": "D. Lile"
+      },
+      {
+        "slot": 6,
+        "player_id": 42748966,
+        "name": "J. Young"
+      },
+      {
+        "slot": 7,
+        "player_id": 42748926,
+        "name": "J. Wiemer"
+      },
+      {
+        "slot": 8,
+        "player_id": 42748955,
+        "name": "N. Nu\u00f1ez"
+      },
+      {
+        "slot": 9,
+        "player_id": 42749005,
+        "name": "K. Ruiz"
+      }
+    ]
+  }
+]

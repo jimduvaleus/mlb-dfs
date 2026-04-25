@@ -112,6 +112,7 @@ class GameStatus(BaseModel):
     home: str
     excluded: bool
     teams: list[TeamStatus]
+    game_start_time: str | None = None
 
 
 class SlateGamesResponse(BaseModel):

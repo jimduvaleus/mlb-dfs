@@ -437,21 +437,28 @@ def _load_slate_df():
     return get_ingestor(platform, str(p)).get_slate_dataframe()
 
 
-def _load_slate_games() -> list[str]:
-    """Parse the configured slate CSV and return unique game strings."""
+def _load_slate_games() -> dict[str, str]:
+    """Parse the configured slate CSV and return {game_id: ISO_start_time} for unique games."""
     df = _load_slate_df()
     if df is None:
-        return []
-    return [g for g in df["game"].dropna().unique().tolist() if g]
+        return {}
+    result: dict[str, str] = {}
+    has_time = "game_start_time" in df.columns
+    for _, row in df.drop_duplicates("game").iterrows():
+        game = str(row["game"])
+        if not game:
+            continue
+        result[game] = str(row["game_start_time"]) if has_time and row["game_start_time"] else ""
+    return result
 
 
 @app.get("/api/slate/games")
 def get_slate_games() -> SlateGamesResponse:
-    games = _load_slate_games()
-    if not games:
+    game_times = _load_slate_games()
+    if not game_times:
         return SlateGamesResponse(slate_id="", games=[], excluded_player_ids=[])
     fingerprint = compute_file_fingerprint(_get_slate_file_path())
-    slate_id, game_dicts, excluded_player_ids = get_slate_games_with_status(games, fingerprint)
+    slate_id, game_dicts, excluded_player_ids = get_slate_games_with_status(game_times, fingerprint)
     return SlateGamesResponse(
         slate_id=slate_id,
         games=[GameStatus(**g) for g in game_dicts],
@@ -488,10 +495,10 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
         excluded_games=update.excluded_games,
         excluded_player_ids=existing_player_ids,
     )
-    games = _load_slate_games()
-    if not games:
+    game_times = _load_slate_games()
+    if not game_times:
         return SlateGamesResponse(slate_id=update.slate_id, games=[], excluded_player_ids=[])
-    slate_id, game_dicts, excluded_player_ids = get_slate_games_with_status(games, fingerprint)
+    slate_id, game_dicts, excluded_player_ids = get_slate_games_with_status(game_times, fingerprint)
     return SlateGamesResponse(
         slate_id=slate_id,
         games=[GameStatus(**g) for g in game_dicts],
