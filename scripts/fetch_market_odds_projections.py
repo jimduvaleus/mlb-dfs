@@ -863,6 +863,32 @@ async def _fetch_game_odds(
             log.debug("Could not select All players for '%s': %s", market_name, e)
         rows: list[list[str]] = await _wait_and_read_table(page)
 
+        # Retry once on empty table — AJAX postback sometimes returns before the
+        # GridView is fully populated, especially under concurrent page load.
+        if not rows:
+            log.debug(
+                "Market '%s' returned empty table for game %d — retrying after delay",
+                market_name, game_id,
+            )
+            await page.wait_for_timeout(2500)
+            try:
+                await page.select_option(SEL_MARKET, label=market_name, timeout=5000)
+            except Exception:
+                pass
+            await _wait_for_ajax(page)
+            try:
+                await page.select_option(SEL_PLAYER, value="0")
+            except Exception:
+                pass
+            rows = await _wait_and_read_table(page)
+            if rows:
+                log.info(
+                    "Market '%s' retry succeeded for game %d (%d rows)",
+                    market_name, game_id, len(rows),
+                )
+            else:
+                log.debug("Market '%s' still empty after retry for game %d", market_name, game_id)
+
         if debug and rows:
             log.debug("Market '%s' raw rows (first 4): %s", market_name, rows[:4])
 
