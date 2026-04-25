@@ -39,3 +39,4 @@ data/processed/batter_score_grid_fd.npy
 data/processed/empirical_copula_fd.parquet
 data/processed/historical_logs_fd.parquet
 data/processed/projections_fd.csv
+data/twitter_lineups.json

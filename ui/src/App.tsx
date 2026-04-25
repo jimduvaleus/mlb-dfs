@@ -69,7 +69,9 @@ export default function App() {
   const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
   // Games (as "AWAY@HOME" strings) to exclude from projection fetches.
   // Empty = fetch all games (default). Non-empty = partial fetch + merge.
-  const [projFetchExcluded, setProjFetchExcluded] = useState<string[]>([])
+  const [projFetchExcluded, setProjFetchExcluded] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem('projFetchExcluded') ?? '[]') } catch { return [] }
+  })
   const [projFetching, setProjFetching] = useState(false)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
@@ -113,6 +115,11 @@ export default function App() {
     refreshUnconfirmed()
     refreshTwitterLineups()
   }, [])
+
+  // Persist proj-fetch exclusions so they survive page reloads
+  useEffect(() => {
+    localStorage.setItem('projFetchExcluded', JSON.stringify(projFetchExcluded))
+  }, [projFetchExcluded])
 
   // Update browser tab title with unread notification count
   useEffect(() => {

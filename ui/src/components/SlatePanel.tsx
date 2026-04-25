@@ -39,7 +39,18 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     setPlayers(null)
     setError(null)
     fetchSlateGames()
-      .then(data => { setSlate(data) })
+      .then(data => {
+        setSlate(data)
+        if (onProjFetchFilterChange) {
+          const slateExcluded = data.games
+            .filter(g => g.excluded)
+            .map(g => `${g.away}@${g.home}`)
+          const merged = [...new Set([...projFetchExcluded, ...slateExcluded])]
+          if (merged.length !== projFetchExcluded.length) {
+            onProjFetchFilterChange(merged)
+          }
+        }
+      })
       .catch(e => setError(String(e)))
     fetchSlatePlayers()
       .then(setPlayers)
@@ -91,11 +102,12 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
   const toggleGame = useCallback(
     (gameStr: string) => {
       if (!slate || disabled || saving) return
+      const toggledGame = slate.games.find(g => g.game === gameStr)
+      const nowExcluded = toggledGame ? !toggledGame.excluded : false
       const updated: SlateGamesResponse = {
         ...slate,
         games: slate.games.map(g => {
           if (g.game !== gameStr) return g
-          const nowExcluded = !g.excluded
           return {
             ...g,
             excluded: nowExcluded,
@@ -104,8 +116,16 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         }),
       }
       persist(updated)
+      if (onProjFetchFilterChange && toggledGame) {
+        const gameKey = `${toggledGame.away}@${toggledGame.home}`
+        onProjFetchFilterChange(
+          nowExcluded
+            ? [...new Set([...projFetchExcluded, gameKey])]
+            : projFetchExcluded.filter(k => k !== gameKey)
+        )
+      }
     },
-    [slate, disabled, saving, persist]
+    [slate, disabled, saving, persist, projFetchExcluded, onProjFetchFilterChange]
   )
 
   const toggleProjFetch = useCallback(
@@ -222,13 +242,15 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
                 )}
               </div>
               <div className="game-card-actions">
-                <button
-                  className={`btn-proj-fetch${fetchSkipped ? ' btn-proj-fetch-off' : ' btn-proj-fetch-on'}`}
-                  onClick={() => toggleProjFetch(gameKey)}
-                  title={fetchSkipped ? 'Include this game in projection fetch' : 'Exclude this game from projection fetch (keeps existing projections for these players)'}
-                >
-                  {fetchSkipped ? '⊘ Proj' : '↓ Proj'}
-                </button>
+                {!g.excluded && (
+                  <button
+                    className={`btn-proj-fetch${fetchSkipped ? ' btn-proj-fetch-off' : ' btn-proj-fetch-on'}`}
+                    onClick={() => toggleProjFetch(gameKey)}
+                    title={fetchSkipped ? 'Include this game in projection fetch' : 'Exclude this game from projection fetch (keeps existing projections for these players)'}
+                  >
+                    {fetchSkipped ? '⊘ Proj' : '↓ Proj'}
+                  </button>
+                )}
                 <button
                   className={`btn-game-toggle${g.excluded ? ' btn-game-excluded' : ' btn-game-included'}`}
                   onClick={() => toggleGame(g.game)}
