@@ -1,3 +1,4 @@
+import { useState, useRef, useEffect } from 'react'
 import type { LineupResult, PlatformType, PlayerRow } from '../types'
 import { getStackNotation } from '../utils'
 import TeamBadge from './TeamBadge'
@@ -107,11 +108,40 @@ function sortAndAssignPositions(
 }
 
 export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
+  const [filterPlayer, setFilterPlayer] = useState<PlayerRow | null>(null)
+  const [search, setSearch] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
+  const searchWrapRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (searchWrapRef.current && !searchWrapRef.current.contains(e.target as Node)) {
+        setSearchOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
+
   if (lineups.length === 0) return null
+
+  const allPlayers = Array.from(
+    new Map(lineups.flatMap(l => l.players).map(p => [p.player_id, p])).values()
+  ).sort((a, b) => a.name.localeCompare(b.name))
+
+  const searchLower = search.toLowerCase()
+  const searchResults = allPlayers
+    .filter(p => p.name.toLowerCase().includes(searchLower))
+    .slice(0, 10)
+
+  const visibleLineups = filterPlayer
+    ? lineups.filter(l => l.players.some(p => p.player_id === filterPlayer.player_id))
+    : lineups
+
   const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
   const unconfirmedByPlayer = new Map<number, { name: string; count: number }>()
-  for (const lineup of lineups) {
+  for (const lineup of visibleLineups) {
     for (const p of lineup.players) {
       if (unconfirmedSet.has(p.player_id)) {
         const entry = unconfirmedByPlayer.get(p.player_id)
@@ -133,14 +163,51 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
 
   return (
     <div className="portfolio-table-wrap">
-      <h3>Portfolio — {lineups.length} Lineups</h3>
+      <h3>Portfolio — {filterPlayer ? `${visibleLineups.length} / ${lineups.length}` : lineups.length} Lineups</h3>
+      <div className="portfolio-filter" ref={searchWrapRef}>
+        {filterPlayer ? (
+          <span className="portfolio-filter-chip">
+            {filterPlayer.name}
+            <button onClick={() => { setFilterPlayer(null); setSearch('') }}>×</button>
+          </span>
+        ) : (
+          <>
+            <input
+              className="portfolio-filter-input"
+              placeholder="Filter by player…"
+              value={search}
+              onChange={e => { setSearch(e.target.value); setSearchOpen(true) }}
+              onFocus={() => setSearchOpen(true)}
+            />
+            {searchOpen && searchResults.length > 0 && (
+              <div className="portfolio-filter-results">
+                {searchResults.map(p => (
+                  <button
+                    key={p.player_id}
+                    className="portfolio-filter-result-btn"
+                    onMouseDown={e => {
+                      e.preventDefault()
+                      setFilterPlayer(p)
+                      setSearch('')
+                      setSearchOpen(false)
+                    }}
+                  >
+                    <span>{p.name}</span>
+                    <span className="portfolio-filter-result-meta">{p.position} · {p.team}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
+        )}
+      </div>
       <div className={`portfolio-unconfirmed-banner ${totalUnconfirmed === 0 ? 'portfolio-unconfirmed-banner--clear' : ''}`}>
         {totalUnconfirmed === 0
           ? '✓ All lineup slots confirmed'
           : `✕ ${totalUnconfirmed} unconfirmed lineup slot${totalUnconfirmed !== 1 ? 's' : ''} across portfolio${breakdown}`}
       </div>
       <div className="portfolio-cards">
-        {lineups.map(lineup => {
+        {visibleLineups.map(lineup => {
           const sorted = sortAndAssignPositions(lineup.players, platform)
           const stack = getStackNotation(lineup.players)
           const isReplacing = replacingLineupIndex === lineup.lineup_index
