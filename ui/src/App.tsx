@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useState } from 'react'
-import type { AppConfig, LineupResult, MergeInfo, RunStatus, CompleteEvent, StoppedEvent, TwitterNotification } from './types'
-import { dismissNotification, fetchConfig, fetchNotifications, fetchPortfolio, fetchUnconfirmedPlayerIds, replaceLineup, stopRun, writeUploadFiles } from './api'
+import type { AppConfig, LineupResult, MergeInfo, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import { dismissNotification, dismissTwitterLineup, fetchConfig, fetchNotifications, fetchPortfolio, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -10,6 +10,7 @@ import { MetricsPanel } from './components/MetricsPanel'
 import { SlatePanel } from './components/SlatePanel'
 import { StopUploadDialog } from './components/StopUploadDialog'
 import { DeleteConfirmModal } from './components/DeleteConfirmModal'
+import { LineupParserDialog } from './components/LineupParserDialog'
 import './App.css'
 
 type Tab = 'config' | 'slate' | 'run' | 'portfolio' | 'metrics'
@@ -21,6 +22,7 @@ interface State {
   activeTab: Tab
   unconfirmedPlayerIds: number[]
   notifications: TwitterNotification[]
+  twitterLineups: TwitterLineupRecord[]
 }
 
 type Action =
@@ -30,6 +32,7 @@ type Action =
   | { type: 'set_tab'; tab: Tab }
   | { type: 'set_unconfirmed'; ids: number[] }
   | { type: 'set_notifications'; notifications: TwitterNotification[] }
+  | { type: 'set_twitter_lineups'; lineups: TwitterLineupRecord[] }
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -45,6 +48,8 @@ function reducer(state: State, action: Action): State {
       return { ...state, unconfirmedPlayerIds: action.ids }
     case 'set_notifications':
       return { ...state, notifications: action.notifications }
+    case 'set_twitter_lineups':
+      return { ...state, twitterLineups: action.lineups }
   }
 }
 
@@ -55,6 +60,7 @@ const initial: State = {
   activeTab: 'config',
   unconfirmedPlayerIds: [],
   notifications: [],
+  twitterLineups: [],
 }
 
 export default function App() {
@@ -70,6 +76,9 @@ export default function App() {
   const [stopPending, setStopPending] = useState(false)
   const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null)
   const [replacingIndex, setReplacingIndex] = useState<number | null>(null)
+  const [parsingNotification, setParsingNotification] = useState<TwitterNotification | null>(null)
+  const [parseResult, setParseResult] = useState<TwitterLineupParseResponse | null>(null)
+  const [parseError, setParseError] = useState<string | null>(null)
   const { events, status: sseStatus, start: startSSE, reset: resetSSE } = useSSE('/api/run/stream')
 
   const running = state.runStatus === 'running'
@@ -77,6 +86,12 @@ export default function App() {
   const refreshUnconfirmed = () => {
     fetchUnconfirmedPlayerIds()
       .then(ids => dispatch({ type: 'set_unconfirmed', ids }))
+      .catch(() => {})
+  }
+
+  const refreshTwitterLineups = () => {
+    fetchTwitterLineups()
+      .then(lineups => dispatch({ type: 'set_twitter_lineups', lineups }))
       .catch(() => {})
   }
 
@@ -96,6 +111,7 @@ export default function App() {
       })
       .catch(e => setConfigError(String(e)))
     refreshUnconfirmed()
+    refreshTwitterLineups()
   }, [])
 
   // Update browser tab title with unread notification count
@@ -154,6 +170,37 @@ export default function App() {
     if (!running || stopPending) return
     setStopPending(true)
     stopRun().catch(() => setStopPending(false))
+  }
+
+  const handleParseNotification = async (notif: TwitterNotification) => {
+    setParseError(null)
+    setParsingNotification(notif)
+    try {
+      const result = await parseTwitterLineup(notif.id, notif.body)
+      if (result.team === null) {
+        setParseError('Team name not recognized in this notification')
+        setParsingNotification(null)
+        return
+      }
+      setParseResult(result)
+    } catch {
+      setParseError('Failed to parse lineup')
+      setParsingNotification(null)
+    }
+  }
+
+  const handleConfirmTwitterLineup = async (req: TwitterLineupSaveRequest) => {
+    await saveTwitterLineup(req)
+    setParsingNotification(null)
+    setParseResult(null)
+    refreshTwitterLineups()
+    refreshUnconfirmed()
+  }
+
+  const handleDismissTwitterLineup = async (team: string) => {
+    await dismissTwitterLineup(team)
+    refreshTwitterLineups()
+    refreshUnconfirmed()
   }
 
   const handleWriteUpload = () => {
@@ -287,7 +334,13 @@ export default function App() {
               dismissNotification(id)
               dispatch({ type: 'set_notifications', notifications: state.notifications.filter(n => n.id !== id) })
             }}
+            twitterLineups={state.twitterLineups}
+            onParseNotification={handleParseNotification}
+            onDismissTwitterLineup={handleDismissTwitterLineup}
           />
+        )}
+        {parseError && state.activeTab === 'slate' && (
+          <div className="parse-error-toast" onClick={() => setParseError(null)}>{parseError}</div>
         )}
 
         {state.activeTab === 'run' && (
@@ -314,6 +367,14 @@ export default function App() {
           lineupIndex={pendingDeleteIndex}
           onConfirm={handleConfirmDelete}
           onCancel={() => setPendingDeleteIndex(null)}
+        />
+      )}
+
+      {parsingNotification && parseResult && (
+        <LineupParserDialog
+          parseResult={parseResult}
+          onConfirm={handleConfirmTwitterLineup}
+          onCancel={() => { setParsingNotification(null); setParseResult(null) }}
         />
       )}
 

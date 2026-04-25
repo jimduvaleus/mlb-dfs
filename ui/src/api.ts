@@ -1,4 +1,4 @@
-import type { AppConfig, ExclusionsUpdate, PlayerExclusionsUpdate, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TwitterNotification } from './types'
+import type { AppConfig, ExclusionsUpdate, PlayerExclusionsUpdate, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -125,4 +125,37 @@ export async function fetchNotifications(): Promise<TwitterNotification[]> {
 
 export async function dismissNotification(id: string): Promise<void> {
   await fetch(`/api/notifications/${encodeURIComponent(id)}`, { method: 'DELETE' })
+}
+
+export async function parseTwitterLineup(notificationId: string, body: string): Promise<TwitterLineupParseResponse> {
+  const res = await fetch('/api/twitter-lineups/parse', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ notification_id: notificationId, body }),
+  })
+  if (!res.ok) throw new Error(`Failed to parse lineup: ${res.statusText}`)
+  return res.json()
+}
+
+export async function fetchTwitterLineups(): Promise<TwitterLineupRecord[]> {
+  const res = await fetch('/api/twitter-lineups')
+  if (!res.ok) return []
+  return res.json()
+}
+
+export async function saveTwitterLineup(req: TwitterLineupSaveRequest): Promise<TwitterLineupRecord> {
+  const res = await fetch('/api/twitter-lineups', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) {
+    const detail = await res.text()
+    throw new Error(`Failed to save lineup: ${detail}`)
+  }
+  return res.json()
+}
+
+export async function dismissTwitterLineup(team: string): Promise<void> {
+  await fetch(`/api/twitter-lineups/${encodeURIComponent(team)}`, { method: 'DELETE' })
 }

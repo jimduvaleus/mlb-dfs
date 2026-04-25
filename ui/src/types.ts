@@ -260,3 +260,46 @@ export interface TwitterNotification {
   app_name: string
   captured_at: number
 }
+
+export interface PlayerMatch {
+  player_id: number
+  name: string
+  team: string
+  position: string
+  salary: number
+  match_confidence: 'exact' | 'fuzzy' | 'none'
+}
+
+export interface ParsedSlot {
+  slot: number
+  raw_name: string
+  position: string
+  matches: PlayerMatch[]
+}
+
+export interface TwitterLineupParseResponse {
+  team: string | null
+  notification_id: string
+  slots: ParsedSlot[]
+  team_in_slate: boolean
+  warning: string | null
+}
+
+export interface TwitterLineupSlot {
+  slot: number
+  player_id: number
+  name: string
+}
+
+export interface TwitterLineupRecord {
+  team: string
+  notification_id: string
+  confirmed_at: number
+  slots: TwitterLineupSlot[]
+}
+
+export interface TwitterLineupSaveRequest {
+  team: string
+  notification_id: string
+  slots: TwitterLineupSlot[]
+}

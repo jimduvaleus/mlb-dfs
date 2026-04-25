@@ -152,6 +152,7 @@ class PipelineRunner:
                 slate_df[["player_id", "name"]], on="player_id", how="left"
             )
 
+        players_df = self._apply_twitter_overrides(players_df)
         players_df, excl_stats = self._apply_exclusions(players_df, slate_path=slate_path)
 
         # --- Value cutoff filtering ------------------------------------
@@ -626,6 +627,23 @@ class PipelineRunner:
         if "slot_confirmed" in df.columns:
             base_cols.append("slot_confirmed")
         return df[base_cols]
+
+    @staticmethod
+    def _apply_twitter_overrides(players_df: pd.DataFrame) -> pd.DataFrame:
+        """Apply confirmed twitter lineup slot/slot_confirmed overrides to players_df."""
+        from .twitter_lineups import get_twitter_overrides
+        overrides = get_twitter_overrides()
+        if not overrides:
+            return players_df
+        df = players_df.copy()
+        if "slot_confirmed" not in df.columns:
+            df["slot_confirmed"] = False
+        for player_id, data in overrides.items():
+            mask = df["player_id"] == player_id
+            if mask.any():
+                df.loc[mask, "slot"] = data["slot"]
+                df.loc[mask, "slot_confirmed"] = True
+        return df
 
     @staticmethod
     def _apply_exclusions(players_df: pd.DataFrame, slate_path: str = "") -> tuple:

@@ -151,3 +151,51 @@ class TwitterNotification(BaseModel):
     body: str
     app_name: str
     captured_at: float  # Unix timestamp
+
+
+class PlayerMatch(BaseModel):
+    player_id: int
+    name: str
+    team: str
+    position: str
+    salary: int
+    match_confidence: str  # "exact" | "fuzzy" | "none"
+
+
+class ParsedSlot(BaseModel):
+    slot: int
+    raw_name: str
+    position: str
+    matches: list[PlayerMatch]
+
+
+class TwitterLineupParseRequest(BaseModel):
+    notification_id: str
+    body: str
+
+
+class TwitterLineupParseResponse(BaseModel):
+    team: Optional[str]
+    notification_id: str
+    slots: list[ParsedSlot]
+    team_in_slate: bool
+    warning: Optional[str] = None
+
+
+class TwitterLineupSlot(BaseModel):
+    slot: int
+    player_id: int
+    name: str
+
+
+class TwitterLineupRecord(BaseModel):
+    team: str
+    notification_id: str
+    confirmed_at: float
+    slots: list[TwitterLineupSlot]
+
+
+class TwitterLineupSaveRequest(BaseModel):
+    team: str
+    notification_id: str
+    slots: list[TwitterLineupSlot]

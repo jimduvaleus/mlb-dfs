@@ -27,7 +27,15 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config_io import read_config, write_config
-from .models import AppConfig, ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse
+from .models import AppConfig, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
+from .twitter_lineups import (
+    delete_twitter_lineup,
+    get_twitter_overrides,
+    load_twitter_lineups,
+    match_player_name,
+    parse_notification_body,
+    upsert_twitter_lineup,
+)
 from .projections_meta import (
     compute_freshness,
     fetch_and_cache_slates,
@@ -271,6 +279,96 @@ def delete_notification(notification_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Twitter lineup endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/twitter-lineups/parse")
+def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseResponse:
+    team, raw_slots = parse_notification_body(req.body)
+    if team is None:
+        return TwitterLineupParseResponse(
+            team=None,
+            notification_id=req.notification_id,
+            slots=[],
+            team_in_slate=False,
+            warning="Team name not recognized",
+        )
+
+    # Load all slate hitters for that team (include excluded players — exclusion ≠ slot confirmation)
+    slate_df = _load_slate_df()
+    team_hitters: list[dict] = []
+    team_in_slate = False
+    if slate_df is not None:
+        rows = slate_df[
+            (slate_df["team"] == team) & (slate_df["position"] != "P")
+        ]
+        team_in_slate = not rows.empty
+        team_hitters = [
+            {
+                "player_id": int(r["player_id"]),
+                "name": str(r["name"]),
+                "team": str(r["team"]),
+                "position": str(r["position"]),
+                "salary": int(r["salary"]),
+            }
+            for _, r in rows.iterrows()
+        ]
+
+    warning: str | None = None
+    if not team_in_slate:
+        warning = f"{team} not found on the current slate"
+
+    parsed_slots: list[ParsedSlot] = []
+    for raw in raw_slots:
+        candidate_dicts = match_player_name(raw["name"], team_hitters)
+        matches = [
+            PlayerMatch(
+                player_id=c["player_id"],
+                name=c["name"],
+                team=c["team"],
+                position=c["position"],
+                salary=c["salary"],
+                match_confidence=c["match_confidence"],
+            )
+            for c in candidate_dicts
+        ]
+        parsed_slots.append(ParsedSlot(
+            slot=raw["slot"],
+            raw_name=raw["name"],
+            position=raw["position"],
+            matches=matches,
+        ))
+
+    return TwitterLineupParseResponse(
+        team=team,
+        notification_id=req.notification_id,
+        slots=parsed_slots,
+        team_in_slate=team_in_slate,
+        warning=warning,
+    )
+
+
+@app.get("/api/twitter-lineups")
+def get_twitter_lineups() -> list[TwitterLineupRecord]:
+    return [TwitterLineupRecord(**l) for l in load_twitter_lineups()]
+
+
+@app.post("/api/twitter-lineups")
+def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
+    slots = [s.model_dump() for s in req.slots]
+    record = upsert_twitter_lineup(req.team, req.notification_id, slots)
+    return TwitterLineupRecord(**record)
+
+
+@app.delete("/api/twitter-lineups/{team}")
+def remove_twitter_lineup(team: str):
+    found = delete_twitter_lineup(team)
+    if not found:
+        raise HTTPException(404, detail="No confirmed lineup for that team")
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
 # Slate game/team exclusion endpoints
 # ---------------------------------------------------------------------------
 
@@ -499,7 +597,7 @@ def projections_status() -> ProjectionsStatus:
         else None
     )
 
-    return ProjectionsStatus(
+    status = ProjectionsStatus(
         exists=True,
         path=str(p.relative_to(PROJECT_ROOT)),
         last_modified=stat.st_mtime,
@@ -508,6 +606,10 @@ def projections_status() -> ProjectionsStatus:
         is_fresh=is_fresh,
         **extra,
     )
+    if status.unconfirmed_count is not None:
+        n_twitter = len(get_twitter_overrides())
+        status.unconfirmed_count = max(0, status.unconfirmed_count - n_twitter)
+    return status
 
 
 @app.get("/api/projections/unconfirmed")
@@ -522,7 +624,9 @@ def projections_unconfirmed():
         if "slot_confirmed" not in df.columns or "player_id" not in df.columns:
             return {"player_ids": []}
         unconfirmed = df[~df["slot_confirmed"].astype(bool)]["player_id"].tolist()
-        return {"player_ids": [int(x) for x in unconfirmed]}
+        twitter_confirmed = set(get_twitter_overrides().keys())
+        unconfirmed = [int(x) for x in unconfirmed if int(x) not in twitter_confirmed]
+        return {"player_ids": unconfirmed}
     except Exception:
         return {"player_ids": []}
 

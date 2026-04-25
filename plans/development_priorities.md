@@ -1,3 +1,4 @@
+- Player filter on Portfolio tab
 - UI run tab to 4-wide
 - BIG Turbo button
 - BIG Opponent/contest modeling

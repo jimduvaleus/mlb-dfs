@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PlatformType, SlateGamesResponse, SlatePlayersResponse, TwitterNotification } from '../types'
+import type { ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PlatformType, SlateGamesResponse, SlatePlayersResponse, TwitterLineupRecord, TwitterNotification } from '../types'
 import { fetchSlateGames, fetchSlatePlayers, savePlayerExclusions, saveSlateExclusions } from '../api'
 
 interface Props {
@@ -9,9 +9,12 @@ interface Props {
   platform?: PlatformType
   notifications?: TwitterNotification[]
   onDismissNotification?: (id: string) => void
+  twitterLineups?: TwitterLineupRecord[]
+  onParseNotification?: (notif: TwitterNotification) => void
+  onDismissTwitterLineup?: (team: string) => void
 }
 
-export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification }: Props) {
+export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
@@ -314,14 +317,60 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
                   </div>
                   {n.body && <span className="twitter-notif-text">{n.body}</span>}
                 </div>
-                <button
-                  className="twitter-notif-dismiss"
-                  onClick={() => onDismissNotification?.(n.id)}
-                  title="Dismiss"
-                  aria-label="Dismiss notification"
-                >
-                  ✕
-                </button>
+                <div className="twitter-notif-actions">
+                  <button
+                    className="twitter-notif-parse"
+                    onClick={() => onParseNotification?.(n)}
+                    title="Parse lineup from this notification"
+                  >
+                    Parse
+                  </button>
+                  <button
+                    className="twitter-notif-dismiss"
+                    onClick={() => onDismissNotification?.(n.id)}
+                    title="Dismiss"
+                    aria-label="Dismiss notification"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {twitterLineups.length > 0 && (
+        <div className="twitter-confirmed-lineups">
+          <div className="twitter-notifications-header">
+            <h3 className="slate-title">Confirmed Lineups</h3>
+            <span className="slate-summary">{twitterLineups.length} team{twitterLineups.length !== 1 ? 's' : ''}</span>
+          </div>
+          <div className="twitter-confirmed-list">
+            {twitterLineups.map(tl => (
+              <div key={tl.team} className="twitter-confirmed-item">
+                <div className="twitter-confirmed-header">
+                  <span className="twitter-confirmed-team">{tl.team}</span>
+                  <span className="twitter-confirmed-time">
+                    {new Date(tl.confirmed_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                  </span>
+                  <button
+                    className="twitter-notif-dismiss"
+                    onClick={() => onDismissTwitterLineup?.(tl.team)}
+                    title={`Remove confirmed lineup for ${tl.team}`}
+                    aria-label={`Dismiss ${tl.team} lineup`}
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="twitter-confirmed-slots">
+                  {tl.slots.map(s => (
+                    <span key={s.slot} className="twitter-confirmed-slot">
+                      <span className="batting-slot-bubble batting-slot-bubble--confirmed">{s.slot}</span>
+                      {s.name}
+                    </span>
+                  ))}
+                </div>
               </div>
             ))}
           </div>
