@@ -19,14 +19,17 @@ export function LineupParserDialog({ parseResult, onConfirm, onCancel }: Props) 
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
-  const canConfirm = selections.every(s => s !== null)
+  const skippedCount = selections.filter(s => s === null).length
+  const resolvedCount = selections.length - skippedCount
+  const canConfirm = resolvedCount > 0
 
   const handleConfirm = async () => {
-    const slots: TwitterLineupSlot[] = parseResult.slots.map((s, i) => ({
-      slot: s.slot,
-      player_id: selections[i]!,
-      name: s.raw_name,
-    }))
+    // Only include slots that were successfully matched
+    const slots: TwitterLineupSlot[] = parseResult.slots
+      .flatMap((s, i) => selections[i] !== null
+        ? [{ slot: s.slot, player_id: selections[i]!, name: s.raw_name }]
+        : []
+      )
     const req: TwitterLineupSaveRequest = {
       team: parseResult.team!,
       notification_id: parseResult.notification_id,
@@ -61,21 +64,31 @@ export function LineupParserDialog({ parseResult, onConfirm, onCancel }: Props) 
           </div>
         )}
 
+        {skippedCount > 0 && (
+          <div className="dialog-warning dialog-warning--caution">
+            {skippedCount} slot{skippedCount !== 1 ? 's' : ''} couldn't be matched to a player in the pool and will be skipped.
+          </div>
+        )}
+
         <div className="lineup-parser-slots">
           {parseResult.slots.map((slot, i) => {
             const selected = getSelectedPlayer(slot, selections[i])
-            const isExact = slot.matches.length === 1 && slot.matches[0].match_confidence === 'exact'
             const noMatch = slot.matches.length === 0
+            const singleMatch = slot.matches.length === 1
 
             return (
               <div key={slot.slot} className="lp-slot-row">
                 <span className="lp-slot-num">{slot.slot}</span>
-                <span className="lp-raw-name">{slot.raw_name} <span className="lp-pos-chip">{slot.position}</span></span>
+                <span className="lp-raw-name">
+                  {slot.raw_name} <span className="lp-pos-chip">{slot.position}</span>
+                </span>
                 <span className="lp-player-cell">
                   {noMatch ? (
-                    <span className="lp-no-match">No player found in pool</span>
-                  ) : isExact ? (
-                    <span className="lp-match-exact">{slot.matches[0].name}</span>
+                    <span className="lp-no-match">Not in player pool — skipped</span>
+                  ) : singleMatch ? (
+                    <span className={slot.matches[0].match_confidence === 'exact' ? 'lp-match-exact' : 'lp-match-fuzzy'}>
+                      {slot.matches[0].name}
+                    </span>
                   ) : (
                     <select
                       className="lp-match-select"
@@ -91,8 +104,7 @@ export function LineupParserDialog({ parseResult, onConfirm, onCancel }: Props) 
                     >
                       {slot.matches.map(m => (
                         <option key={m.player_id} value={m.player_id}>
-                          {m.name} ({m.position} · ${(m.salary / 1000).toFixed(1)}k)
-                          {m.match_confidence === 'fuzzy' ? ' ~' : ''}
+                          {m.match_confidence === 'fuzzy' ? '~ ' : ''}{m.name} ({m.position} · ${(m.salary / 1000).toFixed(1)}k)
                         </option>
                       ))}
                     </select>
@@ -117,7 +129,7 @@ export function LineupParserDialog({ parseResult, onConfirm, onCancel }: Props) 
             onClick={handleConfirm}
             disabled={!canConfirm || saving}
           >
-            {saving ? 'Saving…' : 'Confirm Lineup'}
+            {saving ? 'Saving…' : skippedCount > 0 ? `Confirm ${resolvedCount} Slots` : 'Confirm Lineup'}
           </button>
         </div>
       </div>

@@ -125,6 +125,19 @@ button { cursor: pointer; }
 .btn-run:hover:not(:disabled) { background: #2b6cb0; }
 .btn-run:disabled { background: #2d3748; color: #718096; cursor: not-allowed; }
 
+.btn-primary {
+  padding: 6px 14px;
+  background: #3182ce;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  transition: background 0.15s;
+}
+.btn-primary:hover:not(:disabled) { background: #2b6cb0; }
+.btn-primary:disabled { background: #2d3748; color: #718096; cursor: not-allowed; }
+
 .btn-secondary {
   padding: 6px 14px;
   background: #2d3748;
@@ -1594,6 +1607,12 @@ button { cursor: pointer; }
 
 .lp-match-exact {
   color: #68d391;
+  font-weight: 500;
+  font-size: 13px;
+}
+
+.lp-match-fuzzy {
+  color: #f6ad55;
   font-weight: 500;
   font-size: 13px;
 }
