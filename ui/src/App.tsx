@@ -1,4 +1,4 @@
-import { useEffect, useReducer, useState } from 'react'
+import { useEffect, useReducer, useRef, useState } from 'react'
 import type { AppConfig, LineupResult, MergeInfo, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 import { dismissNotification, dismissTwitterLineup, fetchConfig, fetchNotifications, fetchPortfolio, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
@@ -69,9 +69,9 @@ export default function App() {
   const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
   // Games (as "AWAY@HOME" strings) to exclude from projection fetches.
   // Empty = fetch all games (default). Non-empty = partial fetch + merge.
-  const [projFetchExcluded, setProjFetchExcluded] = useState<string[]>(() => {
-    try { return JSON.parse(localStorage.getItem('projFetchExcluded') ?? '[]') } catch { return [] }
-  })
+  // Stored per-platform in localStorage; restored once config/platform is known.
+  const [projFetchExcluded, setProjFetchExcluded] = useState<string[]>([])
+  const projFetchPlatformRef = useRef<string>('')
   const [projFetching, setProjFetching] = useState(false)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
@@ -116,9 +116,37 @@ export default function App() {
     refreshTwitterLineups()
   }, [])
 
-  // Persist proj-fetch exclusions so they survive page reloads
+  // Restore per-platform proj-fetch exclusions when the platform or salary file changes.
+  // Storage format: { draftkings: string[], fanduel: string[] }
+  // Invalidates (resets) a platform's exclusions when its salary file path changes.
   useEffect(() => {
-    localStorage.setItem('projFetchExcluded', JSON.stringify(projFetchExcluded))
+    if (!state.config) return
+    const { platform, dk_slate, fd_slate } = state.config
+    projFetchPlatformRef.current = platform
+    const currentSlate = platform === 'fanduel' ? fd_slate : dk_slate
+    const slateKey = `projFetchSlatePath_${platform}`
+    const storedPath = localStorage.getItem(slateKey)
+    const all: Record<string, string[]> = (() => {
+      try { return JSON.parse(localStorage.getItem('projFetchExcluded') ?? '{}') } catch { return {} }
+    })()
+    if (storedPath !== null && storedPath !== currentSlate) {
+      all[platform] = []
+      localStorage.setItem('projFetchExcluded', JSON.stringify(all))
+      setProjFetchExcluded([])
+    } else {
+      setProjFetchExcluded(Array.isArray(all[platform]) ? all[platform] : [])
+    }
+    localStorage.setItem(slateKey, currentSlate)
+  }, [state.config?.platform, state.config?.dk_slate, state.config?.fd_slate])
+
+  // Persist proj-fetch exclusions to the current platform's slot
+  useEffect(() => {
+    if (!projFetchPlatformRef.current) return
+    const all: Record<string, string[]> = (() => {
+      try { return JSON.parse(localStorage.getItem('projFetchExcluded') ?? '{}') } catch { return {} }
+    })()
+    all[projFetchPlatformRef.current] = projFetchExcluded
+    localStorage.setItem('projFetchExcluded', JSON.stringify(all))
   }, [projFetchExcluded])
 
   // Update browser tab title with unread notification count
