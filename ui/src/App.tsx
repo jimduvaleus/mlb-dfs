@@ -121,9 +121,9 @@ export default function App() {
   // Invalidates (resets) a platform's exclusions when its salary file path changes.
   useEffect(() => {
     if (!state.config) return
-    const { platform, dk_slate, fd_slate } = state.config
+    const { platform, paths } = state.config
     projFetchPlatformRef.current = platform
-    const currentSlate = platform === 'fanduel' ? fd_slate : dk_slate
+    const currentSlate = platform === 'fanduel' ? paths.fd_slate : paths.dk_slate
     const slateKey = `projFetchSlatePath_${platform}`
     const storedPath = localStorage.getItem(slateKey)
     const all: Record<string, string[]> = (() => {
@@ -137,7 +137,7 @@ export default function App() {
       setProjFetchExcluded(Array.isArray(all[platform]) ? all[platform] : [])
     }
     localStorage.setItem(slateKey, currentSlate)
-  }, [state.config?.platform, state.config?.dk_slate, state.config?.fd_slate])
+  }, [state.config?.platform, state.config?.paths.dk_slate, state.config?.paths.fd_slate])
 
   // Persist proj-fetch exclusions to the current platform's slot
   useEffect(() => {
