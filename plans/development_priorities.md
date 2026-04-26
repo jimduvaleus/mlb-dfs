@@ -1,5 +1,5 @@
-- UI run tab to 4-wide
 - BIG Turbo button
+- BIG Projections tab
 - BIG Opponent/contest modeling
 - BIG late swap?
 - on projections fetch, if number of changes is small, report them

@@ -201,10 +201,17 @@ export interface MergePlayer {
   is_pitcher?: boolean
 }
 
+export interface CappedPlayer {
+  name: string
+  team: string
+  markets: string[]  // raw market keys e.g. ["home_runs", "stolen_bases"]
+}
+
 export interface MergeInfo {
   secondarySource: string
   count: number
   players: MergePlayer[]
+  cappedPlayers?: CappedPlayer[]
 }
 
 // Slate game/team exclusion types

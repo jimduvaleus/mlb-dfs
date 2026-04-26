@@ -153,6 +153,40 @@ _FD_PITCHER = dict(out=1.0,  k=3.0, win=6.0, qs=4.0,
 # when the Earned Runs market is unavailable for a pitcher.
 _QS_ER_FALLBACK_PROB = 0.60
 
+# Minimum implied probability required to accept a flagged (⚠️) one-way-devigged
+# Over line > 0.5 into the NB regression as a tail constraint.
+# Below this threshold the line is essentially a minimum-price noise bet with no
+# real market signal; including it can cause the (k+1)² weighted regression to
+# dramatically overestimate μ for rare events (e.g. HRs for a speedster).
+_FLAGGED_OVER_MIN_PROB = 0.02
+
+# Per-market hard caps on the NB mean E[X] for batters.
+# Set +25% above realistic single-game maximums to accommodate genuine edge
+# cases (Judge HR in Coors, Simpson SB vs a slow catcher).  Firing this cap
+# is unexpected and always logged as a WARNING — verify the odds manually.
+_BATTER_MEAN_CAPS: dict[str, float] = {
+    MK_SINGLES: 3.12,  # elite contact hitters ~1.1-1.3/game
+    MK_DOUBLES: 1.88,  # elite doubles hitters ~0.4-0.5/game
+    MK_TRIPLES: 0.38,  # rare even for speedsters
+    MK_HR:      0.75,  # best power hitters ~0.10-0.15/game
+    MK_SB:      1.00,  # best base stealers ~0.3-0.5/game
+    MK_WALKS:   1.88,  # most patient hitters ~0.4-0.8 BB/game
+    MK_RUNS:    2.25,
+    MK_RBIS:    2.50,
+}
+
+# Human-readable labels for market keys — used in WARNING log messages and UI.
+_MARKET_DISPLAY: dict[str, str] = {
+    MK_SINGLES: "1B",
+    MK_DOUBLES: "2B",
+    MK_TRIPLES: "3B",
+    MK_HR:      "HR",
+    MK_SB:      "SB",
+    MK_WALKS:   "BB",
+    MK_RUNS:    "R",
+    MK_RBIS:    "RBI",
+}
+
 # Max browser pages open simultaneously while fetching game odds.
 # Tune down to 1-2 if the site starts returning empty tables or HTTP 429s.
 _MAX_CONCURRENT_GAMES = 4
@@ -550,6 +584,12 @@ def _fit_nb_mean(lines_probs: list[tuple[float, float]], tol: float = 1e-9) -> f
 
     For a single line the estimator reduces to the previous closed-form:
         θ = log(p_over) / 1  →  q = p_over  →  μ = p_over / (1 − p_over).
+
+    Consistency guardrail: when a 0.5-line is present its implied mean
+    (μ_half = p_over / (1 − p_over)) is the most direct market estimate.
+    The multi-line result is capped at 2× μ_half so that noisy or low-liquidity
+    higher lines cannot override the primary 0.5-line price via their x² weight
+    advantage — the scenario that inflated Chandler Simpson's HR projection.
     """
     numerator = 0.0
     denominator = 0.0
@@ -568,7 +608,18 @@ def _fit_nb_mean(lines_probs: list[tuple[float, float]], tol: float = 1e-9) -> f
     q = math.exp(theta)
     if q >= 1.0 - tol:
         return None
-    return q / (1.0 - q)
+    mu = q / (1.0 - q)
+
+    # 0.5-line consistency cap: the regression must not diverge more than 2×
+    # above what the 0.5-line alone implies.  The 0.5 line is the most liquid
+    # and informative prop; higher lines can be one-way-devigged (⚠️) noise.
+    half_probs = [p for ln, p in lines_probs if math.floor(ln) == 0]
+    if half_probs:
+        p_h = max(tol, min(1.0 - tol, half_probs[0]))
+        mu_half = p_h / (1.0 - p_h)
+        mu = min(mu, 2.0 * mu_half)
+
+    return mu
 
 
 # ---------------------------------------------------------------------------
@@ -935,14 +986,23 @@ async def _fetch_game_odds(
                         # Store for flagged-0.5 fallback (existing logic)
                         flagged_half.setdefault(player_name, {})[outcome] = prob
                     elif outcome == "over":
-                        # Accept flagged Over lines > 0.5 into raw so the NB
-                        # regression can use them as tail constraints.  No Under
-                        # side is available so p_over is used without normalization.
-                        raw.setdefault((player_name, line), {})["over"] = prob
-                        log.debug(
-                            "Accepting flagged over %.1f odds for %s (p_over=%.4f)",
-                            line, player_name, prob,
-                        )
+                        # Accept flagged Over lines > 0.5 as tail constraints for
+                        # the NB regression — but only above _FLAGGED_OVER_MIN_PROB.
+                        # Sub-threshold lines are minimum-price noise bets with no
+                        # real signal; their tiny p_over combined with the (k+1)²
+                        # regression weight can massively inflate μ for rare events.
+                        if prob < _FLAGGED_OVER_MIN_PROB:
+                            log.debug(
+                                "Discarding near-zero flagged over %.1f for %s "
+                                "(p_over=%.4f < %.2f threshold)",
+                                line, player_name, prob, _FLAGGED_OVER_MIN_PROB,
+                            )
+                        else:
+                            raw.setdefault((player_name, line), {})["over"] = prob
+                            log.debug(
+                                "Accepting flagged over %.1f odds for %s (p_over=%.4f)",
+                                line, player_name, prob,
+                            )
                     else:
                         log.debug("Skipping flagged odds row: %s %s", player_name, odds_cell)
                 else:
@@ -1187,9 +1247,9 @@ def _compute_qs_probability(e_outs: float, e_er: float) -> float:
 def _compute_batter_projection(
     player_markets: dict[str, list[tuple[float, float]]],
     platform: str = "draftkings",
-) -> tuple[float, float] | tuple[None, str]:
+) -> tuple[float, float, list[str]] | tuple[None, str]:
     """
-    Compute (mean, std_dev) for a batter from market mean estimates.
+    Compute (mean, std_dev, capped_markets) for a batter from market means.
 
     Uses the Geometric NB (r=1) model to back-solve E[X] from O/U fair odds.
     This corrects the systematic underestimation Poisson produces for batter
@@ -1201,16 +1261,24 @@ def _compute_batter_projection(
 
     Returns (None, reason) when key market data is absent for this player —
     the caller should use a RotoWire fallback projection in that case.
-    Returns (mean, std_dev) on success.
+    Returns (mean, std_dev, capped_markets) on success, where capped_markets
+    lists any market keys whose E[X] was clamped by _BATTER_MEAN_CAPS.
     """
     c = _FD_BATTER if platform == "fanduel" else _DK_BATTER
+    capped: list[str] = []
 
     def get_mu(key: str) -> float:
         lp = player_markets.get(key, [])
         if not lp:
             return 0.0
         mu = _fit_nb_mean(lp)
-        return mu if mu is not None else 0.0
+        if mu is None:
+            return 0.0
+        cap = _BATTER_MEAN_CAPS.get(key, float("inf"))
+        if mu > cap:
+            capped.append(key)
+            return cap
+        return mu
 
     e_s   = get_mu(MK_SINGLES)
     e_d   = get_mu(MK_DOUBLES)
@@ -1254,7 +1322,7 @@ def _compute_batter_projection(
         + e_sb  * (1 + e_sb)  * c["sb"]       ** 2
         + e_hbp * (1 + e_hbp) * c["hbp"]      ** 2
     )
-    return mean, max(math.sqrt(var), 1.0)
+    return mean, max(math.sqrt(var), 1.0), capped
 
 
 def _compute_pitcher_projection(
@@ -1589,6 +1657,8 @@ def build_projections_csv(
     unmatched: list[str] = []
     # player_id → reason string for batters that couldn't be projected from market data
     fallback_reasons: dict[int, str] = {}
+    # player_id → list of market keys that hit the hard cap
+    cap_warnings: dict[int, list[str]] = {}
 
     for (player_name, away, home), player_markets in all_market_data.items():
         source_teams = {away, home}
@@ -1623,7 +1693,18 @@ def build_projections_csv(
                 )
                 fallback_reasons[pid] = reason
                 continue
-            mean, std_dev = float(batter_result[0]), float(batter_result[1])  # type: ignore[arg-type]
+            mean, std_dev, capped_markets = (
+                float(batter_result[0]), float(batter_result[1]), list(batter_result[2])  # type: ignore[arg-type]
+            )
+            if capped_markets:
+                display = ", ".join(_MARKET_DISPLAY.get(k, k) for k in capped_markets)
+                log.warning(
+                    "⚠ HARD CAP APPLIED — %s (pid=%d): %s hit per-market ceiling. "
+                    "Verify odds manually — may reflect a genuine edge case "
+                    "(e.g. Coors HR, fast player vs slow battery).",
+                    player_name, pid, display,
+                )
+                cap_warnings[pid] = capped_markets
 
         matched.append({
             "player_id": pid,
@@ -1679,8 +1760,7 @@ def build_projections_csv(
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_path, index=False)
 
-    # Write sidecar JSON mapping player_id → fallback reason.
-    # The server reads this to annotate the merge_info callout in the UI.
+    # Write sidecar JSONs read by the server to annotate the UI merge_info callout.
     _op = Path(output_path)
     sidecar_path = _op.parent / (_op.stem + "_fallback.json")
     try:
@@ -1690,6 +1770,21 @@ def build_projections_csv(
         log.debug("Wrote fallback reasons for %d players → %s", len(fallback_reasons), sidecar_path)
     except Exception as e:
         log.warning("Could not write fallback sidecar: %s", e)
+
+    caps_path = _op.parent / (_op.stem + "_caps.json")
+    try:
+        caps_path.write_text(
+            json.dumps({str(pid): mkts for pid, mkts in cap_warnings.items()}, indent=2)
+        )
+        if cap_warnings:
+            log.warning(
+                "⚠ %d player(s) hit per-market hard caps — see %s",
+                len(cap_warnings), caps_path,
+            )
+        else:
+            log.debug("No hard caps applied → %s", caps_path)
+    except Exception as e:
+        log.warning("Could not write caps sidecar: %s", e)
 
     n_pitchers = int(out_df["player_id"].map(dk_pos).apply(
         lambda pos: any(p.upper() in {"P", "SP", "RP"} for p in str(pos).split("/"))

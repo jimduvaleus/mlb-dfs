@@ -781,13 +781,14 @@ async def projections_fetch(request: Request):
         dff_out    = proj_path.parent / "projections_dff.csv"
         rw_out     = proj_path.parent / "projections_rw.csv"
         mo_out     = proj_path.parent / "projections_mo.csv"
-        mo_sidecar = proj_path.parent / "projections_mo_fallback.json"
+        mo_sidecar   = proj_path.parent / "projections_mo_fallback.json"
+        mo_caps_path = proj_path.parent / "projections_mo_caps.json"
 
         def _log(msg: str) -> str:
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
 
         # Clean up any stale temp files left by a prior incomplete fetch.
-        for _p in (dff_out, rw_out, mo_out, mo_sidecar):
+        for _p in (dff_out, rw_out, mo_out, mo_sidecar, mo_caps_path):
             try:
                 _p.unlink(missing_ok=True)
             except Exception:
@@ -807,6 +808,16 @@ async def projections_fetch(request: Request):
                 return {}
             try:
                 raw = json.loads(mo_sidecar.read_text())
+                return {int(k): v for k, v in raw.items()}
+            except Exception:
+                return {}
+
+        # Helper: read hard-cap warnings written by the MO fetch script.
+        def _read_mo_caps() -> dict[int, list[str]]:
+            if not mo_caps_path.exists():
+                return {}
+            try:
+                raw = json.loads(mo_caps_path.read_text())
                 return {int(k): v for k, v in raw.items()}
             except Exception:
                 return {}
@@ -961,8 +972,26 @@ async def projections_fetch(request: Request):
                         _write_proj(pool)
                         proj_written = True
 
-                        if fallback_players:
-                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'timestamp': int(time.time() * 1000)})}\n\n"
+                        # Build capped_players list from the caps sidecar + pool.
+                        mo_cap_data = _read_mo_caps()
+                        capped_players: list[dict] = []
+                        if mo_cap_data and "name" in pool.columns:
+                            pid_to_name = (
+                                pool[["player_id", "name"]]
+                                .drop_duplicates("player_id")
+                                .set_index("player_id")["name"]
+                                .to_dict()
+                            )
+                            for cap_pid, cap_mkts in mo_cap_data.items():
+                                if cap_pid in pid_to_name:
+                                    capped_players.append({
+                                        "name": pid_to_name[cap_pid],
+                                        "team": _itm.get(cap_pid, ""),
+                                        "markets": cap_mkts,
+                                    })
+
+                        if fallback_players or capped_players:
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'timestamp': int(time.time() * 1000)})}\n\n"
                         elif result_event is None:
                             result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
 
@@ -970,7 +999,7 @@ async def projections_fetch(request: Request):
                 returncode = 1
                 result_event = _log(f"Warning: merge error — {exc}")
             finally:
-                for p in (rw_out, mo_out, mo_sidecar):
+                for p in (rw_out, mo_out, mo_sidecar, mo_caps_path):
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:

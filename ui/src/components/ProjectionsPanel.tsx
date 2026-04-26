@@ -1,5 +1,10 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { MergeInfo, ProjectionsStatus } from '../types'
+import type { CappedPlayer, MergeInfo, ProjectionsStatus } from '../types'
+
+const MARKET_DISPLAY: Record<string, string> = {
+  singles: '1B', doubles: '2B', triples: '3B', home_runs: 'HR',
+  stolen_bases: 'SB', walks: 'BB', runs: 'R', rbis: 'RBI',
+}
 import { fetchProjectionsStatus, fetchSlatePlayers, savePlayerExclusions } from '../api'
 
 interface Props {
@@ -67,7 +72,8 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         setLog(prev => [...prev, event.line])
       } else if (event.type === 'merge_info') {
         const players = event.players as Array<{ name: string; team: string; reason?: string; player_id?: number; is_pitcher?: boolean }>
-        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players })
+        const cappedPlayers = (event.capped_players ?? []) as CappedPlayer[]
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers })
         // Auto-exclude pitchers that fell back to a secondary source — their
         // projections are lower quality regardless of which primary source was used.
         const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
@@ -179,7 +185,30 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         </div>
       )}
 
-      {mergeInfo && (
+      {mergeInfo && mergeInfo.cappedPlayers && mergeInfo.cappedPlayers.length > 0 && (
+        <div className="merge-info-callout merge-info-caps-callout">
+          <strong>⚠ Hard cap applied — {mergeInfo.cappedPlayers.length} player{mergeInfo.cappedPlayers.length !== 1 ? 's' : ''}</strong>
+          <div className="merge-info-cap-note">
+            One or more market E[X] estimates hit the per-market ceiling.
+            Verify the odds manually — may reflect a genuine edge case (e.g. Coors HR, speedster vs slow battery).
+          </div>
+          <div className="merge-info-players">
+            {mergeInfo.cappedPlayers.map((p, i) => (
+              <span key={i} className="merge-info-team-group">
+                <span className="merge-info-team-label">{p.team}</span>
+                {' ('}
+                <span title={`Capped markets: ${p.markets.map(m => MARKET_DISPLAY[m] ?? m).join(', ')}`}>
+                  {p.name}
+                  <span className="merge-info-reason"> ⓘ {p.markets.map(m => MARKET_DISPLAY[m] ?? m).join(', ')}</span>
+                </span>
+                {')'}
+              </span>
+            )).reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])}
+          </div>
+        </div>
+      )}
+
+      {mergeInfo && mergeInfo.count > 0 && (
         <div className="merge-info-callout">
           <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback projection</strong>
           {mergeInfo.players.some(p => p.is_pitcher) && (
