@@ -738,33 +738,42 @@ async def _wait_for_ajax(page, timeout: int = 15_000) -> None:
 
 async def _wait_and_read_table(page, timeout: int = 15_000) -> list[list[str]]:
     """
-    Wait for an ASP.NET AJAX postback to complete and return the GridView table
-    rows in a single browser round-trip.
+    Wait for the player sub-market AJAX postback to complete and return the
+    GridView table rows in a single browser round-trip.
 
-    Polls a JS function that returns null while the market dropdown is disabled
-    (postback in-flight) and returns the table rows array once it is re-enabled.
-    This replaces the separate _wait_for_ajax() + page.evaluate() pattern,
-    saving one browser ↔ Python round-trip per market per game.
+    After selecting the player dropdown ("All", value=0), ASP.NET fires a
+    postback that disables both dropdowns while it runs.  We watch the player
+    dropdown (SEL_PLAYER) rather than the market dropdown because it's the
+    player postback we're waiting for — using SEL_MARKET was unreliable: a
+    fast player AJAX could complete before the 2-second Phase-1 window caught
+    it disabled, causing us to read a stale table (still showing the previous
+    market's data for the default single player).  This stale read cascaded
+    into the next market iteration (Player Outs Recorded), which could then
+    also be read with "All" not applied, resulting in missing pitcher data and
+    RotoWire fallback for starters.
 
     Falls back to a fixed delay + direct evaluate() if the poll times out.
     """
-    # Phase 1: wait for the market dropdown to become disabled (postback started).
+    # Phase 1: wait for the player dropdown to become disabled (player postback
+    # started).  Short timeout — if we miss it (postback already done), fall
+    # through to Phase 2 which will see it already re-enabled.
     try:
         await page.wait_for_function(
             f"""() => {{
-                const el = document.querySelector('{SEL_MARKET}');
+                const el = document.querySelector('{SEL_PLAYER}');
                 return !el || el.disabled;
             }}""",
             timeout=2000,
         )
     except Exception:
-        pass  # postback may have already completed or was not triggered
+        pass  # postback may have already completed
 
-    # Phase 2: once the dropdown is re-enabled, the table contains updated values.
+    # Phase 2: once the player dropdown is re-enabled, the table reflects the
+    # "All players" selection and is safe to read.
     try:
         handle = await page.wait_for_function(
             f"""() => {{
-                const el = document.querySelector('{SEL_MARKET}');
+                const el = document.querySelector('{SEL_PLAYER}');
                 if (!el || el.disabled) return null;
                 const table = document.querySelector('[id*="GridView1"]');
                 if (!table) return [];
@@ -851,7 +860,7 @@ async def _fetch_game_odds(
         try:
             await page.select_option(SEL_MARKET, label=market_name, timeout=5000)
         except Exception as e:
-            log.debug("Market '%s' not found for game %d: %s", market_name, game_id, e)
+            log.warning("Market '%s' not found in dropdown for game %d: %s", market_name, game_id, e)
             continue
         await _wait_for_ajax(page)
 
@@ -860,13 +869,13 @@ async def _fetch_game_odds(
         try:
             await page.select_option(SEL_PLAYER, value="0")
         except Exception as e:
-            log.debug("Could not select All players for '%s': %s", market_name, e)
+            log.warning("Could not select All players for '%s' game %d: %s", market_name, game_id, e)
         rows: list[list[str]] = await _wait_and_read_table(page)
 
         # Retry once on empty table — AJAX postback sometimes returns before the
         # GridView is fully populated, especially under concurrent page load.
         if not rows:
-            log.debug(
+            log.info(
                 "Market '%s' returned empty table for game %d — retrying after delay",
                 market_name, game_id,
             )
@@ -887,7 +896,7 @@ async def _fetch_game_odds(
                     market_name, game_id, len(rows),
                 )
             else:
-                log.debug("Market '%s' still empty after retry for game %d", market_name, game_id)
+                log.info("Market '%s' still empty after retry for game %d", market_name, game_id)
 
         if debug and rows:
             log.debug("Market '%s' raw rows (first 4): %s", market_name, rows[:4])
@@ -1212,21 +1221,18 @@ def _compute_batter_projection(
     e_r   = get_mu(MK_RUNS)
     e_rbi = get_mu(MK_RBIS)
 
-    # Require at least one hit-type market and all three rate markets (Runs, RBIs,
-    # Batting Walks).  A zero here means the market wasn't available for this
-    # player — fall back to RotoWire rather than silently underestimating their
-    # projection.  Triples and Stolen Bases are legitimately absent for many
-    # players and are not required.
+    # Require at least one hit-type market and both rate markets (Runs, RBIs).
+    # Batting Walks is treated as optional — CrazyNinjaOdds does not post walk
+    # props for every player (low-walk players are often omitted).  When absent,
+    # e_bb = 0 and the walk/HBP terms simply don't contribute to the projection.
+    # Triples and Stolen Bases are similarly optional.
     if e_s == 0 and e_d == 0 and e_t == 0 and e_hr == 0:
         return None, "no hit market data (Singles/Doubles/Triples/HR all missing)"
     missing = [
-        name for name, val in [
-            ("Runs", e_r), ("RBIs", e_rbi), ("Batting Walks", e_bb)
-        ] if val == 0
+        name for name, val in [("Runs", e_r), ("RBIs", e_rbi)] if val == 0
     ]
     if missing:
         return None, f"{' and '.join(missing)} market{'s' if len(missing) > 1 else ''} unavailable"
-
     e_hbp = e_bb * HBP_PER_WALK
 
     mean = (

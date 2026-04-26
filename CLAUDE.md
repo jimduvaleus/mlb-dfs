@@ -159,3 +159,11 @@ The web app is a React + TypeScript + Vite frontend (`ui/`) backed by a FastAPI 
 **UI components** (`ui/src/components/`): `ConfigForm`, `SlatePanel`, `ProjectionsPanel`, `ProgressPanel`, `PortfolioTable`, `MetricsPanel`, `TeamBadge`, `StopUploadDialog`.
 
 Team logos for all 30 MLB franchises are in `ui/public/team-logos/`.
+
+## CrazyNinjaOdds market names (confirmed)
+
+The market dropdown option labels in `fetch_market_odds_projections.py` have been verified against the live site's `<select>` element. **Do not change these strings** — they are confirmed correct:
+
+- `"Player Batting Walks"` (confirmed 2026-04-26; the dropdown also contains `"Player Batting Strikeouts"` as a distinct adjacent entry — do not conflate or rename either)
+
+If a market appears to fail silently, investigate AJAX timing or sub-market ("All players") selection before assuming the label is wrong.
