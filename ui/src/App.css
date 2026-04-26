@@ -1329,8 +1329,16 @@ button { cursor: pointer; }
 
 /* ── X / Twitter Notifications ── */
 
-.twitter-notifications {
+.twitter-columns {
+  display: flex;
+  gap: 24px;
+  align-items: flex-start;
   margin-top: 28px;
+}
+
+.twitter-notifications {
+  flex: 1;
+  min-width: 0;
 }
 
 .twitter-notifications-header {
@@ -1344,7 +1352,6 @@ button { cursor: pointer; }
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-width: 560px;
 }
 
 .twitter-notif-item {
@@ -1450,14 +1457,14 @@ button { cursor: pointer; }
 /* ── Confirmed Twitter Lineups section ── */
 
 .twitter-confirmed-lineups {
-  margin-top: 20px;
+  flex: 1;
+  min-width: 0;
 }
 
 .twitter-confirmed-list {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-width: 560px;
 }
 
 .twitter-confirmed-item {
