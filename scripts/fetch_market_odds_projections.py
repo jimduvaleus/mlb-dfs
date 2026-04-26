@@ -71,6 +71,7 @@ from scipy.stats import poisson as scipy_poisson
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_NAME_MAP_PATH = PROJECT_ROOT / "data" / "name_map.json"
 GAME_ID_CACHE_PATH    = PROJECT_ROOT / "data" / "processed" / "market_odds_game_ids.json"
+FAIR_ODDS_CACHE_PATH  = PROJECT_ROOT / "data" / "processed" / "market_odds_fair_odds.json"
 
 GAMES_URL = "https://crazyninjaodds.com/site/browse/games.aspx"
 GAME_URL  = "https://crazyninjaodds.com/site/browse/game.aspx?game_id={}"
@@ -514,6 +515,36 @@ def _save_game_id_cache(
 
 
 # ---------------------------------------------------------------------------
+# Fair odds cache (raw scraped values for sanity checking)
+# ---------------------------------------------------------------------------
+
+def _load_fair_odds_cache(full_cache_key: str) -> dict:
+    """Return existing fair odds data dict if cache_key matches, else empty dict."""
+    if not FAIR_ODDS_CACHE_PATH.exists():
+        return {}
+    try:
+        d = json.loads(FAIR_ODDS_CACHE_PATH.read_text())
+        if d.get("cache_key") != full_cache_key:
+            log.info("Fair odds cache is stale (slate changed) — starting fresh.")
+            return {}
+        return d.get("data", {})
+    except Exception as e:
+        log.debug("Could not read fair odds cache: %s", e)
+        return {}
+
+
+def _save_fair_odds_cache(full_cache_key: str, data: dict) -> None:
+    try:
+        FAIR_ODDS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        FAIR_ODDS_CACHE_PATH.write_text(
+            json.dumps({"cache_key": full_cache_key, "data": data}, indent=2)
+        )
+        log.debug("Saved fair odds cache → %s", FAIR_ODDS_CACHE_PATH)
+    except Exception as e:
+        log.warning("Could not save fair odds cache: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Poisson O/U → E[X] conversion
 # ---------------------------------------------------------------------------
 
@@ -863,7 +894,7 @@ async def _fetch_game_odds(
     markets: list[str],
     debug: bool = False,
     validate_columns: bool = False,
-) -> dict[str, dict[str, list[tuple[float, float]]]]:
+) -> tuple[dict, set, dict]:
     """
     Navigate to a game page, set the devig method, and scrape all markets.
 
@@ -871,7 +902,11 @@ async def _fetch_game_odds(
     non-empty table result and a RuntimeError is raised if it looks wrong.
 
     Returns:
-        {player_name: {market_key: [(line, p_over), ...]}}
+        (market_data, seen_players, sidecar_rows) where:
+        market_data   — {player_name: {market_key: [(line, p_over), ...]}}
+        seen_players  — set of all player names encountered in any table
+        sidecar_rows  — {player_name: {market_display_name: [row_dicts]}} for
+                        persisting raw fair odds values (audit/sanity-checking)
     """
     url = GAME_URL.format(game_id)
     log.info("Fetching game odds: %s", url)
@@ -888,7 +923,7 @@ async def _fetch_game_odds(
             "Check for HTTP 429/403 warnings above.",
             game_id,
         )
-        return {}, set()
+        return {}, set(), {}
 
     # Set devig method: Liquidity-Weighted - Additive/Shin
     try:
@@ -900,6 +935,7 @@ async def _fetch_game_odds(
 
     market_data: dict[str, dict[str, list[tuple[float, float]]]] = {}
     seen_players: set[str] = set()
+    sidecar_rows: dict[str, dict[str, list[dict]]] = {}
     _validated = False
 
     for market_name in markets:
@@ -982,6 +1018,13 @@ async def _fetch_game_odds(
                 odds_str = odds_cell.split("\u26a0")[0].strip()
                 prob = _parse_fair_odds(odds_str)
                 if prob is not None:
+                    sidecar_rows.setdefault(player_name, {}).setdefault(market_name, []).append({
+                        "line": line,
+                        "outcome": outcome,
+                        "fair_odds": odds_str,
+                        "implied_prob": round(prob, 6),
+                        "flagged": True,
+                    })
                     if line == 0.5:
                         # Store for flagged-0.5 fallback (existing logic)
                         flagged_half.setdefault(player_name, {})[outcome] = prob
@@ -1008,9 +1051,17 @@ async def _fetch_game_odds(
                 else:
                     log.debug("Skipping flagged odds row: %s %s", player_name, odds_cell)
                 continue
-            prob = _parse_fair_odds(odds_cell.strip())
+            odds_str = odds_cell.strip()
+            prob = _parse_fair_odds(odds_str)
             if prob is None:
                 continue
+            sidecar_rows.setdefault(player_name, {}).setdefault(market_name, []).append({
+                "line": line,
+                "outcome": outcome,
+                "fair_odds": odds_str,
+                "implied_prob": round(prob, 6),
+                "flagged": False,
+            })
             raw.setdefault((player_name, line), {})[outcome] = prob
 
         # Normalize Over/Under pair → P(Over), then store
@@ -1062,7 +1113,7 @@ async def _fetch_game_odds(
     log.info(
         "game_id=%d: collected market data for %d players", game_id, len(market_data)
     )
-    return market_data, seen_players
+    return market_data, seen_players, sidecar_rows
 
 
 async def _find_game_ids(
@@ -1464,6 +1515,8 @@ async def _run_playwright(
         log.error("Could not extract games from %s file.", platform.upper())
         return {}, set()
 
+    full_slate_games = dict(slate_games)  # full slate before games_filter for cache key
+
     if games_filter:
         unknown = games_filter - slate_games.keys()
         if unknown:
@@ -1525,7 +1578,7 @@ async def _run_playwright(
 
         async def _fetch_one(
             away: str, home: str, game_id: int, validate: bool
-        ) -> tuple[dict, set]:
+        ) -> tuple[dict, set, dict]:
             async with semaphore:
                 page = await browser.new_page()
                 _install_rate_limit_handler(page, f"{away}@{home}")
@@ -1539,7 +1592,7 @@ async def _run_playwright(
                     log.warning(
                         "Error fetching game %d (%s@%s): %s", game_id, away, home, e
                     )
-                    return {}, set()
+                    return {}, set(), {}
                 finally:
                     await page.close()
 
@@ -1557,8 +1610,10 @@ async def _run_playwright(
     all_market_data: dict[tuple[str, str, str], dict[str, list[tuple[float, float]]]] = {}
     all_seen_players: set[tuple[str, str, str]] = set()
     consecutive_empty = 0
+    full_cache_key = _game_id_cache_key(slate_date, full_slate_games)
+    fair_odds_data = _load_fair_odds_cache(full_cache_key)
     for i, ((away, home), _) in enumerate(game_entries):
-        game_data, seen_players = results[i]
+        game_data, seen_players, raw_odds = results[i]
         if not game_data:
             consecutive_empty += 1
             if consecutive_empty >= 2:
@@ -1579,6 +1634,9 @@ async def _run_playwright(
         for player_name in seen_players:
             mapped = name_map.get(player_name, player_name)
             all_seen_players.add((mapped, away, home))
+        if raw_odds:
+            fair_odds_data[f"{away}@{home}"] = raw_odds
+    _save_fair_odds_cache(full_cache_key, fair_odds_data)
 
     return all_market_data, all_seen_players
 
