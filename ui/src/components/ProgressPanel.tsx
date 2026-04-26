@@ -154,7 +154,7 @@ export function ProgressPanel({ events, running }: Props) {
       </div>
 
       {events.some(e => e.stage === 'optimize_lineup') && (
-        <div className="event-list event-list-three-col">
+        <div className="event-list event-list-four-col">
           {events.filter(e => e.stage === 'optimize_lineup').map((e, i) => {
             const ev = e as OptimizeLineupEvent
             return (
