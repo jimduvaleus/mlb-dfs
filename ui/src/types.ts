@@ -61,6 +61,17 @@ export interface PlayerRow {
   slot_confirmed?: boolean
 }
 
+export interface ProjectionPlayerRow {
+  player_id: number
+  name: string
+  position: string
+  team: string
+  salary: number
+  slot: number | null      // 1–9 batters, 10 pitchers, null if missing
+  slot_confirmed: boolean
+  mean: number             // final scaled projection value
+}
+
 export interface LineupResult {
   lineup_index: number
   p_hit_target: number
@@ -207,11 +218,17 @@ export interface CappedPlayer {
   markets: string[]  // raw market keys e.g. ["home_runs", "stolen_bases"]
 }
 
+export interface LowTeamProjection {
+  team: string
+  total: number
+}
+
 export interface MergeInfo {
   secondarySource: string
   count: number
   players: MergePlayer[]
   cappedPlayers?: CappedPlayer[]
+  lowTeamProjections?: LowTeamProjection[]
 }
 
 // Slate game/team exclusion types

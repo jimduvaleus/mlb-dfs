@@ -1,11 +1,12 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
-import type { AppConfig, LineupResult, MergeInfo, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
-import { dismissNotification, dismissTwitterLineup, fetchConfig, fetchNotifications, fetchPortfolio, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
+import type { AppConfig, LineupResult, MergeInfo, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import { dismissNotification, dismissTwitterLineup, fetchConfig, fetchNotifications, fetchPortfolio, fetchProjectionPlayers, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
 import { ProgressPanel } from './components/ProgressPanel'
 import { PortfolioTable } from './components/PortfolioTable'
+import { ProjectionsTable } from './components/ProjectionsTable'
 import { MetricsPanel } from './components/MetricsPanel'
 import { SlatePanel } from './components/SlatePanel'
 import { StopUploadDialog } from './components/StopUploadDialog'
@@ -13,7 +14,7 @@ import { DeleteConfirmModal } from './components/DeleteConfirmModal'
 import { LineupParserDialog } from './components/LineupParserDialog'
 import './App.css'
 
-type Tab = 'config' | 'slate' | 'run' | 'portfolio' | 'metrics'
+type Tab = 'config' | 'projections' | 'slate' | 'run' | 'portfolio' | 'metrics'
 
 interface State {
   config: AppConfig | null
@@ -66,6 +67,7 @@ const initial: State = {
 export default function App() {
   const [state, dispatch] = useReducer(reducer, initial)
   const [configError, setConfigError] = useState<string | null>(null)
+  const [projectionPlayers, setProjectionPlayers] = useState<ProjectionPlayerRow[]>([])
   const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
   // Games (as "AWAY@HOME" strings) to exclude from projection fetches.
   // Empty = fetch all games (default). Non-empty = partial fetch + merge.
@@ -88,6 +90,12 @@ export default function App() {
   const refreshUnconfirmed = () => {
     fetchUnconfirmedPlayerIds()
       .then(ids => dispatch({ type: 'set_unconfirmed', ids }))
+      .catch(() => {})
+  }
+
+  const refreshProjectionPlayers = () => {
+    fetchProjectionPlayers()
+      .then(setProjectionPlayers)
       .catch(() => {})
   }
 
@@ -114,6 +122,7 @@ export default function App() {
       .catch(e => setConfigError(String(e)))
     refreshUnconfirmed()
     refreshTwitterLineups()
+    refreshProjectionPlayers()
   }, [])
 
   // Restore per-platform proj-fetch exclusions when the platform or salary file changes.
@@ -304,7 +313,7 @@ export default function App() {
       </header>
 
       <nav className="tabs">
-        {(['config', 'slate', 'run', 'portfolio', 'metrics'] as Tab[]).map(tab => (
+        {(['config', 'projections', 'slate', 'run', 'portfolio', 'metrics'] as Tab[]).map(tab => (
           <button
             key={tab}
             className={`tab ${state.activeTab === tab ? 'active' : ''}`}
@@ -331,13 +340,14 @@ export default function App() {
           {configError && <p className="error">{configError}</p>}
           {state.config ? (
             <>
-              <ProjectionsPanel disabled={running} onFetched={refreshUnconfirmed} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} />
+              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} />
               <ConfigForm
                 config={state.config}
                 onSaved={cfg => {
                   const prevPlatform = state.config?.platform
                   dispatch({ type: 'set_config', config: cfg })
                   if (cfg.platform !== prevPlatform) {
+                    refreshProjectionPlayers()
                     // Platform changed — load the portfolio for the new platform (may be empty)
                     fetchPortfolio(cfg.platform)
                       .then(portfolio => {
@@ -357,6 +367,10 @@ export default function App() {
             <p className="muted">Loading config…</p>
           )}
         </div>
+
+        {state.activeTab === 'projections' && (
+          <ProjectionsTable players={projectionPlayers} platform={state.config?.platform} />
+        )}
 
         {state.activeTab === 'slate' && (
           <SlatePanel

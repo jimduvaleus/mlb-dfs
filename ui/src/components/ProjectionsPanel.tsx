@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { CappedPlayer, MergeInfo, ProjectionsStatus } from '../types'
+import type { CappedPlayer, LowTeamProjection, MergeInfo, ProjectionsStatus } from '../types'
 
 const MARKET_DISPLAY: Record<string, string> = {
   singles: '1B', doubles: '2B', triples: '3B', home_runs: 'HR',
@@ -73,7 +73,8 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       } else if (event.type === 'merge_info') {
         const players = event.players as Array<{ name: string; team: string; reason?: string; player_id?: number; is_pitcher?: boolean }>
         const cappedPlayers = (event.capped_players ?? []) as CappedPlayer[]
-        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers })
+        const lowTeamProjections = (event.low_team_projections ?? []) as LowTeamProjection[]
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections })
         // Auto-exclude pitchers that fell back to a secondary source — their
         // projections are lower quality regardless of which primary source was used.
         const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
@@ -202,6 +203,21 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
                   <span className="merge-info-reason"> ⓘ {p.markets.map(m => MARKET_DISPLAY[m] ?? m).join(', ')}</span>
                 </span>
                 {')'}
+              </span>
+            )).reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])}
+          </div>
+        </div>
+      )}
+
+      {mergeInfo && mergeInfo.lowTeamProjections && mergeInfo.lowTeamProjections.length > 0 && (
+        <div className="merge-info-callout merge-info-low-team-callout">
+          <strong>⚠ Low team projection — {mergeInfo.lowTeamProjections.length} team{mergeInfo.lowTeamProjections.length !== 1 ? 's' : ''} below 40 pts</strong>
+          <div className="merge-info-players">
+            {mergeInfo.lowTeamProjections.map((t, i) => (
+              <span key={i} className="merge-info-team-group">
+                <span className="merge-info-team-label">{t.team}</span>
+                {' '}
+                <span className="merge-info-reason">{t.total.toFixed(1)} pts</span>
               </span>
             )).reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])}
           </div>

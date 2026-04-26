@@ -850,6 +850,38 @@ button { cursor: pointer; }
   justify-content: flex-end;
 }
 
+/* ── Projections tab ── */
+
+.projections-table-wrap h3 {
+  margin: 0 0 10px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* 5-column grid: pos | name | team-badge | salary | proj-pts */
+.projections-card-players {
+  grid-template-columns: 29px 1fr auto auto 52px;
+}
+
+.lineup-player-proj {
+  padding-right: 17px;
+  color: #63b3ed;
+  font-size: 13px;
+  min-width: 52px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.projections-team-total {
+  font-size: 13px;
+  color: #a0aec0;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
 /* ── Metrics panel ── */
 
 .metrics-panel {

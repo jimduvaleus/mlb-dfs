@@ -638,6 +638,43 @@ def projections_unconfirmed():
         return {"player_ids": []}
 
 
+@app.get("/api/projections/players")
+def projections_players():
+    import pandas as pd
+    cfg = read_config()
+    proj_path = _resolve_proj_path(cfg)
+    if not proj_path.exists():
+        return []
+    slate_df = _load_slate_df()
+    if slate_df is None or slate_df.empty:
+        return []
+    try:
+        proj_df = pd.read_csv(proj_path)
+        if proj_df.empty:
+            return []
+        for df in (slate_df, proj_df):
+            df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
+        slate_sub = slate_df[["player_id", "name", "position", "team", "salary"]]
+        proj_sub  = proj_df[["player_id", "mean", "lineup_slot", "slot_confirmed"]]
+        merged = slate_sub.merge(proj_sub, on="player_id", how="inner")
+        result = []
+        for _, row in merged.iterrows():
+            slot_raw = row["lineup_slot"]
+            result.append({
+                "player_id":      int(row["player_id"]),
+                "name":           str(row["name"]),
+                "position":       str(row["position"]),
+                "team":           str(row["team"]),
+                "salary":         int(row["salary"]),
+                "slot":           int(slot_raw) if pd.notna(slot_raw) else None,
+                "slot_confirmed": bool(row["slot_confirmed"]),
+                "mean":           float(row["mean"]),
+            })
+        return result
+    except Exception:
+        return []
+
+
 @app.get("/api/projections/slates")
 async def projections_slates() -> SlateListResponse:
     cfg = read_config()
@@ -834,6 +871,29 @@ async def projections_fetch(request: Request):
                     pass
             return {}
 
+        # Helper: return teams whose total batter projection mean is below threshold.
+        def _low_team_projections(
+            merged_df: "pd.DataFrame",
+            itm: dict[int, str],
+            threshold: float = 40.0,
+        ) -> list[dict]:
+            if merged_df.empty or "mean" not in merged_df.columns:
+                return []
+            if "lineup_slot" in merged_df.columns:
+                batters = merged_df[merged_df["lineup_slot"] != 10].copy()
+            else:
+                batters = merged_df.copy()
+            if batters.empty:
+                return []
+            batters["_team"] = batters["player_id"].apply(lambda pid: itm.get(int(pid), ""))
+            sums = batters.groupby("_team")["mean"].sum()
+            low = [
+                {"team": team, "total": round(float(total), 2)}
+                for team, total in sums.items()
+                if team and total < threshold
+            ]
+            return sorted(low, key=lambda x: x["total"])
+
         # Helper: write final merged_df to proj_path, handling partial merge.
         def _write_proj(merged_df: "pd.DataFrame") -> None:
             out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
@@ -990,8 +1050,10 @@ async def projections_fetch(request: Request):
                                         "markets": cap_mkts,
                                     })
 
-                        if fallback_players or capped_players:
-                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'timestamp': int(time.time() * 1000)})}\n\n"
+                        low_team_projs = _low_team_projections(pool, _itm)
+
+                        if fallback_players or capped_players or low_team_projs:
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'timestamp': int(time.time() * 1000)})}\n\n"
                         elif result_event is None:
                             result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
 
@@ -1134,8 +1196,10 @@ async def projections_fetch(request: Request):
                     _write_proj(pool)
                     proj_written = True
 
-                    if fallback_players2:
-                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'timestamp': int(time.time() * 1000)})}\n\n"
+                    low_team_projs2 = _low_team_projections(pool, _itm2)
+
+                    if fallback_players2 or low_team_projs2:
+                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'timestamp': int(time.time() * 1000)})}\n\n"
                     else:
                         result_event2 = _log(f"All player projections sourced from {preferred_label}.")
 

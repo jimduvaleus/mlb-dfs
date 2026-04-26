@@ -1,4 +1,4 @@
-import type { AppConfig, ExclusionsUpdate, PlayerExclusionsUpdate, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, ExclusionsUpdate, PlayerExclusionsUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -30,6 +30,12 @@ export async function fetchUnconfirmedPlayerIds(): Promise<number[]> {
   if (!res.ok) return []
   const data = await res.json()
   return data.player_ids ?? []
+}
+
+export async function fetchProjectionPlayers(): Promise<ProjectionPlayerRow[]> {
+  const res = await fetch('/api/projections/players')
+  if (!res.ok) return []
+  return res.json()
 }
 
 export async function fetchProjectionSlates(): Promise<SlateListResponse> {
