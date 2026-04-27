@@ -80,6 +80,7 @@ export default function App() {
   const [stopPending, setStopPending] = useState(false)
   const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null)
   const [replacingIndex, setReplacingIndex] = useState<number | null>(null)
+  const [projStatusTrigger, setProjStatusTrigger] = useState(0)
   const [parsingNotification, setParsingNotification] = useState<TwitterNotification | null>(null)
   const [parseResult, setParseResult] = useState<TwitterLineupParseResponse | null>(null)
   const [parseError, setParseError] = useState<string | null>(null)
@@ -239,12 +240,14 @@ export default function App() {
     setParseResult(null)
     refreshTwitterLineups()
     refreshUnconfirmed()
+    setProjStatusTrigger(t => t + 1)
   }
 
   const handleDismissTwitterLineup = async (team: string) => {
     await dismissTwitterLineup(team)
     refreshTwitterLineups()
     refreshUnconfirmed()
+    setProjStatusTrigger(t => t + 1)
   }
 
   const handleWriteUpload = () => {
@@ -340,7 +343,7 @@ export default function App() {
           {configError && <p className="error">{configError}</p>}
           {state.config ? (
             <>
-              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} />
+              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} refreshTrigger={projStatusTrigger} />
               <ConfigForm
                 config={state.config}
                 onSaved={cfg => {

@@ -165,14 +165,18 @@ _FD_PITCHER = dict(out=1.0,  k=3.0, win=6.0, qs=4.0,
 # when the Earned Runs market is unavailable for a pitcher.
 _QS_ER_FALLBACK_PROB = 0.60
 
-# Minimum implied probability required to accept a flagged (⚠️) one-way-devigged
-# Over line > 0.5 into the NB regression as a tail constraint.
-# Below this threshold the line is essentially a minimum-price noise bet with no
-# real market signal; including it can cause the (k+1)² weighted regression to
-# dramatically overestimate μ for rare events (e.g. HRs for a speedster).
-_FLAGGED_OVER_MIN_PROB = 0.02
+# Batter markets fitted with Poisson rather than NB(r=1).
+# Poisson is appropriate where each plate appearance is an approximately
+# independent Bernoulli trial with a stable per-PA rate and no within-game
+# clustering: hits (all types), walks, stolen bases, and runs.
+# RBIs are excluded — rally clustering creates genuine overdispersion that
+# NB(r=1) captures well, confirmed by the two unflagged lines being far more
+# consistent under NB than under Poisson.
+_POISSON_BATTER_MARKETS = frozenset({
+    MK_SINGLES, MK_DOUBLES, MK_TRIPLES, MK_HR, MK_WALKS, MK_SB, MK_RUNS,
+})
 
-# Per-market hard caps on the NB mean E[X] for batters.
+# Per-market hard caps on the fitted mean E[X] for batters.
 # Set +25% above realistic single-game maximums to accommodate genuine edge
 # cases (Judge HR in Coors, Simpson SB vs a slow catcher).  Firing this cap
 # is unexpected and always logged as a WARNING — verify the odds manually.
@@ -1009,26 +1013,17 @@ async def _fetch_game_odds(
                     if line == 0.5:
                         # Store for flagged-0.5 fallback (existing logic)
                         flagged_half.setdefault(player_name, {})[outcome] = prob
-                    elif outcome == "over":
-                        # Accept flagged Over lines > 0.5 as tail constraints for
-                        # the NB regression — but only above _FLAGGED_OVER_MIN_PROB.
-                        # Sub-threshold lines are minimum-price noise bets with no
-                        # real signal; their tiny p_over combined with the (k+1)²
-                        # regression weight can massively inflate μ for rare events.
-                        if prob < _FLAGGED_OVER_MIN_PROB:
-                            log.debug(
-                                "Discarding near-zero flagged over %.1f for %s "
-                                "(p_over=%.4f < %.2f threshold)",
-                                line, player_name, prob, _FLAGGED_OVER_MIN_PROB,
-                            )
-                        else:
-                            raw.setdefault((player_name, line), {})["over"] = prob
-                            log.debug(
-                                "Accepting flagged over %.1f odds for %s (p_over=%.4f)",
-                                line, player_name, prob,
-                            )
                     else:
-                        log.debug("Skipping flagged odds row: %s %s", player_name, odds_cell)
+                        # Flagged higher lines (> 0.5) are one-sided square-bait props:
+                        # the book only prices the over because squares want to bet it.
+                        # There is no legitimate two-sided price discovery, so these
+                        # lines carry no information about the true distribution and
+                        # must not enter the regression.
+                        log.debug(
+                            "Ignoring flagged over %.1f for %s (p_over=%.4f) "
+                            "— one-sided square prop, no price discovery",
+                            line, player_name, prob,
+                        )
                 else:
                     log.debug("Skipping flagged odds row: %s %s", player_name, odds_cell)
                 continue
@@ -1283,13 +1278,18 @@ def _compute_batter_projection(
     """
     Compute (mean, std_dev, capped_markets) for a batter from market means.
 
-    Uses the Geometric NB (r=1) model to back-solve E[X] from O/U fair odds.
-    This corrects the systematic underestimation Poisson produces for batter
-    counting stats, which are heavily overdispersed: most games a player gets
-    0 of a given stat, but the right tail is long.
+    Markets in _POISSON_BATTER_MARKETS use Poisson (_fit_lambda): these are
+    per-PA rate events (hits, walks, stolen bases, runs) where each plate
+    appearance is an approximately independent Bernoulli trial.  Poisson
+    estimates are more consistent across the 0.5 and unflagged 1.5 lines for
+    these markets, and correctly predict a tighter right tail.
 
-    Runs and RBIs are fetched as dedicated markets rather than derived as a
-    residual from the combined Hits+Runs+RBIs market.
+    RBIs use NB(r=1) (_fit_nb_mean): rally-based clustering creates genuine
+    overdispersion.  NB estimates for RBIs are far more consistent across lines
+    than Poisson estimates, confirming the distributional choice.
+
+    Flagged higher lines (one-sided square-bait props) are excluded upstream
+    before reaching this function; only two-sided unflagged lines enter the fit.
 
     Returns (None, reason) when key market data is absent for this player —
     the caller should use a RotoWire fallback projection in that case.
@@ -1299,7 +1299,22 @@ def _compute_batter_projection(
     c = _FD_BATTER if platform == "fanduel" else _DK_BATTER
     capped: list[str] = []
 
+    def get_lam(key: str) -> float:
+        """Poisson fit — for per-PA rate markets."""
+        lp = player_markets.get(key, [])
+        if not lp:
+            return 0.0
+        lam = _fit_lambda(lp)
+        if lam is None:
+            return 0.0
+        cap = _BATTER_MEAN_CAPS.get(key, float("inf"))
+        if lam > cap:
+            capped.append(key)
+            return cap
+        return lam
+
     def get_mu(key: str) -> float:
+        """NB(r=1) fit — for overdispersed markets (RBIs)."""
         lp = player_markets.get(key, [])
         if not lp:
             return 0.0
@@ -1312,13 +1327,13 @@ def _compute_batter_projection(
             return cap
         return mu
 
-    e_s   = get_mu(MK_SINGLES)
-    e_d   = get_mu(MK_DOUBLES)
-    e_t   = get_mu(MK_TRIPLES)
-    e_hr  = get_mu(MK_HR)
-    e_sb  = get_mu(MK_SB)
-    e_bb  = get_mu(MK_WALKS)
-    e_r   = get_mu(MK_RUNS)
+    e_s   = get_lam(MK_SINGLES)
+    e_d   = get_lam(MK_DOUBLES)
+    e_t   = get_lam(MK_TRIPLES)
+    e_hr  = get_lam(MK_HR)
+    e_sb  = get_lam(MK_SB)
+    e_bb  = get_lam(MK_WALKS)
+    e_r   = get_lam(MK_RUNS)
     e_rbi = get_mu(MK_RBIS)
 
     # Require at least one hit-type market and both rate markets (Runs, RBIs).
@@ -1340,19 +1355,17 @@ def _compute_batter_projection(
         + e_r * c["run"] + e_rbi * c["rbi"] + e_bb * c["walk"] + e_sb * c["sb"]
         + e_hbp * c["hbp"]
     )
-    # Var[aX] = a² * μ(1+μ) for Geometric NB(r=1).
-    # The μ(1+μ) term (vs. Poisson's μ) captures the overdispersion inherent
-    # in batter game-log distributions and gives a more realistic std_dev.
+    # Variance: Poisson markets use Var[aX] = a²λ; NB(r=1) RBIs use a²μ(1+μ).
     var = (
-        e_s   * (1 + e_s)   * c["single"]   ** 2
-        + e_d   * (1 + e_d)   * c["double"]   ** 2
-        + e_t   * (1 + e_t)   * c["triple"]   ** 2
-        + e_hr  * (1 + e_hr)  * c["home_run"] ** 2
-        + e_r   * (1 + e_r)   * c["run"]      ** 2
-        + e_rbi * (1 + e_rbi) * c["rbi"]      ** 2
-        + e_bb  * (1 + e_bb)  * c["walk"]     ** 2
-        + e_sb  * (1 + e_sb)  * c["sb"]       ** 2
-        + e_hbp * (1 + e_hbp) * c["hbp"]      ** 2
+        e_s   * c["single"]            ** 2
+        + e_d   * c["double"]          ** 2
+        + e_t   * c["triple"]          ** 2
+        + e_hr  * c["home_run"]        ** 2
+        + e_r   * c["run"]             ** 2
+        + e_rbi * (1 + e_rbi) * c["rbi"] ** 2
+        + e_bb  * c["walk"]            ** 2
+        + e_sb  * c["sb"]              ** 2
+        + e_hbp * c["hbp"]             ** 2
     )
     return mean, max(math.sqrt(var), 1.0), capped
 

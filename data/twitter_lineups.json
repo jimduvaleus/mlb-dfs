@@ -1,1 +1,54 @@
-[]
+[
+  {
+    "team": "LAD",
+    "notification_id": "1c3b7b34-5419-4701-9fa4-28d40bb39384",
+    "confirmed_at": 1777327557.2272618,
+    "slots": [
+      {
+        "slot": 1,
+        "player_id": 42760437,
+        "name": "S. Ohtani"
+      },
+      {
+        "slot": 2,
+        "player_id": 42760451,
+        "name": "F. Freeman"
+      },
+      {
+        "slot": 3,
+        "player_id": 42760491,
+        "name": "W. Smith"
+      },
+      {
+        "slot": 4,
+        "player_id": 42760442,
+        "name": "K. Tucker"
+      },
+      {
+        "slot": 5,
+        "player_id": 42760467,
+        "name": "T. Hern\u00e1ndez"
+      },
+      {
+        "slot": 6,
+        "player_id": 42760465,
+        "name": "M. Muncy"
+      },
+      {
+        "slot": 7,
+        "player_id": 42760460,
+        "name": "A. Pages"
+      },
+      {
+        "slot": 8,
+        "player_id": 42760557,
+        "name": "H. Kim"
+      },
+      {
+        "slot": 9,
+        "player_id": 42760553,
+        "name": "A. Freeland"
+      }
+    ]
+  }
+]

@@ -14,6 +14,7 @@ interface Props {
   onMergeInfo: (info: MergeInfo | null) => void
   projFetchExcluded?: string[]
   onFetchingChange?: (fetching: boolean) => void
+  refreshTrigger?: number
 }
 
 function formatET(unixSec: number): string {
@@ -27,7 +28,7 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange }: Props) {
+export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange, refreshTrigger }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
@@ -43,6 +44,10 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
     refreshStatus()
     return () => esRef.current?.close()
   }, [])
+
+  useEffect(() => {
+    if (refreshTrigger) refreshStatus()
+  }, [refreshTrigger])
 
   useEffect(() => {
     if (logRef.current) {
