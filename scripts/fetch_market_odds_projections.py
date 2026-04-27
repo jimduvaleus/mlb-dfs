@@ -3,24 +3,28 @@ Fetch MLB player projections from CrazyNinjaOdds market odds and produce a proje
 compatible with the main pipeline.
 
 Flow:
-  1. Load DK salary CSV to extract slate games (team pairs + times) and player lookup
-  2. Playwright navigates to crazyninjaodds.com/site/browse/games.aspx
-  3. Games are matched to the slate by league (MLB), date, team pair, and game time (±30 min)
-  4. For each matched game, navigate to the game detail page and:
-     a. Set Devig Method to Liquidity-Weighted Additive/Shin
-     b. For each relevant market, select All players and parse the Fair Odds table
-        Batter markets: Player Runs, Player RBIs, Player Singles, Player Doubles,
-          Player Triples, Player Home Runs, Player Stolen Bases, Player Batting Walks
-        Pitcher markets: Player Outs Recorded, Player Pitching Strikeouts,
-          Player Record A Win, Player Hits Allowed, Player Walks Allowed,
-          Player Earned Runs Allowed
-  5. Convert O/U fair odds to E[X]:
+  1. Load DK/FD salary CSV to extract slate games (team pairs + times) and player lookup
+  2. Playwright navigates to account/settings.aspx and saves the devig method
+     (Liquidity-Weighted Additive/Shin, value="2") as a cookie — applies to all
+     subsequent page loads in this session without any AJAX interaction
+  3. Navigate to games.aspx, match game IDs to the slate (cached per slate date)
+  4. For each matched game, visit game.aspx once to parse the market dropdown and
+     record {market_name: market_id} (cached per slate date)
+     Batter markets: Player Runs, Player RBIs, Player Singles, Player Doubles,
+       Player Triples, Player Home Runs, Player Stolen Bases, Player Batting Walks
+     Pitcher markets: Player Outs Recorded, Player Pitching Strikeouts,
+       Player Record A Win, Player Hits Allowed, Player Walks Allowed,
+       Player Earned Runs Allowed
+  5. For each game×market, navigate directly to:
+       game.aspx?game_id={X}&market_id={Y}&submarket_id=0
+     Wait only for the GridView table to load — no AJAX, no dropdown selection
+  6. Convert O/U fair odds to E[X]:
      - Batters: Geometric NB (r=1) closed-form solver — corrects for the heavy
        overdispersion in per-game batter counting stats vs. the Poisson assumption
      - Pitchers: Poisson (scipy brentq solver) — appropriate for outs/strikeouts
-  6. Apply DK scoring formula to compute mean; derive std_dev from NB/Poisson variance
-  7. Match player names to DK player IDs (normalise + fuzzy match)
-  8. Write projections CSV (player_id, name, mean, std_dev)
+  7. Apply DK scoring formula to compute mean; derive std_dev from NB/Poisson variance
+  8. Match player names to DK player IDs (normalise + fuzzy match)
+  9. Write projections CSV (player_id, name, mean, std_dev)
      lineup_slot is NOT set here — provided by RotoWire during server merge
 
 Table column layout (verified):
@@ -73,8 +77,15 @@ DEFAULT_NAME_MAP_PATH = PROJECT_ROOT / "data" / "name_map.json"
 GAME_ID_CACHE_PATH    = PROJECT_ROOT / "data" / "processed" / "market_odds_game_ids.json"
 FAIR_ODDS_CACHE_PATH  = PROJECT_ROOT / "data" / "processed" / "market_odds_fair_odds.json"
 
-GAMES_URL = "https://crazyninjaodds.com/site/browse/games.aspx"
-GAME_URL  = "https://crazyninjaodds.com/site/browse/game.aspx?game_id={}"
+GAMES_URL       = "https://crazyninjaodds.com/site/browse/games.aspx"
+GAME_URL        = "https://crazyninjaodds.com/site/browse/game.aspx?game_id={}"
+SETTINGS_URL    = "https://crazyninjaodds.com/site/account/settings.aspx"
+GAME_MARKET_URL = (
+    "https://crazyninjaodds.com/site/browse/game.aspx"
+    "?game_id={game_id}&market_id={market_id}&submarket_id=0"
+)
+
+MARKET_ID_CACHE_PATH = PROJECT_ROOT / "data" / "processed" / "market_odds_market_ids.json"
 
 # Dropdown value for Liquidity-Weighted - Additive/Shin devig method
 DEVIG_VALUE = "2"
@@ -193,18 +204,19 @@ _MARKET_DISPLAY: dict[str, str] = {
 _MAX_CONCURRENT_GAMES = 4
 
 # Playwright selector IDs (verified from page inspection)
-SEL_DEVIG  = (
-    "#ContentPlaceHolderMain_ContentPlaceHolderRight_"
-    "WebUserControl_FilterDevigMethod_DropDownListDevigMethod"
-)
-SEL_DEVIG_UPDATE = (
-    "#ContentPlaceHolderMain_ContentPlaceHolderRight_ButtonUpdate"
-)
 SEL_MARKET = (
     "#ContentPlaceHolderMain_ContentPlaceHolderRight_DropDownListMarket"
 )
-SEL_PLAYER = (
-    "#ContentPlaceHolderMain_ContentPlaceHolderRight_DropDownListSubMarket"
+
+# Account settings page — devig method is saved as a cookie and persists to all
+# subsequent pages when a shared BrowserContext is used (context.new_page()).
+SEL_SETTINGS_DEVIG = (
+    "#ContentPlaceHolderMain_ContentPlaceHolderRight_"
+    "DropDownListDevigMethod"
+)
+SEL_SETTINGS_SAVE = (
+    "#ContentPlaceHolderMain_ContentPlaceHolderRight_"
+    "ButtonSaveSettings"
 )
 
 # Table column indices — adjust if site layout changes (use --debug to inspect)
@@ -545,6 +557,36 @@ def _save_fair_odds_cache(full_cache_key: str, data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Market ID cache
+# ---------------------------------------------------------------------------
+
+def _load_market_id_cache(cache_key: str) -> dict[str, dict[str, str]] | None:
+    """Return {game_id_str: {market_name: market_id_str}} if cache_key matches, else None."""
+    if not MARKET_ID_CACHE_PATH.exists():
+        return None
+    try:
+        d = json.loads(MARKET_ID_CACHE_PATH.read_text())
+        if d.get("cache_key") != cache_key:
+            return None
+        return d.get("market_ids", {})
+    except Exception as e:
+        log.debug("Could not read market ID cache: %s", e)
+        return None
+
+
+def _save_market_id_cache(cache_key: str, market_ids: dict[str, dict[str, str]]) -> None:
+    """Persist {game_id_str: {market_name: market_id_str}} keyed by the slate fingerprint."""
+    try:
+        MARKET_ID_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        MARKET_ID_CACHE_PATH.write_text(
+            json.dumps({"cache_key": cache_key, "market_ids": market_ids}, indent=2)
+        )
+        log.debug("Saved market ID cache → %s", MARKET_ID_CACHE_PATH)
+    except Exception as e:
+        log.warning("Could not save market ID cache: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Poisson O/U → E[X] conversion
 # ---------------------------------------------------------------------------
 
@@ -786,117 +828,86 @@ def _validate_table_columns(rows: list[list[str]], market_name: str) -> None:
 # Playwright helpers
 # ---------------------------------------------------------------------------
 
-async def _wait_for_ajax(page, timeout: int = 15_000) -> None:
-    """Wait for ASP.NET AJAX postback to complete after a dropdown change."""
-    # Phase 1: wait for the market dropdown to become disabled, confirming the
-    # postback has actually started.  Use a short timeout — it should happen in
-    # well under a second.  If it times out (e.g. no postback was triggered),
-    # fall through so Phase 2 still guards the read.
-    try:
-        await page.wait_for_function(
-            f"""() => {{
-                const el = document.querySelector('{SEL_MARKET}');
-                return !el || el.disabled;
-            }}""",
-            timeout=2000,
-        )
-    except Exception:
-        pass  # postback may have already completed or was not triggered
-
-    # Phase 2: wait for the market dropdown to be re-enabled (AJAX complete,
-    # table values updated with the new devig method).
-    try:
-        await page.wait_for_function(
-            f"""() => {{
-                const el = document.querySelector('{SEL_MARKET}');
-                return el && !el.disabled;
-            }}""",
-            timeout=timeout,
-        )
-    except Exception:
-        # Fallback: fixed delay if function-wait fails
-        await page.wait_for_timeout(1200)
+# JS snippet used to extract GridView table rows — reused across URL fetches.
+_TABLE_JS = """() => {
+    const table = document.querySelector('[id*="GridView1"]');
+    if (!table) return [];
+    const out = [];
+    for (const tr of table.querySelectorAll('tr')) {
+        const cells = Array.from(tr.querySelectorAll('td')).map(c => c.innerText.trim());
+        if (cells.length > 0) out.push(cells);
+    }
+    return out;
+}"""
 
 
-async def _wait_and_read_table(page, timeout: int = 15_000) -> list[list[str]]:
+async def _set_devig_cookie(page) -> bool:
     """
-    Wait for the player sub-market AJAX postback to complete and return the
-    GridView table rows in a single browser round-trip.
+    Navigate to the account settings page and save devig method value "2"
+    (Liquidity-Weighted Additive/Shin) as a cookie so that all subsequent
+    page loads in this browser session use it automatically.
 
-    After selecting the player dropdown ("All", value=0), ASP.NET fires a
-    postback that disables both dropdowns while it runs.  We watch the player
-    dropdown (SEL_PLAYER) rather than the market dropdown because it's the
-    player postback we're waiting for — using SEL_MARKET was unreliable: a
-    fast player AJAX could complete before the 2-second Phase-1 window caught
-    it disabled, causing us to read a stale table (still showing the previous
-    market's data for the default single player).  This stale read cascaded
-    into the next market iteration (Player Outs Recorded), which could then
-    also be read with "All" not applied, resulting in missing pitcher data and
-    RotoWire fallback for starters.
-
-    Falls back to a fixed delay + direct evaluate() if the poll times out.
+    Returns True on success, False on failure (non-fatal — caller logs a warning).
     """
-    # Phase 1: wait for the player dropdown to become disabled (player postback
-    # started).  Short timeout — if we miss it (postback already done), fall
-    # through to Phase 2 which will see it already re-enabled.
     try:
-        await page.wait_for_function(
-            f"""() => {{
-                const el = document.querySelector('{SEL_PLAYER}');
-                return !el || el.disabled;
-            }}""",
-            timeout=2000,
-        )
-    except Exception:
-        pass  # postback may have already completed
+        await page.goto(SETTINGS_URL, wait_until="domcontentloaded")
+        await page.wait_for_selector(SEL_SETTINGS_DEVIG, timeout=10_000)
+        await page.select_option(SEL_SETTINGS_DEVIG, value=DEVIG_VALUE)
+        await page.click(SEL_SETTINGS_SAVE)
+        await page.wait_for_timeout(800)  # allow form submit to register
+        log.info("Devig method set via settings page.")
+        return True
+    except Exception as e:
+        log.warning("Could not set devig method via settings page: %s", e)
+        return False
 
-    # Phase 2: once the player dropdown is re-enabled, the table reflects the
-    # "All players" selection and is safe to read.
+
+async def _parse_market_ids(
+    page,
+    game_id: int,
+    debug: bool = False,
+) -> dict[str, str]:
+    """
+    Navigate to game.aspx?game_id=X and extract {market_display_name: market_id_value}
+    from the market dropdown, filtered to markets in BATTER_MARKETS + PITCHER_MARKETS.
+    Returns empty dict on failure.
+    """
+    _wanted = set(BATTER_MARKETS + PITCHER_MARKETS)
+    url = GAME_URL.format(game_id)
     try:
-        handle = await page.wait_for_function(
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_selector(SEL_MARKET, timeout=20_000)
+        options = await page.evaluate(
             f"""() => {{
-                const el = document.querySelector('{SEL_PLAYER}');
-                if (!el || el.disabled) return null;
-                const table = document.querySelector('[id*="GridView1"]');
-                if (!table) return [];
-                const out = [];
-                for (const tr of table.querySelectorAll('tr')) {{
-                    const cells = Array.from(tr.querySelectorAll('td'))
-                                       .map(c => c.innerText.trim());
-                    if (cells.length > 0) out.push(cells);
-                }}
-                return out;
-            }}""",
-            timeout=timeout,
+                const sel = document.querySelector('{SEL_MARKET}');
+                if (!sel) return [];
+                return Array.from(sel.options).map(o => ({{text: o.text.trim(), value: o.value}}));
+            }}"""
         )
-        return await handle.json_value()
-    except Exception:
-        # Fallback: fixed delay then direct evaluate
-        await page.wait_for_timeout(1200)
-        return await page.evaluate(
-            """() => {
-                const table = document.querySelector('[id*="GridView1"]');
-                if (!table) return [];
-                const out = [];
-                for (const tr of table.querySelectorAll('tr')) {
-                    const cells = Array.from(tr.querySelectorAll('td'))
-                                       .map(c => c.innerText.trim());
-                    if (cells.length > 0) out.push(cells);
-                }
-                return out;
-            }"""
+        result = {o["text"]: o["value"] for o in options if o["text"] in _wanted}
+        log.info(
+            "game_id=%d: found %d/%d wanted market IDs", game_id, len(result), len(_wanted)
         )
+        if debug:
+            log.debug("game_id=%d market IDs: %s", game_id, result)
+        return result
+    except Exception as e:
+        log.warning("Could not parse market IDs for game_id=%d: %s", game_id, e)
+        return {}
 
 
 async def _fetch_game_odds(
     page,
     game_id: int,
-    markets: list[str],
+    market_id_map: dict[str, str],
     debug: bool = False,
     validate_columns: bool = False,
 ) -> tuple[dict, set, dict]:
     """
-    Navigate to a game page, set the devig method, and scrape all markets.
+    For each market in market_id_map, navigate directly to
+    game.aspx?game_id=X&market_id=Y&submarket_id=0 and scrape the table.
+    No AJAX interactions are needed — the devig method and "All players"
+    selection are encoded in the URL (cookie + submarket_id=0).
 
     If validate_columns=True, the column layout is sanity-checked on the first
     non-empty table result and a RuntimeError is raised if it looks wrong.
@@ -908,82 +919,52 @@ async def _fetch_game_odds(
         sidecar_rows  — {player_name: {market_display_name: [row_dicts]}} for
                         persisting raw fair odds values (audit/sanity-checking)
     """
-    url = GAME_URL.format(game_id)
-    log.info("Fetching game odds: %s", url)
-    await page.goto(url, wait_until="domcontentloaded")
-
-    # Wait for the ASP.NET timer to fire and populate the GridView.
-    # No fixed sleep: wait_for_selector polls efficiently until the table appears.
-    try:
-        await page.wait_for_selector('[id*="GridView1"] tr', timeout=20_000)
-    except Exception:
-        log.warning(
-            "Game page table did not load for game_id=%d — "
-            "possible rate-limit, redirect, or site change. "
-            "Check for HTTP 429/403 warnings above.",
-            game_id,
-        )
-        return {}, set(), {}
-
-    # Set devig method: Liquidity-Weighted - Additive/Shin
-    try:
-        await page.select_option(SEL_DEVIG, value=DEVIG_VALUE)
-        await page.click(SEL_DEVIG_UPDATE)
-        await _wait_for_ajax(page)
-    except Exception as e:
-        log.warning("Could not set devig method for game %d: %s", game_id, e)
-
     market_data: dict[str, dict[str, list[tuple[float, float]]]] = {}
     seen_players: set[str] = set()
     sidecar_rows: dict[str, dict[str, list[dict]]] = {}
     _validated = False
 
-    for market_name in markets:
+    for market_name, market_id in market_id_map.items():
         market_key = MARKET_KEY_MAP.get(market_name)
         if not market_key:
             continue
 
-        # Select market by display text
+        url = GAME_MARKET_URL.format(game_id=game_id, market_id=market_id)
+        log.info("Fetching market '%s' for game_id=%d", market_name, game_id)
+        await page.goto(url, wait_until="domcontentloaded")
+
         try:
-            await page.select_option(SEL_MARKET, label=market_name, timeout=5000)
-        except Exception as e:
-            log.warning("Market '%s' not found in dropdown for game %d: %s", market_name, game_id, e)
+            await page.wait_for_selector('[id*="GridView1"] tr', timeout=20_000)
+        except Exception:
+            log.warning(
+                "Table did not load for game_id=%d market='%s' — "
+                "possible rate-limit, redirect, or site change. "
+                "Check for HTTP 429/403 warnings above.",
+                game_id, market_name,
+            )
             continue
-        await _wait_for_ajax(page)
 
-        # Select All players (value="0"), then combined-wait + table read in one
-        # round-trip via _wait_and_read_table (saves a separate evaluate() call).
-        try:
-            await page.select_option(SEL_PLAYER, value="0")
-        except Exception as e:
-            log.warning("Could not select All players for '%s' game %d: %s", market_name, game_id, e)
-        rows: list[list[str]] = await _wait_and_read_table(page)
+        rows: list[list[str]] = await page.evaluate(_TABLE_JS)
 
-        # Retry once on empty table — AJAX postback sometimes returns before the
-        # GridView is fully populated, especially under concurrent page load.
         if not rows:
             log.info(
-                "Market '%s' returned empty table for game %d — retrying after delay",
+                "Market '%s' returned empty table for game_id=%d — retrying after delay",
                 market_name, game_id,
             )
             await page.wait_for_timeout(2500)
+            await page.goto(url, wait_until="domcontentloaded")
             try:
-                await page.select_option(SEL_MARKET, label=market_name, timeout=5000)
+                await page.wait_for_selector('[id*="GridView1"] tr', timeout=15_000)
             except Exception:
                 pass
-            await _wait_for_ajax(page)
-            try:
-                await page.select_option(SEL_PLAYER, value="0")
-            except Exception:
-                pass
-            rows = await _wait_and_read_table(page)
+            rows = await page.evaluate(_TABLE_JS)
             if rows:
                 log.info(
-                    "Market '%s' retry succeeded for game %d (%d rows)",
+                    "Market '%s' retry succeeded for game_id=%d (%d rows)",
                     market_name, game_id, len(rows),
                 )
             else:
-                log.info("Market '%s' still empty after retry for game %d", market_name, game_id)
+                log.info("Market '%s' still empty after retry for game_id=%d", market_name, game_id)
 
         if debug and rows:
             log.debug("Market '%s' raw rows (first 4): %s", market_name, rows[:4])
@@ -1105,7 +1086,7 @@ async def _fetch_game_odds(
             )
 
     if debug:
-        for mkt in markets:
+        for mkt in market_id_map:
             mk = MARKET_KEY_MAP.get(mkt)
             count = sum(1 for p in market_data.values() if mk in p) if mk else 0
             status = f"{count} players" if count else "NO DATA"
@@ -1531,12 +1512,9 @@ async def _run_playwright(
 
     log.info("Fetching for games: %s", [f"{a}@{h}" for a, h in slate_games.keys()])
 
-    all_markets = BATTER_MARKETS + PITCHER_MARKETS
-    all_market_data: dict[str, dict[str, list[tuple[float, float]]]] = {}
-    all_seen_players: set[str] = set()
-
-    cache_key   = _game_id_cache_key(slate_date, slate_games)
-    game_id_map = _load_game_id_cache(cache_key)
+    cache_key        = _game_id_cache_key(slate_date, slate_games)
+    full_cache_key   = _game_id_cache_key(slate_date, full_slate_games)
+    game_id_map      = _load_game_id_cache(cache_key)
 
     # Discard a partial cache — if any slate game is missing a game ID the
     # cache was built before a previous match failure was resolved.
@@ -1551,10 +1529,26 @@ async def _run_playwright(
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)
+        # One shared context so that the devig cookie set in Phase 0 persists
+        # to every page opened in Phases 1-3.  browser.new_page() creates a
+        # separate context per call — cookies don't carry over when that page
+        # closes.  context.new_page() shares the cookie jar across all pages.
+        context = await browser.new_context()
+
+        # Phase 0: set devig method cookie once — persists to all context pages.
+        cookie_page = await context.new_page()
+        _install_rate_limit_handler(cookie_page, "settings.aspx")
+        ok = await _set_devig_cookie(cookie_page)
+        if not ok:
+            log.warning(
+                "Devig method not confirmed via settings — "
+                "continuing with whatever method is currently active."
+            )
+        await cookie_page.close()
 
         # Phase 1: game ID discovery uses a single dedicated page.
         if game_id_map is None:
-            lookup_page = await browser.new_page()
+            lookup_page = await context.new_page()
             _install_rate_limit_handler(lookup_page, "games.aspx")
             game_id_map = await _find_game_ids(
                 lookup_page, slate_games, slate_date, debug=debug
@@ -1562,30 +1556,84 @@ async def _run_playwright(
             await lookup_page.close()
             if not game_id_map:
                 log.error("No slate games matched on CrazyNinjaOdds.")
+                await context.close()
                 await browser.close()
                 return {}, set()
             _save_game_id_cache(cache_key, game_id_map)
         else:
             log.info("Skipping games.aspx — using %d cached game IDs.", len(game_id_map))
 
-        # Phase 2: fetch all games in parallel, capped by _MAX_CONCURRENT_GAMES.
+        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GAMES)
+
+        # Phase 2: market ID discovery — one page per game, cached per slate date.
+        raw_market_cache: dict[str, dict[str, str]] = _load_market_id_cache(full_cache_key) or {}
+        game_market_ids: dict[int, dict[str, str]] = {}
+        games_needing_mids: list[tuple[str, str, int]] = []
+
+        for (away, home), game_id in game_id_map.items():
+            cached_mids = raw_market_cache.get(str(game_id))
+            if cached_mids:
+                game_market_ids[game_id] = cached_mids
+                log.info("Using cached market IDs for game_id=%d (%s@%s)", game_id, away, home)
+            else:
+                games_needing_mids.append((away, home, game_id))
+
+        if games_needing_mids:
+            log.info("Fetching market IDs for %d game(s).", len(games_needing_mids))
+
+            async def _fetch_mids_one(
+                away: str, home: str, game_id: int
+            ) -> tuple[int, dict[str, str]]:
+                async with semaphore:
+                    p = await context.new_page()
+                    _install_rate_limit_handler(p, f"mids:{away}@{home}")
+                    try:
+                        return game_id, await _parse_market_ids(p, game_id, debug=debug)
+                    except Exception as e:
+                        log.warning("Error fetching market IDs for game %d: %s", game_id, e)
+                        return game_id, {}
+                    finally:
+                        await p.close()
+
+            mid_results = await asyncio.gather(*[
+                _fetch_mids_one(a, h, g) for a, h, g in games_needing_mids
+            ])
+            new_entries: dict[str, dict[str, str]] = {}
+            for game_id, mid_map in mid_results:
+                if mid_map:
+                    game_market_ids[game_id] = mid_map
+                    new_entries[str(game_id)] = mid_map
+            if new_entries:
+                merged_cache = {**raw_market_cache, **new_entries}
+                _save_market_id_cache(full_cache_key, merged_cache)
+
+        # Phase 3: fetch all game×market URLs in parallel, capped by _MAX_CONCURRENT_GAMES.
         game_entries = list(game_id_map.items())
         log.info(
             "Fetching %d game(s) with up to %d concurrent pages.",
             len(game_entries), _MAX_CONCURRENT_GAMES,
         )
-        semaphore = asyncio.Semaphore(_MAX_CONCURRENT_GAMES)
 
         async def _fetch_one(
             away: str, home: str, game_id: int, validate: bool
         ) -> tuple[dict, set, dict]:
             async with semaphore:
-                page = await browser.new_page()
+                page = await context.new_page()
                 _install_rate_limit_handler(page, f"{away}@{home}")
-                log.info("Fetching odds for %s@%s (game_id=%d)", away, home, game_id)
+                market_id_map = game_market_ids.get(game_id, {})
+                if not market_id_map:
+                    log.warning(
+                        "No market IDs for game_id=%d (%s@%s) — skipping.",
+                        game_id, away, home,
+                    )
+                    return {}, set(), {}
+                log.info(
+                    "Fetching odds for %s@%s (game_id=%d, %d markets)",
+                    away, home, game_id, len(market_id_map),
+                )
                 try:
                     return await _fetch_game_odds(
-                        page, game_id, all_markets, debug=debug,
+                        page, game_id, market_id_map, debug=debug,
                         validate_columns=validate,
                     )
                 except Exception as e:
@@ -1602,6 +1650,7 @@ async def _run_playwright(
         ]
         results = await asyncio.gather(*tasks)
 
+        await context.close()
         await browser.close()
 
     # Merge results, keeping market data separate per (player_name, away, home) so
@@ -1610,7 +1659,6 @@ async def _run_playwright(
     all_market_data: dict[tuple[str, str, str], dict[str, list[tuple[float, float]]]] = {}
     all_seen_players: set[tuple[str, str, str]] = set()
     consecutive_empty = 0
-    full_cache_key = _game_id_cache_key(slate_date, full_slate_games)
     fair_odds_data = _load_fair_odds_cache(full_cache_key)
     for i, ((away, home), _) in enumerate(game_entries):
         game_data, seen_players, raw_odds = results[i]
