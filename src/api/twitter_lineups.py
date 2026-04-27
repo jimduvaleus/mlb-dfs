@@ -195,3 +195,25 @@ def get_twitter_overrides() -> dict[int, dict]:
             if pid is not None and slot is not None:
                 overrides[int(pid)] = {"slot": int(slot)}
     return overrides
+
+
+def get_confirmed_team_lineups() -> dict[str, dict[int, int]]:
+    """Return {team: {player_id: slot}} for all teams with a confirmed Twitter lineup.
+
+    Used to determine which batters are authoritative starters (in the map) and
+    which are scratched (in the team but not in the map).
+    """
+    result: dict[str, dict[int, int]] = {}
+    for lineup in load_twitter_lineups():
+        team = lineup.get("team")
+        if not team:
+            continue
+        pid_to_slot: dict[int, int] = {}
+        for slot_entry in lineup.get("slots", []):
+            pid = slot_entry.get("player_id")
+            slot = slot_entry.get("slot")
+            if pid is not None and slot is not None:
+                pid_to_slot[int(pid)] = int(slot)
+        if pid_to_slot:
+            result[team] = pid_to_slot
+    return result

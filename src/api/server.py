@@ -362,10 +362,44 @@ def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
 
 @app.delete("/api/twitter-lineups/{team}")
 def remove_twitter_lineup(team: str):
-    found = delete_twitter_lineup(team)
-    if not found:
+    # Before removing the record, bake the confirmed slots into projections.csv so
+    # the confirmation persists (e.g. when Rotowire has caught up and the Twitter
+    # record is dismissed as redundant).
+    lineups = load_twitter_lineups()
+    lineup = next((l for l in lineups if l.get("team") == team), None)
+    if lineup is None:
         raise HTTPException(404, detail="No confirmed lineup for that team")
+    _bake_twitter_lineup_to_projections(lineup)
+    delete_twitter_lineup(team)
     return {"ok": True}
+
+
+def _bake_twitter_lineup_to_projections(lineup: dict) -> None:
+    """Write confirmed slot data from a Twitter lineup into projections.csv."""
+    import pandas as pd
+    try:
+        cfg = read_config()
+        proj_path = _resolve_proj_path(cfg)
+        if not proj_path.exists():
+            return
+        df = pd.read_csv(proj_path)
+        if "player_id" not in df.columns:
+            return
+        changed = False
+        for slot_entry in lineup.get("slots", []):
+            pid = slot_entry.get("player_id")
+            slot = slot_entry.get("slot")
+            if pid is None or slot is None:
+                continue
+            mask = df["player_id"] == pid
+            if mask.any():
+                df.loc[mask, "lineup_slot"] = slot
+                df.loc[mask, "slot_confirmed"] = True
+                changed = True
+        if changed:
+            df.to_csv(proj_path, index=False)
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -591,10 +625,27 @@ def projections_status() -> ProjectionsStatus:
     age = time.time() - stat.st_mtime
 
     row_count = None
+    live_unconfirmed_count = None
     try:
         import pandas as pd
+        from .twitter_lineups import get_confirmed_team_lineups
         df = pd.read_csv(p)
         row_count = len(df)
+        if {"slot_confirmed", "player_id"}.issubset(df.columns):
+            unconf = df[~df["slot_confirmed"].astype(bool)].copy()
+            confirmed = get_confirmed_team_lineups()
+            if confirmed:
+                twitter_pids = {pid for pid_to_slot in confirmed.values() for pid in pid_to_slot}
+                unconf = unconf[~unconf["player_id"].isin(twitter_pids)]
+                if "team" in unconf.columns and "position" in unconf.columns:
+                    for team, pid_to_slot in confirmed.items():
+                        scratched = (
+                            (unconf["position"] != "P")
+                            & (unconf["team"] == team)
+                            & ~unconf["player_id"].isin(pid_to_slot)
+                        )
+                        unconf = unconf[~scratched]
+            live_unconfirmed_count = len(unconf)
     except Exception:
         pass
 
@@ -604,7 +655,11 @@ def projections_status() -> ProjectionsStatus:
         else None
     )
 
-    status = ProjectionsStatus(
+    # Override stored unconfirmed_count with the live computation if available
+    if live_unconfirmed_count is not None:
+        extra["unconfirmed_count"] = live_unconfirmed_count
+
+    return ProjectionsStatus(
         exists=True,
         path=str(p.relative_to(PROJECT_ROOT)),
         last_modified=stat.st_mtime,
@@ -613,10 +668,6 @@ def projections_status() -> ProjectionsStatus:
         is_fresh=is_fresh,
         **extra,
     )
-    if status.unconfirmed_count is not None:
-        n_twitter = len(get_twitter_overrides())
-        status.unconfirmed_count = max(0, status.unconfirmed_count - n_twitter)
-    return status
 
 
 @app.get("/api/projections/unconfirmed")
@@ -627,13 +678,29 @@ def projections_unconfirmed():
         return {"player_ids": []}
     try:
         import pandas as pd
+        from .twitter_lineups import get_confirmed_team_lineups
         df = pd.read_csv(p)
         if "slot_confirmed" not in df.columns or "player_id" not in df.columns:
             return {"player_ids": []}
-        unconfirmed = df[~df["slot_confirmed"].astype(bool)]["player_id"].tolist()
-        twitter_confirmed = set(get_twitter_overrides().keys())
-        unconfirmed = [int(x) for x in unconfirmed if int(x) not in twitter_confirmed]
-        return {"player_ids": unconfirmed}
+        unconfirmed = df[~df["slot_confirmed"].astype(bool)].copy()
+
+        confirmed = get_confirmed_team_lineups()
+        if confirmed:
+            # Players in Twitter-confirmed lineups are confirmed regardless of CSV value
+            twitter_pids = {pid for pid_to_slot in confirmed.values() for pid in pid_to_slot}
+            unconfirmed = unconfirmed[~unconfirmed["player_id"].isin(twitter_pids)]
+            # Scratched batters (in a confirmed-lineup team but not in the lineup)
+            # are not in the active pool — exclude them from the unconfirmed list too
+            if "team" in unconfirmed.columns and "position" in unconfirmed.columns:
+                for team, pid_to_slot in confirmed.items():
+                    scratched_mask = (
+                        (unconfirmed["position"] != "P")
+                        & (unconfirmed["team"] == team)
+                        & ~unconfirmed["player_id"].isin(pid_to_slot)
+                    )
+                    unconfirmed = unconfirmed[~scratched_mask]
+
+        return {"player_ids": [int(x) for x in unconfirmed["player_id"].tolist()]}
     except Exception:
         return {"player_ids": []}
 
@@ -641,6 +708,7 @@ def projections_unconfirmed():
 @app.get("/api/projections/players")
 def projections_players():
     import pandas as pd
+    from .twitter_lineups import get_confirmed_team_lineups
     cfg = read_config()
     proj_path = _resolve_proj_path(cfg)
     if not proj_path.exists():
@@ -657,6 +725,23 @@ def projections_players():
         slate_sub = slate_df[["player_id", "name", "position", "team", "salary"]]
         proj_sub  = proj_df[["player_id", "mean", "lineup_slot", "slot_confirmed"]]
         merged = slate_sub.merge(proj_sub, on="player_id", how="inner")
+
+        # Twitter confirmed lineups are authoritative: drop scratched batters and
+        # update slot/slot_confirmed for the players who are actually starting.
+        confirmed = get_confirmed_team_lineups()
+        if confirmed:
+            batter_mask = merged["position"] != "P"
+            for team, pid_to_slot in confirmed.items():
+                scratched = batter_mask & (merged["team"] == team) & ~merged["player_id"].isin(pid_to_slot)
+                merged = merged[~scratched]
+            merged = merged.copy()
+            for pid_to_slot in confirmed.values():
+                for pid, slot in pid_to_slot.items():
+                    mask = merged["player_id"] == pid
+                    if mask.any():
+                        merged.loc[mask, "lineup_slot"] = slot
+                        merged.loc[mask, "slot_confirmed"] = True
+
         result = []
         for _, row in merged.iterrows():
             slot_raw = row["lineup_slot"]

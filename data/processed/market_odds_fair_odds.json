@@ -26095,8 +26095,8 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+1972",
-            "implied_prob": 0.048263,
+            "fair_odds": "+1871",
+            "implied_prob": 0.050736,
             "flagged": true
           }
         ],
@@ -26104,15 +26104,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+392",
-            "implied_prob": 0.203252,
+            "fair_odds": "+386",
+            "implied_prob": 0.205761,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-376",
-            "implied_prob": 0.789916,
+            "fair_odds": "-375",
+            "implied_prob": 0.789474,
             "flagged": false
           },
           {
@@ -26134,15 +26134,15 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-800",
-            "implied_prob": 0.888889,
+            "fair_odds": "-803",
+            "implied_prob": 0.889258,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+16500",
-            "implied_prob": 0.006024,
+            "fair_odds": "+16724",
+            "implied_prob": 0.005944,
             "flagged": true
           },
           {
@@ -26164,22 +26164,22 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-181",
-            "implied_prob": 0.644128,
+            "fair_odds": "-182",
+            "implied_prob": 0.64539,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+643",
-            "implied_prob": 0.13459,
+            "fair_odds": "+660",
+            "implied_prob": 0.131579,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-641",
-            "implied_prob": 0.865047,
+            "fair_odds": "-657",
+            "implied_prob": 0.8679,
             "flagged": false
           },
           {
@@ -26201,15 +26201,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+141",
-            "implied_prob": 0.414938,
+            "fair_odds": "+142",
+            "implied_prob": 0.413223,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-140",
-            "implied_prob": 0.583333,
+            "fair_odds": "-141",
+            "implied_prob": 0.585062,
             "flagged": false
           },
           {
@@ -26245,15 +26245,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "-118",
-            "implied_prob": 0.541284,
+            "fair_odds": "-116",
+            "implied_prob": 0.537037,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "+118",
-            "implied_prob": 0.458716,
+            "fair_odds": "+116",
+            "implied_prob": 0.462963,
             "flagged": false
           },
           {
@@ -26295,15 +26295,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+172",
-            "implied_prob": 0.367647,
+            "fair_odds": "+170",
+            "implied_prob": 0.37037,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-171",
-            "implied_prob": 0.630996,
+            "fair_odds": "-169",
+            "implied_prob": 0.628253,
             "flagged": false
           },
           {
@@ -26341,8 +26341,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+566",
-            "implied_prob": 0.15015,
+            "fair_odds": "+565",
+            "implied_prob": 0.150376,
             "flagged": false
           },
           {
@@ -26362,8 +26362,8 @@
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+79656",
-            "implied_prob": 0.001254,
+            "fair_odds": "+59659",
+            "implied_prob": 0.001673,
             "flagged": true
           }
         ],
@@ -26385,15 +26385,15 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+681",
-            "implied_prob": 0.128041,
+            "fair_odds": "+676",
+            "implied_prob": 0.128866,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-676",
-            "implied_prob": 0.871134,
+            "fair_odds": "-664",
+            "implied_prob": 0.86911,
             "flagged": false
           },
           {
@@ -26422,8 +26422,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-118",
-            "implied_prob": 0.541284,
+            "fair_odds": "-120",
+            "implied_prob": 0.545455,
             "flagged": false
           },
           {
@@ -26496,8 +26496,8 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+19669",
-            "implied_prob": 0.005058,
+            "fair_odds": "+24666",
+            "implied_prob": 0.004038,
             "flagged": true
           }
         ],
@@ -26505,8 +26505,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+8680",
-            "implied_prob": 0.01139,
+            "fair_odds": "+7683",
+            "implied_prob": 0.012849,
             "flagged": true
           }
         ]
@@ -26523,15 +26523,15 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-129",
-            "implied_prob": 0.563319,
+            "fair_odds": "-128",
+            "implied_prob": 0.561404,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+1146",
-            "implied_prob": 0.080257,
+            "fair_odds": "+1110",
+            "implied_prob": 0.082645,
             "flagged": true
           }
         ],
@@ -26592,8 +26592,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+239",
-            "implied_prob": 0.294985,
+            "fair_odds": "+241",
+            "implied_prob": 0.293255,
             "flagged": false
           },
           {
@@ -26606,15 +26606,15 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+928",
-            "implied_prob": 0.097276,
+            "fair_odds": "+984",
+            "implied_prob": 0.092251,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-925",
-            "implied_prob": 0.902439,
+            "fair_odds": "-968",
+            "implied_prob": 0.906367,
             "flagged": false
           },
           {
@@ -26643,8 +26643,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-142",
-            "implied_prob": 0.586777,
+            "fair_odds": "-141",
+            "implied_prob": 0.585062,
             "flagged": false
           },
           {
@@ -26680,22 +26680,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+107",
-            "implied_prob": 0.483092,
+            "fair_odds": "+109",
+            "implied_prob": 0.478469,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-106",
-            "implied_prob": 0.514563,
+            "fair_odds": "-108",
+            "implied_prob": 0.519231,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+706",
-            "implied_prob": 0.124069,
+            "fair_odds": "+732",
+            "implied_prob": 0.120192,
             "flagged": true
           }
         ],
@@ -26703,22 +26703,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1910",
-            "implied_prob": 0.049751,
+            "fair_odds": "+1950",
+            "implied_prob": 0.04878,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1861",
-            "implied_prob": 0.949006,
+            "fair_odds": "-1922",
+            "implied_prob": 0.950544,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+24666",
-            "implied_prob": 0.004038,
+            "fair_odds": "+34663",
+            "implied_prob": 0.002877,
             "flagged": true
           }
         ],
@@ -26733,8 +26733,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-4707",
-            "implied_prob": 0.979197,
+            "fair_odds": "-4702",
+            "implied_prob": 0.979175,
             "flagged": false
           }
         ]
@@ -26751,8 +26751,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-353",
-            "implied_prob": 0.779249,
+            "fair_odds": "-354",
+            "implied_prob": 0.779736,
             "flagged": false
           }
         ],
@@ -26767,8 +26767,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-591",
-            "implied_prob": 0.855282,
+            "fair_odds": "-592",
+            "implied_prob": 0.855491,
             "flagged": false
           }
         ],
@@ -26776,15 +26776,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1118",
-            "implied_prob": 0.082102,
+            "fair_odds": "+1145",
+            "implied_prob": 0.080321,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1088",
-            "implied_prob": 0.915825,
+            "fair_odds": "-1132",
+            "implied_prob": 0.918831,
             "flagged": false
           },
           {
@@ -26806,8 +26806,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+254",
-            "implied_prob": 0.282486,
+            "fair_odds": "+255",
+            "implied_prob": 0.28169,
             "flagged": false
           },
           {
@@ -26850,15 +26850,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+198",
-            "implied_prob": 0.33557,
+            "fair_odds": "+195",
+            "implied_prob": 0.338983,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-195",
-            "implied_prob": 0.661017,
+            "fair_odds": "-193",
+            "implied_prob": 0.658703,
             "flagged": false
           },
           {
@@ -26894,15 +26894,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+136",
-            "implied_prob": 0.423729,
+            "fair_odds": "+139",
+            "implied_prob": 0.41841,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-136",
-            "implied_prob": 0.576271,
+            "fair_odds": "-139",
+            "implied_prob": 0.58159,
             "flagged": false
           },
           {
@@ -26917,15 +26917,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+2122",
-            "implied_prob": 0.045005,
+            "fair_odds": "+2131",
+            "implied_prob": 0.044823,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-2113",
-            "implied_prob": 0.954812,
+            "fair_odds": "-2126",
+            "implied_prob": 0.955076,
             "flagged": false
           }
         ],
@@ -26933,8 +26933,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+8680",
-            "implied_prob": 0.01139,
+            "fair_odds": "+7683",
+            "implied_prob": 0.012849,
             "flagged": true
           }
         ]
@@ -26967,15 +26967,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+481",
-            "implied_prob": 0.172117,
+            "fair_odds": "+484",
+            "implied_prob": 0.171233,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-479",
-            "implied_prob": 0.827288,
+            "fair_odds": "-483",
+            "implied_prob": 0.828473,
             "flagged": false
           }
         ],
@@ -26983,15 +26983,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+960",
-            "implied_prob": 0.09434,
+            "fair_odds": "+935",
+            "implied_prob": 0.096618,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-917",
-            "implied_prob": 0.901672,
+            "fair_odds": "-915",
+            "implied_prob": 0.901478,
             "flagged": false
           },
           {
@@ -27013,8 +27013,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+234",
-            "implied_prob": 0.299401,
+            "fair_odds": "+235",
+            "implied_prob": 0.298507,
             "flagged": false
           },
           {
@@ -27027,15 +27027,15 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+971",
-            "implied_prob": 0.093371,
+            "fair_odds": "+1037",
+            "implied_prob": 0.087951,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-960",
-            "implied_prob": 0.90566,
+            "fair_odds": "-1014",
+            "implied_prob": 0.910233,
             "flagged": false
           },
           {
@@ -27064,8 +27064,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-123",
-            "implied_prob": 0.55157,
+            "fair_odds": "-122",
+            "implied_prob": 0.54955,
             "flagged": false
           },
           {
@@ -27101,22 +27101,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "-111",
-            "implied_prob": 0.526066,
+            "fair_odds": "-110",
+            "implied_prob": 0.52381,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "+111",
-            "implied_prob": 0.473934,
+            "fair_odds": "+110",
+            "implied_prob": 0.47619,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+562",
-            "implied_prob": 0.151057,
+            "fair_odds": "+560",
+            "implied_prob": 0.151515,
             "flagged": true
           }
         ],
@@ -27124,15 +27124,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1832",
-            "implied_prob": 0.05176,
+            "fair_odds": "+1972",
+            "implied_prob": 0.048263,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1828",
-            "implied_prob": 0.948133,
+            "fair_odds": "-1972",
+            "implied_prob": 0.951737,
             "flagged": false
           }
         ],
@@ -27140,8 +27140,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+13673",
-            "implied_prob": 0.007261,
+            "fair_odds": "+15671",
+            "implied_prob": 0.006341,
             "flagged": true
           }
         ]
@@ -27181,8 +27181,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-455",
-            "implied_prob": 0.81982,
+            "fair_odds": "-456",
+            "implied_prob": 0.820144,
             "flagged": false
           },
           {
@@ -27197,15 +27197,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1145",
-            "implied_prob": 0.080321,
+            "fair_odds": "+1213",
+            "implied_prob": 0.076161,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1020",
-            "implied_prob": 0.910714,
+            "fair_odds": "-1182",
+            "implied_prob": 0.921997,
             "flagged": false
           },
           {
@@ -27218,8 +27218,8 @@
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+139649",
-            "implied_prob": 0.000716,
+            "fair_odds": "+99653",
+            "implied_prob": 0.001002,
             "flagged": true
           }
         ],
@@ -27234,8 +27234,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-277",
-            "implied_prob": 0.734748,
+            "fair_odds": "-278",
+            "implied_prob": 0.73545,
             "flagged": false
           },
           {
@@ -27248,8 +27248,8 @@
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-1229",
-            "implied_prob": 0.924755,
+            "fair_odds": "-1228",
+            "implied_prob": 0.924699,
             "flagged": false
           },
           {
@@ -27271,15 +27271,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+120",
-            "implied_prob": 0.454545,
+            "fair_odds": "+119",
+            "implied_prob": 0.456621,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-120",
-            "implied_prob": 0.545455,
+            "fair_odds": "-119",
+            "implied_prob": 0.543379,
             "flagged": false
           },
           {
@@ -27315,22 +27315,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+101",
-            "implied_prob": 0.497512,
-            "flagged": false
-          },
-          {
-            "line": 0.5,
-            "outcome": "under",
             "fair_odds": "-101",
             "implied_prob": 0.502488,
             "flagged": false
           },
           {
+            "line": 0.5,
+            "outcome": "under",
+            "fair_odds": "+102",
+            "implied_prob": 0.49505,
+            "flagged": false
+          },
+          {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+627",
-            "implied_prob": 0.137552,
+            "fair_odds": "+619",
+            "implied_prob": 0.139082,
             "flagged": true
           }
         ],
@@ -27338,8 +27338,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+761",
-            "implied_prob": 0.116144,
+            "fair_odds": "+760",
+            "implied_prob": 0.116279,
             "flagged": false
           },
           {
@@ -27352,8 +27352,8 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+12674",
-            "implied_prob": 0.007828,
+            "fair_odds": "+10677",
+            "implied_prob": 0.009279,
             "flagged": true
           }
         ],
@@ -27361,15 +27361,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+9108",
-            "implied_prob": 0.01086,
+            "fair_odds": "+7943",
+            "implied_prob": 0.012433,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-7339",
-            "implied_prob": 0.986557,
+            "fair_odds": "-6758",
+            "implied_prob": 0.985418,
             "flagged": false
           }
         ]
@@ -27425,15 +27425,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+775",
-            "implied_prob": 0.114286,
+            "fair_odds": "+796",
+            "implied_prob": 0.111607,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-748",
-            "implied_prob": 0.882075,
+            "fair_odds": "-769",
+            "implied_prob": 0.884925,
             "flagged": false
           },
           {
@@ -27449,21 +27449,14 @@
             "fair_odds": "+79656",
             "implied_prob": 0.001254,
             "flagged": true
-          },
-          {
-            "line": 3.5,
-            "outcome": "over",
-            "fair_odds": "+139649",
-            "implied_prob": 0.000716,
-            "flagged": true
           }
         ],
         "Player RBIs": [
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+189",
-            "implied_prob": 0.346021,
+            "fair_odds": "+188",
+            "implied_prob": 0.347222,
             "flagged": false
           },
           {
@@ -27476,22 +27469,22 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+687",
-            "implied_prob": 0.127065,
+            "fair_odds": "+705",
+            "implied_prob": 0.124224,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-686",
-            "implied_prob": 0.872774,
+            "fair_odds": "-703",
+            "implied_prob": 0.875467,
             "flagged": false
           },
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+2076",
-            "implied_prob": 0.045956,
+            "fair_odds": "+2070",
+            "implied_prob": 0.046083,
             "flagged": true
           },
           {
@@ -27506,15 +27499,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+149",
-            "implied_prob": 0.401606,
+            "fair_odds": "+150",
+            "implied_prob": 0.4,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-149",
-            "implied_prob": 0.598394,
+            "fair_odds": "-150",
+            "implied_prob": 0.6,
             "flagged": false
           },
           {
@@ -27557,8 +27550,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-108",
-            "implied_prob": 0.519231,
+            "fair_odds": "-109",
+            "implied_prob": 0.521531,
             "flagged": false
           },
           {
@@ -27573,15 +27566,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1110",
-            "implied_prob": 0.082645,
+            "fair_odds": "+1094",
+            "implied_prob": 0.083752,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1109",
-            "implied_prob": 0.917287,
+            "fair_odds": "-1085",
+            "implied_prob": 0.915612,
             "flagged": false
           },
           {
@@ -27607,15 +27600,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+356",
-            "implied_prob": 0.219298,
+            "fair_odds": "+339",
+            "implied_prob": 0.22779,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-355",
-            "implied_prob": 0.78022,
+            "fair_odds": "-337",
+            "implied_prob": 0.771167,
             "flagged": false
           }
         ],
@@ -27623,15 +27616,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+586",
-            "implied_prob": 0.145773,
+            "fair_odds": "+596",
+            "implied_prob": 0.143678,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-583",
-            "implied_prob": 0.853587,
+            "fair_odds": "-588",
+            "implied_prob": 0.854651,
             "flagged": false
           }
         ],
@@ -27639,15 +27632,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1605",
-            "implied_prob": 0.058651,
+            "fair_odds": "+1590",
+            "implied_prob": 0.059172,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1574",
-            "implied_prob": 0.940263,
+            "fair_odds": "-1554",
+            "implied_prob": 0.939541,
             "flagged": false
           },
           {
@@ -27669,29 +27662,29 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+252",
-            "implied_prob": 0.284091,
+            "fair_odds": "+260",
+            "implied_prob": 0.277778,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-252",
-            "implied_prob": 0.715909,
+            "fair_odds": "-259",
+            "implied_prob": 0.721448,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+994",
-            "implied_prob": 0.091408,
+            "fair_odds": "+996",
+            "implied_prob": 0.091241,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-991",
-            "implied_prob": 0.908341,
+            "fair_odds": "-993",
+            "implied_prob": 0.908509,
             "flagged": false
           },
           {
@@ -27741,8 +27734,8 @@
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+12676",
-            "implied_prob": 0.007827,
+            "fair_odds": "+11675",
+            "implied_prob": 0.008493,
             "flagged": true
           },
           {
@@ -27757,22 +27750,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "-104",
-            "implied_prob": 0.509804,
+            "fair_odds": "+101",
+            "implied_prob": 0.497512,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "+104",
-            "implied_prob": 0.490196,
+            "fair_odds": "-101",
+            "implied_prob": 0.502488,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+697",
-            "implied_prob": 0.125471,
+            "fair_odds": "+779",
+            "implied_prob": 0.113766,
             "flagged": true
           }
         ],
@@ -27780,22 +27773,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+520",
-            "implied_prob": 0.16129,
+            "fair_odds": "+658",
+            "implied_prob": 0.131926,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-514",
-            "implied_prob": 0.837134,
+            "fair_odds": "-633",
+            "implied_prob": 0.863574,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+7683",
-            "implied_prob": 0.012849,
+            "fair_odds": "+12674",
+            "implied_prob": 0.007828,
             "flagged": true
           }
         ],
@@ -27860,15 +27853,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+766",
-            "implied_prob": 0.115473,
+            "fair_odds": "+755",
+            "implied_prob": 0.116959,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-761",
-            "implied_prob": 0.883856,
+            "fair_odds": "-749",
+            "implied_prob": 0.882214,
             "flagged": false
           },
           {
@@ -27904,15 +27897,15 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+768",
-            "implied_prob": 0.115207,
+            "fair_odds": "+757",
+            "implied_prob": 0.116686,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-763",
-            "implied_prob": 0.884125,
+            "fair_odds": "-742",
+            "implied_prob": 0.881235,
             "flagged": false
           },
           {
@@ -27955,8 +27948,8 @@
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-1376",
-            "implied_prob": 0.932249,
+            "fair_odds": "-1382",
+            "implied_prob": 0.932524,
             "flagged": false
           },
           {
@@ -27992,8 +27985,8 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+921",
-            "implied_prob": 0.097943,
+            "fair_odds": "+956",
+            "implied_prob": 0.094697,
             "flagged": true
           }
         ],
@@ -28028,8 +28021,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+541",
-            "implied_prob": 0.156006,
+            "fair_odds": "+538",
+            "implied_prob": 0.15674,
             "flagged": false
           },
           {
@@ -28044,22 +28037,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1910",
-            "implied_prob": 0.049751,
+            "fair_odds": "+2037",
+            "implied_prob": 0.046795,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1861",
-            "implied_prob": 0.949006,
+            "fair_odds": "-1961",
+            "implied_prob": 0.95148,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+39662",
-            "implied_prob": 0.002515,
+            "fair_odds": "+49660",
+            "implied_prob": 0.00201,
             "flagged": true
           },
           {
@@ -28081,8 +28074,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-259",
-            "implied_prob": 0.721448,
+            "fair_odds": "-261",
+            "implied_prob": 0.722992,
             "flagged": false
           },
           {
@@ -28095,8 +28088,8 @@
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-1040",
-            "implied_prob": 0.912281,
+            "fair_odds": "-1044",
+            "implied_prob": 0.912587,
             "flagged": false
           },
           {
@@ -28118,15 +28111,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+192",
-            "implied_prob": 0.342466,
+            "fair_odds": "+196",
+            "implied_prob": 0.337838,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-192",
-            "implied_prob": 0.657534,
+            "fair_odds": "-196",
+            "implied_prob": 0.662162,
             "flagged": false
           },
           {
@@ -28139,8 +28132,8 @@
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-1971",
-            "implied_prob": 0.951714,
+            "fair_odds": "-1978",
+            "implied_prob": 0.951877,
             "flagged": false
           },
           {
@@ -28185,15 +28178,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1237",
-            "implied_prob": 0.074794,
+            "fair_odds": "+1218",
+            "implied_prob": 0.075873,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1235",
-            "implied_prob": 0.925094,
+            "fair_odds": "-1203",
+            "implied_prob": 0.923254,
             "flagged": false
           },
           {
@@ -28208,15 +28201,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+6830",
-            "implied_prob": 0.01443,
+            "fair_odds": "+7648",
+            "implied_prob": 0.012907,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-6444",
-            "implied_prob": 0.984719,
+            "fair_odds": "-6940",
+            "implied_prob": 0.985795,
             "flagged": false
           }
         ]
@@ -28242,15 +28235,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+592",
-            "implied_prob": 0.144509,
+            "fair_odds": "+593",
+            "implied_prob": 0.1443,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-590",
-            "implied_prob": 0.855072,
+            "fair_odds": "-592",
+            "implied_prob": 0.855491,
             "flagged": false
           }
         ],
@@ -28258,15 +28251,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1246",
-            "implied_prob": 0.074294,
+            "fair_odds": "+1231",
+            "implied_prob": 0.075131,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1228",
-            "implied_prob": 0.924699,
+            "fair_odds": "-1214",
+            "implied_prob": 0.923896,
             "flagged": false
           },
           {
@@ -28279,8 +28272,8 @@
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+99653",
-            "implied_prob": 0.001002,
+            "fair_odds": "+39462",
+            "implied_prob": 0.002528,
             "flagged": true
           }
         ],
@@ -28295,8 +28288,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-271",
-            "implied_prob": 0.730458,
+            "fair_odds": "-272",
+            "implied_prob": 0.731183,
             "flagged": false
           },
           {
@@ -28332,15 +28325,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+198",
-            "implied_prob": 0.33557,
+            "fair_odds": "+200",
+            "implied_prob": 0.333333,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-198",
-            "implied_prob": 0.66443,
+            "fair_odds": "-200",
+            "implied_prob": 0.666667,
             "flagged": false
           },
           {
@@ -28353,8 +28346,8 @@
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-1767",
-            "implied_prob": 0.946438,
+            "fair_odds": "-1770",
+            "implied_prob": 0.946524,
             "flagged": false
           },
           {
@@ -28399,22 +28392,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+867",
-            "implied_prob": 0.103413,
+            "fair_odds": "+850",
+            "implied_prob": 0.105263,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-859",
-            "implied_prob": 0.895725,
+            "fair_odds": "-846",
+            "implied_prob": 0.894292,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+15671",
-            "implied_prob": 0.006341,
+            "fair_odds": "+14672",
+            "implied_prob": 0.00677,
             "flagged": true
           }
         ],
@@ -28422,15 +28415,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+5565",
-            "implied_prob": 0.017652,
+            "fair_odds": "+5810",
+            "implied_prob": 0.01692,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-5506",
-            "implied_prob": 0.982162,
+            "fair_odds": "-5718",
+            "implied_prob": 0.982812,
             "flagged": false
           }
         ]
@@ -28456,15 +28449,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+543",
-            "implied_prob": 0.155521,
+            "fair_odds": "+560",
+            "implied_prob": 0.151515,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-510",
-            "implied_prob": 0.836066,
+            "fair_odds": "-520",
+            "implied_prob": 0.83871,
             "flagged": false
           },
           {
@@ -28479,29 +28472,29 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+2205",
-            "implied_prob": 0.043384,
+            "fair_odds": "+2101",
+            "implied_prob": 0.045434,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-2139",
-            "implied_prob": 0.955337,
+            "fair_odds": "-2095",
+            "implied_prob": 0.954442,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+40752",
-            "implied_prob": 0.002448,
+            "fair_odds": "+79656",
+            "implied_prob": 0.001254,
             "flagged": true
           },
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+39462",
-            "implied_prob": 0.002528,
+            "fair_odds": "+139649",
+            "implied_prob": 0.000716,
             "flagged": true
           }
         ],
@@ -28530,8 +28523,8 @@
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-995",
-            "implied_prob": 0.908676,
+            "fair_odds": "-996",
+            "implied_prob": 0.908759,
             "flagged": false
           },
           {
@@ -28574,8 +28567,8 @@
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-2037",
-            "implied_prob": 0.953205,
+            "fair_odds": "-1990",
+            "implied_prob": 0.952153,
             "flagged": false
           },
           {
@@ -28620,22 +28613,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+2025",
-            "implied_prob": 0.047059,
+            "fair_odds": "+1965",
+            "implied_prob": 0.048426,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-2021",
-            "implied_prob": 0.952852,
+            "fair_odds": "-1947",
+            "implied_prob": 0.951148,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+24666",
-            "implied_prob": 0.004038,
+            "fair_odds": "+44661",
+            "implied_prob": 0.002234,
             "flagged": true
           }
         ],
@@ -28650,8 +28643,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-6156",
-            "implied_prob": 0.984015,
+            "fair_odds": "-6150",
+            "implied_prob": 0.984,
             "flagged": false
           }
         ]
@@ -28684,15 +28677,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+553",
-            "implied_prob": 0.153139,
+            "fair_odds": "+566",
+            "implied_prob": 0.15015,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-550",
-            "implied_prob": 0.846154,
+            "fair_odds": "-559",
+            "implied_prob": 0.848255,
             "flagged": false
           }
         ],
@@ -28700,15 +28693,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+791",
-            "implied_prob": 0.112233,
+            "fair_odds": "+778",
+            "implied_prob": 0.113895,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-768",
-            "implied_prob": 0.884793,
+            "fair_odds": "-763",
+            "implied_prob": 0.884125,
             "flagged": false
           },
           {
@@ -28744,22 +28737,22 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+783",
-            "implied_prob": 0.11325,
+            "fair_odds": "+782",
+            "implied_prob": 0.113379,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-777",
-            "implied_prob": 0.885975,
+            "fair_odds": "-775",
+            "implied_prob": 0.885714,
             "flagged": false
           },
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+2435",
-            "implied_prob": 0.039448,
+            "fair_odds": "+2410",
+            "implied_prob": 0.039841,
             "flagged": true
           },
           {
@@ -28774,15 +28767,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+168",
-            "implied_prob": 0.373134,
+            "fair_odds": "+164",
+            "implied_prob": 0.378788,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-165",
-            "implied_prob": 0.622642,
+            "fair_odds": "-162",
+            "implied_prob": 0.618321,
             "flagged": false
           },
           {
@@ -28832,8 +28825,8 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+1567",
-            "implied_prob": 0.059988,
+            "fair_odds": "+1545",
+            "implied_prob": 0.06079,
             "flagged": true
           }
         ],
@@ -28861,38 +28854,31 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+157",
-            "implied_prob": 0.389105,
+            "fair_odds": "+151",
+            "implied_prob": 0.398406,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-156",
-            "implied_prob": 0.609375,
+            "fair_odds": "-151",
+            "implied_prob": 0.601594,
             "flagged": false
-          },
-          {
-            "line": 1.5,
-            "outcome": "over",
-            "fair_odds": "+1478",
-            "implied_prob": 0.063371,
-            "flagged": true
           }
         ],
         "Player Doubles": [
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+439",
-            "implied_prob": 0.185529,
+            "fair_odds": "+437",
+            "implied_prob": 0.18622,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-432",
-            "implied_prob": 0.81203,
+            "fair_odds": "-430",
+            "implied_prob": 0.811321,
             "flagged": false
           },
           {
@@ -28907,29 +28893,36 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+459",
-            "implied_prob": 0.178891,
+            "fair_odds": "+498",
+            "implied_prob": 0.167224,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-455",
-            "implied_prob": 0.81982,
+            "fair_odds": "-488",
+            "implied_prob": 0.829932,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+6284",
-            "implied_prob": 0.015664,
+            "fair_odds": "+6298",
+            "implied_prob": 0.01563,
             "flagged": true
           },
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+49660",
-            "implied_prob": 0.00201,
+            "fair_odds": "+79656",
+            "implied_prob": 0.001254,
+            "flagged": true
+          },
+          {
+            "line": 3.5,
+            "outcome": "over",
+            "fair_odds": "+139649",
+            "implied_prob": 0.000716,
             "flagged": true
           }
         ],
@@ -28937,29 +28930,29 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+196",
-            "implied_prob": 0.337838,
+            "fair_odds": "+202",
+            "implied_prob": 0.331126,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-196",
-            "implied_prob": 0.662162,
+            "fair_odds": "-201",
+            "implied_prob": 0.667774,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+746",
-            "implied_prob": 0.118203,
+            "fair_odds": "+747",
+            "implied_prob": 0.118064,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-745",
-            "implied_prob": 0.881657,
+            "fair_odds": "-746",
+            "implied_prob": 0.881797,
             "flagged": false
           },
           {
@@ -28981,15 +28974,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "-101",
-            "implied_prob": 0.502488,
+            "fair_odds": "-102",
+            "implied_prob": 0.50495,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "+102",
-            "implied_prob": 0.49505,
+            "fair_odds": "+104",
+            "implied_prob": 0.490196,
             "flagged": false
           },
           {
@@ -29025,8 +29018,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+135",
-            "implied_prob": 0.425532,
+            "fair_odds": "+134",
+            "implied_prob": 0.42735,
             "flagged": false
           },
           {
@@ -29035,35 +29028,28 @@
             "fair_odds": "-134",
             "implied_prob": 0.57265,
             "flagged": false
-          },
-          {
-            "line": 1.5,
-            "outcome": "over",
-            "fair_odds": "+1069",
-            "implied_prob": 0.085543,
-            "flagged": true
           }
         ],
         "Player Stolen Bases": [
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+367",
-            "implied_prob": 0.214133,
+            "fair_odds": "+331",
+            "implied_prob": 0.232019,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-360",
-            "implied_prob": 0.782609,
+            "fair_odds": "-331",
+            "implied_prob": 0.767981,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+3163",
-            "implied_prob": 0.030647,
+            "fair_odds": "+2810",
+            "implied_prob": 0.034364,
             "flagged": true
           }
         ],
@@ -29071,15 +29057,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+4313",
-            "implied_prob": 0.02266,
+            "fair_odds": "+3235",
+            "implied_prob": 0.029985,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-4108",
-            "implied_prob": 0.976236,
+            "fair_odds": "-3235",
+            "implied_prob": 0.970015,
             "flagged": false
           }
         ]
@@ -29105,15 +29091,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+657",
-            "implied_prob": 0.1321,
+            "fair_odds": "+652",
+            "implied_prob": 0.132979,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-645",
-            "implied_prob": 0.865772,
+            "fair_odds": "-639",
+            "implied_prob": 0.864682,
             "flagged": false
           }
         ],
@@ -29128,8 +29114,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1478",
-            "implied_prob": 0.936629,
+            "fair_odds": "-1480",
+            "implied_prob": 0.936709,
             "flagged": false
           },
           {
@@ -29195,15 +29181,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+210",
-            "implied_prob": 0.322581,
+            "fair_odds": "+214",
+            "implied_prob": 0.318471,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-210",
-            "implied_prob": 0.677419,
+            "fair_odds": "-214",
+            "implied_prob": 0.681529,
             "flagged": false
           },
           {
@@ -29253,8 +29239,8 @@
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+1069",
-            "implied_prob": 0.085543,
+            "fair_odds": "+1028",
+            "implied_prob": 0.088652,
             "flagged": true
           }
         ],
@@ -29273,14 +29259,7 @@
             "outcome": "over",
             "fair_odds": "+19669",
             "implied_prob": 0.005058,
-            "flagged": false
-          },
-          {
-            "line": 0.5,
-            "outcome": "under",
-            "fair_odds": "-11613",
-            "implied_prob": 0.991462,
-            "flagged": false
+            "flagged": true
           }
         ]
       },
@@ -29335,15 +29314,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1071",
-            "implied_prob": 0.085397,
+            "fair_odds": "+1027",
+            "implied_prob": 0.088731,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1045",
-            "implied_prob": 0.912664,
+            "fair_odds": "-1018",
+            "implied_prob": 0.910555,
             "flagged": false
           },
           {
@@ -29356,8 +29335,8 @@
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+39462",
-            "implied_prob": 0.002528,
+            "fair_odds": "+99653",
+            "implied_prob": 0.001002,
             "flagged": true
           }
         ],
@@ -29365,29 +29344,29 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+202",
-            "implied_prob": 0.331126,
+            "fair_odds": "+201",
+            "implied_prob": 0.332226,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-202",
-            "implied_prob": 0.668874,
+            "fair_odds": "-200",
+            "implied_prob": 0.666667,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+837",
-            "implied_prob": 0.106724,
+            "fair_odds": "+812",
+            "implied_prob": 0.109649,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-820",
-            "implied_prob": 0.891304,
+            "fair_odds": "-782",
+            "implied_prob": 0.886621,
             "flagged": false
           },
           {
@@ -29409,15 +29388,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+146",
-            "implied_prob": 0.406504,
+            "fair_odds": "+147",
+            "implied_prob": 0.404858,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-145",
-            "implied_prob": 0.591837,
+            "fair_odds": "-146",
+            "implied_prob": 0.593496,
             "flagged": false
           },
           {
@@ -29476,8 +29455,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+2776",
-            "implied_prob": 0.034771,
+            "fair_odds": "+2539",
+            "implied_prob": 0.037893,
             "flagged": true
           }
         ],
@@ -29496,22 +29475,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+187",
-            "implied_prob": 0.348432,
+            "fair_odds": "+173",
+            "implied_prob": 0.3663,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-184",
-            "implied_prob": 0.647887,
+            "fair_odds": "-173",
+            "implied_prob": 0.6337,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+1938",
-            "implied_prob": 0.049068,
+            "fair_odds": "+1478",
+            "implied_prob": 0.063371,
             "flagged": true
           }
         ],
@@ -29526,8 +29505,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-517",
-            "implied_prob": 0.837925,
+            "fair_odds": "-504",
+            "implied_prob": 0.834437,
             "flagged": false
           },
           {
@@ -29542,15 +29521,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1333",
-            "implied_prob": 0.069784,
+            "fair_odds": "+1327",
+            "implied_prob": 0.070077,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1312",
-            "implied_prob": 0.929178,
+            "fair_odds": "-1301",
+            "implied_prob": 0.928622,
             "flagged": false
           },
           {
@@ -29563,8 +29542,8 @@
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+39462",
-            "implied_prob": 0.002528,
+            "fair_odds": "+139649",
+            "implied_prob": 0.000716,
             "flagged": true
           }
         ],
@@ -29572,29 +29551,29 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+255",
-            "implied_prob": 0.28169,
+            "fair_odds": "+264",
+            "implied_prob": 0.274725,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-255",
-            "implied_prob": 0.71831,
+            "fair_odds": "-259",
+            "implied_prob": 0.721448,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+1052",
-            "implied_prob": 0.086806,
+            "fair_odds": "+1062",
+            "implied_prob": 0.086059,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-1042",
-            "implied_prob": 0.912434,
+            "fair_odds": "-1055",
+            "implied_prob": 0.91342,
             "flagged": false
           },
           {
@@ -29616,15 +29595,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+192",
-            "implied_prob": 0.342466,
+            "fair_odds": "+174",
+            "implied_prob": 0.364964,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-188",
-            "implied_prob": 0.652778,
+            "fair_odds": "-167",
+            "implied_prob": 0.625468,
             "flagged": false
           },
           {
@@ -29637,15 +29616,15 @@
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-1769",
-            "implied_prob": 0.946495,
+            "fair_odds": "-1771",
+            "implied_prob": 0.946553,
             "flagged": false
           },
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+11675",
-            "implied_prob": 0.008493,
+            "fair_odds": "+8512",
+            "implied_prob": 0.011612,
             "flagged": true
           },
           {
@@ -29660,22 +29639,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+126",
-            "implied_prob": 0.442478,
+            "fair_odds": "+118",
+            "implied_prob": 0.458716,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-125",
-            "implied_prob": 0.555556,
+            "fair_odds": "-114",
+            "implied_prob": 0.53271,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+938",
-            "implied_prob": 0.096339,
+            "fair_odds": "+665",
+            "implied_prob": 0.130719,
             "flagged": true
           }
         ],
@@ -29683,8 +29662,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+4099",
-            "implied_prob": 0.023815,
+            "fair_odds": "+3088",
+            "implied_prob": 0.031368,
             "flagged": true
           }
         ],
@@ -29692,8 +29671,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+19669",
-            "implied_prob": 0.005058,
+            "fair_odds": "+13673",
+            "implied_prob": 0.007261,
             "flagged": true
           }
         ]
@@ -29735,15 +29714,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+1511",
-            "implied_prob": 0.062073,
+            "fair_odds": "+1564",
+            "implied_prob": 0.060096,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-1498",
-            "implied_prob": 0.937422,
+            "fair_odds": "-1547",
+            "implied_prob": 0.939284,
             "flagged": false
           },
           {
@@ -29772,8 +29751,8 @@
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-264",
-            "implied_prob": 0.725275,
+            "fair_odds": "-265",
+            "implied_prob": 0.726027,
             "flagged": false
           },
           {
@@ -29809,15 +29788,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+199",
-            "implied_prob": 0.334448,
+            "fair_odds": "+203",
+            "implied_prob": 0.330033,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-199",
-            "implied_prob": 0.665552,
+            "fair_odds": "-202",
+            "implied_prob": 0.668874,
             "flagged": false
           },
           {
@@ -29853,22 +29832,22 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+108",
-            "implied_prob": 0.480769,
+            "fair_odds": "+109",
+            "implied_prob": 0.478469,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-108",
-            "implied_prob": 0.519231,
+            "fair_odds": "-109",
+            "implied_prob": 0.521531,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+763",
-            "implied_prob": 0.115875,
+            "fair_odds": "+797",
+            "implied_prob": 0.111483,
             "flagged": true
           }
         ],
@@ -29876,15 +29855,15 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+2182",
-            "implied_prob": 0.043821,
+            "fair_odds": "+2171",
+            "implied_prob": 0.044033,
             "flagged": false
           },
           {
             "line": 0.5,
             "outcome": "under",
-            "fair_odds": "-2168",
-            "implied_prob": 0.955908,
+            "fair_odds": "-2153",
+            "implied_prob": 0.955615,
             "flagged": false
           }
         ],
@@ -29892,8 +29871,8 @@
           {
             "line": 0.5,
             "outcome": "over",
-            "fair_odds": "+8680",
-            "implied_prob": 0.01139,
+            "fair_odds": "+6686",
+            "implied_prob": 0.014736,
             "flagged": true
           }
         ]
@@ -30001,8 +29980,8 @@
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+116",
-            "implied_prob": 0.462963,
+            "fair_odds": "+114",
+            "implied_prob": 0.46729,
             "flagged": false
           },
           {
@@ -30033,94 +30012,87 @@
           {
             "line": 15.5,
             "outcome": "over",
-            "fair_odds": "-102",
-            "implied_prob": 0.50495,
+            "fair_odds": "-103",
+            "implied_prob": 0.507389,
             "flagged": false
           },
           {
             "line": 15.5,
             "outcome": "under",
-            "fair_odds": "+102",
-            "implied_prob": 0.49505,
-            "flagged": false
-          },
-          {
-            "line": 16.5,
-            "outcome": "over",
-            "fair_odds": "+116",
-            "implied_prob": 0.462963,
-            "flagged": false
-          },
-          {
-            "line": 16.5,
-            "outcome": "under",
-            "fair_odds": "-116",
-            "implied_prob": 0.537037,
+            "fair_odds": "+104",
+            "implied_prob": 0.490196,
             "flagged": false
           }
         ],
         "Player Pitching Strikeouts": [
           {
+            "line": 0.5,
+            "outcome": "over",
+            "fair_odds": "-2811",
+            "implied_prob": 0.965648,
+            "flagged": true
+          },
+          {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "-1524",
-            "implied_prob": 0.938424,
+            "fair_odds": "-1295",
+            "implied_prob": 0.928315,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "+1545",
-            "implied_prob": 0.06079,
+            "fair_odds": "+1338",
+            "implied_prob": 0.069541,
             "flagged": false
           },
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "-552",
-            "implied_prob": 0.846626,
+            "fair_odds": "-486",
+            "implied_prob": 0.829352,
             "flagged": false
           },
           {
             "line": 2.5,
             "outcome": "under",
-            "fair_odds": "+554",
-            "implied_prob": 0.152905,
+            "fair_odds": "+539",
+            "implied_prob": 0.156495,
             "flagged": false
           },
           {
             "line": 3.5,
             "outcome": "over",
-            "fair_odds": "-234",
-            "implied_prob": 0.700599,
+            "fair_odds": "-223",
+            "implied_prob": 0.690402,
             "flagged": false
           },
           {
             "line": 3.5,
             "outcome": "under",
-            "fair_odds": "+238",
-            "implied_prob": 0.295858,
+            "fair_odds": "+229",
+            "implied_prob": 0.303951,
             "flagged": false
           },
           {
             "line": 4.5,
             "outcome": "over",
-            "fair_odds": "-104",
-            "implied_prob": 0.509804,
+            "fair_odds": "-103",
+            "implied_prob": 0.507389,
             "flagged": false
           },
           {
             "line": 4.5,
             "outcome": "under",
-            "fair_odds": "+104",
-            "implied_prob": 0.490196,
+            "fair_odds": "+103",
+            "implied_prob": 0.492611,
             "flagged": false
           },
           {
             "line": 5.5,
             "outcome": "over",
-            "fair_odds": "+220",
-            "implied_prob": 0.3125,
+            "fair_odds": "+224",
+            "implied_prob": 0.308642,
             "flagged": false
           },
           {
@@ -30133,50 +30105,43 @@
           {
             "line": 6.5,
             "outcome": "over",
-            "fair_odds": "+456",
-            "implied_prob": 0.179856,
+            "fair_odds": "+480",
+            "implied_prob": 0.172414,
             "flagged": false
           },
           {
             "line": 6.5,
             "outcome": "under",
-            "fair_odds": "-452",
-            "implied_prob": 0.818841,
+            "fair_odds": "-479",
+            "implied_prob": 0.827288,
             "flagged": false
           },
           {
             "line": 7.5,
             "outcome": "over",
-            "fair_odds": "+1233",
-            "implied_prob": 0.075019,
+            "fair_odds": "+1212",
+            "implied_prob": 0.07622,
             "flagged": false
           },
           {
             "line": 7.5,
             "outcome": "under",
-            "fair_odds": "-1233",
-            "implied_prob": 0.924981,
+            "fair_odds": "-1169",
+            "implied_prob": 0.921198,
             "flagged": false
           },
           {
             "line": 8.5,
             "outcome": "over",
-            "fair_odds": "+3233",
-            "implied_prob": 0.030003,
-            "flagged": false
-          },
-          {
-            "line": 8.5,
-            "outcome": "under",
-            "fair_odds": "-3233",
-            "implied_prob": 0.969997,
-            "flagged": false
+            "fair_odds": "+2743",
+            "implied_prob": 0.035174,
+            "flagged": true
           },
           {
             "line": 9.5,
             "outcome": "over",
-            "fair_odds": "+4786",
-            "implied_prob": 0.020467,
+            "fair_odds": "+5690",
+            "implied_prob": 0.017271,
             "flagged": true
           }
         ],
@@ -30184,15 +30149,15 @@
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+165",
-            "implied_prob": 0.377358,
+            "fair_odds": "+170",
+            "implied_prob": 0.37037,
             "flagged": false
           },
           {
             "line": 2.5,
             "outcome": "under",
-            "fair_odds": "-165",
-            "implied_prob": 0.622642,
+            "fair_odds": "-170",
+            "implied_prob": 0.62963,
             "flagged": false
           }
         ]
@@ -30300,24 +30265,31 @@
       "Mason Montgomery": {
         "Player Pitching Strikeouts": [
           {
+            "line": 0.5,
+            "outcome": "over",
+            "fair_odds": "-320",
+            "implied_prob": 0.761905,
+            "flagged": true
+          },
+          {
             "line": 1.5,
             "outcome": "over",
-            "fair_odds": "+151",
-            "implied_prob": 0.398406,
+            "fair_odds": "+147",
+            "implied_prob": 0.404858,
             "flagged": false
           },
           {
             "line": 1.5,
             "outcome": "under",
-            "fair_odds": "-148",
-            "implied_prob": 0.596774,
+            "fair_odds": "-146",
+            "implied_prob": 0.593496,
             "flagged": false
           },
           {
             "line": 2.5,
             "outcome": "over",
-            "fair_odds": "+406",
-            "implied_prob": 0.197628,
+            "fair_odds": "+553",
+            "implied_prob": 0.153139,
             "flagged": true
           },
           {

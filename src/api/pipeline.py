@@ -630,19 +630,35 @@ class PipelineRunner:
 
     @staticmethod
     def _apply_twitter_overrides(players_df: pd.DataFrame) -> pd.DataFrame:
-        """Apply confirmed twitter lineup slot/slot_confirmed overrides to players_df."""
-        from .twitter_lineups import get_twitter_overrides
-        overrides = get_twitter_overrides()
-        if not overrides:
+        """Apply confirmed twitter lineup slot/slot_confirmed overrides to players_df.
+
+        For each team with a confirmed Twitter lineup, batters from that team who are
+        NOT in the lineup are dropped entirely (they are scratched). Batters who ARE
+        in the lineup get their slot updated and slot_confirmed set to True.
+        """
+        from .twitter_lineups import get_confirmed_team_lineups
+        confirmed = get_confirmed_team_lineups()
+        if not confirmed:
             return players_df
         df = players_df.copy()
         if "slot_confirmed" not in df.columns:
             df["slot_confirmed"] = False
-        for player_id, data in overrides.items():
-            mask = df["player_id"] == player_id
-            if mask.any():
-                df.loc[mask, "slot"] = data["slot"]
-                df.loc[mask, "slot_confirmed"] = True
+
+        # Drop scratched batters: batter from a confirmed-lineup team but not in that lineup
+        batter_mask = df["position"] != "P"
+        for team, pid_to_slot in confirmed.items():
+            scratched = batter_mask & (df["team"] == team) & ~df["player_id"].isin(pid_to_slot)
+            df = df[~scratched]
+        df = df.copy()
+
+        # Apply confirmed slot and slot_confirmed for each lineup player
+        for pid_to_slot in confirmed.values():
+            for pid, slot in pid_to_slot.items():
+                mask = df["player_id"] == pid
+                if mask.any():
+                    df.loc[mask, "slot"] = slot
+                    df.loc[mask, "slot_confirmed"] = True
+
         return df
 
     @staticmethod

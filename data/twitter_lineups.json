@@ -1,53 +1,53 @@
 [
   {
-    "team": "LAD",
-    "notification_id": "1c3b7b34-5419-4701-9fa4-28d40bb39384",
-    "confirmed_at": 1777327557.2272618,
+    "team": "PIT",
+    "notification_id": "ce4e5c16-b830-4e9e-a136-bc0f8d191373",
+    "confirmed_at": 1777328854.5406516,
     "slots": [
       {
         "slot": 1,
-        "player_id": 42760437,
-        "name": "S. Ohtani"
+        "player_id": 42760578,
+        "name": "S. Horwitz"
       },
       {
         "slot": 2,
-        "player_id": 42760451,
-        "name": "F. Freeman"
+        "player_id": 42760453,
+        "name": "B. Lowe"
       },
       {
         "slot": 3,
-        "player_id": 42760491,
-        "name": "W. Smith"
+        "player_id": 42760476,
+        "name": "B. Reynolds"
       },
       {
         "slot": 4,
-        "player_id": 42760442,
-        "name": "K. Tucker"
+        "player_id": 42760466,
+        "name": "R. O'Hearn"
       },
       {
         "slot": 5,
-        "player_id": 42760467,
-        "name": "T. Hern\u00e1ndez"
+        "player_id": 42760539,
+        "name": "M. Ozuna"
       },
       {
         "slot": 6,
-        "player_id": 42760465,
-        "name": "M. Muncy"
+        "player_id": 42760519,
+        "name": "N. Gonzales"
       },
       {
         "slot": 7,
-        "player_id": 42760460,
-        "name": "A. Pages"
+        "player_id": 42760515,
+        "name": "K. Griffin"
       },
       {
         "slot": 8,
-        "player_id": 42760557,
-        "name": "H. Kim"
+        "player_id": 42760550,
+        "name": "J. Mangum"
       },
       {
         "slot": 9,
-        "player_id": 42760553,
-        "name": "A. Freeland"
+        "player_id": 42760592,
+        "name": "H. Davis"
       }
     ]
   }
