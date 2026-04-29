@@ -41,3 +41,7 @@ data/processed/historical_logs_fd.parquet
 data/processed/projections_fd.csv
 data/twitter_lineups.json
 data/twitter_lineups.json
+data/processed/market_odds_fair_odds.json
+data/processed/market_odds_market_ids.json
+data/processed/market_odds_market_ids.json
+data/processed/market_odds_fair_odds.json

@@ -10,7 +10,7 @@ Provides:
 
 import numpy as np
 from scipy.stats import norm
-from scipy.optimize import minimize
+from scipy.optimize import minimize, root as scipy_root, brentq
 from typing import Optional, Tuple
 
 
@@ -24,6 +24,18 @@ def _mixture_cdf(x: np.ndarray, w: float, lam: float,
     exp_cdf = np.where(x >= 0, 1.0 - np.exp(-lam * x), 0.0)
     norm_cdf = norm.cdf(x, loc=mu, scale=sigma)
     return w * exp_cdf + (1.0 - w) * norm_cdf
+
+
+def _mix_ev(w: float, lam: float, mu: float) -> float:
+    """Expected value of the mixture distribution."""
+    return w / lam + (1.0 - w) * mu
+
+
+def _mix_var(w: float, lam: float, mu: float, sigma: float) -> float:
+    """Variance of the mixture distribution (floored at 0)."""
+    ev = _mix_ev(w, lam, mu)
+    e_x2 = w * 2.0 / (lam ** 2) + (1.0 - w) * (sigma ** 2 + mu ** 2)
+    return max(e_x2 - ev ** 2, 0.0)
 
 
 def fit_mixture_params(
@@ -117,17 +129,16 @@ class BatterPCAModel:
     def project(self, mu_proj: float, sigma_proj: float) -> Tuple[float, float, float, float]:
         """
         Find the point on the 2-D PCA plane whose mixture-distribution mean
-        and std best match the supplied projections, then reconstruct the
-        full 4-D parameter vector (w, lam, mu, sigma).
+        and std match the supplied projections, then reconstruct the full
+        4-D parameter vector (w, lam, mu, sigma).
 
         Strategy:
-        1. Try the full 2×2 solve (constrain both mu and sigma).
-        2. If the result is degenerate (w or lam out of physical range),
-           fall back to a 1-constraint solve that matches only mu_proj
-           and picks the closest point on the PCA line to the manifold
-           centre.  This handles the common case where sigma_proj is a
-           heuristic (e.g. 0.85 × mu) that does not match the historical
-           sigma/mu relationship captured by the PCA.
+        1. Nonlinear 2-constraint solve: mixture mean = mu_proj AND
+           mixture std = sigma_proj, using the old linear solve as init.
+        2. If that fails or is degenerate, fall back to a 1-constraint
+           nonlinear solve matching only mixture mean = mu_proj.
+        3. Last resort: use global-mean (w, lam) and solve analytically
+           for mu so the mixture EV matches mu_proj.
         """
         if self.mean_ is None:
             raise RuntimeError("BatterPCAModel has not been fitted yet.")
@@ -136,52 +147,77 @@ class BatterPCAModel:
         if result is not None:
             return result
 
-        # Fallback: match only mu, minimise distance to manifold centre
         result = self._project_1d(mu_proj)
         if result is not None:
             return result
 
-        # Last resort: scale the global mean parameters to match mu_proj
-        scale = mu_proj / self.mean_[2] if self.mean_[2] != 0 else 1.0
-        w = float(np.clip(self.mean_[0], 1e-6, 1.0 - 1e-6))
-        lam = float(max(self.mean_[1] / scale, 1e-4))
-        return w, lam, mu_proj, float(max(self.mean_[3] * scale, 0.1))
+        # Last resort: global-mean shape, mu solved to match mixture EV
+        w   = float(np.clip(self.mean_[0], 1e-6, 1.0 - 1e-6))
+        lam = float(max(self.mean_[1], 1e-4))
+        mu  = (mu_proj - w / lam) / (1.0 - w)
+        sigma = float(max(self.mean_[3], 0.1))
+        return w, lam, mu, sigma
+
+    def _decode_alpha(self, alpha: np.ndarray) -> Tuple[float, float, float, float]:
+        """Decode 2-D PCA coords to raw (w, lam, mu, sigma) without clipping."""
+        rec = (alpha @ self.components_) * self.std_ + self.mean_
+        return float(rec[0]), float(rec[1]), float(rec[2]), float(rec[3])
 
     def _project_2d(
         self, mu_proj: float, sigma_proj: float
     ) -> Optional[Tuple[float, float, float, float]]:
-        """Full 2-constraint solve.  Returns None if result is degenerate."""
-        mu_norm = (mu_proj - self.mean_[2]) / self.std_[2]
-        sigma_norm = (sigma_proj - self.mean_[3]) / self.std_[3]
+        """Nonlinear 2-constraint solve: mixture mean = mu_proj, mixture std = sigma_proj."""
+        # Coarse grid search for a starting point whose mix_ev is close to mu_proj.
+        # The linear-solve init is unsuitable because it constrains normal-component
+        # parameters, landing far from the mixture-moment target.
+        grid = np.linspace(-5, 5, 20)
+        best_alpha, best_err = None, float('inf')
+        for a0 in grid:
+            for a1 in grid:
+                alpha = np.array([a0, a1])
+                w, lam, mu, sigma = self._decode_alpha(alpha)
+                if w <= 0 or w >= 1 or lam <= 0.5 or sigma <= 0:
+                    continue
+                err = abs(_mix_ev(w, lam, mu) - mu_proj)
+                if err < best_err:
+                    best_err, best_alpha = err, alpha.copy()
 
-        A = np.array([
-            [self.components_[0, 2], self.components_[1, 2]],
-            [self.components_[0, 3], self.components_[1, 3]],
-        ])
-        b = np.array([mu_norm, sigma_norm])
-        alpha, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
+        if best_alpha is None:
+            return None
 
-        return self._reconstruct_if_valid(alpha)
+        def residuals(alpha: np.ndarray) -> np.ndarray:
+            w, lam, mu, sigma = self._decode_alpha(alpha)
+            if lam <= 0 or w <= 0 or w >= 1 or sigma <= 0:
+                return np.array([1e6, 1e6])
+            return np.array([
+                _mix_ev(w, lam, mu) - mu_proj,
+                np.sqrt(_mix_var(w, lam, mu, sigma)) - sigma_proj,
+            ])
+
+        res = scipy_root(residuals, best_alpha, method='hybr')
+        if not res.success:
+            return None
+        return self._reconstruct_if_valid(res.x)
 
     def _project_1d(
         self, mu_proj: float
     ) -> Optional[Tuple[float, float, float, float]]:
-        """1-constraint solve: match mu only, minimise ‖alpha‖ (closest to
-        manifold centre on the PCA line satisfying the mu constraint)."""
-        mu_norm = (mu_proj - self.mean_[2]) / self.std_[2]
+        """1-constraint solve: match mixture mean along the first PCA direction."""
+        def mix_mean_at(a0: float) -> float:
+            w, lam, mu, _ = self._decode_alpha(np.array([a0, 0.0]))
+            w   = float(np.clip(w,   1e-6, 1.0 - 1e-6))
+            lam = float(max(lam, 1e-4))
+            return _mix_ev(w, lam, mu)
 
-        # components_[:, 2] are the two PCA loadings on the mu dimension.
-        # We want:  alpha . components_[:, 2] = mu_norm
-        # with minimum ‖alpha‖.  Solution: alpha = c * v  where
-        # v = components_[:, 2] and c = mu_norm / (v . v).
-        v = self.components_[:, 2]
-        denom = v @ v
-        if abs(denom) < 1e-12:
+        try:
+            lo, hi = -10.0, 10.0
+            if (mix_mean_at(lo) - mu_proj) * (mix_mean_at(hi) - mu_proj) > 0:
+                return None
+            a0_sol = brentq(lambda a: mix_mean_at(a) - mu_proj, lo, hi, xtol=1e-6)
+        except (ValueError, RuntimeError):
             return None
-        c = mu_norm / denom
-        alpha = c * v
 
-        return self._reconstruct_if_valid(alpha)
+        return self._reconstruct_if_valid(np.array([a0_sol, 0.0]))
 
     def _reconstruct_if_valid(
         self, alpha: np.ndarray
