@@ -151,11 +151,15 @@ class BatterPCAModel:
         if result is not None:
             return result
 
-        # Last resort: global-mean shape, mu solved to match mixture EV
+        # Last resort: global-mean shape, mu and sigma solved analytically
+        # to match mixture mean = mu_proj and mixture std = sigma_proj.
         w   = float(np.clip(self.mean_[0], 1e-6, 1.0 - 1e-6))
         lam = float(max(self.mean_[1], 1e-4))
         mu  = (mu_proj - w / lam) / (1.0 - w)
-        sigma = float(max(self.mean_[3], 0.1))
+        # Solve (1-w)*sigma^2 = sigma_proj^2 - w*2/lam^2 - (1-w)*mu^2 + mu_proj^2
+        sigma_sq = (sigma_proj ** 2 - w * 2.0 / lam ** 2
+                    - (1.0 - w) * mu ** 2 + mu_proj ** 2) / (1.0 - w)
+        sigma = float(max(np.sqrt(max(sigma_sq, 0.0)), 0.1))
         return w, lam, mu, sigma
 
     def _decode_alpha(self, alpha: np.ndarray) -> Tuple[float, float, float, float]:
