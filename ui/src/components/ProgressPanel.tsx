@@ -95,16 +95,13 @@ export function ProgressPanel({ events, running }: Props) {
   const lineupEvents = events.filter(e => e.stage === 'optimize_lineup') as OptimizeLineupEvent[]
   let etaMs: number | null = null
   if (running && current > 0 && total > current) {
-    let avgPerLineup: number
     const recent = lineupEvents.slice(-4) // up to 4 events → 3 intervals
     if (recent.length >= 2) {
       const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
-      avgPerLineup = recentElapsed / (recent.length - 1)
-    } else {
-      // Only one lineup done — use time since it completed as a floor
-      avgPerLineup = now - recent[0].timestamp
+      const avgPerLineup = recentElapsed / (recent.length - 1)
+      etaMs = avgPerLineup * (total - current)
     }
-    etaMs = avgPerLineup * (total - current)
+    // With only one lineup we can't measure an interval, so omit the ETA
   }
 
   const liveElapsedMs = running && first && current > 0 ? now - first.timestamp : null
