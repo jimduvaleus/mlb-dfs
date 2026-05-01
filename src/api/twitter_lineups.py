@@ -46,6 +46,23 @@ _BATTER_POSITIONS = {"DH", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "C"}
 _SLOT_LINE_RE = re.compile(
     r"^([A-Z]\.\s+\S+(?:\s+\S+)*?)\s+(DH|1B|2B|3B|SS|LF|CF|RF|C|SP|RP|P)\s*$"
 )
+_NOTIF_META_RE = re.compile(r"^(@\w+|·|\d+[mhd]|Underdog\s+MLB)$", re.IGNORECASE)
+
+
+def looks_like_lineup(body: str) -> bool:
+    """Return True if the notification body plausibly contains an Underdog lineup.
+
+    Checks for a recognized team name using the same scan as parse_notification_body.
+    """
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or _NOTIF_META_RE.match(line):
+            continue
+        candidate = re.sub(r"^Updated\s+", "", line, flags=re.IGNORECASE).strip()
+        candidate = re.sub(r"\s+\d+/\d+(?:/\d+)?\s*$", "", candidate).strip().lower()
+        if candidate in TEAM_NAME_MAP:
+            return True
+    return False
 
 
 def parse_notification_body(body: str) -> tuple[Optional[str], list[dict]]:
@@ -65,12 +82,11 @@ def parse_notification_body(body: str) -> tuple[Optional[str], list[dict]]:
 
     # Scan all lines for the team header line — it matches "Updated? TeamName Date"
     # Skip lines that look like Twitter metadata (@handle, ·, time stamps, "Underdog MLB" account name)
-    _SKIP_RE = re.compile(r"^(@\w+|·|\d+[mhd]|Underdog\s+MLB)$", re.IGNORECASE)
     team_abbrev: Optional[str] = None
     header_idx: int = -1
 
     for i, line in enumerate(lines):
-        if _SKIP_RE.match(line):
+        if _NOTIF_META_RE.match(line):
             continue
         # Strip "Updated " prefix, then trailing date
         candidate = re.sub(r"^Updated\s+", "", line, flags=re.IGNORECASE).strip()

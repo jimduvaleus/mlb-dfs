@@ -32,6 +32,7 @@ from .twitter_lineups import (
     delete_twitter_lineup,
     get_twitter_overrides,
     load_twitter_lineups,
+    looks_like_lineup,
     match_player_name,
     parse_notification_body,
     upsert_twitter_lineup,
@@ -263,7 +264,7 @@ def get_notifications():
     with _notifications_lock:
         items = list(_notifications)
     items.sort(key=lambda n: n['captured_at'], reverse=True)
-    return items
+    return [{**n, 'could_be_lineup': looks_like_lineup(n.get('body', ''))} for n in items]
 
 
 @app.delete("/api/notifications/{notification_id}")

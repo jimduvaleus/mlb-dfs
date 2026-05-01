@@ -284,6 +284,7 @@ export interface TwitterNotification {
   body: string
   app_name: string
   captured_at: number
+  could_be_lineup?: boolean
 }
 
 export interface PlayerMatch {

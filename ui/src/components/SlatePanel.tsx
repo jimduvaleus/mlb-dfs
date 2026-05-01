@@ -356,13 +356,15 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
                       {n.body && <span className="twitter-notif-text">{n.body}</span>}
                     </div>
                     <div className="twitter-notif-actions">
-                      <button
-                        className="twitter-notif-parse"
-                        onClick={() => onParseNotification?.(n)}
-                        title="Parse lineup from this notification"
-                      >
-                        Parse
-                      </button>
+                      {n.could_be_lineup && (
+                        <button
+                          className="twitter-notif-parse"
+                          onClick={() => onParseNotification?.(n)}
+                          title="Parse lineup from this notification"
+                        >
+                          Parse
+                        </button>
+                      )}
                       <button
                         className="twitter-notif-dismiss"
                         onClick={() => onDismissNotification?.(n.id)}
