@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import type { AppConfig, PlatformType } from '../types'
+import type { AppConfig, GppConfig, PlatformType } from '../types'
 import { saveConfig } from '../api'
 
 interface Props {
@@ -31,6 +31,11 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
 
   const configJson = useMemo(() => JSON.stringify(config), [config])
   const isDirty = JSON.stringify(draft) !== configJson
+
+  const setGpp = (key: keyof GppConfig, value: unknown) => {
+    setDraft(d => ({ ...d, gpp: { ...d.gpp, [key]: value } }))
+    setSaved(false)
+  }
 
   const set = (section: keyof AppConfig, key: string, value: unknown) => {
     setDraft(d => ({
@@ -209,6 +214,24 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 onChange={e => set('portfolio', 'target_score', num(e.target.value))} disabled={disabled} />
             </FieldRow>
           </section>
+
+          {draft.optimizer.objective === 'leverage_surplus' && (
+            <section>
+              <h3>GPP</h3>
+              <FieldRow label="Candidates">
+                <input type="number" min={100} value={draft.gpp.n_candidates}
+                  onChange={e => setGpp('n_candidates', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="Field lineups">
+                <input type="number" min={100} value={draft.gpp.n_field_lineups}
+                  onChange={e => setGpp('n_field_lineups', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="Field samples">
+                <input type="number" min={1} max={10} value={draft.gpp.n_field_samples}
+                  onChange={e => setGpp('n_field_samples', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+            </section>
+          )}
         </div>
       </div>
 

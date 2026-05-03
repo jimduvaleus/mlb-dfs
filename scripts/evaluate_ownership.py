@@ -24,11 +24,15 @@ Models evaluated
   C. Mean + salary-value softmax — softmax(w_mean*mean + w_sv*sv) within position.
   D. Model C + team-total boost — batters on high-implied teams get a multiplier.
      Only runs when dff_team_totals.csv is present in the archive directory.
+  E. compute_heuristic_ownership() — full model with sqrt compression, batting
+     order multiplier, pitcher matchup boost, and multi-position eligibility.
+     Requires dff_team_totals.csv and lineup_slot in dff_projections.csv.
 """
 
 import argparse
 import csv
 import io
+import re
 import sys
 import zipfile
 from pathlib import Path
@@ -144,6 +148,18 @@ def _canonical_position(raw: str) -> str:
     return raw.split("/")[0].strip().upper()
 
 
+def _parse_eligible_positions(raw: str) -> list[str]:
+    """Parse a DK position string like '3B/SS' into a list of canonical positions."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for part in str(raw).split("/"):
+        canon = _POSITION_CANONICAL.get(part.strip().upper())
+        if canon and canon != "UTIL" and canon not in seen:
+            seen.add(canon)
+            result.append(canon)
+    return result or [raw.split("/")[0].strip().upper()]
+
+
 def _build_player_pool(
     archive_dir: Path,
 ) -> pd.DataFrame:
@@ -152,8 +168,8 @@ def _build_player_pool(
     player_id, and compute features needed for ownership models.
 
     Returns a DataFrame with columns:
-        player_id, name, salary, position, team, game,
-        mean, std_dev, salary_value, implied_total (if available)
+        player_id, name, salary, position, eligible_positions, team, opponent,
+        game, mean, std_dev, lineup_slot, salary_value, implied_total (if available)
     """
     salary_path = archive_dir / "DKSalaries.csv"
     dff_path    = archive_dir / "dff_projections.csv"
@@ -170,13 +186,29 @@ def _build_player_pool(
         inplace=True,
     )
     sal_df["player_id"] = sal_df["player_id"].astype(int)
-    sal_df["position"] = sal_df["raw_position"].apply(_canonical_position)
-    sal_df = sal_df[["player_id", "name", "salary", "position", "team", "game"]].drop_duplicates("player_id")
+    sal_df["eligible_positions"] = sal_df["raw_position"].apply(_parse_eligible_positions)
+    sal_df["position"] = sal_df["eligible_positions"].str[0]
+
+    # Derive opponent from game string (e.g. "TEX@DET 05/02/2026 07:15PM ET")
+    def _opponent(row: pd.Series) -> str:
+        m = re.match(r"(\w+)@(\w+)", str(row["game"]))
+        if m:
+            away, home = m.group(1), m.group(2)
+            return home if row["team"] == away else away
+        return ""
+
+    sal_df["opponent"] = sal_df.apply(_opponent, axis=1)
+    sal_df = sal_df[
+        ["player_id", "name", "salary", "position", "eligible_positions", "team", "opponent", "game"]
+    ].drop_duplicates("player_id")
 
     proj_df = pd.read_csv(dff_path)
     proj_df["player_id"] = proj_df["player_id"].astype(int)
+    proj_cols = ["player_id", "mean", "std_dev"]
+    if "lineup_slot" in proj_df.columns:
+        proj_cols.append("lineup_slot")
 
-    merged = sal_df.merge(proj_df[["player_id", "mean", "std_dev"]], on="player_id", how="left")
+    merged = sal_df.merge(proj_df[proj_cols], on="player_id", how="left")
     merged = merged.dropna(subset=["mean"])  # only projected starters
 
     merged["salary_value"] = merged["mean"] / merged["salary"] * 1000
@@ -260,6 +292,23 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
         pool_df.loc[~is_batter, "_score_D"] = pool_df.loc[~is_batter, "_score_C"]
         models["D_team_total"] = _apply_per_position(pool_df, "_score_D")
 
+    # Model E: compute_heuristic_ownership — sqrt compression, batting order
+    # multiplier, pitcher matchup boost, multi-position eligibility.
+    try:
+        from src.optimization.ownership import compute_heuristic_ownership
+        team_totals: dict[str, float] | None = None
+        if pool_df["implied_total"].notna().any():
+            team_totals = (
+                pool_df[["team", "implied_total"]]
+                .dropna(subset=["implied_total"])
+                .drop_duplicates("team")
+                .set_index("team")["implied_total"]
+                .to_dict()
+            )
+        models["E_full"] = compute_heuristic_ownership(pool_df, team_totals)
+    except Exception as exc:
+        print(f"  [Model E skipped: {exc}]")
+
     return models
 
 
@@ -305,8 +354,10 @@ def _match_ownership(
                 "player_name": raw_name,
                 "position": r["position"],
                 "team": r["team"],
+                "opponent": r.get("opponent", ""),
                 "salary": r["salary"],
                 "mean": r["mean"],
+                "lineup_slot": r.get("lineup_slot", np.nan),
                 "salary_value": r["salary_value"],
                 "implied_total": r.get("implied_total", np.nan),
                 "pct_drafted": row["pct_drafted"],

@@ -418,8 +418,9 @@ class PipelineRunner:
                     ownership_vec=ownership_vector,
                     team_totals=team_totals_gpp,
                     candidate_batch_size=cand_batch,
+                    portfolio_size=portfolio_size,
                 )
-                robust_payout = scorer.score_candidates(
+                candidates, robust_payout = scorer.score_candidates(
                     candidates,
                     stop_check=self._stop_check,
                     progress_cb=lambda done, total: self._cb(
@@ -428,6 +429,8 @@ class PipelineRunner:
                     ),
                 )
                 self._cb("gpp_score_done", {})
+                if scorer.last_injected_count > 0:
+                    self._cb("gpp_field_inject", {"n_injected": scorer.last_injected_count})
 
                 if _gpp_stopped and self._stop_check():
                     portfolio = []

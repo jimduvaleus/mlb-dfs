@@ -120,6 +120,10 @@ class ContestScorer:
     ownership_vec : if None, computed from players_df via compute_heuristic_ownership
     team_totals : optional {team: implied_total} for Model D ownership
     candidate_batch_size : BATCH — candidates processed simultaneously (memory control)
+    portfolio_size : used to determine N for field lineup injection (0 = disabled)
+    inject_field_lineups : if True and portfolio_size > 0, score field sample 0 lineups
+                           and promote any that crack the top portfolio_size EV into
+                           the candidate pool, replacing the bottom performers
     """
 
     def __init__(
@@ -133,6 +137,8 @@ class ContestScorer:
         ownership_vec: Optional[np.ndarray] = None,
         team_totals: Optional[dict] = None,
         candidate_batch_size: int = 500,
+        portfolio_size: int = 0,
+        inject_field_lineups: bool = True,
     ) -> None:
         self._sim_results = sim_results
         self._players_df = players_df
@@ -140,6 +146,9 @@ class ContestScorer:
         self._n_k = n_field_samples
         self._field_seed = field_rng_seed
         self._batch_size = candidate_batch_size
+        self._portfolio_size = portfolio_size
+        self._inject_field_lineups = inject_field_lineups
+        self.last_injected_count: int = 0
 
         if payout_arr is None:
             from src.optimization.payout import load_payout_structure, payout_table_to_array
@@ -167,8 +176,13 @@ class ContestScorer:
         candidates: list[Lineup],
         progress_cb: Optional[Callable[[int, int], None]] = None,
         stop_check: Optional[Callable[[], bool]] = None,
-    ) -> np.ndarray:
+    ) -> tuple[list[Lineup], np.ndarray]:
         """Compute robust_payout for all candidates.
+
+        If inject_field_lineups is enabled, scores field sample 0 lineups
+        alongside the original candidates and promotes any that crack the top
+        portfolio_size EV into the pool (replacing the bottom performers).
+        The enriched pool is then scored against all K field samples normally.
 
         Parameters
         ----------
@@ -177,22 +191,40 @@ class ContestScorer:
 
         Returns
         -------
-        np.ndarray, shape (M, n_sims), dtype float32
+        tuple of (candidates, robust_payout) where candidates may be the
+        enriched list if injection occurred, and robust_payout has shape
+        (len(candidates), n_sims) float32.
         """
-        M = len(candidates)
         n_sims = self._sim_matrix.shape[0]
 
-        # --- Pre-compute candidate column indices ---
-        col_lineups = self._build_col_lineups(candidates)  # (M, 10) int32
-
-        # --- Generate and sort all K field score arrays ---
+        # --- Generate all K field samples (raw arrays + sorted scoring arrays) ---
         logger.info(
-            "Generating and scoring %d field samples (N=%d each)...",
+            "Generating %d field samples (N=%d each)...",
             self._n_k, self._n_field,
         )
-        field_sorted_list = self._generate_all_fields()
+        field_raw_list: list[np.ndarray] = []
+        field_sorted_list: list[np.ndarray] = []
+        for k in range(self._n_k):
+            seed = self._field_seed + k
+            raw = self._cs.generate_field(
+                self._players_df, self._ownership_vec,
+                n_lineups=self._n_field, rng_seed=seed,
+            )
+            field_raw_list.append(raw)
+            field_sorted_list.append(self._build_field_sorted(raw))
+            logger.info("  Field %d/%d: %d lineups", k + 1, self._n_k, raw.shape[0])
 
-        # --- Score candidates in batches ---
+        # --- Optional injection: promote top field lineups into candidate pool ---
+        if self._inject_field_lineups and self._portfolio_size > 0 and self._n_k > 0:
+            candidates = self._inject_top_field_lineups(
+                candidates, field_raw_list[0], field_sorted_list[0],
+            )
+            # last_injected_count is set inside _inject_top_field_lineups
+
+        M = len(candidates)
+        col_lineups = self._build_col_lineups(candidates)  # (M, 10) int32
+
+        # --- Score the (possibly enriched) candidate pool against all K fields ---
         robust_payout = np.zeros((M, n_sims), dtype=np.float32)
         n_batches = (M + self._batch_size - 1) // self._batch_size
         logger.info(
@@ -205,7 +237,6 @@ class ContestScorer:
             batch_cols = col_lineups[start:end]  # (batch, 10)
 
             # Score this batch against the sim matrix: (batch, n_sims) float32
-            # sim_matrix[:, batch_cols] → (n_sims, batch, 10) → sum axis=2 → (n_sims, batch)
             cand_scores_batch = (
                 self._sim_matrix[:, batch_cols].sum(axis=2).T.astype(np.float32)
             )  # (batch, n_sims)
@@ -226,7 +257,7 @@ class ContestScorer:
                 logger.info("ContestScorer: stop requested after batch %d/%d.", batch_idx + 1, n_batches)
                 break
 
-        return robust_payout
+        return candidates, robust_payout
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -250,21 +281,6 @@ class ContestScorer:
                     )
         return col_lineups
 
-    def _generate_all_fields(self) -> list[np.ndarray]:
-        """Generate K field samples; return list of (n_sims, N_valid) sorted float32 arrays."""
-        fields: list[np.ndarray] = []
-        for k in range(self._n_k):
-            seed = self._field_seed + k
-            field_lineups = self._cs.generate_field(
-                self._players_df,
-                self._ownership_vec,
-                n_lineups=self._n_field,
-                rng_seed=seed,
-            )
-            fields.append(self._build_field_sorted(field_lineups))
-            logger.info("  Field %d/%d: %d lineups", k + 1, self._n_k, field_lineups.shape[0])
-        return fields
-
     def _build_field_sorted(self, field_lineups: np.ndarray) -> np.ndarray:
         """Score field lineups and sort per simulation for binary search.
 
@@ -274,6 +290,117 @@ class ContestScorer:
             field_lineups, self._sim_matrix, self._col_map,
         )  # (n_sims, N_valid) float32
         return np.ascontiguousarray(np.sort(field_scores, axis=1))
+
+    def _score_raw_lineups_against_field(
+        self,
+        raw_lineups: np.ndarray,   # (N, 10) int64 player_ids
+        field_sorted: np.ndarray,  # (n_sims, F) float32 sorted
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Score raw (N, 10) lineup arrays against a sorted field array.
+
+        Returns
+        -------
+        payout : (N, n_sims) float32 — zero for lineups with unmapped players
+        valid_mask : (N,) bool
+        """
+        N = raw_lineups.shape[0]
+        n_sims = self._sim_matrix.shape[0]
+
+        col = np.full((N, 10), -1, dtype=np.int32)
+        valid_mask = np.ones(N, dtype=bool)
+        for i in range(N):
+            for j in range(10):
+                c = self._col_map.get(int(raw_lineups[i, j]), -1)
+                if c == -1:
+                    valid_mask[i] = False
+                    break
+                col[i, j] = c
+
+        payout = np.zeros((N, n_sims), dtype=np.float32)
+        valid_idx = np.where(valid_mask)[0]
+        for start in range(0, len(valid_idx), self._batch_size):
+            end = min(start + self._batch_size, len(valid_idx))
+            vi = valid_idx[start:end]
+            scores = self._sim_matrix[:, col[vi]].sum(axis=2).T.astype(np.float32)
+            payout[vi] = _compute_payout_from_sorted_field(scores, field_sorted, self._payout_arr)
+
+        return payout, valid_mask
+
+    def _inject_top_field_lineups(
+        self,
+        candidates: list[Lineup],
+        field_lineups: np.ndarray,  # (N_field, 10) int64
+        field_sorted: np.ndarray,   # (n_sims, N_valid) float32 sorted
+    ) -> list[Lineup]:
+        """Promote top-performing field lineups into the candidate pool.
+
+        Scores both the original candidates and the field sample 0 lineups
+        against field_sorted. Any field lineup whose mean $EV exceeds that of
+        its paired bottom candidate is substituted in. Up to portfolio_size
+        substitutions are made.
+        """
+        N_inject = self._portfolio_size
+        M = len(candidates)
+        n_sims = self._sim_matrix.shape[0]
+
+        # Score original candidates against field 0
+        orig_col = self._build_col_lineups(candidates)
+        orig_payout = np.zeros((M, n_sims), dtype=np.float32)
+        for start in range(0, M, self._batch_size):
+            end = min(start + self._batch_size, M)
+            scores = self._sim_matrix[:, orig_col[start:end]].sum(axis=2).T.astype(np.float32)
+            orig_payout[start:end] = _compute_payout_from_sorted_field(
+                scores, field_sorted, self._payout_arr,
+            )
+        cand_mean_ev = orig_payout.mean(axis=1)  # (M,)
+
+        # Score field lineups against field 0 (they compete against themselves,
+        # but N=5000 makes the self-inclusion effect negligible)
+        field_payout, field_valid = self._score_raw_lineups_against_field(
+            field_lineups, field_sorted,
+        )
+        field_mean_ev = field_payout.mean(axis=1)  # (N_field,); invalid → 0.0
+
+        # Rank field lineups best→worst; rank candidates worst→best
+        top_field = np.argsort(field_mean_ev)[::-1][:N_inject]
+        bottom_cands = np.argsort(cand_mean_ev)[:N_inject]
+
+        existing_pid_sets = {frozenset(lu.player_ids) for lu in candidates}
+        new_candidates = list(candidates)
+        injected = 0
+
+        for rank in range(min(N_inject, len(top_field))):
+            fi = top_field[rank]
+            ci = bottom_cands[rank]
+
+            if not field_valid[fi]:
+                continue
+
+            field_ev = float(field_mean_ev[fi])
+            cand_ev = float(cand_mean_ev[ci])
+            if field_ev <= cand_ev:
+                break  # sorted descending; nothing further will beat it either
+
+            raw_pids = [int(p) for p in field_lineups[fi]]
+            pid_set = frozenset(raw_pids)
+            if pid_set in existing_pid_sets:
+                continue  # already in pool
+
+            existing_pid_sets.discard(frozenset(new_candidates[ci].player_ids))
+            existing_pid_sets.add(pid_set)
+            new_candidates[ci] = Lineup(player_ids=raw_pids)
+            injected += 1
+
+        self.last_injected_count = injected
+        if injected > 0:
+            logger.info(
+                "Injected %d field lineup(s) into candidate pool (replaced %d bottom candidates).",
+                injected, injected,
+            )
+        else:
+            logger.info("No field lineups qualified for injection (all below bottom candidate EV).")
+
+        return new_candidates
 
 
 # ------------------------------------------------------------------ #

@@ -41,12 +41,22 @@ export interface PortfolioConfig {
   target_score: number | null
 }
 
+export interface GppConfig {
+  n_candidates: number
+  n_field_lineups: number
+  n_field_samples: number
+  holdout_fraction: number
+  candidate_batch_size: number
+  max_attempts_multiplier: number
+}
+
 export interface AppConfig {
   platform: PlatformType
   paths: PathsConfig
   simulation: SimulationConfig
   optimizer: OptimizerConfig
   portfolio: PortfolioConfig
+  gpp: GppConfig
 }
 
 export interface PlayerRow {
@@ -123,6 +133,7 @@ export type SSEStage =
   | 'gpp_score_start'
   | 'gpp_score_progress'
   | 'gpp_score_done'
+  | 'gpp_field_inject'
   | 'gpp_select_progress'
   | 'gpp_holdout'
   | 'complete'

@@ -185,7 +185,7 @@ def test_scorer_output_shape(sim_results, players_df, candidates, ownership_vec,
         ownership_vec=ownership_vec,
         candidate_batch_size=10,
     )
-    result = scorer.score_candidates(candidates[:20])
+    _, result = scorer.score_candidates(candidates[:20])
     assert result.shape == (20, sim_results.n_sims)
     assert result.dtype == np.float32
 
@@ -198,7 +198,7 @@ def test_scorer_values_nonnegative(sim_results, players_df, candidates, ownershi
         ownership_vec=ownership_vec,
         candidate_batch_size=20,
     )
-    result = scorer.score_candidates(candidates[:10])
+    _, result = scorer.score_candidates(candidates[:10])
     assert np.all(result >= 0.0), "Payout values must be non-negative"
 
 
@@ -212,7 +212,7 @@ def test_scorer_values_bounded(sim_results, players_df, candidates, ownership_ve
         ownership_vec=ownership_vec,
         candidate_batch_size=20,
     )
-    result = scorer.score_candidates(candidates[:10])
+    _, result = scorer.score_candidates(candidates[:10])
     assert np.all(result <= max_payout + 1e-3), (
         f"Payout exceeds max (${max_payout:.2f}): max observed ${result.max():.2f}"
     )
@@ -248,8 +248,8 @@ def test_scorer_different_seeds_vary(sim_results, players_df, candidates, owners
         payout_arr=test_payout_arr, ownership_vec=ownership_vec,
         field_rng_seed=99, candidate_batch_size=20,
     )
-    r1 = scorer1.score_candidates(candidates[:10])
-    r2 = scorer2.score_candidates(candidates[:10])
+    _, r1 = scorer1.score_candidates(candidates[:10])
+    _, r2 = scorer2.score_candidates(candidates[:10])
     # Should not be identical (different fields → different percentiles)
     assert not np.allclose(r1, r2)
 
@@ -362,7 +362,7 @@ def test_selector_portfolio_size(sim_results, players_df, candidates, ownership_
         ownership_vec=ownership_vec,
         candidate_batch_size=20,
     )
-    robust_payout = scorer.score_candidates(candidates)
+    candidates, robust_payout = scorer.score_candidates(candidates)
     selector = EVPortfolioSelector(robust_payout, candidates, portfolio_size=5)
     result = selector.select()
     assert len(result) == 5
@@ -375,7 +375,7 @@ def test_selector_all_distinct(sim_results, players_df, candidates, ownership_ve
         ownership_vec=ownership_vec,
         candidate_batch_size=20,
     )
-    robust_payout = scorer.score_candidates(candidates)
+    candidates, robust_payout = scorer.score_candidates(candidates)
     selector = EVPortfolioSelector(robust_payout, candidates, portfolio_size=8)
     result = selector.select()
     pid_sets = [frozenset(lu.player_ids) for lu, _ in result]
@@ -390,7 +390,7 @@ def test_selector_marginal_ev_decreasing(sim_results, players_df, candidates, ow
         ownership_vec=ownership_vec,
         candidate_batch_size=20,
     )
-    robust_payout = scorer.score_candidates(candidates)
+    candidates, robust_payout = scorer.score_candidates(candidates)
     selector = EVPortfolioSelector(robust_payout, candidates, portfolio_size=8)
     result = selector.select()
 
@@ -408,7 +408,7 @@ def test_selector_holdout_score(sim_results, players_df, candidates, ownership_v
         ownership_vec=ownership_vec,
         candidate_batch_size=20,
     )
-    robust_payout = scorer.score_candidates(candidates)
+    candidates, robust_payout = scorer.score_candidates(candidates)
     selector = EVPortfolioSelector(
         robust_payout, candidates, portfolio_size=5,
         holdout_fraction=0.2, rng_seed=42,
@@ -428,7 +428,7 @@ def test_selector_no_holdout_returns_none(sim_results, players_df, candidates, o
         ownership_vec=ownership_vec,
         candidate_batch_size=20,
     )
-    robust_payout = scorer.score_candidates(candidates)
+    candidates, robust_payout = scorer.score_candidates(candidates)
     selector = EVPortfolioSelector(robust_payout, candidates, portfolio_size=3)
     selector.select()
     assert selector.holdout_score() is None

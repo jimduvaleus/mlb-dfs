@@ -47,12 +47,22 @@ class PortfolioConfig(BaseModel):
     target_score: Optional[float] = None
 
 
+class GppConfig(BaseModel):
+    n_candidates: int = 10000
+    n_field_lineups: int = 5000
+    n_field_samples: int = 3
+    holdout_fraction: float = 0.0
+    candidate_batch_size: int = 500
+    max_attempts_multiplier: int = 50
+
+
 class AppConfig(BaseModel):
     platform: Platform = Platform.DRAFTKINGS
     paths: PathsConfig = PathsConfig()
     simulation: SimulationConfig = SimulationConfig()
     optimizer: OptimizerConfig = OptimizerConfig()
     portfolio: PortfolioConfig = PortfolioConfig()
+    gpp: GppConfig = GppConfig()
 
 
 class PlayerRow(BaseModel):

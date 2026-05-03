@@ -31,6 +31,7 @@ const STAGE_LABELS: Record<string, string> = {
   gpp_generate_done: 'Generate candidates',
   gpp_score_start: 'Score candidates',
   gpp_score_done: 'Score candidates',
+  gpp_field_inject: 'Field injection',
   gpp_holdout: 'Holdout evaluation',
   complete: 'Complete',
   stopped: 'Stopped',
@@ -338,6 +339,10 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'gpp_score_done':
       return 'Scoring complete'
+    case 'gpp_field_inject': {
+      const ev = e as unknown as { n_injected: number }
+      return `${ev.n_injected} field lineup${ev.n_injected !== 1 ? 's' : ''} promoted to candidate pool`
+    }
     case 'gpp_holdout': {
       const ev = e as unknown as { holdout_mean_payout: number }
       return `Holdout mean payout: ${ev.holdout_mean_payout.toFixed(4)}`
