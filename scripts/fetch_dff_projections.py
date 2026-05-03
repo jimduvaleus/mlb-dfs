@@ -412,10 +412,14 @@ async def _fetch_rows_playwright(
     slate_override: str | None = None,
     url_segment: str = DK_URL_SEGMENT,
     debug: bool = False,
-) -> list[dict]:
+) -> tuple[list[dict], list[dict]]:
     """
-    Launch headless Chromium, navigate to the correct DFF slate, and return all
-    <tr class="projections-listing"> rows as attribute dicts.
+    Launch headless Chromium, navigate to the correct DFF slate, and return
+    (player_rows, team_rows) where each element is a list of attribute dicts.
+
+    player_rows — all <tr class="projections-listing"> rows (one per player).
+    team_rows   — all <tr class="team-listing"> rows (one per team, contains
+                  TM PTS implied totals).  Empty list if DFF changes the markup.
 
     *url_segment* selects the platform — "draftkings" or "fanduel".
     If *slate_override* is given (a DFF slate ID like '235A9'), navigation goes
@@ -479,10 +483,18 @@ async def _fetch_rows_playwright(
             log.debug("Playwright: extracted %d player rows", len(rows))
             if rows:
                 log.debug("Sample row keys: %s", list(rows[0].keys()))
+        elif rows:
+            # Always log the full attribute key set at INFO level so we can
+            # identify TM PTS and other useful fields without --debug.
+            log.info("Playwright: player row attribute keys: %s", sorted(rows[0].keys()))
+
+        # TM PTS (data-proj_score) and game O/U (data-ou) are embedded directly on
+        # each player row — no separate team rows needed.
+        team_rows: list[dict] = []
 
         await browser.close()
 
-    return rows
+    return rows, team_rows
 
 
 def fetch_player_rows(
@@ -492,7 +504,21 @@ def fetch_player_rows(
     url_segment: str = DK_URL_SEGMENT,
     debug: bool = False,
 ) -> list[dict]:
-    """Synchronous entry point for Playwright-based player data fetch."""
+    """Synchronous entry point for Playwright-based player data fetch (player rows only)."""
+    player_rows, _ = asyncio.run(
+        _fetch_rows_playwright(target_date, game_count, slate_override, url_segment, debug)
+    )
+    return player_rows
+
+
+def fetch_player_and_team_rows(
+    target_date: str | None,
+    game_count: int,
+    slate_override: str | None = None,
+    url_segment: str = DK_URL_SEGMENT,
+    debug: bool = False,
+) -> tuple[list[dict], list[dict]]:
+    """Synchronous entry point returning (player_rows, team_rows) from one browser session."""
     return asyncio.run(
         _fetch_rows_playwright(target_date, game_count, slate_override, url_segment, debug)
     )
@@ -543,6 +569,14 @@ def parse_players(rows: list[dict]) -> pd.DataFrame:
 
         dff_team = _normalise_dff_team(row.get("data-team") or "")
 
+        def _fval(key: str) -> float | None:
+            raw = row.get(key, "")
+            try:
+                v = float(raw) if raw not in ("", None) else None
+                return v if v is not None and v > 0 else None
+            except (ValueError, TypeError):
+                return None
+
         records.append(
             {
                 "dff_name": name,
@@ -552,6 +586,8 @@ def parse_players(rows: list[dict]) -> pd.DataFrame:
                 "projected_fpts": pts,
                 "lineup_slot": lineup_slot,
                 "slot_confirmed": slot_confirmed,
+                "proj_score": _fval("data-proj_score"),  # TM PTS (own team for batters, opp for pitchers)
+                "game_ou": _fval("data-ou"),              # game over/under total
             }
         )
     return pd.DataFrame(records)
@@ -594,6 +630,61 @@ async def _list_slates_playwright(
 
 
 # ---------------------------------------------------------------------------
+# Archive helpers
+# ---------------------------------------------------------------------------
+
+def _date_to_archive_dir(date_str: str) -> str:
+    """Convert 'YYYY-MM-DD' to 'MMDDYYYY' for archive directory naming."""
+    yr, mo, dy = date_str.split("-")
+    return f"{mo}{dy}{yr}"
+
+
+def _archive_dff_slate(
+    target_date: str | None,
+    proj_df: pd.DataFrame,
+) -> None:
+    """Mirror projections and team totals into archive/MMDDYYYY/ for later evaluation.
+
+    proj_df must contain proj_score and game_ou columns (added by parse_players).
+    Team totals are derived from batter rows where proj_score == own team's implied total.
+    """
+    if not target_date:
+        return
+    try:
+        archive_dir = PROJECT_ROOT / "archive" / _date_to_archive_dir(target_date)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+
+        # Archive the full player projection data including proj_score / game_ou.
+        archive_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot",
+                        "slot_confirmed", "proj_score", "game_ou"]
+        proj_df[[c for c in archive_cols if c in proj_df.columns]].to_csv(
+            archive_dir / "dff_projections.csv", index=False
+        )
+        log.info("Archived DFF projections → %s", archive_dir / "dff_projections.csv")
+
+        # Derive team totals from batter rows: for non-pitchers, proj_score is the
+        # batter's own team's implied run total.
+        if "proj_score" in proj_df.columns and "lineup_slot" in proj_df.columns:
+            batters = proj_df[proj_df["lineup_slot"] != 10].copy()
+            if not batters.empty and "team" in batters.columns:
+                totals = (
+                    batters.groupby("team")["proj_score"]
+                    .first()
+                    .dropna()
+                    .reset_index()
+                    .rename(columns={"proj_score": "implied_total"})
+                )
+                if not totals.empty:
+                    totals.to_csv(archive_dir / "dff_team_totals.csv", index=False)
+                    log.info(
+                        "Archived DFF team totals (%d teams) → %s",
+                        len(totals), archive_dir / "dff_team_totals.csv",
+                    )
+    except Exception as exc:
+        log.warning("Could not archive DFF projections: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -627,7 +718,7 @@ def build_projections_csv(
     game_count = len(_slate_df_teams(slate_df)) // 2
 
     # --- Fetch DFF player rows via Playwright --------------------------------
-    raw_rows = fetch_player_rows(
+    raw_rows, team_rows = fetch_player_and_team_rows(
         target_date=target_date,
         game_count=game_count,
         slate_override=slate_override,
@@ -675,8 +766,11 @@ def build_projections_csv(
                     "name": dff_name,
                     "mean": row["projected_fpts"],
                     "position": pos_map.get(pid, row["position"]),
+                    "team": row.get("dff_team", ""),
                     "lineup_slot": row["lineup_slot"],
                     "slot_confirmed": row["slot_confirmed"],
+                    "proj_score": row.get("proj_score"),
+                    "game_ou": row.get("game_ou"),
                 }
             )
         else:
@@ -709,6 +803,7 @@ def build_projections_csv(
     )
 
     # --- Write output --------------------------------------------------------
+    archive_df = out_df.copy()  # preserve full columns (team, proj_score, game_ou) for archive
     out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
     out_df = out_df[out_cols].sort_values("mean", ascending=False).reset_index(drop=True)
 
@@ -721,6 +816,10 @@ def build_projections_csv(
         "Wrote %d starter projections → %s  (pitchers=%d, batters=%d, unmatched=%d)",
         len(out_df), output_path, n_pitchers, n_batters, len(unmatched),
     )
+
+    # --- Auto-archive for historical ownership evaluation --------------------
+    _archive_dff_slate(target_date, archive_df)
+
     return out_df
 
 

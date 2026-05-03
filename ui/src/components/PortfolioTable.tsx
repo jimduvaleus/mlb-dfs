@@ -251,7 +251,7 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
                       {p.name}
                       {displayPos !== 'P' && (() => {
                         const slotNum = p.slot != null && p.slot >= 1 && p.slot <= 9 ? p.slot : null
-                        if (p.slot_confirmed) {
+                        if (!unconfirmedSet.has(p.player_id)) {
                           return <span className="batting-slot-bubble batting-slot-bubble--confirmed" title="Confirmed lineup slot">{slotNum ?? '?'}</span>
                         }
                         return <span className="batting-slot-bubble batting-slot-bubble--projected" title="Projected lineup slot">{slotNum ?? '?'}</span>

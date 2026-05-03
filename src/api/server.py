@@ -363,14 +363,10 @@ def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
 
 @app.delete("/api/twitter-lineups/{team}")
 def remove_twitter_lineup(team: str):
-    # Before removing the record, bake the confirmed slots into projections.csv so
-    # the confirmation persists (e.g. when Rotowire has caught up and the Twitter
-    # record is dismissed as redundant).
     lineups = load_twitter_lineups()
     lineup = next((l for l in lineups if l.get("team") == team), None)
     if lineup is None:
         raise HTTPException(404, detail="No confirmed lineup for that team")
-    _bake_twitter_lineup_to_projections(lineup)
     delete_twitter_lineup(team)
     return {"ok": True}
 
@@ -743,8 +739,19 @@ def projections_players():
                         merged.loc[mask, "lineup_slot"] = slot
                         merged.loc[mask, "slot_confirmed"] = True
 
+        # Compute heuristic ownership — Model D if team totals available, else C.
+        try:
+            from src.optimization.ownership import compute_heuristic_ownership
+            from .pipeline import PipelineRunner
+            slate_path = _get_slate_file_path()
+            team_totals = PipelineRunner._load_team_totals(str(slate_path) if slate_path else "")
+            ow_vec = compute_heuristic_ownership(merged, team_totals)
+            ow_pct = (ow_vec * 100).round(1).tolist()
+        except Exception:
+            ow_pct = [None] * len(merged)
+
         result = []
-        for _, row in merged.iterrows():
+        for i, (_, row) in enumerate(merged.iterrows()):
             slot_raw = row["lineup_slot"]
             result.append({
                 "player_id":      int(row["player_id"]),
@@ -755,6 +762,7 @@ def projections_players():
                 "slot":           int(slot_raw) if pd.notna(slot_raw) else None,
                 "slot_confirmed": bool(row["slot_confirmed"]),
                 "mean":           float(row["mean"]),
+                "ownership_pct":  ow_pct[i],
             })
         return result
     except Exception:
@@ -1013,6 +1021,28 @@ async def projections_fetch(request: Request):
             # No yields occur inside the merge step, so once it starts it
             # completes atomically before the generator can be suspended again.
             try:
+                # Fire DFF archive fetch in the background: runs concurrently with
+                # RW+MO, archives to archive/MMDDYYYY/ but does NOT write to processed/.
+                _dff_tmp = proj_path.parent / ".dff_archive_tmp.csv"
+
+                async def _archive_dff_silent() -> None:
+                    try:
+                        _proc = await asyncio.create_subprocess_exec(
+                            str(python), str(dff_script),
+                            "--output", str(_dff_tmp),
+                            *_platform_args,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                            cwd=str(PROJECT_ROOT),
+                        )
+                        await _proc.wait()
+                    except Exception:
+                        pass
+                    finally:
+                        _dff_tmp.unlink(missing_ok=True)
+
+                asyncio.create_task(_archive_dff_silent())
+
                 # Step 1: RotoWire is always required (player pool + lineup slots)
                 yield _log("--- Fetching RotoWire projections (player pool) ---")
                 proc = await asyncio.create_subprocess_exec(

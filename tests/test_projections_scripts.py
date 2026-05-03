@@ -446,7 +446,7 @@ class TestDFFBuildProjectionsCSV:
         from scripts.fetch_dff_projections import build_projections_csv, DK_URL_SEGMENT
         slate_df = _make_slate_df(SAMPLE_DK_SPECS)
         output = str(tmp_path / "proj.csv")
-        with patch("scripts.fetch_dff_projections.fetch_player_rows", return_value=self._player_rows()):
+        with patch("scripts.fetch_dff_projections.fetch_player_and_team_rows", return_value=(self._player_rows(), [])):
             result = build_projections_csv(
                 slate_df=slate_df,
                 target_date="2026-04-12",
@@ -460,7 +460,7 @@ class TestDFFBuildProjectionsCSV:
         from scripts.fetch_dff_projections import build_projections_csv, FD_URL_SEGMENT
         slate_df = _make_slate_df(SAMPLE_FD_SPECS)
         output = str(tmp_path / "proj_fd.csv")
-        with patch("scripts.fetch_dff_projections.fetch_player_rows", return_value=self._player_rows()):
+        with patch("scripts.fetch_dff_projections.fetch_player_and_team_rows", return_value=(self._player_rows(), [])):
             result = build_projections_csv(
                 slate_df=slate_df,
                 target_date="2026-04-12",
@@ -469,12 +469,12 @@ class TestDFFBuildProjectionsCSV:
             )
         assert Path(output).exists()
 
-    def test_url_segment_passed_to_fetch_player_rows(self, tmp_path):
+    def test_url_segment_passed_to_fetch_player_and_team_rows(self, tmp_path):
         from scripts.fetch_dff_projections import build_projections_csv, FD_URL_SEGMENT
         slate_df = _make_slate_df(SAMPLE_DK_SPECS)
         output = str(tmp_path / "proj.csv")
-        with patch("scripts.fetch_dff_projections.fetch_player_rows") as mock_fetch:
-            mock_fetch.return_value = self._player_rows()
+        with patch("scripts.fetch_dff_projections.fetch_player_and_team_rows") as mock_fetch:
+            mock_fetch.return_value = (self._player_rows(), [])
             build_projections_csv(
                 slate_df=slate_df,
                 target_date="2026-04-12",
@@ -488,7 +488,7 @@ class TestDFFBuildProjectionsCSV:
         from scripts.fetch_dff_projections import build_projections_csv
         slate_df = _make_slate_df(SAMPLE_DK_SPECS)
         output = str(tmp_path / "proj.csv")
-        with patch("scripts.fetch_dff_projections.fetch_player_rows", return_value=self._player_rows()):
+        with patch("scripts.fetch_dff_projections.fetch_player_and_team_rows", return_value=(self._player_rows(), [])):
             build_projections_csv(
                 slate_df=slate_df, target_date="2026-04-12", output_path=output
             )

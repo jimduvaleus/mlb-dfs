@@ -66,7 +66,7 @@ def _build_player_meta(players_df: pd.DataFrame) -> PlayerMeta:
 # ------------------------------------------------------------------ #
 
 # Supported objective names (used in config and API).
-OBJECTIVES = ("p_hit", "expected_surplus", "marginal_payout")
+OBJECTIVES = ("p_hit", "expected_surplus", "marginal_payout", "leverage_surplus")
 
 
 def _score_totals_p_hit(totals: np.ndarray, target: float) -> float:
@@ -120,6 +120,40 @@ def _score_swap_candidates_surplus(
             val = totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in]
             if val > target:
                 surplus += val - target
+        cand_scores[j] = surplus / n_sims
+    return cand_scores
+
+
+def _score_totals_leverage(
+    totals: np.ndarray, field_mean: np.ndarray, best_scores: np.ndarray
+) -> float:
+    """E[max(max(lineup_total, best_scores) - field_mean, 0)] — marginal leverage surplus."""
+    effective = np.maximum(totals, best_scores)
+    return float(np.maximum(effective - field_mean, 0.0).mean())
+
+
+@njit(cache=True)
+def _score_swap_candidates_leverage(
+    sim_matrix: np.ndarray,
+    totals: np.ndarray,
+    col_out: int,
+    cand_cols: np.ndarray,
+    field_mean: np.ndarray,
+    best_scores: np.ndarray,
+) -> np.ndarray:
+    """Score all swap candidates using marginal leverage surplus (Numba-accelerated)."""
+    n_sims = totals.shape[0]
+    n_cands = cand_cols.shape[0]
+    cand_scores = np.empty(n_cands, dtype=np.float64)
+    for j in range(n_cands):
+        surplus = 0.0
+        col_in = cand_cols[j]
+        for i in range(n_sims):
+            new_total = totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in]
+            effective = new_total if new_total > best_scores[i] else best_scores[i]
+            diff = effective - field_mean[i]
+            if diff > 0.0:
+                surplus += diff
         cand_scores[j] = surplus / n_sims
     return cand_scores
 
@@ -294,6 +328,7 @@ class _ChainRunner:
         payout_coverage_bonus: float = 0.0,
         rules=None,
         slot_eligibility: Optional[Dict[str, set]] = None,
+        ownership_vector: Optional[np.ndarray] = None,
     ):
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
@@ -338,6 +373,20 @@ class _ChainRunner:
             self._score_swap_candidates = lambda sm, t, co, cc, tgt: _score_swap_candidates_payout(
                 sm, t, co, cc, self._payout_cash_line, self._best_scores, self._payout_beta,
                 self._payout_coverage_bonus,
+            )
+        elif objective == "leverage_surplus":
+            if ownership_vector is None:
+                raise ValueError("leverage_surplus objective requires ownership_vector")
+            if best_scores is None:
+                best_scores = np.zeros(sim_matrix.shape[0], dtype=np.float64)
+            self._best_scores = best_scores
+            # Pre-compute field mean once: E[field score | sim i] = ownership @ sim_matrix[i,:]
+            self._field_mean = sim_matrix @ ownership_vector.astype(np.float64)
+            self._score_totals = lambda totals, tgt: _score_totals_leverage(
+                totals, self._field_mean, self._best_scores
+            )
+            self._score_swap_candidates = lambda sm, t, co, cc, tgt: _score_swap_candidates_leverage(
+                sm, t, co, cc, self._field_mean, self._best_scores
             )
         else:
             self._score_totals = _score_totals_surplus
@@ -963,7 +1012,7 @@ def _worker_init() -> None:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, payout_coverage_bonus, n_workers, rules, slot_eligibility, initial_lineup = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, payout_coverage_bonus, n_workers, rules, slot_eligibility, initial_lineup, ownership_vector = args
     # Cap Numba intra-op threads so that n_workers processes don't collectively
     # over-subscribe the CPU.  Single-process mode (n_workers=1) leaves Numba
     # free to use all available cores for prange parallelism.
@@ -993,6 +1042,7 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             payout_coverage_bonus=payout_coverage_bonus,
             rules=rules,
             slot_eligibility=slot_eligibility,
+            ownership_vector=ownership_vector,
         )
         return runner.run(seed, initial_lineup=initial_lineup)
     finally:
@@ -1044,6 +1094,7 @@ class BasinHoppingOptimizer:
         payout_coverage_bonus: float = 0.0,
         rules=None,
         slot_eligibility: Optional[Dict[str, set]] = None,
+        ownership_vector: Optional[np.ndarray] = None,
     ):
         if objective not in OBJECTIVES:
             raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
@@ -1084,6 +1135,21 @@ class BasinHoppingOptimizer:
         self.payout_cash_line = payout_cash_line
         self.payout_coverage_bonus = payout_coverage_bonus
 
+        # Align ownership_vector to sim_results.player_ids column ordering.
+        # compute_heuristic_ownership() returns values in players_df row order,
+        # but sim_matrix columns are in sim_results.player_ids order — the two
+        # orderings are almost never the same.
+        if ownership_vector is not None:
+            pid_to_ow = dict(zip(
+                players_df['player_id'].tolist(),
+                ownership_vector.tolist(),
+            ))
+            ownership_vector = np.array(
+                [pid_to_ow.get(pid, 0.0) for pid in sim_results.player_ids],
+                dtype=np.float64,
+            )
+        self.ownership_vector = ownership_vector
+
         # Pre-group player IDs by position for fast pool queries.
         # Derive the set of individual positions from slot_eligibility values
         # so both DK (P,C,1B,...) and FD (C/1B,UTIL,...) are handled uniformly.
@@ -1113,6 +1179,7 @@ class BasinHoppingOptimizer:
             payout_coverage_bonus=self.payout_coverage_bonus,
             rules=self.rules,
             slot_eligibility=self.slot_eligibility,
+            ownership_vector=self.ownership_vector,
         )
 
     def _run_chains(
@@ -1176,6 +1243,7 @@ class BasinHoppingOptimizer:
                     self.rules,
                     self.slot_eligibility,
                     initial,
+                    self.ownership_vector,
                 ))
             owned_executor = executor is None
             try:

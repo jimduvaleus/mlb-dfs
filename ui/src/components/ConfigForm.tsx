@@ -127,6 +127,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <option value="expected_surplus">Expected Surplus</option>
                 <option value="p_hit">Probability Hit</option>
                 <option value="marginal_payout">Marginal Payout</option>
+                <option value="leverage_surplus">Leverage Surplus</option>
               </select>
             </FieldRow>
             {draft.optimizer.objective === 'marginal_payout' && (

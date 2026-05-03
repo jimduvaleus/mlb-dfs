@@ -160,6 +160,10 @@ The web app is a React + TypeScript + Vite frontend (`ui/`) backed by a FastAPI 
 
 Team logos for all 30 MLB franchises are in `ui/public/team-logos/`.
 
+## DK Classic GPP payout structure
+
+`data/payout_structures/dk_classic_gpp.json` models a typical DK $4 Classic GPP: 14,863 entries, 3,855 paying positions (~26% cash rate). The cash cutoff is finishing in roughly the **top 26%**, which requires beating ~74% of the field. `ContestSimulator.eval_portfolio()` reads this file via `PipelineRunner._load_cash_threshold()` to derive the `cash_threshold` used in `cash_rate` computation — do not use `> 0.5` (beats half the field) as a cash proxy.
+
 ## CrazyNinjaOdds market names (confirmed)
 
 The market dropdown option labels in `fetch_market_odds_projections.py` have been verified against the live site's `<select>` element. **Do not change these strings** — they are confirmed correct:

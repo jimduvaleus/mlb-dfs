@@ -35,6 +35,8 @@ export function MetricsPanel({ lineups, events }: Props) {
     avgLineupMs = (lineupEnd - lineupStart) / (lineupEvents.length - 1)
   }
 
+
+
   // --- Coverage analysis (marginal_payout objective only) ---
   const portfolioStatsEvent = events.find(e => e.stage === 'portfolio_stats') as PortfolioStatsEvent | undefined
 
@@ -226,6 +228,7 @@ export function MetricsPanel({ lineups, events }: Props) {
           )}
         </div>
       )}
+
 
       {/* Stacking */}
       <div className="metrics-section">

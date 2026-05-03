@@ -858,9 +858,9 @@ button { cursor: pointer; }
   font-weight: 600;
 }
 
-/* 5-column grid: pos | name | team-badge | salary | proj-pts */
+/* 6-column grid: pos | name | team-badge | salary | proj-pts | own% */
 .projections-card-players {
-  grid-template-columns: 29px 1fr auto auto 52px;
+  grid-template-columns: 29px 1fr auto auto 52px 46px;
 }
 
 .lineup-player-proj {
@@ -868,6 +868,18 @@ button { cursor: pointer; }
   color: #63b3ed;
   font-size: 13px;
   min-width: 52px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.lineup-player-own {
+  padding-right: 17px;
+  color: #f6ad55;
+  font-size: 13px;
+  min-width: 46px;
   text-align: right;
   font-variant-numeric: tabular-nums;
   display: flex;

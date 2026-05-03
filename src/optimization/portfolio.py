@@ -27,6 +27,27 @@ from src.simulation.results import SimulationResults
 
 logger = logging.getLogger(__name__)
 
+_MIN_LEVERAGE_STACK = 4  # minimum hitters from one team required for round-0 leverage_surplus lineup
+
+
+def _pick_best_stacked(
+    top_k: List[Tuple[Lineup, float]],
+    pos_lookup: dict,
+    team_lookup: dict,
+    min_stack: int = _MIN_LEVERAGE_STACK,
+) -> Optional[Lineup]:
+    """Return the highest-scoring lineup from top_k that has min_stack batters from one team."""
+    for lineup, _ in top_k:
+        counts: dict = {}
+        for pid in lineup.player_ids:
+            if pos_lookup.get(pid, '') != 'P':
+                t = team_lookup.get(pid, '')
+                counts[t] = counts.get(t, 0) + 1
+        if max(counts.values(), default=0) >= min_stack:
+            return lineup
+    return None
+
+
 # Margin above `target` distinguishing "great" from "good" coverage in progress messages.
 # DraftKings fantasy points. Display-only — not an optimization parameter.
 _GREAT_COVERAGE_MARGIN: float = 15.0
@@ -90,12 +111,13 @@ class PortfolioConstructor:
         payout_coverage_bonus: float = 0.0,
         rules=None,
         slot_eligibility: Optional[dict] = None,
+        ownership_vector=None,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
         self.target = target
         self.portfolio_size = portfolio_size
-        self._payout_weighted = objective == "marginal_payout"
+        self._payout_weighted = objective in ("marginal_payout", "leverage_surplus")
         self._payout_beta = payout_beta
         self._n_seed_lineups = n_seed_lineups
         self._ref_p90 = ref_p90
@@ -113,6 +135,7 @@ class PortfolioConstructor:
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
             payout_coverage_bonus=payout_coverage_bonus,
+            ownership_vector=ownership_vector,
             rules=rules,
             slot_eligibility=slot_eligibility,
         )
@@ -311,6 +334,14 @@ class PortfolioConstructor:
                 )
 
                 seed = None if self._base_seed is None else self._base_seed + i
+                objective = opt_kwargs.get('objective', '')
+                # For leverage_surplus round 0, request more candidates so we can
+                # pick the best stacked lineup (the unconstrained global optimum is
+                # a spread lineup that consistently beats field_mean, which is
+                # mathematically correct but undesirable for GPP stack diversity).
+                is_leverage_first = (i == 0 and objective == 'leverage_surplus')
+                k_request = max(20, self._n_seed_lineups + 1) if is_leverage_first else (self._n_seed_lineups + 1)
+
                 optimizer = BasinHoppingOptimizer(
                     sim_results=self.sim_results,
                     players_df=self.players_df,
@@ -320,12 +351,18 @@ class PortfolioConstructor:
                     **opt_kwargs,
                 )
                 top_k = optimizer.optimize_top_k(
-                    self._n_seed_lineups + 1,
+                    k_request,
                     executor=shared_executor if n_workers > 1 else None,
                     seed_lineups=pending_seeds if pending_seeds else None,
                 )
-                lineup = top_k[0][0]
-                pending_seeds = [lu for lu, _ in top_k[1:]]
+
+                if is_leverage_first:
+                    pos_lookup = dict(zip(self.players_df['player_id'], self.players_df['position']))
+                    team_lookup = dict(zip(self.players_df['player_id'], self.players_df['team']))
+                    lineup = _pick_best_stacked(top_k, pos_lookup, team_lookup) or top_k[0][0]
+                else:
+                    lineup = top_k[0][0]
+                pending_seeds = [lu for lu, _ in top_k if lu is not lineup][: self._n_seed_lineups]
 
                 # Compute this lineup's scores across all sims.
                 cols = [col_map[pid] for pid in lineup.player_ids]
@@ -442,6 +479,7 @@ class BeamPortfolioConstructor:
         n_seed_lineups: int = 5,
         rules=None,
         slot_eligibility: Optional[dict] = None,
+        ownership_vector=None,
     ) -> None:
         self.sim_results = sim_results
         self.players_df = players_df
@@ -459,6 +497,7 @@ class BeamPortfolioConstructor:
             objective=objective,
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
+            ownership_vector=ownership_vector,
             rules=rules,
             slot_eligibility=slot_eligibility,
         )

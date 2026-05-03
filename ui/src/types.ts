@@ -70,6 +70,7 @@ export interface ProjectionPlayerRow {
   slot: number | null      // 1–9 batters, 10 pitchers, null if missing
   slot_confirmed: boolean
   mean: number             // final scaled projection value
+  ownership_pct: number | null  // heuristic projected ownership %
 }
 
 export interface LineupResult {
@@ -113,7 +114,17 @@ export type SSEStage =
   | 'calibrate_beta'
   | 'optimize_lineup'
   | 'portfolio_stats'
+  | 'contest_ev_start'
+  | 'contest_ev_complete'
   | 'upload_files'
+  | 'gpp_generate_start'
+  | 'gpp_generate_progress'
+  | 'gpp_generate_done'
+  | 'gpp_score_start'
+  | 'gpp_score_progress'
+  | 'gpp_score_done'
+  | 'gpp_select_progress'
+  | 'gpp_holdout'
   | 'complete'
   | 'stopped'
   | 'error'
@@ -183,6 +194,33 @@ export interface PortfolioStatsEvent extends SSEEvent {
   overall_p95: number
   overall_p99: number
   histogram: Array<{ lo: number; hi: number; mid: number; count: number }>
+}
+
+export interface ContestEvResult {
+  lineup_index: number
+  cash_rate: number | null
+  beat_pct: number | null
+  ev_gap: number | null
+  field_gap: number | null
+  fragile: boolean | null
+}
+
+export interface ContestEvCompleteEvent extends SSEEvent {
+  stage: 'contest_ev_complete'
+  ev_results: ContestEvResult[]
+}
+
+export interface GppScoreProgressEvent extends SSEEvent {
+  stage: 'gpp_score_progress'
+  batches_done: number
+  batches_total: number
+}
+
+export interface GppSelectProgressEvent extends SSEEvent {
+  stage: 'gpp_select_progress'
+  round: number
+  lineup_index: number
+  marginal_ev: number
 }
 
 export interface CompleteEvent extends SSEEvent {

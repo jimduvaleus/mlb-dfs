@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, OptimizeLineupEvent } from '../types'
+import type { SSEEvent, OptimizeLineupEvent, GppScoreProgressEvent, GppSelectProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -27,17 +27,23 @@ const STAGE_LABELS: Record<string, string> = {
   compute_target: 'Compute target',
   calibrate_beta: 'Calibrate beta',
   optimize_lineup: 'Optimize lineups',
+  gpp_generate_start: 'Generate candidates',
+  gpp_generate_done: 'Generate candidates',
+  gpp_score_start: 'Score candidates',
+  gpp_score_done: 'Score candidates',
+  gpp_holdout: 'Holdout evaluation',
   complete: 'Complete',
   stopped: 'Stopped',
   error: 'Error',
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
   const tickTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const lastLineupTimeRef = useRef<number | null>(null)
+  const lastEventTimeRef = useRef<number | null>(null)
 
   // Clear tick timer when run stops
   useEffect(() => {
@@ -52,25 +58,33 @@ export function ProgressPanel({ events, running }: Props) {
     return () => { if (tickTimerRef.current) clearTimeout(tickTimerRef.current) }
   }, [])
 
-  // Update now on each optimize_lineup event; schedule 30s-boundary ticks until the next lineup
+  // Update now on each live progress event; schedule 30s-boundary ticks until the next event
   useEffect(() => {
     const last = events[events.length - 1]
-    if (last?.stage !== 'optimize_lineup') return
+    const isLiveProgressEvent =
+      last?.stage === 'optimize_lineup' ||
+      last?.stage === 'gpp_generate_start' ||
+      last?.stage === 'gpp_generate_progress' ||
+      last?.stage === 'gpp_generate_done' ||
+      last?.stage === 'gpp_score_start' ||
+      last?.stage === 'gpp_score_progress' ||
+      last?.stage === 'gpp_select_progress'
+    if (!isLiveProgressEvent) return
 
     const ts = Date.now()
-    lastLineupTimeRef.current = ts
+    lastEventTimeRef.current = ts
     setNow(ts)
 
     if (tickTimerRef.current) clearTimeout(tickTimerRef.current)
 
     function scheduleTick() {
-      const lineupTime = lastLineupTimeRef.current!
-      const sinceLineup = Date.now() - lineupTime
-      const nextTick = Math.ceil((sinceLineup + 1) / 30000) * 30000
+      const eventTime = lastEventTimeRef.current!
+      const sinceEvent = Date.now() - eventTime
+      const nextTick = Math.ceil((sinceEvent + 1) / 30000) * 30000
       tickTimerRef.current = setTimeout(() => {
         setNow(Date.now())
-        if (lastLineupTimeRef.current === lineupTime) scheduleTick()
-      }, nextTick - sinceLineup)
+        if (lastEventTimeRef.current === eventTime) scheduleTick()
+      }, nextTick - sinceEvent)
     }
 
     scheduleTick()
@@ -82,6 +96,9 @@ export function ProgressPanel({ events, running }: Props) {
   const last = events[events.length - 1]
   const elapsed = first && last ? last.timestamp - first.timestamp : null
 
+  const isGpp = events.some(e => e.stage === 'gpp_generate_start' || e.stage === 'gpp_score_start' || e.stage === 'gpp_select_progress')
+
+  // --- Non-GPP lineup progress ---
   const latestLineup = [...events]
     .reverse()
     .find(e => e.stage === 'optimize_lineup') as OptimizeLineupEvent | undefined
@@ -90,21 +107,53 @@ export function ProgressPanel({ events, running }: Props) {
   const current = latestLineup?.lineup_index ?? 0
   const pct = total > 0 ? Math.round((current / total) * 100) : 0
 
-  // ETA: use the last 3 lineup intervals (recent performance) to avoid optimism
-  // from fast early lineups skewing the average downward.
   const lineupEvents = events.filter(e => e.stage === 'optimize_lineup') as OptimizeLineupEvent[]
-  let etaMs: number | null = null
-  if (running && current > 0 && total > current) {
-    const recent = lineupEvents.slice(-4) // up to 4 events → 3 intervals
-    if (recent.length >= 2) {
-      const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
-      const avgPerLineup = recentElapsed / (recent.length - 1)
-      etaMs = avgPerLineup * (total - current)
+
+  // --- GPP progress ---
+  const scoreProgressEvents = events.filter(e => e.stage === 'gpp_score_progress') as unknown as GppScoreProgressEvent[]
+  const latestScoreProgress = scoreProgressEvents[scoreProgressEvents.length - 1]
+  const selectProgressEvents = events.filter(e => e.stage === 'gpp_select_progress') as unknown as GppSelectProgressEvent[]
+  const scoreDone = events.some(e => e.stage === 'gpp_score_done')
+
+  let gppPct = 0
+  let gppLabel = ''
+  if (isGpp) {
+    if (selectProgressEvents.length > 0) {
+      gppPct = 100
+      gppLabel = `Portfolio selection: round ${selectProgressEvents[selectProgressEvents.length - 1].round + 1}`
+    } else if (latestScoreProgress) {
+      gppPct = Math.round((latestScoreProgress.batches_done / latestScoreProgress.batches_total) * 100)
+      gppLabel = `Scoring batch ${latestScoreProgress.batches_done} / ${latestScoreProgress.batches_total}`
+    } else if (events.some(e => e.stage === 'gpp_generate_start')) {
+      gppPct = 0
+      gppLabel = 'Generating candidates…'
     }
-    // With only one lineup we can't measure an interval, so omit the ETA
   }
 
-  const liveElapsedMs = running && first && current > 0 ? now - first.timestamp : null
+  // --- ETA ---
+  let etaMs: number | null = null
+  if (isGpp) {
+    if (running && latestScoreProgress && !scoreDone) {
+      const recent = scoreProgressEvents.slice(-4)
+      if (recent.length >= 2) {
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const avgPerBatch = recentElapsed / (recent.length - 1)
+        const remaining = latestScoreProgress.batches_total - latestScoreProgress.batches_done
+        if (remaining > 0) etaMs = avgPerBatch * remaining
+      }
+    }
+  } else {
+    if (running && current > 0 && total > current) {
+      const recent = lineupEvents.slice(-4) // up to 4 events → 3 intervals
+      if (recent.length >= 2) {
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const avgPerLineup = recentElapsed / (recent.length - 1)
+        etaMs = avgPerLineup * (total - current)
+      }
+    }
+  }
+
+  const liveElapsedMs = running && first && (current > 0 || isGpp) ? now - first.timestamp : null
 
   return (
     <div className="progress-panel">
@@ -127,12 +176,21 @@ export function ProgressPanel({ events, running }: Props) {
         )}
       </h3>
 
-      {(running || latestLineup) && total > 0 && (
+      {/* Non-GPP progress bar */}
+      {!isGpp && (running || latestLineup) && total > 0 && (
         <div className="progress-bar-wrap">
           <div className="progress-bar" style={{ width: `${pct}%` }} />
           <span className="progress-label">
             Lineup {current} / {total}
           </span>
+        </div>
+      )}
+
+      {/* GPP progress bar */}
+      {isGpp && running && gppLabel && (
+        <div className="progress-bar-wrap">
+          <div className="progress-bar" style={{ width: `${gppPct}%` }} />
+          <span className="progress-label">{gppLabel}</span>
         </div>
       )}
 
@@ -143,13 +201,14 @@ export function ProgressPanel({ events, running }: Props) {
             <span className="event-detail">{item.detail}</span>
           </div>
         ))}
-        {running && !latestLineup && (
+        {running && !latestLineup && !isGpp && (
           <div className="event-row">
             <span className="event-stage muted">…</span>
           </div>
         )}
       </div>
 
+      {/* Non-GPP lineup grid */}
       {events.some(e => e.stage === 'optimize_lineup') && (
         <div className="event-list event-list-four-col">
           {events.filter(e => e.stage === 'optimize_lineup').map((e, i) => {
@@ -161,6 +220,18 @@ export function ProgressPanel({ events, running }: Props) {
               </div>
             )
           })}
+        </div>
+      )}
+
+      {/* GPP selection grid */}
+      {selectProgressEvents.length > 0 && (
+        <div className="event-list event-list-four-col">
+          {selectProgressEvents.map((ev, i) => (
+            <div key={i} className="event-row event-gpp_select_progress">
+              <span className="event-stage event-stage-lineup">{ev.round + 1}</span>
+              <span className="event-detail">${ev.marginal_ev.toFixed(2)}</span>
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -188,8 +259,14 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
   const result: Array<{ stage: string; label: string; detail: string }> = []
   let configInserted = false
 
+  const hasEvent = (stage: string) => events.some(e => e.stage === stage)
+
   for (const e of events) {
     if (e.stage === 'optimize_lineup' || e.stage === 'upload_files') continue
+    if (GPP_PROGRESS_STAGES.has(e.stage)) continue
+    // Skip start event once done event is present (collapse into one row)
+    if (e.stage === 'gpp_generate_start' && hasEvent('gpp_generate_done')) continue
+    if (e.stage === 'gpp_score_start' && hasEvent('gpp_score_done')) continue
     if (CONFIG_STAGES.has(e.stage)) {
       if (!configInserted) {
         result.push({ stage: 'config', label: 'Configuration', detail: buildConfigDetail(events) })
@@ -246,6 +323,24 @@ function renderDetail(e: SSEEvent): string {
       const pctFmt = (v: number | null | undefined) => v != null ? `${v.toFixed(1)}%` : '—'
       const ptLabel = ev.target_percentile != null ? `p${ev.target_percentile}` : 'target'
       return `p90: ${pctFmt(ev.pct_above_p90)} · ${ptLabel}: ${pctFmt(ev.pct_above_target)} · p99: ${pctFmt(ev.pct_above_p99)}`
+    }
+    case 'gpp_generate_start': {
+      const ev = e as unknown as { n_candidates: number }
+      return `Generating ${ev.n_candidates.toLocaleString()} candidates…`
+    }
+    case 'gpp_generate_done': {
+      const ev = e as unknown as { n_generated: number }
+      return `${ev.n_generated.toLocaleString()} candidates generated`
+    }
+    case 'gpp_score_start': {
+      const ev = e as unknown as { n_candidates: number; n_field_samples: number }
+      return `${ev.n_candidates.toLocaleString()} candidates × ${ev.n_field_samples} field samples`
+    }
+    case 'gpp_score_done':
+      return 'Scoring complete'
+    case 'gpp_holdout': {
+      const ev = e as unknown as { holdout_mean_payout: number }
+      return `Holdout mean payout: ${ev.holdout_mean_payout.toFixed(4)}`
     }
     case 'complete': {
       const ev = e as unknown as { n_lineups: number }

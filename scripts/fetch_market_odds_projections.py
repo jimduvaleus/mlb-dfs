@@ -1703,6 +1703,30 @@ async def _run_playwright(
 
 
 # ---------------------------------------------------------------------------
+# Archive helper
+# ---------------------------------------------------------------------------
+
+def _date_to_archive_dir(date_str: str) -> str:
+    yr, mo, dy = date_str.split("-")
+    return f"{mo}{dy}{yr}"
+
+
+def _archive_market_odds_slate(slate_path: str, proj_df: pd.DataFrame) -> None:
+    """Mirror market odds projections into archive/MMDDYYYY/ for later evaluation."""
+    try:
+        slate_date = _extract_date_from_dk(slate_path) or _extract_date_from_fd_path(slate_path)
+        if not slate_date:
+            return
+        archive_dir = PROJECT_ROOT / "archive" / _date_to_archive_dir(slate_date)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        dest = archive_dir / "market_odds_projections.csv"
+        proj_df.to_csv(dest, index=False)
+        log.info("Archived market odds projections → %s", dest)
+    except Exception as exc:
+        log.warning("Could not archive market odds projections: %s", exc)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
@@ -1878,6 +1902,9 @@ def build_projections_csv(
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_path, index=False)
+
+    # Auto-archive for historical ownership evaluation
+    _archive_market_odds_slate(slate_path, out_df)
 
     # Write sidecar JSONs read by the server to annotate the UI merge_info callout.
     _op = Path(output_path)

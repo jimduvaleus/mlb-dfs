@@ -60,6 +60,9 @@ export function ProjectionsTable({ players }: Props) {
                       <TeamBadge team={p.team} className="lineup-player-team" />
                       <span className="lineup-player-sal">${(p.salary / 1000).toFixed(1)}k</span>
                       <span className="lineup-player-proj">{p.mean.toFixed(1)}</span>
+                      {p.ownership_pct != null && (
+                        <span className="lineup-player-own" title="Projected ownership">{p.ownership_pct.toFixed(1)}%</span>
+                      )}
                     </div>
                   )
                 })}

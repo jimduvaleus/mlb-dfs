@@ -267,11 +267,23 @@ class PipelineRunner:
             payout_cash_line = None
             payout_beta = float(payout_beta_cfg) if payout_beta_cfg is not None else 2.5
 
+        # --- Compute ownership vector for leverage_surplus objective ----------
+        ownership_vector: Optional[np.ndarray] = None
+        if objective == "leverage_surplus":
+            from src.optimization.ownership import compute_heuristic_ownership
+            team_totals = self._load_team_totals(slate_path)
+            ownership_vector = compute_heuristic_ownership(players_df, team_totals)
+            logger.info(
+                "Computed heuristic ownership — model %s, %d players",
+                "D" if team_totals else "C", len(ownership_vector),
+            )
+
         # Store simulation artifacts for post-run operations (lineup replacement).
         self._sim_results = sim_results
         self._players_df = players_df
         self._target = target
         self._objective = objective
+        self._ownership_vector = ownership_vector
         self._optimizer_kwargs_replace = dict(
             n_chains=int(opt_cfg.get("n_chains", 250)),
             temperature=float(opt_cfg.get("temperature", 0.1)),
@@ -285,6 +297,7 @@ class PipelineRunner:
             objective=objective,
             payout_beta=payout_beta,
             payout_cash_line=payout_cash_line,
+            ownership_vector=ownership_vector,
             rules=roster_rules,
             slot_eligibility=slot_elig,
         )
@@ -297,71 +310,9 @@ class PipelineRunner:
                 "Entry files require %d lineups; overriding config size %d.",
                 total_entries, config_size,
             )
-        logger.info(
-            "Constructing portfolio — size=%d, target=%.1f, chains=%d",
-            portfolio_size, target, opt_cfg.get("n_chains", 250),
-        )
-        constructor = PortfolioConstructor(
-            sim_results=sim_results,
-            players_df=players_df,
-            target=target,
-            portfolio_size=portfolio_size,
-            n_chains=int(opt_cfg.get("n_chains", 250)),
-            temperature=float(opt_cfg.get("temperature", 0.1)),
-            n_steps=int(opt_cfg.get("n_steps", 100)),
-            niter_success=int(opt_cfg.get("niter_success", 25)),
-            n_workers=int(opt_cfg.get("n_workers", 1)),
-            rng_seed=opt_cfg.get("rng_seed"),
-            early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
-            early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
-            salary_floor=float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None,
-            objective=objective,
-            payout_beta=payout_beta,
-            payout_cash_line=payout_cash_line,
-            payout_coverage_bonus=float(opt_cfg.get("payout_coverage_bonus", 0.0)),
-            n_seed_lineups=int(opt_cfg.get("n_seed_lineups", 5)),
-            ref_p90=fixed_ref_p90,
-            ref_p99=fixed_ref_p99,
-            rules=roster_rules,
-            slot_eligibility=slot_elig,
-        )
-
-        def _on_lineup_complete(
-            lineup_index: int, total: int, score: float,
-            arg4: int, arg5: int, arg6: Optional[float] = None,
-            arg7: Optional[float] = None, arg8: Optional[float] = None,
-            arg9: Optional[float] = None,
-        ) -> None:
-            if objective == "marginal_payout":
-                self._cb("optimize_lineup", {
-                    "lineup_index": lineup_index,
-                    "total": total,
-                    "score": round(score, 4),
-                    "sims_great": arg4,
-                    "sims_good": arg5,
-                    "sims_uncovered": arg6,
-                    "pct_above_p90": round(arg7, 1) if arg7 is not None else None,
-                    "pct_above_p99": round(arg8, 1) if arg8 is not None else None,
-                    "pct_above_target": round(arg9, 1) if arg9 is not None else None,
-                    "target_percentile": target_percentile,
-                    "objective": objective,
-                })
-            else:
-                self._cb("optimize_lineup", {
-                    "lineup_index": lineup_index,
-                    "total": total,
-                    "score": round(score, 4),
-                    "sims_covered": arg4,
-                    "sims_remaining": arg5,
-                    "pct_above_p90": round(arg6, 1) if arg6 is not None else None,
-                    "pct_above_p99": round(arg7, 1) if arg7 is not None else None,
-                    "pct_above_target": round(arg8, 1) if arg8 is not None else None,
-                    "target_percentile": target_percentile,
-                    "objective": objective,
-                })
 
         def _on_portfolio_complete(best_scores: np.ndarray) -> None:
-            n_sims = len(best_scores)
+            n_sims_ps = len(best_scores)
             covered_mask = best_scores >= target
             covered = best_scores[covered_mask]
 
@@ -388,7 +339,7 @@ class PipelineRunner:
             self._cb("portfolio_stats", {
                 "target": round(target, 1),
                 "great_threshold": round(target + 15.0, 1),
-                "n_sims": n_sims,
+                "n_sims": n_sims_ps,
                 "covered_count": int(covered_mask.sum()),
                 "covered_mean": round(float(covered.mean()), 1) if len(covered) > 0 else None,
                 "covered_p50": _pct(covered, 50),
@@ -401,12 +352,199 @@ class PipelineRunner:
                 "histogram": histogram,
             })
 
-        portfolio = constructor.construct(
-            on_lineup_complete=_on_lineup_complete,
-            on_portfolio_complete=_on_portfolio_complete if objective == "marginal_payout" else None,
-            stop_check=self._stop_check,
-            target_percentile=target_percentile if objective == "marginal_payout" else None,
-        )
+        if objective == "leverage_surplus":
+            # ----------------------------------------------------------------
+            # GPP portfolio: rapid candidate pool + contest simulation +
+            # marginal-EV greedy selection.
+            # ----------------------------------------------------------------
+            from src.optimization.candidate_generator import CandidateGenerator
+            from src.optimization.gpp_portfolio import ContestScorer, EVPortfolioSelector
+
+            gpp_cfg = cfg.get("gpp", {})
+            n_candidates = int(gpp_cfg.get("n_candidates", 10_000))
+            n_field = int(gpp_cfg.get("n_field_lineups", 5_000))
+            n_k = int(gpp_cfg.get("n_field_samples", 3))
+            holdout_frac = float(gpp_cfg.get("holdout_fraction", 0.0))
+            cand_batch = int(gpp_cfg.get("candidate_batch_size", 500))
+            max_attempts_mult = int(gpp_cfg.get("max_attempts_multiplier", 50))
+            salary_floor_gpp = (
+                float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None
+            )
+
+            logger.info(
+                "GPP portfolio — %d candidates, N=%d field lineups × K=%d samples, "
+                "size=%d",
+                n_candidates, n_field, n_k, portfolio_size,
+            )
+
+            _gpp_stopped = self._stop_check is not None and self._stop_check
+
+            # Phase 1: generate stacked candidate pool
+            self._cb("gpp_generate_start", {"n_candidates": n_candidates})
+            gen = CandidateGenerator(
+                players_df, ownership_vector,
+                rng_seed=opt_cfg.get("rng_seed"),
+                salary_floor=salary_floor_gpp,
+            )
+            candidates = gen.generate(
+                n_candidates=n_candidates,
+                max_attempts_multiplier=max_attempts_mult,
+                stop_check=self._stop_check,
+                progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
+            )
+            self._cb("gpp_generate_done", {"n_generated": len(candidates)})
+            logger.info("Generated %d candidate lineups.", len(candidates))
+
+            if not candidates or (_gpp_stopped and self._stop_check()):
+                portfolio = []
+            else:
+                # Phase 2: score candidates against K simulated opponent fields
+                self._cb("gpp_score_start", {
+                    "n_candidates": len(candidates),
+                    "n_field_samples": n_k,
+                })
+                team_totals_gpp = self._load_team_totals(slate_path)
+                from src.optimization.payout import load_payout_structure, payout_table_to_array
+                _gpp_payout_arr = payout_table_to_array(
+                    load_payout_structure("dk_classic_gpp")
+                ).astype(np.float32)
+                scorer = ContestScorer(
+                    sim_results=sim_results,
+                    players_df=players_df,
+                    n_field_lineups=n_field,
+                    n_field_samples=n_k,
+                    payout_arr=_gpp_payout_arr,
+                    field_rng_seed=int(opt_cfg.get("rng_seed") or 42),
+                    ownership_vec=ownership_vector,
+                    team_totals=team_totals_gpp,
+                    candidate_batch_size=cand_batch,
+                )
+                robust_payout = scorer.score_candidates(
+                    candidates,
+                    stop_check=self._stop_check,
+                    progress_cb=lambda done, total: self._cb(
+                        "gpp_score_progress",
+                        {"batches_done": done, "batches_total": total},
+                    ),
+                )
+                self._cb("gpp_score_done", {})
+
+                if _gpp_stopped and self._stop_check():
+                    portfolio = []
+                else:
+                    # Phase 3: greedy marginal-EV portfolio selection
+                    selector = EVPortfolioSelector(
+                        robust_payout=robust_payout,
+                        candidates=candidates,
+                        portfolio_size=portfolio_size,
+                        holdout_fraction=holdout_frac,
+                        rng_seed=opt_cfg.get("rng_seed"),
+                    )
+                    gpp_result = selector.select(
+                        stop_check=self._stop_check,
+                        progress_cb=lambda k, idx, ev: self._cb(
+                            "gpp_select_progress",
+                            {"round": k, "lineup_index": idx, "marginal_ev": round(ev, 6)},
+                        ),
+                    )
+                    if selector.holdout_score() is not None:
+                        self._cb("gpp_holdout", {
+                            "holdout_mean_payout": round(selector.holdout_score(), 6),
+                        })
+
+                    portfolio = gpp_result
+
+                    # Compute best_scores for portfolio_stats event.
+                    col_map_ps = {pid: i for i, pid in enumerate(sim_results.player_ids)}
+                    sim_mat_ps = sim_results.results_matrix.astype(np.float32)
+                    best_scores_gpp = np.zeros(sim_mat_ps.shape[0], dtype=np.float64)
+                    for lu, _ in portfolio:
+                        cols = [col_map_ps[pid] for pid in lu.player_ids if pid in col_map_ps]
+                        if len(cols) == 10:
+                            lu_scores = sim_mat_ps[:, cols].sum(axis=1).astype(np.float64)
+                            np.maximum(best_scores_gpp, lu_scores, out=best_scores_gpp)
+                    if not (_gpp_stopped and self._stop_check()):
+                        _on_portfolio_complete(best_scores_gpp)
+
+                    # Cache GPP artifacts for potential future use.
+                    self._gpp_robust_payout = robust_payout
+                    self._gpp_candidates = candidates
+
+        else:
+            # ----------------------------------------------------------------
+            # Original PortfolioConstructor path (all other objectives).
+            # ----------------------------------------------------------------
+            logger.info(
+                "Constructing portfolio — size=%d, target=%.1f, chains=%d",
+                portfolio_size, target, opt_cfg.get("n_chains", 250),
+            )
+            constructor = PortfolioConstructor(
+                sim_results=sim_results,
+                players_df=players_df,
+                target=target,
+                portfolio_size=portfolio_size,
+                n_chains=int(opt_cfg.get("n_chains", 250)),
+                temperature=float(opt_cfg.get("temperature", 0.1)),
+                n_steps=int(opt_cfg.get("n_steps", 100)),
+                niter_success=int(opt_cfg.get("niter_success", 25)),
+                n_workers=int(opt_cfg.get("n_workers", 1)),
+                rng_seed=opt_cfg.get("rng_seed"),
+                early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
+                early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
+                salary_floor=float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None,
+                objective=objective,
+                payout_beta=payout_beta,
+                payout_cash_line=payout_cash_line,
+                payout_coverage_bonus=float(opt_cfg.get("payout_coverage_bonus", 0.0)),
+                n_seed_lineups=int(opt_cfg.get("n_seed_lineups", 5)),
+                ref_p90=fixed_ref_p90,
+                ref_p99=fixed_ref_p99,
+                ownership_vector=ownership_vector,
+                rules=roster_rules,
+                slot_eligibility=slot_elig,
+            )
+
+            def _on_lineup_complete(
+                lineup_index: int, total: int, score: float,
+                arg4: int, arg5: int, arg6: Optional[float] = None,
+                arg7: Optional[float] = None, arg8: Optional[float] = None,
+                arg9: Optional[float] = None,
+            ) -> None:
+                if objective in ("marginal_payout",):
+                    self._cb("optimize_lineup", {
+                        "lineup_index": lineup_index,
+                        "total": total,
+                        "score": round(score, 4),
+                        "sims_great": arg4,
+                        "sims_good": arg5,
+                        "sims_uncovered": arg6,
+                        "pct_above_p90": round(arg7, 1) if arg7 is not None else None,
+                        "pct_above_p99": round(arg8, 1) if arg8 is not None else None,
+                        "pct_above_target": round(arg9, 1) if arg9 is not None else None,
+                        "target_percentile": target_percentile,
+                        "objective": objective,
+                    })
+                else:
+                    self._cb("optimize_lineup", {
+                        "lineup_index": lineup_index,
+                        "total": total,
+                        "score": round(score, 4),
+                        "sims_covered": arg4,
+                        "sims_remaining": arg5,
+                        "pct_above_p90": round(arg6, 1) if arg6 is not None else None,
+                        "pct_above_p99": round(arg7, 1) if arg7 is not None else None,
+                        "pct_above_target": round(arg8, 1) if arg8 is not None else None,
+                        "target_percentile": target_percentile,
+                        "objective": objective,
+                    })
+
+            portfolio = constructor.construct(
+                on_lineup_complete=_on_lineup_complete,
+                on_portfolio_complete=_on_portfolio_complete if objective == "marginal_payout" else None,
+                stop_check=self._stop_check,
+                target_percentile=target_percentile if objective == "marginal_payout" else None,
+            )
+
         logger.info("Portfolio complete: %d lineups.", len(portfolio))
 
         # Store raw artifacts for on-demand upload file writing.
@@ -780,6 +918,57 @@ class PipelineRunner:
             players_df, sim_results, rules=rules, slot_eligibility=slot_eligibility
         )
         return float(np.percentile(totals, percentile))
+
+    @staticmethod
+    def _load_team_totals(slate_path: str) -> Optional[dict]:
+        """Try to load dff_team_totals.csv from the archive for the slate date.
+
+        Returns {team: implied_total} or None if not found.
+        """
+        import re as _re
+        from pathlib import Path as _Path
+        # Extract date from DK slate filename: DKSalaries_MM_DD_YYYY or MMDDYYYY patterns
+        fname = _Path(slate_path).name if slate_path else ""
+        archive_dir = None
+        m = _re.search(r'(\d{1,2})[_\-](\d{1,2})[_\-](\d{4})', fname)
+        if m:
+            mm, dd, yyyy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+            archive_dir = _Path(__file__).resolve().parents[2] / "archive" / f"{mm}{dd}{yyyy}"
+        if archive_dir is None or not archive_dir.exists():
+            # Fall back to today's date
+            from datetime import date as _date
+            today = _date.today().strftime("%m%d%Y")
+            archive_dir = _Path(__file__).resolve().parents[2] / "archive" / today
+        totals_path = archive_dir / "dff_team_totals.csv" if archive_dir else None
+        if totals_path is None or not totals_path.exists():
+            return None
+        try:
+            df = pd.read_csv(totals_path)
+            if "team" in df.columns and "implied_total" in df.columns:
+                return dict(zip(df["team"], df["implied_total"].astype(float)))
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _load_cash_threshold() -> float:
+        """Compute cash threshold from the DK Classic GPP payout structure.
+
+        Cash threshold = fraction of the field you must beat to finish in a
+        paying position.  E.g. top-26% payout → need to beat 74% of the field.
+        Falls back to 0.74 if the file is missing or malformed.
+        """
+        from pathlib import Path as _Path
+        import json as _json
+        path = _Path(__file__).resolve().parents[2] / "data" / "payout_structures" / "dk_classic_gpp.json"
+        try:
+            with open(path) as f:
+                ps = _json.load(f)
+            total = int(ps["total_entries"])
+            paying = int(ps["total_payout_positions"])
+            return 1.0 - paying / total
+        except Exception:
+            return 0.74
 
     @staticmethod
     def _pos_label(row: pd.Series) -> str:

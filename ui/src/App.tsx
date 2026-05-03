@@ -240,6 +240,7 @@ export default function App() {
     setParseResult(null)
     refreshTwitterLineups()
     refreshUnconfirmed()
+    refreshProjectionPlayers()
     setProjStatusTrigger(t => t + 1)
   }
 
@@ -247,6 +248,7 @@ export default function App() {
     await dismissTwitterLineup(team)
     refreshTwitterLineups()
     refreshUnconfirmed()
+    refreshProjectionPlayers()
     setProjStatusTrigger(t => t + 1)
   }
 
