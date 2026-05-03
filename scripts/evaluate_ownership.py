@@ -225,6 +225,19 @@ def _build_player_pool(
     else:
         merged["implied_total"] = np.nan
 
+    # Apply exclusions — players who were scratched or otherwise invalid.
+    exclusions_path = archive_dir / "exclusions.csv"
+    if exclusions_path.exists():
+        excl_df = pd.read_csv(exclusions_path)
+        if "player_id" in excl_df.columns:
+            excl_ids = set(excl_df["player_id"].dropna().astype(int))
+            n_before = len(merged)
+            merged = merged[~merged["player_id"].isin(excl_ids)]
+            dropped = n_before - len(merged)
+            if dropped:
+                names = excl_df.loc[excl_df["player_id"].isin(excl_ids), "name"].tolist() if "name" in excl_df.columns else []
+                print(f"  Excluded {dropped} player(s) via exclusions.csv: {names}")
+
     return merged.reset_index(drop=True)
 
 

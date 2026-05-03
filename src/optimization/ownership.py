@@ -22,11 +22,17 @@ _SLOT_COUNTS: dict[str, int] = {
 }
 
 # Batting order multipliers applied to _raw before softmax.
-# Slots 1-2 lead off more often (more PA); 8-9 are at the bottom of the order.
+# Flattened vs initial version: actual field data shows slot 1/slot 9 ratio
+# is ~2.6x, but the original 1.25/0.65 range was amplified by softmax into ~12x.
 _BATTING_ORDER_MULT: dict[int, float] = {
-    1: 1.25, 2: 1.18, 3: 1.12, 4: 1.06, 5: 1.00,
-    6: 0.90, 7: 0.80, 8: 0.72, 9: 0.65,
+    1: 1.12, 2: 1.08, 3: 1.05, 4: 1.02, 5: 1.00,
+    6: 0.95, 7: 0.90, 8: 0.86, 9: 0.83,
 }
+
+# Fraction of secondary-pool ownership credited to multi-eligible players.
+# A 3B/SS player gets full credit from their primary pool plus this fraction
+# of whatever the SS pool would award them (and vice-versa).
+_SECONDARY_POSITION_DISCOUNT = 0.5
 
 
 def compute_heuristic_ownership(
@@ -43,8 +49,8 @@ def compute_heuristic_ownership(
         - ``slot`` or ``lineup_slot``: batting order (1-9) for order multiplier.
         - ``opponent``: pitcher's opposing team for matchup boost (requires team_totals).
         - ``eligible_positions``: list of DK-eligible positions; multi-eligible
-          players are included in each position group's softmax and their
-          ownership contributions are summed.
+          players receive full credit from their primary pool and a discounted
+          contribution from each secondary eligible pool.
     team_totals:
         Optional {team_abbrev: implied_run_total} dict.  When provided,
         batter ownership is boosted proportional to the team's implied total
@@ -82,10 +88,11 @@ def compute_heuristic_ownership(
                 # Batters: higher team implied total → more fantasy points expected
                 mask = batter_mask & (df["team"] == team)
                 df.loc[mask, "_boost"] = total / mean_total
-                # Pitchers: lower opponent implied total → better matchup
+                # Pitchers: lower opponent implied total → better matchup.
+                # Exponent 1.5 strengthens the signal vs a plain ratio.
                 if "opponent" in df.columns:
                     mask_p = pitcher_mask & (df["opponent"] == team)
-                    df.loc[mask_p, "_boost"] = mean_total / total
+                    df.loc[mask_p, "_boost"] = (mean_total / total) ** 1.5
         df["_raw"] = df["_raw"] * df["_boost"]
 
     # --- Per-position softmax, respecting multi-position eligibility -------
@@ -93,7 +100,6 @@ def compute_heuristic_ownership(
     df["ownership"] = 0.0
 
     if use_eligible:
-        # Collect all positions that appear across eligible lists.
         all_pos: set[str] = set()
         for ep in df["eligible_positions"]:
             if isinstance(ep, list):
@@ -121,8 +127,15 @@ def compute_heuristic_ownership(
         shifted = (vals - vals.mean()) / max(std, 0.4)
         exp_vals = np.exp(shifted)
         n_slots = _SLOT_COUNTS.get(pos, 1)
-        # Scale so each position group sums to its slot count.
-        # Multi-eligible players accumulate ownership from each eligible group.
-        df.loc[mask, "ownership"] += (exp_vals / exp_vals.sum()) * n_slots
+        contribution = (exp_vals / exp_vals.sum()) * n_slots
+
+        # Primary-position players get full credit; multi-eligible players whose
+        # primary position differs from `pos` get a discounted secondary credit.
+        if use_eligible:
+            is_primary = (df.loc[mask, "position"] == pos).values
+            discount = np.where(is_primary, 1.0, _SECONDARY_POSITION_DISCOUNT)
+            df.loc[mask, "ownership"] += contribution * discount
+        else:
+            df.loc[mask, "ownership"] += contribution
 
     return df["ownership"].values.astype(np.float64)
