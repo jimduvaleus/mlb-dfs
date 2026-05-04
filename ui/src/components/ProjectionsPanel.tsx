@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { CappedPlayer, LowTeamProjection, MergeInfo, ProjectionsStatus } from '../types'
+import type { CappedPlayer, ExclusionScope, LowTeamProjection, MergeInfo, ProjectionsStatus } from '../types'
 
 const MARKET_DISPLAY: Record<string, string> = {
   singles: '1B', doubles: '2B', triples: '3B', home_runs: 'HR',
@@ -80,17 +80,26 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         const cappedPlayers = (event.capped_players ?? []) as CappedPlayer[]
         const lowTeamProjections = (event.low_team_projections ?? []) as LowTeamProjection[]
         onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections })
-        // Auto-exclude pitchers that fell back to a secondary source — their
-        // projections are lower quality regardless of which primary source was used.
+        // Auto-exclude pitchers that fell back to a secondary source at 'candidates'
+        // scope — their projections are lower quality but they still model the field.
         const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
         if (pitcherIds.length > 0) {
           fetchSlatePlayers().then(slate => {
-            const alreadyExcluded = slate.players.filter(p => p.excluded).map(p => p.player_id)
-            const newExcluded = [...new Set([...alreadyExcluded, ...pitcherIds])]
-            if (newExcluded.length > alreadyExcluded.length) {
-              const player_scopes = Object.fromEntries(newExcluded.map(id => [String(id), 'both' as const]))
-              savePlayerExclusions({ slate_id: slate.slate_id, player_scopes })
-                .catch(console.error)
+            const player_scopes: Record<string, ExclusionScope> = {}
+            for (const p of slate.players) {
+              if (p.individual_scope !== 'none') player_scopes[String(p.player_id)] = p.individual_scope
+            }
+            let addedNew = false
+            for (const id of pitcherIds) {
+              const key = String(id)
+              if (!player_scopes[key]) {
+                player_scopes[key] = 'candidates'
+                addedNew = true
+              }
+              // already excluded at some scope — leave as-is (no downgrade)
+            }
+            if (addedNew) {
+              savePlayerExclusions({ slate_id: slate.slate_id, player_scopes }).catch(console.error)
             }
           }).catch(console.error)
         }
@@ -235,7 +244,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
           <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback projection</strong>
           {mergeInfo.players.some(p => p.is_pitcher) && (
             <div className="merge-info-pitcher-warning">
-              ⚠ Pitcher(s) using {mergeInfo.secondarySource} fallback projections have been automatically added to Player Exclusions.
+              ⚠ Pitcher(s) using {mergeInfo.secondarySource} fallback projections have been automatically added to candidate exclusions.
             </div>
           )}
           <div className="merge-info-players">

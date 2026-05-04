@@ -323,6 +323,7 @@ export interface PlayerExclusionStatus {
   salary: number
   excluded: boolean
   exclusion_scope: ExclusionScope
+  individual_scope: ExclusionScope
 }
 
 export interface SlatePlayersResponse {

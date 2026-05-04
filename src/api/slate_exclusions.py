@@ -343,5 +343,6 @@ def get_slate_players_with_status(
             "salary": int(row["salary"]),
             "excluded": effective_scope != "none",
             "exclusion_scope": effective_scope,
+            "individual_scope": individual_scope,
         })
     return result

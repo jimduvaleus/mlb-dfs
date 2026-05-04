@@ -1392,6 +1392,19 @@ button { cursor: pointer; }
   margin-bottom: 12px;
 }
 
+.player-search-group {
+  margin-bottom: 20px;
+}
+
+.player-search-group-label {
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: #718096;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 6px;
+}
+
 .player-search-wrap {
   position: relative;
   max-width: 360px;
@@ -1469,6 +1482,11 @@ button { cursor: pointer; }
 .psr-meta {
   font-size: 0.75rem;
   color: #718096;
+}
+
+.psr-upgrade-hint {
+  color: #fbd38d;
+  font-style: italic;
 }
 
 .player-search-empty {

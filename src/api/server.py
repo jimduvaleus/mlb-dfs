@@ -577,6 +577,7 @@ def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersRespon
     excluded_games: list[str] = stored.get("excluded_games", [])
     cand_excluded_teams: list[str] = stored.get("candidate_excluded_teams", [])
     cand_excluded_games: list[str] = stored.get("candidate_excluded_games", [])
+    game_ppd_pcts: dict[str, float] = stored.get("game_ppd_pcts", {})
 
     # Split scope dict into "both" and "candidates" lists
     both_pids = [int(pid) for pid, s in update.player_scopes.items() if s == "both"]
@@ -607,6 +608,7 @@ def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersRespon
         candidate_excluded_teams=cand_excluded_teams,
         candidate_excluded_games=cand_excluded_games,
         candidate_excluded_player_ids=cand_pids,
+        game_ppd_pcts=game_ppd_pcts,
     )
 
     if df is None or df.empty:
@@ -1063,6 +1065,71 @@ async def projections_fetch(request: Request):
             result = result.sort_values("mean", ascending=False).reset_index(drop=True)
             result.to_csv(proj_path, index=False)
 
+        # Helper: inject confirmed Twitter lineup players missing from pool.
+        # The projection sources only output their own "confirmed starter" pool;
+        # a player confirmed via Underdog lineup notification may have a projection
+        # in the raw source data but be absent from the filtered output.  This
+        # ensures they're always included so _apply_twitter_overrides can slot them.
+        # Falls back to salary / 400.0 heuristic only when no source had them at all.
+        def _inject_twitter_confirmed(pool: "pd.DataFrame") -> "pd.DataFrame":
+            from .twitter_lineups import get_confirmed_team_lineups
+            confirmed = get_confirmed_team_lineups()
+            if not confirmed:
+                return pool
+            slate_file = _slate_path_for_meta
+            if slate_file is None or not slate_file.exists():
+                return pool
+            pid_to_slot: dict[int, int] = {
+                pid: slot
+                for pid_to_slot in confirmed.values()
+                for pid, slot in pid_to_slot.items()
+            }
+            pool_pids = (
+                {int(p) for p in pool["player_id"].tolist()}
+                if not pool.empty and "player_id" in pool.columns
+                else set()
+            )
+            missing_pids = set(pid_to_slot.keys()) - pool_pids
+            if is_partial and included_pids:
+                missing_pids &= {int(p) for p in included_pids}
+            if not missing_pids:
+                return pool
+            try:
+                if platform_val == "fanduel":
+                    sl = pd.read_csv(slate_file, usecols=["Id", "Nickname", "Salary"])
+                    sl["_pid"] = pd.to_numeric(
+                        sl["Id"].astype(str).str.split("-").str[-1], errors="coerce"
+                    ).astype("Int64")
+                    sl = sl[sl["_pid"].isin(missing_pids)]
+                    name_col = "Nickname"
+                else:
+                    sl = pd.read_csv(slate_file, usecols=["ID", "Name", "Salary"])
+                    sl["_pid"] = pd.to_numeric(sl["ID"], errors="coerce").astype("Int64")
+                    sl = sl[sl["_pid"].isin(missing_pids)]
+                    name_col = "Name"
+            except Exception:
+                return pool
+            if sl.empty:
+                return pool
+            rows = []
+            for _, row in sl.iterrows():
+                pid = int(row["_pid"])
+                salary = float(row["Salary"]) if pd.notna(row.get("Salary")) else 3000.0
+                proj_mean = salary / 400.0
+                rows.append({
+                    "player_id": pid,
+                    "name": str(row[name_col]),
+                    "mean": round(proj_mean, 2),
+                    "std_dev": round(proj_mean * 0.85, 2),
+                    "lineup_slot": pid_to_slot.get(pid, 1),
+                    "slot_confirmed": True,
+                })
+            if not rows:
+                return pool
+            new_df = pd.DataFrame(rows)
+            new_df["player_id"] = new_df["player_id"].astype("Int64")
+            return pd.concat([pool, new_df], ignore_index=True)
+
         # ---- Market Odds path -----------------------------------------------
         if is_market_preferred:
             returncode = 0
@@ -1200,6 +1267,7 @@ async def projections_fetch(request: Request):
                                 "Warning: Market odds unavailable; using RotoWire projections for all players."
                             )
 
+                        pool = _inject_twitter_confirmed(pool)
                         _write_proj(pool)
                         proj_written = True
 
@@ -1364,6 +1432,7 @@ async def projections_fetch(request: Request):
                             if _itm2.get(int(p.get("player_id", 0)), "") in included_teams
                         ]
 
+                    pool = _inject_twitter_confirmed(pool)
                     _write_proj(pool)
                     proj_written = True
 

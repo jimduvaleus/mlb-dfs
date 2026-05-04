@@ -148,7 +148,8 @@ class PlayerExclusionStatus(BaseModel):
     team: str
     salary: int
     excluded: bool
-    exclusion_scope: str = "none"   # 'none' | 'candidates' | 'both'
+    exclusion_scope: str = "none"        # effective scope (player + team/game combined)
+    individual_scope: str = "none"       # player-level only (ignores team/game)
 
 
 class SlatePlayersResponse(BaseModel):

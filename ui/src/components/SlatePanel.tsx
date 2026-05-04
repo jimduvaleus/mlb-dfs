@@ -37,21 +37,19 @@ function scopeLabel(scope: ExclusionScope): string {
   return 'Included'
 }
 
-function scopeClass(scope: ExclusionScope): string {
-  if (scope === 'both') return 'scope-both'
-  if (scope === 'candidates') return 'scope-candidates'
-  return 'scope-none'
-}
 
 export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [search, setSearch] = useState('')
-  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchCands, setSearchCands] = useState('')
+  const [searchCandsOpen, setSearchCandsOpen] = useState(false)
+  const searchCandsRef = useRef<HTMLDivElement>(null)
+  const [searchFull, setSearchFull] = useState('')
+  const [searchFullOpen, setSearchFullOpen] = useState(false)
+  const searchFullRef = useRef<HTMLDivElement>(null)
   const [ppdPcts, setPpdPcts] = useState<Record<string, string>>({})
-  const searchRef = useRef<HTMLDivElement>(null)
 
   const syncPpdFromSlate = useCallback((data: SlateGamesResponse) => {
     const pcts: Record<string, string> = {}
@@ -89,12 +87,13 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
       .catch(e => setError(String(e)))
   }, [platform])
 
-  // Close search dropdown when clicking outside
+  // Close search dropdowns when clicking outside
   useEffect(() => {
     function handleClick(e: MouseEvent) {
-      if (searchRef.current && !searchRef.current.contains(e.target as Node)) {
-        setSearchOpen(false)
-      }
+      if (searchCandsRef.current && !searchCandsRef.current.contains(e.target as Node))
+        setSearchCandsOpen(false)
+      if (searchFullRef.current && !searchFullRef.current.contains(e.target as Node))
+        setSearchFullOpen(false)
     }
     document.addEventListener('mousedown', handleClick)
     return () => document.removeEventListener('mousedown', handleClick)
@@ -232,8 +231,8 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     (playersList: PlayerExclusionStatus[]): Record<string, ExclusionScope> => {
       const scopes: Record<string, ExclusionScope> = {}
       for (const p of playersList) {
-        if (p.exclusion_scope !== 'none') {
-          scopes[String(p.player_id)] = p.exclusion_scope
+        if (p.individual_scope !== 'none') {
+          scopes[String(p.player_id)] = p.individual_scope
         }
       }
       return scopes
@@ -241,16 +240,16 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     []
   )
 
-  const excludePlayer = useCallback(
-    async (player: PlayerExclusionStatus) => {
+  const excludePlayerWithScope = useCallback(
+    async (player: PlayerExclusionStatus, scope: 'candidates' | 'both') => {
       if (!players || disabled || saving) return
       const scopes = buildPlayerScopes(players.players)
-      scopes[String(player.player_id)] = 'candidates'  // default scope when adding
+      scopes[String(player.player_id)] = scope
       const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, player_scopes: scopes }
       setSaving(true)
       setError(null)
-      setSearch('')
-      setSearchOpen(false)
+      if (scope === 'candidates') { setSearchCands(''); setSearchCandsOpen(false) }
+      else { setSearchFull(''); setSearchFullOpen(false) }
       try {
         const result = await savePlayerExclusions(update)
         setPlayers(result)
@@ -305,11 +304,23 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     0
   )
 
-  const searchLower = search.toLowerCase().trim()
-  const activePlayers = players?.players.filter(p => p.exclusion_scope === 'none') ?? []
-  const excludedPlayers = players?.players.filter(p => p.exclusion_scope !== 'none') ?? []
-  const searchResults = searchLower.length > 0
-    ? activePlayers.filter(p => p.name.toLowerCase().includes(searchLower)).slice(0, 8)
+  const searchCandsLower = searchCands.toLowerCase().trim()
+  const searchFullLower = searchFull.toLowerCase().trim()
+
+  // Display lists: only individually-excluded players (not team/game-implied)
+  const candsExcludedList = players?.players.filter(p => p.individual_scope === 'candidates') ?? []
+  const bothExcludedList  = players?.players.filter(p => p.individual_scope === 'both') ?? []
+
+  // Candidates search pool: players with no effective exclusion (truly active)
+  const activeForCandsSearch = players?.players.filter(p => p.exclusion_scope === 'none') ?? []
+  // Full exclusion search pool: not yet individually fully excluded (allows upgrading team-implied cands)
+  const activeForFullSearch = players?.players.filter(p => p.individual_scope !== 'both') ?? []
+
+  const searchCandsResults = searchCandsLower.length > 0
+    ? activeForCandsSearch.filter(p => p.name.toLowerCase().includes(searchCandsLower)).slice(0, 8)
+    : []
+  const searchFullResults = searchFullLower.length > 0
+    ? activeForFullSearch.filter(p => p.name.toLowerCase().includes(searchFullLower)).slice(0, 8)
     : []
 
   return (
@@ -407,86 +418,163 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
       <div className="player-exclusions">
         <div className="player-exclusions-header">
           <h3 className="slate-title">Player Exclusions</h3>
-          {excludedPlayers.length > 0 && (
-            <span className="slate-summary">{excludedPlayers.length} excluded</span>
+          {(candsExcludedList.length + bothExcludedList.length) > 0 && (
+            <span className="slate-summary">{candsExcludedList.length + bothExcludedList.length} excluded</span>
           )}
         </div>
 
-        <div className="player-search-wrap" ref={searchRef}>
-          <input
-            className="player-search-input"
-            type="text"
-            placeholder="Search players to exclude…"
-            value={search}
-            onChange={e => { setSearch(e.target.value); setSearchOpen(true) }}
-            onFocus={() => setSearchOpen(true)}
-            disabled={disabled || saving}
-          />
-          {searchOpen && searchResults.length > 0 && (
-            <ul className="player-search-results">
-              {searchResults.map(p => (
-                <li key={p.player_id}>
-                  <button
-                    className="player-search-result-btn"
-                    onMouseDown={e => { e.preventDefault(); excludePlayer(p) }}
-                  >
-                    <span className="psr-name">{p.name}</span>
-                    <span className="psr-meta">{p.position} · {p.team} · ${p.salary.toLocaleString()}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          )}
-          {searchOpen && searchLower.length > 0 && searchResults.length === 0 && (
-            <div className="player-search-empty">No active players match</div>
-          )}
-        </div>
-
-        {excludedPlayers.length > 0 && (
-          <div className="excluded-players-list">
-            {excludedPlayers.map(p => (
-              <span key={p.player_id} className={`excluded-player-chip excluded-player-chip--${p.exclusion_scope}`}>
-                <span className="epc-name">{p.name}</span>
-                <span className="epc-meta">{p.position} · {p.team}</span>
-                <button
-                  className={`epc-scope ${scopeClass(p.exclusion_scope)}`}
-                  onClick={() => cyclePlayerScope(p.player_id)}
-                  disabled={disabled || saving}
-                  title={
-                    p.exclusion_scope === 'candidates'
-                      ? 'Excluded from candidates only — click to exclude from everything'
-                      : 'Excluded from everything — click to re-include'
-                  }
-                >
-                  {p.exclusion_scope === 'candidates' ? 'Cands' : 'Excl.'}
-                </button>
-                <button
-                  className="epc-remove"
-                  onClick={async () => {
-                    if (!players || disabled || saving) return
-                    const scopes = buildPlayerScopes(players.players)
-                    delete scopes[String(p.player_id)]
-                    const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, player_scopes: scopes }
-                    setSaving(true)
-                    setError(null)
-                    try {
-                      const result = await savePlayerExclusions(update)
-                      setPlayers(result)
-                    } catch (e) {
-                      setError(String(e))
-                    } finally {
-                      setSaving(false)
-                    }
-                  }}
-                  disabled={disabled || saving}
-                  title={`Re-include ${p.name}`}
-                >
-                  ✕
-                </button>
-              </span>
-            ))}
+        <div className="player-search-group">
+          <div className="player-search-group-label">Exclude from candidates</div>
+          <div className="player-search-wrap" ref={searchCandsRef}>
+            <input
+              className="player-search-input"
+              type="text"
+              placeholder="Search players to exclude from candidates…"
+              value={searchCands}
+              onChange={e => { setSearchCands(e.target.value); setSearchCandsOpen(true) }}
+              onFocus={() => setSearchCandsOpen(true)}
+              disabled={disabled || saving}
+            />
+            {searchCandsOpen && searchCandsResults.length > 0 && (
+              <ul className="player-search-results">
+                {searchCandsResults.map(p => (
+                  <li key={p.player_id}>
+                    <button
+                      className="player-search-result-btn"
+                      onMouseDown={e => { e.preventDefault(); excludePlayerWithScope(p, 'candidates') }}
+                    >
+                      <span className="psr-name">{p.name}</span>
+                      <span className="psr-meta">{p.position} · {p.team} · ${p.salary.toLocaleString()}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {searchCandsOpen && searchCandsLower.length > 0 && searchCandsResults.length === 0 && (
+              <div className="player-search-empty">No active players match</div>
+            )}
           </div>
-        )}
+          {candsExcludedList.length > 0 && (
+            <div className="excluded-players-list">
+              {candsExcludedList.map(p => (
+                <span key={p.player_id} className="excluded-player-chip excluded-player-chip--candidates">
+                  <span className="epc-name">{p.name}</span>
+                  <span className="epc-meta">{p.position} · {p.team}</span>
+                  <button
+                    className="epc-scope scope-candidates"
+                    onClick={() => cyclePlayerScope(p.player_id)}
+                    disabled={disabled || saving}
+                    title="Excluded from candidates only — click to exclude from everything"
+                  >
+                    Cands
+                  </button>
+                  <button
+                    className="epc-remove"
+                    onClick={async () => {
+                      if (!players || disabled || saving) return
+                      const scopes = buildPlayerScopes(players.players)
+                      delete scopes[String(p.player_id)]
+                      const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, player_scopes: scopes }
+                      setSaving(true)
+                      setError(null)
+                      try {
+                        const result = await savePlayerExclusions(update)
+                        setPlayers(result)
+                      } catch (e) {
+                        setError(String(e))
+                      } finally {
+                        setSaving(false)
+                      }
+                    }}
+                    disabled={disabled || saving}
+                    title={`Re-include ${p.name}`}
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="player-search-group">
+          <div className="player-search-group-label">Exclude from candidates + field</div>
+          <div className="player-search-wrap" ref={searchFullRef}>
+            <input
+              className="player-search-input"
+              type="text"
+              placeholder="Search players to exclude from everything…"
+              value={searchFull}
+              onChange={e => { setSearchFull(e.target.value); setSearchFullOpen(true) }}
+              onFocus={() => setSearchFullOpen(true)}
+              disabled={disabled || saving}
+            />
+            {searchFullOpen && searchFullResults.length > 0 && (
+              <ul className="player-search-results">
+                {searchFullResults.map(p => (
+                  <li key={p.player_id}>
+                    <button
+                      className="player-search-result-btn"
+                      onMouseDown={e => { e.preventDefault(); excludePlayerWithScope(p, 'both') }}
+                    >
+                      <span className="psr-name">{p.name}</span>
+                      <span className="psr-meta">
+                        {p.position} · {p.team} · ${p.salary.toLocaleString()}
+                        {p.exclusion_scope === 'candidates' && (
+                          <span className="psr-upgrade-hint"> · upgrade from cands</span>
+                        )}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+            {searchFullOpen && searchFullLower.length > 0 && searchFullResults.length === 0 && (
+              <div className="player-search-empty">No players match</div>
+            )}
+          </div>
+          {bothExcludedList.length > 0 && (
+            <div className="excluded-players-list">
+              {bothExcludedList.map(p => (
+                <span key={p.player_id} className="excluded-player-chip excluded-player-chip--both">
+                  <span className="epc-name">{p.name}</span>
+                  <span className="epc-meta">{p.position} · {p.team}</span>
+                  <button
+                    className="epc-scope scope-both"
+                    onClick={() => cyclePlayerScope(p.player_id)}
+                    disabled={disabled || saving}
+                    title="Excluded from everything — click to re-include"
+                  >
+                    Excl.
+                  </button>
+                  <button
+                    className="epc-remove"
+                    onClick={async () => {
+                      if (!players || disabled || saving) return
+                      const scopes = buildPlayerScopes(players.players)
+                      delete scopes[String(p.player_id)]
+                      const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, player_scopes: scopes }
+                      setSaving(true)
+                      setError(null)
+                      try {
+                        const result = await savePlayerExclusions(update)
+                        setPlayers(result)
+                      } catch (e) {
+                        setError(String(e))
+                      } finally {
+                        setSaving(false)
+                      }
+                    }}
+                    disabled={disabled || saving}
+                    title={`Re-include ${p.name}`}
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {(notifications.length > 0 || twitterLineups.length > 0) && (
