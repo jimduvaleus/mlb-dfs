@@ -312,9 +312,8 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'ppd_applied': {
       const ev = e as unknown as { games: { game: string; ppd_pct: number; n_sims_zeroed: number }[]; n_sims_total: number }
-      const parts = ev.games.map(g => `${g.game} ${g.ppd_pct}%`)
-      const totalZeroed = ev.games.reduce((s, g) => s + g.n_sims_zeroed, 0)
-      return `${parts.join(', ')} — ${totalZeroed.toLocaleString()} / ${ev.n_sims_total.toLocaleString()} sims zeroed`
+      const parts = ev.games.map(g => `${g.game} ${g.ppd_pct}% (${g.n_sims_zeroed.toLocaleString()} sims)`)
+      return `${parts.join(', ')} — zeroed independently`
     }
     case 'compute_target': {
       const ev = e as unknown as { target: number; percentile: number | null }

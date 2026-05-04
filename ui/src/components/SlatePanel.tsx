@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PlatformType, SlateGamesResponse, SlatePlayersResponse, TwitterLineupRecord, TwitterNotification } from '../types'
+import type { ExclusionScope, ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PlatformType, SlateGamesResponse, SlatePlayersResponse, TwitterLineupRecord, TwitterNotification } from '../types'
 import { fetchSlateGames, fetchSlatePlayers, savePlayerExclusions, saveSlateExclusions } from '../api'
 
 interface Props {
@@ -23,6 +23,24 @@ function formatGameTime(iso: string | null | undefined): string {
   const period = h >= 12 ? 'PM' : 'AM'
   const h12 = h % 12 || 12
   return `${h12}:${mStr} ${period} ET`
+}
+
+function nextScope(scope: ExclusionScope): ExclusionScope {
+  if (scope === 'none') return 'candidates'
+  if (scope === 'candidates') return 'both'
+  return 'none'
+}
+
+function scopeLabel(scope: ExclusionScope): string {
+  if (scope === 'both') return 'Excl.'
+  if (scope === 'candidates') return 'Cands'
+  return 'Included'
+}
+
+function scopeClass(scope: ExclusionScope): string {
+  if (scope === 'both') return 'scope-both'
+  if (scope === 'candidates') return 'scope-candidates'
+  return 'scope-none'
 }
 
 export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
@@ -55,8 +73,9 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         setSlate(data)
         syncPpdFromSlate(data)
         if (onProjFetchFilterChange) {
+          // Only "both"-excluded games auto-sync to projFetchExcluded
           const slateExcluded = data.games
-            .filter(g => g.excluded)
+            .filter(g => g.exclusion_scope === 'both')
             .map(g => `${g.away}@${g.home}`)
           const merged = [...new Set([...projFetchExcluded, ...slateExcluded])]
           if (merged.length !== projFetchExcluded.length) {
@@ -83,17 +102,20 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
 
   const buildUpdate = useCallback(
     (games: GameStatus[]): ExclusionsUpdate => {
-      const excluded_games = games.filter(g => g.excluded).map(g => g.game)
-      // Only include teams that are individually excluded (game not fully excluded)
-      const excluded_teams = games
-        .filter(g => !g.excluded)
-        .flatMap(g => g.teams.filter(t => t.excluded).map(t => t.team))
+      const game_scopes: Record<string, ExclusionScope> = {}
+      const team_scopes: Record<string, ExclusionScope> = {}
+      for (const g of games) {
+        game_scopes[g.game] = g.exclusion_scope
+        for (const t of g.teams) {
+          team_scopes[t.team] = t.exclusion_scope
+        }
+      }
       const game_ppd_pcts: Record<string, number> = {}
       for (const [gameKey, val] of Object.entries(ppdPcts)) {
         const n = parseFloat(val)
         if (!isNaN(n) && n > 0) game_ppd_pcts[gameKey] = n
       }
-      return { slate_id: slate?.slate_id ?? '', excluded_games, excluded_teams, game_ppd_pcts }
+      return { slate_id: slate?.slate_id ?? '', game_scopes, team_scopes, game_ppd_pcts }
     },
     [slate, ppdPcts]
   )
@@ -106,7 +128,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         const result = await saveSlateExclusions(buildUpdate(updated.games))
         setSlate(result)
         syncPpdFromSlate(result)
-        // Refresh player list since team/game exclusions affect the pool
+        // Refresh player list since team/game scopes affect the pool
         const updatedPlayers = await fetchSlatePlayers()
         setPlayers(updatedPlayers)
       } catch (e) {
@@ -136,30 +158,34 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     [slate, disabled, saving, buildUpdate, syncPpdFromSlate]
   )
 
-  const toggleGame = useCallback(
+  const cycleGameScope = useCallback(
     (gameStr: string) => {
       if (!slate || disabled || saving) return
-      const toggledGame = slate.games.find(g => g.game === gameStr)
-      const nowExcluded = toggledGame ? !toggledGame.excluded : false
+      const game = slate.games.find(g => g.game === gameStr)
+      if (!game) return
+      const newScope = nextScope(game.exclusion_scope)
       const updated: SlateGamesResponse = {
         ...slate,
         games: slate.games.map(g => {
           if (g.game !== gameStr) return g
           return {
             ...g,
-            excluded: nowExcluded,
-            teams: g.teams.map(t => ({ ...t, excluded: nowExcluded })),
+            excluded: newScope !== 'none',
+            exclusion_scope: newScope,
+            teams: g.teams.map(t => ({ ...t, excluded: newScope !== 'none', exclusion_scope: newScope })),
           }
         }),
       }
       persist(updated)
-      if (onProjFetchFilterChange && toggledGame) {
-        const gameKey = `${toggledGame.away}@${toggledGame.home}`
-        onProjFetchFilterChange(
-          nowExcluded
-            ? [...new Set([...projFetchExcluded, gameKey])]
-            : projFetchExcluded.filter(k => k !== gameKey)
-        )
+      // Sync projFetchExcluded: only "both"-excluded games skip projection fetch
+      if (onProjFetchFilterChange) {
+        const gameKey = `${game.away}@${game.home}`
+        if (newScope === 'none') {
+          onProjFetchFilterChange(projFetchExcluded.filter(k => k !== gameKey))
+        } else if (newScope === 'both') {
+          onProjFetchFilterChange([...new Set([...projFetchExcluded, gameKey])])
+        }
+        // 'candidates' scope — keep projections fetching (no change to projFetchExcluded)
       }
     },
     [slate, disabled, saving, persist, projFetchExcluded, onProjFetchFilterChange]
@@ -178,18 +204,23 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     [projFetchExcluded, onProjFetchFilterChange]
   )
 
-  const toggleTeam = useCallback(
+  const cycleTeamScope = useCallback(
     (gameStr: string, team: string) => {
       if (!slate || disabled || saving) return
       const updated: SlateGamesResponse = {
         ...slate,
         games: slate.games.map(g => {
           if (g.game !== gameStr) return g
-          const updatedTeams = g.teams.map(t =>
-            t.team === team ? { ...t, excluded: !t.excluded } : t
-          )
-          const allExcluded = updatedTeams.every(t => t.excluded)
-          return { ...g, excluded: allExcluded, teams: updatedTeams }
+          const updatedTeams = g.teams.map(t => {
+            if (t.team !== team) return t
+            const ns = nextScope(t.exclusion_scope)
+            return { ...t, exclusion_scope: ns, excluded: ns !== 'none' }
+          })
+          // If all teams share the same non-none scope, promote to game level
+          const allScopes = updatedTeams.map(t => t.exclusion_scope)
+          const allSame = allScopes.every(s => s === allScopes[0]) && allScopes[0] !== 'none'
+          const gameScope: ExclusionScope = allSame ? allScopes[0] as ExclusionScope : 'none'
+          return { ...g, excluded: gameScope !== 'none', exclusion_scope: gameScope, teams: updatedTeams }
         }),
       }
       persist(updated)
@@ -197,11 +228,25 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     [slate, disabled, saving, persist]
   )
 
+  const buildPlayerScopes = useCallback(
+    (playersList: PlayerExclusionStatus[]): Record<string, ExclusionScope> => {
+      const scopes: Record<string, ExclusionScope> = {}
+      for (const p of playersList) {
+        if (p.exclusion_scope !== 'none') {
+          scopes[String(p.player_id)] = p.exclusion_scope
+        }
+      }
+      return scopes
+    },
+    []
+  )
+
   const excludePlayer = useCallback(
     async (player: PlayerExclusionStatus) => {
       if (!players || disabled || saving) return
-      const newIds = [...players.players.filter(p => p.excluded).map(p => p.player_id), player.player_id]
-      const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, excluded_player_ids: newIds }
+      const scopes = buildPlayerScopes(players.players)
+      scopes[String(player.player_id)] = 'candidates'  // default scope when adding
+      const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, player_scopes: scopes }
       setSaving(true)
       setError(null)
       setSearch('')
@@ -215,14 +260,22 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         setSaving(false)
       }
     },
-    [players, disabled, saving]
+    [players, disabled, saving, buildPlayerScopes]
   )
 
-  const includePlayer = useCallback(
+  const cyclePlayerScope = useCallback(
     async (playerId: number) => {
       if (!players || disabled || saving) return
-      const newIds = players.players.filter(p => p.excluded && p.player_id !== playerId).map(p => p.player_id)
-      const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, excluded_player_ids: newIds }
+      const player = players.players.find(p => p.player_id === playerId)
+      if (!player) return
+      const newScope = nextScope(player.exclusion_scope)
+      const scopes = buildPlayerScopes(players.players)
+      if (newScope === 'none') {
+        delete scopes[String(playerId)]
+      } else {
+        scopes[String(playerId)] = newScope
+      }
+      const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, player_scopes: scopes }
       setSaving(true)
       setError(null)
       try {
@@ -234,7 +287,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         setSaving(false)
       }
     },
-    [players, disabled, saving]
+    [players, disabled, saving, buildPlayerScopes]
   )
 
   if (error) return <p className="slate-error">{error}</p>
@@ -244,13 +297,17 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
 
   const totalTeams = slate.games.length * 2
   const activeTeams = slate.games.reduce(
-    (n, g) => n + g.teams.filter(t => !t.excluded).length,
+    (n, g) => n + g.teams.filter(t => t.exclusion_scope === 'none').length,
+    0
+  )
+  const candidateExcludedTeams = slate.games.reduce(
+    (n, g) => n + g.teams.filter(t => t.exclusion_scope === 'candidates').length,
     0
   )
 
   const searchLower = search.toLowerCase().trim()
-  const activePlayers = players?.players.filter(p => !p.excluded) ?? []
-  const excludedPlayers = players?.players.filter(p => p.excluded) ?? []
+  const activePlayers = players?.players.filter(p => p.exclusion_scope === 'none') ?? []
+  const excludedPlayers = players?.players.filter(p => p.exclusion_scope !== 'none') ?? []
   const searchResults = searchLower.length > 0
     ? activePlayers.filter(p => p.name.toLowerCase().includes(searchLower)).slice(0, 8)
     : []
@@ -261,6 +318,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         <h3 className="slate-title">Slate Games</h3>
         <span className="slate-summary">
           {activeTeams} of {totalTeams} teams active
+          {candidateExcludedTeams > 0 && <span className="slate-cands-note"> · {candidateExcludedTeams} cands-excl</span>}
           {saving && <span className="slate-saving"> — saving…</span>}
         </span>
       </div>
@@ -270,7 +328,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
           const gameKey = `${g.away}@${g.home}`
           const fetchSkipped = projFetchExcluded.includes(gameKey)
           return (
-          <div key={g.game} className={`game-card${g.excluded ? ' game-excluded' : ''}`}>
+          <div key={g.game} className={`game-card game-card--${g.exclusion_scope}`}>
             <div className="game-card-header">
               <div className="game-label-group">
                 <span className="game-label">{g.away} @ {g.home}</span>
@@ -279,15 +337,19 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
                 )}
               </div>
               <button
-                className={`btn-game-toggle${g.excluded ? ' btn-game-excluded' : ' btn-game-included'}`}
-                onClick={() => toggleGame(g.game)}
+                className={`btn-game-toggle btn-game-toggle--${g.exclusion_scope}`}
+                onClick={() => cycleGameScope(g.game)}
                 disabled={disabled || saving}
-                title={g.excluded ? 'Re-include entire game' : 'Exclude entire game'}
+                title={
+                  g.exclusion_scope === 'none' ? 'Click to exclude from candidates only' :
+                  g.exclusion_scope === 'candidates' ? 'Click to exclude from both candidates and field' :
+                  'Click to re-include game'
+                }
               >
-                {g.excluded ? 'Excluded' : 'Included'}
+                {scopeLabel(g.exclusion_scope)}
               </button>
             </div>
-            {!g.excluded && (
+            {g.exclusion_scope !== 'both' && (
               <div className="game-card-secondary-actions">
                 <button
                   className={`btn-proj-fetch${fetchSkipped ? ' btn-proj-fetch-off' : ' btn-proj-fetch-on'}`}
@@ -319,12 +381,21 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
               {g.teams.map(t => (
                 <button
                   key={t.team}
-                  className={`team-chip${t.excluded ? ' team-excluded' : ' team-active'}`}
-                  onClick={() => toggleTeam(g.game, t.team)}
+                  className={`team-chip team-chip--${t.exclusion_scope}`}
+                  onClick={() => cycleTeamScope(g.game, t.team)}
                   disabled={disabled || saving}
-                  title={t.excluded ? `Re-include ${t.team}` : `Exclude ${t.team}`}
+                  title={
+                    t.exclusion_scope === 'none' ? `Click to exclude ${t.team} from candidates only` :
+                    t.exclusion_scope === 'candidates' ? `Click to exclude ${t.team} from everything` :
+                    `Click to re-include ${t.team}`
+                  }
                 >
                   {t.team}
+                  {t.exclusion_scope !== 'none' && (
+                    <span className={`team-chip-scope team-chip-scope--${t.exclusion_scope}`}>
+                      {t.exclusion_scope === 'candidates' ? 'C' : 'X'}
+                    </span>
+                  )}
                 </button>
               ))}
             </div>
@@ -374,12 +445,39 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         {excludedPlayers.length > 0 && (
           <div className="excluded-players-list">
             {excludedPlayers.map(p => (
-              <span key={p.player_id} className="excluded-player-chip">
+              <span key={p.player_id} className={`excluded-player-chip excluded-player-chip--${p.exclusion_scope}`}>
                 <span className="epc-name">{p.name}</span>
                 <span className="epc-meta">{p.position} · {p.team}</span>
                 <button
+                  className={`epc-scope ${scopeClass(p.exclusion_scope)}`}
+                  onClick={() => cyclePlayerScope(p.player_id)}
+                  disabled={disabled || saving}
+                  title={
+                    p.exclusion_scope === 'candidates'
+                      ? 'Excluded from candidates only — click to exclude from everything'
+                      : 'Excluded from everything — click to re-include'
+                  }
+                >
+                  {p.exclusion_scope === 'candidates' ? 'Cands' : 'Excl.'}
+                </button>
+                <button
                   className="epc-remove"
-                  onClick={() => includePlayer(p.player_id)}
+                  onClick={async () => {
+                    if (!players || disabled || saving) return
+                    const scopes = buildPlayerScopes(players.players)
+                    delete scopes[String(p.player_id)]
+                    const update: PlayerExclusionsUpdate = { slate_id: players.slate_id, player_scopes: scopes }
+                    setSaving(true)
+                    setError(null)
+                    try {
+                      const result = await savePlayerExclusions(update)
+                      setPlayers(result)
+                    } catch (e) {
+                      setError(String(e))
+                    } finally {
+                      setSaving(false)
+                    }
+                  }}
                   disabled={disabled || saving}
                   title={`Re-include ${p.name}`}
                 >

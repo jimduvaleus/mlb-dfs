@@ -153,30 +153,37 @@ class PipelineRunner:
             )
 
         players_df = self._apply_twitter_overrides(players_df)
-        players_df, excl_stats, game_ppd_pcts = self._apply_exclusions(players_df, slate_path=slate_path)
+        # sim_players_df: "both"-excluded removed — used for simulation + field generation
+        # cand_players_df: "candidates"+"both"-excluded removed — used for lineup optimization
+        sim_players_df, cand_players_df, excl_stats, game_ppd_pcts = self._apply_exclusions(
+            players_df, slate_path=slate_path
+        )
 
-        # --- Value cutoff filtering ------------------------------------
+        # --- Value cutoff filtering (candidates only) ----------------------
+        # sim_players_df is intentionally NOT value-cutoff filtered so that
+        # candidate-excluded players retain scoring coverage for field lineups.
         min_p_val = opt_cfg.get("min_pitcher_value")
         min_b_val = opt_cfg.get("min_batter_value")
         n_pitchers_value_excluded = 0
         n_batters_value_excluded = 0
 
         if min_p_val or min_b_val:
-            players_df["_value"] = players_df["mean"] / (players_df["salary"] / 1000.0)
+            cand_players_df["_value"] = cand_players_df["mean"] / (cand_players_df["salary"] / 1000.0)
             if min_p_val:
-                mask_p = (players_df["position"] == "P") & (players_df["_value"] < min_p_val)
+                mask_p = (cand_players_df["position"] == "P") & (cand_players_df["_value"] < min_p_val)
                 n_pitchers_value_excluded = int(mask_p.sum())
-                players_df = players_df[~mask_p]
+                cand_players_df = cand_players_df[~mask_p]
             if min_b_val:
-                mask_b = (players_df["position"] != "P") & (players_df["_value"] < min_b_val)
+                mask_b = (cand_players_df["position"] != "P") & (cand_players_df["_value"] < min_b_val)
                 n_batters_value_excluded = int(mask_b.sum())
-                players_df = players_df[~mask_b]
-            players_df = players_df.drop(columns=["_value"])
+                cand_players_df = cand_players_df[~mask_b]
+            cand_players_df = cand_players_df.drop(columns=["_value"])
 
-        n_teams_loaded = players_df["team"].nunique()
-        n_batters = int((players_df["position"] != "P").sum())
-        n_pitchers = int((players_df["position"] == "P").sum())
-        pitcher_counts = players_df[players_df["position"] == "P"].groupby("team").size()
+        # Stats reflect the candidate pool (what the user is optimizing from)
+        n_teams_loaded = cand_players_df["team"].nunique()
+        n_batters = int((cand_players_df["position"] != "P").sum())
+        n_pitchers = int((cand_players_df["position"] == "P").sum())
+        pitcher_counts = cand_players_df[cand_players_df["position"] == "P"].groupby("team").size()
         multi_pitcher_teams = {team: int(cnt) for team, cnt in pitcher_counts.items() if cnt > 1}
         self._cb("load_slate", {
             "n_teams": n_teams_loaded,
@@ -219,14 +226,14 @@ class PipelineRunner:
         logger.info("Running %d simulations...", n_sims)
         self._cb("simulate", {"n_sims": n_sims})
         engine = SimulationEngine(
-            copula, players_df, batter_pca_model=pca_model, score_grid=score_grid
+            copula, sim_players_df, batter_pca_model=pca_model, score_grid=score_grid
         )
         sim_results = engine.simulate(n_sims)
         logger.info("Simulation complete — matrix: %s", sim_results.results_matrix.shape)
 
         # --- PPD zeroing ------------------------------------------------
         if game_ppd_pcts:
-            sim_results, ppd_stats = self._apply_ppd_to_simulation(sim_results, players_df, game_ppd_pcts)
+            sim_results, ppd_stats = self._apply_ppd_to_simulation(sim_results, sim_players_df, game_ppd_pcts)
             self._cb("ppd_applied", {
                 "games": [
                     {"game": g, "ppd_pct": s["ppd_pct"], "n_sims_zeroed": s["n_sims_zeroed"]}
@@ -240,7 +247,7 @@ class PipelineRunner:
         if target is None:
             target_percentile = int(port_cfg.get("target_percentile", 90))
             target = self._compute_auto_target(
-                players_df, sim_results, target_percentile,
+                cand_players_df, sim_results, target_percentile,
                 rules=roster_rules, slot_eligibility=slot_elig,
             )
             logger.info(
@@ -258,7 +265,7 @@ class PipelineRunner:
         payout_beta_cfg = opt_cfg.get("payout_beta")
         _BETA_MAX = 4.0
         score_dist = self._best_lineup_score_distribution(
-            players_df, sim_results, rules=roster_rules, slot_eligibility=slot_elig
+            cand_players_df, sim_results, rules=roster_rules, slot_eligibility=slot_elig
         )
         fixed_ref_p90 = float(np.percentile(score_dist, 90))
         fixed_ref_p99 = float(np.percentile(score_dist, 99))
@@ -283,7 +290,7 @@ class PipelineRunner:
         if objective == "leverage_surplus":
             from src.optimization.ownership import compute_heuristic_ownership
             team_totals = self._load_team_totals(slate_path)
-            ownership_vector = compute_heuristic_ownership(players_df, team_totals)
+            ownership_vector = compute_heuristic_ownership(cand_players_df, team_totals)
             logger.info(
                 "Computed heuristic ownership — model %s, %d players",
                 "D" if team_totals else "C", len(ownership_vector),
@@ -291,7 +298,7 @@ class PipelineRunner:
 
         # Store simulation artifacts for post-run operations (lineup replacement).
         self._sim_results = sim_results
-        self._players_df = players_df
+        self._players_df = cand_players_df
         self._target = target
         self._objective = objective
         self._ownership_vector = ownership_vector
@@ -393,7 +400,7 @@ class PipelineRunner:
             # Phase 1: generate stacked candidate pool
             self._cb("gpp_generate_start", {"n_candidates": n_candidates})
             gen = CandidateGenerator(
-                players_df, ownership_vector,
+                cand_players_df, ownership_vector,
                 rng_seed=opt_cfg.get("rng_seed"),
                 salary_floor=salary_floor_gpp,
             )
@@ -421,7 +428,8 @@ class PipelineRunner:
                 ).astype(np.float32)
                 scorer = ContestScorer(
                     sim_results=sim_results,
-                    players_df=players_df,
+                    players_df=cand_players_df,
+                    field_players_df=sim_players_df,
                     n_field_lineups=n_field,
                     n_field_samples=n_k,
                     payout_arr=_gpp_payout_arr,
@@ -494,7 +502,7 @@ class PipelineRunner:
             )
             constructor = PortfolioConstructor(
                 sim_results=sim_results,
-                players_df=players_df,
+                players_df=cand_players_df,
                 target=target,
                 portfolio_size=portfolio_size,
                 n_chains=int(opt_cfg.get("n_chains", 250)),
@@ -817,8 +825,15 @@ class PipelineRunner:
     def _apply_exclusions(players_df: pd.DataFrame, slate_path: str = "") -> tuple:
         """Filter players_df based on persisted slate exclusions.
 
-        Returns (filtered_df, excl_stats) where excl_stats has:
-          n_teams_excluded, n_batters_ind_excluded, n_pitchers_ind_excluded
+        Returns (sim_players_df, cand_players_df, excl_stats, game_ppd_pcts):
+          sim_players_df  — removes only "both"-scoped entities; used for the
+                            simulation engine and opponent field generation so
+                            "candidate-excluded" players still get scores and can
+                            appear in field lineups.
+          cand_players_df — removes ("candidates" + "both")-scoped entities;
+                            used for our own lineup/candidate optimization.
+          excl_stats       — {n_teams_excluded, n_batters_ind_excluded, ...}
+          game_ppd_pcts    — {game: pct} for PPD handling
         """
         from pathlib import Path as _Path
         from .slate_exclusions import compute_file_fingerprint, compute_slate_id, read_exclusions
@@ -826,7 +841,7 @@ class PipelineRunner:
 
         current_games = [g for g in players_df["game"].dropna().unique().tolist() if g]
         if not current_games:
-            return players_df, empty_stats, {}
+            return players_df, players_df, empty_stats, {}
 
         slate_file = _Path(slate_path) if slate_path else None
         fingerprint = compute_file_fingerprint(slate_file)
@@ -835,35 +850,64 @@ class PipelineRunner:
 
         game_ppd_pcts: dict = {k: v for k, v in stored.get("game_ppd_pcts", {}).items() if v and v > 0}
 
-        excluded_games = set(stored.get("excluded_games", []))
-        excluded_teams = set(stored.get("excluded_teams", []))
-        excluded_player_ids = set(stored.get("excluded_player_ids", []))
-        if not excluded_games and not excluded_teams and not excluded_player_ids:
-            return players_df, empty_stats, game_ppd_pcts
+        # "both" scope — excluded from everything
+        both_games = set(stored.get("excluded_games", []))
+        both_teams = set(stored.get("excluded_teams", []))
+        both_player_ids = set(stored.get("excluded_player_ids", []))
 
-        # Count individually excluded players by position (before team/game exclusions)
-        ind_excl_df = players_df[players_df["player_id"].isin(excluded_player_ids)]
+        # "candidates" scope — excluded from our pool only
+        cand_games = set(stored.get("candidate_excluded_games", []))
+        cand_teams = set(stored.get("candidate_excluded_teams", []))
+        cand_player_ids = set(stored.get("candidate_excluded_player_ids", []))
+
+        any_both = bool(both_games or both_teams or both_player_ids)
+        any_cand = bool(cand_games or cand_teams or cand_player_ids)
+
+        if not any_both and not any_cand:
+            return players_df, players_df, empty_stats, game_ppd_pcts
+
+        # sim_players_df: remove only "both"-scoped entities
+        if any_both:
+            both_mask = (
+                players_df["game"].isin(both_games) |
+                players_df["team"].isin(both_teams) |
+                players_df["player_id"].isin(both_player_ids)
+            )
+            sim_df = players_df[~both_mask].copy()
+            n_sim_removed = int(both_mask.sum())
+            if n_sim_removed:
+                logger.info("Both-exclusions removed %d players from sim (%d remain).", n_sim_removed, len(sim_df))
+        else:
+            sim_df = players_df
+
+        # cand_players_df: remove "candidates" + "both" scoped entities
+        all_excl_games = both_games | cand_games
+        all_excl_teams = both_teams | cand_teams
+        all_excl_pids = both_player_ids | cand_player_ids
+
+        cand_mask = (
+            players_df["game"].isin(all_excl_games) |
+            players_df["team"].isin(all_excl_teams) |
+            players_df["player_id"].isin(all_excl_pids)
+        )
+        cand_df = players_df[~cand_mask].copy()
+        n_cand_removed = int(cand_mask.sum())
+        if n_cand_removed:
+            logger.info("Exclusions removed %d players from candidate pool (%d remain).", n_cand_removed, len(cand_df))
+
+        # Stats based on candidate pool (what user sees as their optimizable pool)
+        ind_excl_df = players_df[players_df["player_id"].isin(all_excl_pids)]
         n_batters_ind_excluded = int((ind_excl_df["position"] != "P").sum())
         n_pitchers_ind_excluded = int((ind_excl_df["position"] == "P").sum())
-
         pre_n_teams = players_df["team"].nunique()
-        mask = (
-            players_df["game"].isin(excluded_games) |
-            players_df["team"].isin(excluded_teams) |
-            players_df["player_id"].isin(excluded_player_ids)
-        )
-        filtered = players_df[~mask].copy()
-        n_removed = len(players_df) - len(filtered)
-        if n_removed:
-            logger.info("Exclusions removed %d players (%d remain).", n_removed, len(filtered))
+        n_teams_excluded = pre_n_teams - cand_df["team"].nunique()
 
-        n_teams_excluded = pre_n_teams - filtered["team"].nunique()
         excl_stats = {
             "n_teams_excluded": int(n_teams_excluded),
             "n_batters_ind_excluded": n_batters_ind_excluded,
             "n_pitchers_ind_excluded": n_pitchers_ind_excluded,
         }
-        return filtered, excl_stats, game_ppd_pcts
+        return sim_df, cand_df, excl_stats, game_ppd_pcts
 
     @staticmethod
     def _apply_ppd_to_simulation(

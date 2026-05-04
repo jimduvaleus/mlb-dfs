@@ -501,30 +501,42 @@ def get_slate_games() -> SlateGamesResponse:
 def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
     fingerprint = compute_file_fingerprint(_get_slate_file_path())
 
-    # Load existing player exclusions so we can prune them
-    stored = read_exclusions(update.slate_id, fingerprint)
-    existing_player_ids: list[int] = stored.get("excluded_player_ids", [])
+    # Split scope dicts into separate "both" and "candidates" lists
+    both_games = [g for g, s in update.game_scopes.items() if s == "both"]
+    cand_games = [g for g, s in update.game_scopes.items() if s == "candidates"]
+    both_teams = [t for t, s in update.team_scopes.items() if s == "both"]
+    cand_teams = [t for t, s in update.team_scopes.items() if s == "candidates"]
 
-    # Prune player exclusions now covered by team/game exclusions
+    # Load existing player exclusions so we can apply scoped pruning
+    stored = read_exclusions(update.slate_id, fingerprint)
+    existing_both_pids: list[int] = stored.get("excluded_player_ids", [])
+    existing_cand_pids: list[int] = stored.get("candidate_excluded_player_ids", [])
+
     df = _load_slate_df()
-    if df is not None and existing_player_ids:
+    if df is not None:
         all_players = [
             {"player_id": int(r["player_id"]), "team": str(r["team"]), "game": str(r.get("game", ""))}
             for _, r in df.iterrows()
         ]
-        existing_player_ids = prune_player_exclusions(
-            existing_player_ids,
-            set(update.excluded_teams),
-            set(update.excluded_games),
+        existing_both_pids, existing_cand_pids = prune_player_exclusions(
+            existing_both_pids,
+            set(both_teams),
+            set(both_games),
             all_players,
+            candidate_excluded_player_ids=existing_cand_pids,
+            candidate_excluded_teams=set(cand_teams),
+            candidate_excluded_games=set(cand_games),
         )
 
     write_exclusions(
         slate_id=update.slate_id,
         file_fingerprint=fingerprint,
-        excluded_teams=update.excluded_teams,
-        excluded_games=update.excluded_games,
-        excluded_player_ids=existing_player_ids,
+        excluded_teams=both_teams,
+        excluded_games=both_games,
+        excluded_player_ids=existing_both_pids,
+        candidate_excluded_teams=cand_teams,
+        candidate_excluded_games=cand_games,
+        candidate_excluded_player_ids=existing_cand_pids,
         game_ppd_pcts=update.game_ppd_pcts,
     )
     game_times = _load_slate_games()
@@ -563,22 +575,38 @@ def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersRespon
     stored = read_exclusions(update.slate_id, fingerprint)
     excluded_teams: list[str] = stored.get("excluded_teams", [])
     excluded_games: list[str] = stored.get("excluded_games", [])
+    cand_excluded_teams: list[str] = stored.get("candidate_excluded_teams", [])
+    cand_excluded_games: list[str] = stored.get("candidate_excluded_games", [])
+
+    # Split scope dict into "both" and "candidates" lists
+    both_pids = [int(pid) for pid, s in update.player_scopes.items() if s == "both"]
+    cand_pids = [int(pid) for pid, s in update.player_scopes.items() if s == "candidates"]
 
     df = _load_slate_df()
-    pruned_ids = update.excluded_player_ids
-    if df is not None and pruned_ids:
+    if df is not None:
         all_players = [
             {"player_id": int(r["player_id"]), "team": str(r["team"]), "game": str(r.get("game", ""))}
             for _, r in df.iterrows()
         ]
-        pruned_ids = prune_player_exclusions(pruned_ids, set(excluded_teams), set(excluded_games), all_players)
+        both_pids, cand_pids = prune_player_exclusions(
+            both_pids,
+            set(excluded_teams),
+            set(excluded_games),
+            all_players,
+            candidate_excluded_player_ids=cand_pids,
+            candidate_excluded_teams=set(cand_excluded_teams),
+            candidate_excluded_games=set(cand_excluded_games),
+        )
 
     write_exclusions(
         slate_id=update.slate_id,
         file_fingerprint=fingerprint,
         excluded_teams=excluded_teams,
         excluded_games=excluded_games,
-        excluded_player_ids=pruned_ids,
+        excluded_player_ids=both_pids,
+        candidate_excluded_teams=cand_excluded_teams,
+        candidate_excluded_games=cand_excluded_games,
+        candidate_excluded_player_ids=cand_pids,
     )
 
     if df is None or df.empty:
@@ -867,6 +895,29 @@ async def projections_fetch(request: Request):
             if "@" in token:
                 away, home = token.split("@", 1)
                 excluded_pairs.add((away, home))
+
+    # Auto-skip games that are "both"-excluded in stored exclusions.
+    # Market Odds is the only source with per-game filtering (--games arg),
+    # but adding these to excluded_pairs is a no-op for other sources.
+    if dk_path is not None:
+        try:
+            from .slate_exclusions import compute_slate_id, compute_file_fingerprint as _cfp, read_exclusions as _re_excl
+            _dk_gi_auto = pd.read_csv(dk_path, usecols=["Game Info"])
+            _auto_games: list[str] = []
+            for _gi in _dk_gi_auto["Game Info"].dropna().unique():
+                _m = _re.match(r"(\w+)@(\w+)\s", str(_gi).strip())
+                if _m:
+                    _auto_games.append(f"{_m.group(1).upper()}@{_m.group(2).upper()}")
+            if _auto_games:
+                _auto_slate_id = compute_slate_id(_auto_games)
+                _auto_fp = _cfp(dk_path)
+                _auto_stored = _re_excl(_auto_slate_id, _auto_fp)
+                for _g in _auto_stored.get("excluded_games", []):
+                    if "@" in _g:
+                        _a, _h = _g.split("@", 1)
+                        excluded_pairs.add((_a.upper(), _h.upper()))
+        except Exception:
+            pass  # non-fatal; fall back to query-param-only exclusions
 
     # Resolve which games are actually in this slate (from DK CSV) and which
     # to include in the fetch.  Only used when excluded_pairs is non-empty.

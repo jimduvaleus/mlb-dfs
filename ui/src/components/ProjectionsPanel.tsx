@@ -88,7 +88,8 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
             const alreadyExcluded = slate.players.filter(p => p.excluded).map(p => p.player_id)
             const newExcluded = [...new Set([...alreadyExcluded, ...pitcherIds])]
             if (newExcluded.length > alreadyExcluded.length) {
-              savePlayerExclusions({ slate_id: slate.slate_id, excluded_player_ids: newExcluded })
+              const player_scopes = Object.fromEntries(newExcluded.map(id => [String(id), 'both' as const]))
+              savePlayerExclusions({ slate_id: slate.slate_id, player_scopes })
                 .catch(console.error)
             }
           }).catch(console.error)

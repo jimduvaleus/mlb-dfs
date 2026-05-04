@@ -114,6 +114,7 @@ class ProjectionsStatus(BaseModel):
 class TeamStatus(BaseModel):
     team: str
     excluded: bool
+    exclusion_scope: str = "none"   # 'none' | 'candidates' | 'both'
 
 
 class GameStatus(BaseModel):
@@ -121,6 +122,7 @@ class GameStatus(BaseModel):
     away: str
     home: str
     excluded: bool
+    exclusion_scope: str = "none"   # 'none' | 'candidates' | 'both'
     ppd_pct: float | None = None
     teams: list[TeamStatus]
     game_start_time: str | None = None
@@ -134,8 +136,8 @@ class SlateGamesResponse(BaseModel):
 
 class ExclusionsUpdate(BaseModel):
     slate_id: str
-    excluded_teams: list[str]
-    excluded_games: list[str]
+    game_scopes: dict[str, str] = {}    # game_str → 'none'|'candidates'|'both'
+    team_scopes: dict[str, str] = {}    # team_str → 'none'|'candidates'|'both'
     game_ppd_pcts: dict[str, float] = {}
 
 
@@ -146,6 +148,7 @@ class PlayerExclusionStatus(BaseModel):
     team: str
     salary: int
     excluded: bool
+    exclusion_scope: str = "none"   # 'none' | 'candidates' | 'both'
 
 
 class SlatePlayersResponse(BaseModel):
@@ -155,7 +158,7 @@ class SlatePlayersResponse(BaseModel):
 
 class PlayerExclusionsUpdate(BaseModel):
     slate_id: str
-    excluded_player_ids: list[int]
+    player_scopes: dict[str, str] = {}  # str(player_id) → 'none'|'candidates'|'both'
 
 
 class TwitterNotification(BaseModel):

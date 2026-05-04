@@ -130,6 +130,7 @@ class ContestScorer:
         self,
         sim_results: SimulationResults,
         players_df: pd.DataFrame,
+        field_players_df: Optional[pd.DataFrame] = None,
         n_field_lineups: int = 5_000,
         n_field_samples: int = 3,
         payout_arr: Optional[np.ndarray] = None,
@@ -164,6 +165,16 @@ class ContestScorer:
         if ownership_vec is None:
             ownership_vec = compute_heuristic_ownership(players_df, team_totals)
         self._ownership_vec = ownership_vec
+
+        # Field lineup generation uses the full (unfiltered) player pool so that
+        # opponent field lineups reflect the real DFS player universe, not just
+        # the players we chose to include in our own candidate pool.
+        if field_players_df is not None:
+            self._field_players_df = field_players_df
+            self._field_ownership_vec = compute_heuristic_ownership(field_players_df, team_totals)
+        else:
+            self._field_players_df = players_df
+            self._field_ownership_vec = self._ownership_vec
 
         self._cs = ContestSimulator()
 
@@ -207,7 +218,7 @@ class ContestScorer:
         for k in range(self._n_k):
             seed = self._field_seed + k
             raw = self._cs.generate_field(
-                self._players_df, self._ownership_vec,
+                self._field_players_df, self._field_ownership_vec,
                 n_lineups=self._n_field, rng_seed=seed,
             )
             field_raw_list.append(raw)

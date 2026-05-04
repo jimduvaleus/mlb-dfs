@@ -1075,7 +1075,20 @@ button { cursor: pointer; }
   transition: opacity 0.15s, border-color 0.15s;
 }
 
+/* legacy class retained for any remaining refs */
 .game-excluded {
+  opacity: 0.45;
+  border-style: dashed;
+  border-color: #4a5568;
+}
+
+.game-card--candidates {
+  opacity: 0.7;
+  border-style: dashed;
+  border-color: #744210;
+}
+
+.game-card--both {
   opacity: 0.45;
   border-style: dashed;
   border-color: #4a5568;
@@ -1151,6 +1164,40 @@ button { cursor: pointer; }
 }
 
 .btn-game-excluded:hover:not(:disabled) {
+  background: #9b2c2c;
+  color: #fff5f5;
+}
+
+/* scope-based toggle variants */
+.btn-game-toggle--none {
+  background: #2d3748;
+  color: #a0aec0;
+  border-color: #4a5568;
+}
+
+.btn-game-toggle--none:hover:not(:disabled) {
+  background: #4a5568;
+  color: #e2e8f0;
+}
+
+.btn-game-toggle--candidates {
+  background: #744210;
+  color: #fbd38d;
+  border-color: #975a16;
+}
+
+.btn-game-toggle--candidates:hover:not(:disabled) {
+  background: #975a16;
+  color: #fef3c7;
+}
+
+.btn-game-toggle--both {
+  background: #742a2a;
+  color: #feb2b2;
+  border-color: #9b2c2c;
+}
+
+.btn-game-toggle--both:hover:not(:disabled) {
   background: #9b2c2c;
   color: #fff5f5;
 }
@@ -1269,6 +1316,62 @@ button { cursor: pointer; }
 .team-excluded:hover:not(:disabled) {
   background: #4a5568;
   color: #e2e8f0;
+}
+
+/* scope-based team chip variants */
+.team-chip--none {
+  background: #1a3a2a;
+  color: #68d391;
+  border-color: #276749;
+}
+
+.team-chip--none:hover:not(:disabled) {
+  background: #22543d;
+  color: #9ae6b4;
+}
+
+.team-chip--candidates {
+  background: #2d1e00;
+  color: #fbd38d;
+  border-color: #744210;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+}
+
+.team-chip--candidates:hover:not(:disabled) {
+  background: #3d2800;
+  color: #fef3c7;
+}
+
+.team-chip--both {
+  background: #2d2d2d;
+  color: #718096;
+  border-color: #4a5568;
+}
+
+.team-chip--both:hover:not(:disabled) {
+  background: #4a5568;
+  color: #e2e8f0;
+}
+
+.team-chip-scope {
+  font-size: 0.6rem;
+  font-weight: 700;
+  border-radius: 3px;
+  padding: 0 3px;
+  line-height: 1.4;
+}
+
+.team-chip-scope--candidates {
+  background: #744210;
+  color: #fbd38d;
+}
+
+.team-chip-scope--both {
+  background: #4a5568;
+  color: #a0aec0;
 }
 
 .team-chip:disabled {
@@ -1397,6 +1500,59 @@ button { cursor: pointer; }
   border: 1px solid #742a2a;
   border-radius: 20px;
   font-size: 0.8rem;
+}
+
+.excluded-player-chip--candidates {
+  background: #2d1e00;
+  border-color: #744210;
+}
+
+.excluded-player-chip--both {
+  background: #2d1f1f;
+  border-color: #742a2a;
+}
+
+.epc-scope {
+  font-size: 0.65rem;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: opacity 0.1s;
+  white-space: nowrap;
+}
+
+.epc-scope:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.scope-candidates {
+  background: #744210;
+  color: #fbd38d;
+  border-color: #975a16;
+}
+
+.scope-candidates:hover:not(:disabled) {
+  background: #975a16;
+  color: #fef3c7;
+}
+
+.scope-both {
+  background: #742a2a;
+  color: #feb2b2;
+  border-color: #9b2c2c;
+}
+
+.scope-both:hover:not(:disabled) {
+  background: #9b2c2c;
+  color: #fff5f5;
+}
+
+.slate-cands-note {
+  color: #fbd38d;
+  font-size: 0.75rem;
 }
 
 .epc-name {

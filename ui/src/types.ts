@@ -282,9 +282,12 @@ export interface MergeInfo {
 }
 
 // Slate game/team exclusion types
+export type ExclusionScope = 'none' | 'candidates' | 'both'
+
 export interface TeamStatus {
   team: string
   excluded: boolean
+  exclusion_scope: ExclusionScope
 }
 
 export interface GameStatus {
@@ -292,6 +295,7 @@ export interface GameStatus {
   away: string
   home: string
   excluded: boolean
+  exclusion_scope: ExclusionScope
   ppd_pct?: number | null
   teams: TeamStatus[]
   game_start_time?: string | null
@@ -305,8 +309,8 @@ export interface SlateGamesResponse {
 
 export interface ExclusionsUpdate {
   slate_id: string
-  excluded_teams: string[]
-  excluded_games: string[]
+  game_scopes: Record<string, ExclusionScope>
+  team_scopes: Record<string, ExclusionScope>
   game_ppd_pcts?: Record<string, number>
 }
 
@@ -318,6 +322,7 @@ export interface PlayerExclusionStatus {
   team: string
   salary: number
   excluded: boolean
+  exclusion_scope: ExclusionScope
 }
 
 export interface SlatePlayersResponse {
@@ -327,7 +332,7 @@ export interface SlatePlayersResponse {
 
 export interface PlayerExclusionsUpdate {
   slate_id: string
-  excluded_player_ids: number[]
+  player_scopes: Record<string, ExclusionScope>  // key is string(player_id)
 }
 
 export interface TwitterNotification {
