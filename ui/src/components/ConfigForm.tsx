@@ -230,6 +230,18 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <input type="number" min={1} max={10} value={draft.gpp.n_field_samples}
                   onChange={e => setGpp('n_field_samples', Number(e.target.value))} disabled={disabled} />
               </FieldRow>
+              <FieldRow label="Candidate batch size">
+                <input type="number" min={100} step={100} value={draft.gpp.candidate_batch_size}
+                  onChange={e => setGpp('candidate_batch_size', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="Max attempts multiplier">
+                <input type="number" min={1} value={draft.gpp.max_attempts_multiplier}
+                  onChange={e => setGpp('max_attempts_multiplier', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="Holdout fraction (0 = off)">
+                <input type="number" step={0.05} min={0} max={0.5} value={draft.gpp.holdout_fraction}
+                  onChange={e => setGpp('holdout_fraction', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
             </section>
           )}
         </div>

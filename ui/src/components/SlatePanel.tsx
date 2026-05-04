@@ -32,15 +32,28 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
   const [error, setError] = useState<string | null>(null)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
+  const [ppdPcts, setPpdPcts] = useState<Record<string, string>>({})
   const searchRef = useRef<HTMLDivElement>(null)
+
+  const syncPpdFromSlate = useCallback((data: SlateGamesResponse) => {
+    const pcts: Record<string, string> = {}
+    for (const g of data.games) {
+      if (g.ppd_pct != null && g.ppd_pct > 0) {
+        pcts[g.game] = String(g.ppd_pct)
+      }
+    }
+    setPpdPcts(pcts)
+  }, [])
 
   useEffect(() => {
     setSlate(null)
     setPlayers(null)
     setError(null)
+    setPpdPcts({})
     fetchSlateGames()
       .then(data => {
         setSlate(data)
+        syncPpdFromSlate(data)
         if (onProjFetchFilterChange) {
           const slateExcluded = data.games
             .filter(g => g.excluded)
@@ -75,9 +88,14 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
       const excluded_teams = games
         .filter(g => !g.excluded)
         .flatMap(g => g.teams.filter(t => t.excluded).map(t => t.team))
-      return { slate_id: slate?.slate_id ?? '', excluded_games, excluded_teams }
+      const game_ppd_pcts: Record<string, number> = {}
+      for (const [gameKey, val] of Object.entries(ppdPcts)) {
+        const n = parseFloat(val)
+        if (!isNaN(n) && n > 0) game_ppd_pcts[gameKey] = n
+      }
+      return { slate_id: slate?.slate_id ?? '', excluded_games, excluded_teams, game_ppd_pcts }
     },
-    [slate]
+    [slate, ppdPcts]
   )
 
   const persist = useCallback(
@@ -87,6 +105,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
       try {
         const result = await saveSlateExclusions(buildUpdate(updated.games))
         setSlate(result)
+        syncPpdFromSlate(result)
         // Refresh player list since team/game exclusions affect the pool
         const updatedPlayers = await fetchSlatePlayers()
         setPlayers(updatedPlayers)
@@ -96,7 +115,25 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         setSaving(false)
       }
     },
-    [buildUpdate]
+    [buildUpdate, syncPpdFromSlate]
+  )
+
+  const persistPpd = useCallback(
+    async () => {
+      if (!slate || disabled || saving) return
+      setSaving(true)
+      setError(null)
+      try {
+        const result = await saveSlateExclusions(buildUpdate(slate.games))
+        setSlate(result)
+        syncPpdFromSlate(result)
+      } catch (e) {
+        setError(String(e))
+      } finally {
+        setSaving(false)
+      }
+    },
+    [slate, disabled, saving, buildUpdate, syncPpdFromSlate]
   )
 
   const toggleGame = useCallback(
@@ -241,26 +278,43 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
                   <span className="game-time">{formatGameTime(g.game_start_time)}</span>
                 )}
               </div>
-              <div className="game-card-actions">
-                {!g.excluded && (
-                  <button
-                    className={`btn-proj-fetch${fetchSkipped ? ' btn-proj-fetch-off' : ' btn-proj-fetch-on'}`}
-                    onClick={() => toggleProjFetch(gameKey)}
-                    title={fetchSkipped ? 'Include this game in projection fetch' : 'Exclude this game from projection fetch (keeps existing projections for these players)'}
-                  >
-                    {fetchSkipped ? '⊘ Proj' : '↓ Proj'}
-                  </button>
-                )}
-                <button
-                  className={`btn-game-toggle${g.excluded ? ' btn-game-excluded' : ' btn-game-included'}`}
-                  onClick={() => toggleGame(g.game)}
-                  disabled={disabled || saving}
-                  title={g.excluded ? 'Re-include entire game' : 'Exclude entire game'}
-                >
-                  {g.excluded ? 'Excluded' : 'Included'}
-                </button>
-              </div>
+              <button
+                className={`btn-game-toggle${g.excluded ? ' btn-game-excluded' : ' btn-game-included'}`}
+                onClick={() => toggleGame(g.game)}
+                disabled={disabled || saving}
+                title={g.excluded ? 'Re-include entire game' : 'Exclude entire game'}
+              >
+                {g.excluded ? 'Excluded' : 'Included'}
+              </button>
             </div>
+            {!g.excluded && (
+              <div className="game-card-secondary-actions">
+                <button
+                  className={`btn-proj-fetch${fetchSkipped ? ' btn-proj-fetch-off' : ' btn-proj-fetch-on'}`}
+                  onClick={() => toggleProjFetch(gameKey)}
+                  title={fetchSkipped ? 'Include this game in projection fetch' : 'Exclude this game from projection fetch (keeps existing projections for these players)'}
+                >
+                  {fetchSkipped ? '⊘ Proj' : '↓ Proj'}
+                </button>
+                <label className="ppd-label">
+                  PPD
+                  <input
+                    className="ppd-input"
+                    type="number"
+                    min={0}
+                    max={99}
+                    step={1}
+                    placeholder="0"
+                    value={ppdPcts[g.game] ?? ''}
+                    onChange={e => setPpdPcts(prev => ({ ...prev, [g.game]: e.target.value }))}
+                    onBlur={() => persistPpd()}
+                    onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
+                    disabled={disabled || saving}
+                  />
+                  %
+                </label>
+              </div>
+            )}
             <div className="game-teams">
               {g.teams.map(t => (
                 <button

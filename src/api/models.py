@@ -121,6 +121,7 @@ class GameStatus(BaseModel):
     away: str
     home: str
     excluded: bool
+    ppd_pct: float | None = None
     teams: list[TeamStatus]
     game_start_time: str | None = None
 
@@ -135,6 +136,7 @@ class ExclusionsUpdate(BaseModel):
     slate_id: str
     excluded_teams: list[str]
     excluded_games: list[str]
+    game_ppd_pcts: dict[str, float] = {}
 
 
 class PlayerExclusionStatus(BaseModel):

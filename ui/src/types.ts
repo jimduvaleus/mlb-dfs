@@ -120,6 +120,7 @@ export interface ProjectionsStatus {
 export type SSEStage =
   | 'load_slate'
   | 'simulate'
+  | 'ppd_applied'
   | 'compute_target'
   | 'calibrate_beta'
   | 'optimize_lineup'
@@ -291,6 +292,7 @@ export interface GameStatus {
   away: string
   home: string
   excluded: boolean
+  ppd_pct?: number | null
   teams: TeamStatus[]
   game_start_time?: string | null
 }
@@ -305,6 +307,7 @@ export interface ExclusionsUpdate {
   slate_id: string
   excluded_teams: string[]
   excluded_games: string[]
+  game_ppd_pcts?: Record<string, number>
 }
 
 // Player-level exclusion types

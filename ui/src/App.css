@@ -1096,6 +1096,13 @@ button { cursor: pointer; }
   flex-shrink: 0;
 }
 
+.game-card-secondary-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
 .game-label-group {
   display: flex;
   flex-direction: column;
@@ -1184,6 +1191,45 @@ button { cursor: pointer; }
 .btn-proj-fetch-off:hover {
   background: #2d3748;
   color: #718096;
+}
+
+/* PPD % input — compact numeric field in game-card-actions */
+.ppd-label {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 0.68rem;
+  color: #718096;
+  white-space: nowrap;
+  cursor: default;
+}
+
+.ppd-input {
+  width: 40px;
+  padding: 2px 4px;
+  font-size: 0.68rem;
+  background: #1a202c;
+  color: #e2e8f0;
+  border: 1px solid #4a5568;
+  border-radius: 4px;
+  text-align: center;
+  -moz-appearance: textfield;
+}
+
+.ppd-input::-webkit-inner-spin-button,
+.ppd-input::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.ppd-input:focus {
+  outline: none;
+  border-color: #63b3ed;
+}
+
+.ppd-input:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
 }
 
 .game-teams {

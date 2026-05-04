@@ -525,6 +525,7 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
         excluded_teams=update.excluded_teams,
         excluded_games=update.excluded_games,
         excluded_player_ids=existing_player_ids,
+        game_ppd_pcts=update.game_ppd_pcts,
     )
     game_times = _load_slate_games()
     if not game_times:

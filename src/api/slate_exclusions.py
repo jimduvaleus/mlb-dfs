@@ -11,7 +11,7 @@ from pathlib import Path
 
 EXCLUSIONS_PATH = Path(__file__).resolve().parents[2] / "data" / "slate_exclusions.json"
 
-_EMPTY_ENTRY = {"excluded_teams": [], "excluded_games": [], "excluded_player_ids": []}
+_EMPTY_ENTRY = {"excluded_teams": [], "excluded_games": [], "excluded_player_ids": [], "game_ppd_pcts": {}}
 
 
 def compute_slate_id(games: list[str]) -> str:
@@ -80,6 +80,7 @@ def write_exclusions(
     excluded_teams: list[str],
     excluded_games: list[str],
     excluded_player_ids: list[int] | None = None,
+    game_ppd_pcts: dict[str, float] | None = None,
 ) -> None:
     """Persist exclusions for this slate/file combination."""
     EXCLUSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +90,7 @@ def write_exclusions(
         "excluded_teams": excluded_teams,
         "excluded_games": excluded_games,
         "excluded_player_ids": excluded_player_ids or [],
+        "game_ppd_pcts": game_ppd_pcts or {},
     }
     with open(EXCLUSIONS_PATH, "w") as f:
         json.dump(all_data, f, indent=2)
@@ -124,6 +126,7 @@ def get_slate_games_with_status(
     excluded_teams = stored.get("excluded_teams", [])
     excluded_games = stored.get("excluded_games", [])
     excluded_player_ids = stored.get("excluded_player_ids", [])
+    game_ppd_pcts = stored.get("game_ppd_pcts", {})
 
     excluded_teams_set = set(excluded_teams)
     excluded_games_set = set(excluded_games)
@@ -134,12 +137,14 @@ def get_slate_games_with_status(
         away = parts[0] if len(parts) == 2 else game
         home = parts[1] if len(parts) == 2 else ""
         game_excluded = game in excluded_games_set
+        ppd_pct = game_ppd_pcts.get(game)
         result.append(
             {
                 "game": game,
                 "away": away,
                 "home": home,
                 "excluded": game_excluded,
+                "ppd_pct": ppd_pct,
                 "game_start_time": game_times[game] or None,
                 "teams": [
                     {"team": away, "excluded": game_excluded or away in excluded_teams_set},

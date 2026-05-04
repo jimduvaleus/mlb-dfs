@@ -17,6 +17,7 @@ def read_config() -> AppConfig:
         simulation=raw.get("simulation", {}),
         optimizer=raw.get("optimizer", {}),
         portfolio=raw.get("portfolio", {}),
+        gpp=raw.get("gpp", {}),
     )
 
 

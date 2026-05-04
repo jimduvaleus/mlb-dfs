@@ -153,7 +153,7 @@ class PipelineRunner:
             )
 
         players_df = self._apply_twitter_overrides(players_df)
-        players_df, excl_stats = self._apply_exclusions(players_df, slate_path=slate_path)
+        players_df, excl_stats, game_ppd_pcts = self._apply_exclusions(players_df, slate_path=slate_path)
 
         # --- Value cutoff filtering ------------------------------------
         min_p_val = opt_cfg.get("min_pitcher_value")
@@ -223,6 +223,17 @@ class PipelineRunner:
         )
         sim_results = engine.simulate(n_sims)
         logger.info("Simulation complete — matrix: %s", sim_results.results_matrix.shape)
+
+        # --- PPD zeroing ------------------------------------------------
+        if game_ppd_pcts:
+            sim_results, ppd_stats = self._apply_ppd_to_simulation(sim_results, players_df, game_ppd_pcts)
+            self._cb("ppd_applied", {
+                "games": [
+                    {"game": g, "ppd_pct": s["ppd_pct"], "n_sims_zeroed": s["n_sims_zeroed"]}
+                    for g, s in ppd_stats.items()
+                ],
+                "n_sims_total": n_sims,
+            })
 
         # --- Target score -----------------------------------------------
         target = port_cfg.get("target_score")
@@ -815,18 +826,20 @@ class PipelineRunner:
 
         current_games = [g for g in players_df["game"].dropna().unique().tolist() if g]
         if not current_games:
-            return players_df, empty_stats
+            return players_df, empty_stats, {}
 
         slate_file = _Path(slate_path) if slate_path else None
         fingerprint = compute_file_fingerprint(slate_file)
         slate_id = compute_slate_id(current_games)
         stored = read_exclusions(slate_id, fingerprint)
 
+        game_ppd_pcts: dict = {k: v for k, v in stored.get("game_ppd_pcts", {}).items() if v and v > 0}
+
         excluded_games = set(stored.get("excluded_games", []))
         excluded_teams = set(stored.get("excluded_teams", []))
         excluded_player_ids = set(stored.get("excluded_player_ids", []))
         if not excluded_games and not excluded_teams and not excluded_player_ids:
-            return players_df, empty_stats
+            return players_df, empty_stats, game_ppd_pcts
 
         # Count individually excluded players by position (before team/game exclusions)
         ind_excl_df = players_df[players_df["player_id"].isin(excluded_player_ids)]
@@ -850,7 +863,35 @@ class PipelineRunner:
             "n_batters_ind_excluded": n_batters_ind_excluded,
             "n_pitchers_ind_excluded": n_pitchers_ind_excluded,
         }
-        return filtered, excl_stats
+        return filtered, excl_stats, game_ppd_pcts
+
+    @staticmethod
+    def _apply_ppd_to_simulation(
+        sim_results: "SimulationResults",
+        players_df: pd.DataFrame,
+        game_ppd_pcts: dict,
+    ) -> tuple:
+        """Zero out players from PPD'd games in an independent random fraction of simulations.
+
+        Returns (updated SimulationResults, stats dict {game: {ppd_pct, n_sims_zeroed}}).
+        """
+        matrix = sim_results.results_matrix.copy()
+        col_map = {pid: i for i, pid in enumerate(sim_results.player_ids)}
+        rng = np.random.default_rng()
+        stats: dict = {}
+        for game, pct in game_ppd_pcts.items():
+            if not pct or pct <= 0:
+                continue
+            game_pids = players_df[players_df["game"] == game]["player_id"].tolist()
+            cols = [col_map[pid] for pid in game_pids if pid in col_map]
+            if not cols:
+                continue
+            n_ppd = max(1, round(matrix.shape[0] * pct / 100.0))
+            idx = rng.choice(matrix.shape[0], size=n_ppd, replace=False)
+            matrix[np.ix_(idx, cols)] = 0.0
+            stats[game] = {"ppd_pct": pct, "n_sims_zeroed": int(n_ppd)}
+            logger.info("PPD applied: %s (%.0f%%) — %d/%d sims zeroed", game, pct, n_ppd, matrix.shape[0])
+        return SimulationResults(sim_results.player_ids, matrix), stats
 
     @staticmethod
     def _best_lineup_score_distribution(
