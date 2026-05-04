@@ -198,6 +198,29 @@ def test_validation_rejects_unknown_primary(tmp_path):
         DraftKingsSlateIngestor(str(f))
 
 
+@pytest.fixture
+def sample_dk_csv_with_removed_game(tmp_path):
+    """Simulates a DK CSV where one game was pulled from the slate (Game Info = '-')."""
+    csv_content = """ID,Name,Roster Position,Position,Salary,Game Info,TeamAbbrev,AvgPointsPerGame,"Name + ID"
+10001,Shohei Ohtani,P/DH,P,10000,"LAD @ SD 03/20/2026 09:40PM ET",LAD,18.5,"Shohei Ohtani (10001)"
+10002,Freddie Freeman,1B,1B,9000,"LAD @ SD 03/20/2026 09:40PM ET",LAD,12.3,"Freddie Freeman (10002)"
+10010,Juan Soto,OF,OF,6600,-,NYM,8.2,"Juan Soto (10010)"
+10011,Pete Alonso,1B,1B,5800,-,NYM,7.5,"Pete Alonso (10011)"
+10012,Ezequiel Tovar,SS,SS,4800,-,COL,6.1,"Ezequiel Tovar (10012)"
+"""
+    f = tmp_path / "removed_game.csv"
+    f.write_text(csv_content)
+    return str(f)
+
+
+def test_players_from_removed_game_are_excluded(sample_dk_csv_with_removed_game):
+    ingestor = DraftKingsSlateIngestor(sample_dk_csv_with_removed_game)
+    df = ingestor.get_slate_dataframe()
+    assert len(df) == 2
+    assert set(df['team'].tolist()) == {'LAD'}
+    assert df['game'].ne("").all()
+
+
 def test_retrosheet_parser_process_pitching_stats_starters_only():
     # When starters_only=True, only rows with GS == 1 are kept.
     data = {
