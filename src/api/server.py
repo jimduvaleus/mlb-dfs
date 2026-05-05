@@ -1046,7 +1046,7 @@ async def projections_fetch(request: Request):
             return sorted(low, key=lambda x: x["total"])
 
         # Helper: write final merged_df to proj_path, handling partial merge.
-        def _write_proj(merged_df: "pd.DataFrame") -> None:
+        def _write_proj(merged_df: "pd.DataFrame") -> "str | None":
             out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
             result = merged_df[[c for c in out_cols if c in merged_df.columns]]
             if is_partial and proj_path.exists():
@@ -1062,8 +1062,37 @@ async def projections_fetch(request: Request):
                 out_cols2 = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
                 other = other[[c for c in out_cols2 if c in other.columns]]
                 result = pd.concat([other, result], ignore_index=True)
+            # Filter out players no longer on the current slate (e.g. from games that
+            # were postponed and removed from the DK/FD CSV after projections were fetched).
+            warn_msg: "str | None" = None
+            if _slate_path_for_meta is not None and _slate_path_for_meta.exists():
+                try:
+                    if platform_val == "fanduel":
+                        _id_col = pd.read_csv(_slate_path_for_meta, usecols=["Id"])
+                        _current_pids: set = set(
+                            pd.to_numeric(
+                                _id_col["Id"].astype(str).str.split("-").str[-1], errors="coerce"
+                            ).dropna().astype(int)
+                        )
+                    else:
+                        _id_col = pd.read_csv(_slate_path_for_meta, usecols=["ID"])
+                        _current_pids = set(pd.to_numeric(_id_col["ID"], errors="coerce").dropna().astype(int))
+                    _before = len(result)
+                    if "player_id" in result.columns:
+                        result = result[
+                            pd.to_numeric(result["player_id"], errors="coerce").isin(_current_pids)
+                        ].copy()
+                    _n_dropped = _before - len(result)
+                    if _n_dropped:
+                        warn_msg = (
+                            f"Removed {_n_dropped} stale projection row(s) for player(s) "
+                            f"no longer on the current slate — likely from a postponed game."
+                        )
+                except Exception:
+                    pass
             result = result.sort_values("mean", ascending=False).reset_index(drop=True)
             result.to_csv(proj_path, index=False)
+            return warn_msg
 
         # Helper: inject confirmed Twitter lineup players missing from pool.
         # The projection sources only output their own "confirmed starter" pool;
@@ -1268,7 +1297,9 @@ async def projections_fetch(request: Request):
                             )
 
                         pool = _inject_twitter_confirmed(pool)
-                        _write_proj(pool)
+                        _stale_warn = _write_proj(pool)
+                        if _stale_warn:
+                            yield _log(f"Warning: {_stale_warn}")
                         proj_written = True
 
                         # Build capped_players list from the caps sidecar + pool.
@@ -1433,7 +1464,9 @@ async def projections_fetch(request: Request):
                         ]
 
                     pool = _inject_twitter_confirmed(pool)
-                    _write_proj(pool)
+                    _stale_warn = _write_proj(pool)
+                    if _stale_warn:
+                        yield _log(f"Warning: {_stale_warn}")
                     proj_written = True
 
                     low_team_projs2 = _low_team_projections(pool, _itm2)

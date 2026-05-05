@@ -759,6 +759,24 @@ class PipelineRunner:
         )
         if proj_df is not None:
             proj = proj_df.copy().rename(columns={"mu": "mean", "sigma": "std_dev"})
+            # Warn if the projections file has players not on the current slate.
+            # This happens when projections were fetched before a game was postponed
+            # and its teams removed from the DK/FD CSV.  The LEFT join below drops
+            # them silently, but surfacing this helps diagnose stale projections.
+            _slate_pids = set(pd.to_numeric(df["player_id"], errors="coerce").dropna().astype(int))
+            _proj_pids  = set(pd.to_numeric(proj["player_id"], errors="coerce").dropna().astype(int))
+            _stale = _proj_pids - _slate_pids
+            if _stale:
+                _stale_names = (
+                    proj[proj["player_id"].isin(_stale)]["name"].tolist()
+                    if "name" in proj.columns else list(_stale)
+                )
+                logger.warning(
+                    "Projections file has %d player(s) not on the current slate "
+                    "(possibly from a postponed game — they will be excluded): %s",
+                    len(_stale),
+                    ", ".join(str(n) for n in _stale_names[:20]),
+                )
             proj_cols = ["player_id", "mean", "std_dev"]
             if "lineup_slot" in proj.columns:
                 proj_cols.append("lineup_slot")
@@ -1023,10 +1041,21 @@ class PipelineRunner:
             mm, dd, yyyy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
             archive_dir = _Path(__file__).resolve().parents[2] / "archive" / f"{mm}{dd}{yyyy}"
         if archive_dir is None or not archive_dir.exists():
-            # Fall back to today's date
-            from datetime import date as _date
-            today = _date.today().strftime("%m%d%Y")
-            archive_dir = _Path(__file__).resolve().parents[2] / "archive" / today
+            # Fall back to slate date from Game Info column in DKSalaries.csv
+            slate_file = _Path(slate_path) if slate_path else None
+            if slate_file and slate_file.exists():
+                try:
+                    import csv as _csv
+                    with open(slate_file, newline="") as _f:
+                        for row in _csv.DictReader(_f):
+                            game_info = row.get("Game Info", "")
+                            dm = _re.search(r'(\d{2})/(\d{2})/(\d{4})', game_info)
+                            if dm:
+                                mm, dd, yyyy = dm.group(1), dm.group(2), dm.group(3)
+                                archive_dir = _Path(__file__).resolve().parents[2] / "archive" / f"{mm}{dd}{yyyy}"
+                                break
+                except Exception:
+                    pass
         totals_path = archive_dir / "dff_team_totals.csv" if archive_dir else None
         if totals_path is None or not totals_path.exists():
             return None
