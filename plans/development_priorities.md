@@ -1,5 +1,3 @@
 - BIG late swap?
 - I think we're overestimating ownership % at top implied total end. might need to stop scaling after some cap of like 6.5 runs
 - I think we're underestimating ownership % for pitchers with low opposing implied total
-- let's fix up how we indicate candidate vs full exclude - make auto exclusion from projections a candidate exclude
-- make a full exclude impact projected ownership %??

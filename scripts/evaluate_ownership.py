@@ -27,6 +27,8 @@ Models evaluated
   E. compute_heuristic_ownership() — full model with sqrt compression, batting
      order multiplier, pitcher matchup boost, and multi-position eligibility.
      Requires dff_team_totals.csv and lineup_slot in dff_projections.csv.
+  F. Model E + mean-only batters + salary-cap pressure + softer softmax +
+     pitcher co-stack boost + pitcher pool compression.
 """
 
 import argparse
@@ -164,8 +166,12 @@ def _build_player_pool(
     archive_dir: Path,
 ) -> pd.DataFrame:
     """
-    Load DKSalaries.csv and dff_projections.csv from archive_dir, join on
-    player_id, and compute features needed for ownership models.
+    Load DKSalaries.csv and projections from archive_dir, join on player_id,
+    and compute features needed for ownership models.
+
+    Projection source priority (mirrors live app "Market Odds" mode):
+      1. market_odds_projections.csv — mean/std_dev for players that have it.
+      2. dff_projections.csv — mean/std_dev fallback + lineup_slot for all players.
 
     Returns a DataFrame with columns:
         player_id, name, salary, position, eligible_positions, team, opponent,
@@ -173,6 +179,7 @@ def _build_player_pool(
     """
     salary_path = archive_dir / "DKSalaries.csv"
     dff_path    = archive_dir / "dff_projections.csv"
+    mo_path     = archive_dir / "market_odds_projections.csv"
 
     if not salary_path.exists():
         raise FileNotFoundError(f"DKSalaries.csv not found in {archive_dir}")
@@ -202,13 +209,27 @@ def _build_player_pool(
         ["player_id", "name", "salary", "position", "eligible_positions", "team", "opponent", "game"]
     ].drop_duplicates("player_id")
 
-    proj_df = pd.read_csv(dff_path)
-    proj_df["player_id"] = proj_df["player_id"].astype(int)
-    proj_cols = ["player_id", "mean", "std_dev"]
-    if "lineup_slot" in proj_df.columns:
-        proj_cols.append("lineup_slot")
+    # Load DFF for lineup_slot (and as mean/std_dev fallback).
+    dff_df = pd.read_csv(dff_path)
+    dff_df["player_id"] = dff_df["player_id"].astype(int)
+    dff_cols = ["player_id", "mean", "std_dev"]
+    if "lineup_slot" in dff_df.columns:
+        dff_cols.append("lineup_slot")
 
-    merged = sal_df.merge(proj_df[proj_cols], on="player_id", how="left")
+    # Load market odds if present and overlay mean/std_dev (mirrors live "Market Odds" source).
+    if mo_path.exists():
+        mo_df = pd.read_csv(mo_path)
+        mo_df["player_id"] = mo_df["player_id"].astype(int)
+        mo_lookup = mo_df.set_index("player_id")[["mean", "std_dev"]]
+        dff_df = dff_df.copy()
+        has_mo = dff_df["player_id"].isin(mo_lookup.index)
+        dff_df.loc[has_mo, "mean"]    = dff_df.loc[has_mo, "player_id"].map(mo_lookup["mean"])
+        dff_df.loc[has_mo, "std_dev"] = dff_df.loc[has_mo, "player_id"].map(mo_lookup["std_dev"])
+        print(f"  Projections: market_odds for {has_mo.sum()} players, DFF fallback for {(~has_mo).sum()}")
+    else:
+        print(f"  Projections: DFF only (no market_odds_projections.csv)")
+
+    merged = sal_df.merge(dff_df[dff_cols], on="player_id", how="left")
     merged = merged.dropna(subset=["mean"])  # only projected starters
 
     merged["salary_value"] = merged["mean"] / merged["salary"] * 1000
@@ -307,22 +328,177 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
 
     # Model E: compute_heuristic_ownership — sqrt compression, batting order
     # multiplier, pitcher matchup boost, multi-position eligibility.
+    team_totals: dict[str, float] | None = None
+    if pool_df["implied_total"].notna().any():
+        team_totals = (
+            pool_df[["team", "implied_total"]]
+            .dropna(subset=["implied_total"])
+            .drop_duplicates("team")
+            .set_index("team")["implied_total"]
+            .to_dict()
+        )
     try:
         from src.optimization.ownership import compute_heuristic_ownership
-        team_totals: dict[str, float] | None = None
-        if pool_df["implied_total"].notna().any():
-            team_totals = (
-                pool_df[["team", "implied_total"]]
-                .dropna(subset=["implied_total"])
-                .drop_duplicates("team")
-                .set_index("team")["implied_total"]
-                .to_dict()
-            )
         models["E_full"] = compute_heuristic_ownership(pool_df, team_totals)
     except Exception as exc:
         print(f"  [Model E skipped: {exc}]")
 
+    # Model F: mean-only raw score, salary cap pressure, softer softmax,
+    # pitcher own-team co-stack boost, pitcher pool compression.
+    try:
+        models["F_new"] = _compute_model_f(pool_df, team_totals)
+    except Exception as exc:
+        print(f"  [Model F skipped: {exc}]")
+
     return models
+
+
+def _compute_model_f(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+) -> np.ndarray:
+    """
+    Model F — experimental improvements over E:
+
+    1. Mean-only raw score: drop salary_value (Spearman vs actual = 0.23 for
+       batters; it adds noise rather than signal).
+    2. Salary-cap pressure: soft batter penalty (4500/salary)^0.5 for players
+       priced above the ~75th-percentile batter salary ($4500). Accounts for
+       the $50k cap making expensive players harder to roster alongside stacks.
+    3. Softer within-position softmax: std floor raised to 0.7 for batters
+       (from 0.4 in E) to prevent one outlier from consuming the position pool.
+    4. Pitcher own-team co-stack boost: pitchers on high-implied teams see
+       elevated ownership because the field stacks that offense and often
+       correlates the pitcher. Boost = (own_team_total / mean_total)^0.5.
+    5. Pitcher pool compression: post-softmax blend of 70% softmax + 30% uniform
+       within the pitcher position. Empirical pitcher ownership is much flatter
+       than softmax alone produces.
+    """
+    from src.optimization.ownership import (
+        _BATTING_ORDER_MULT, _SLOT_COUNTS, _SECONDARY_POSITION_DISCOUNT,
+        _BATTER_TOTAL_CAP, _PITCHER_MATCHUP_EXP,
+    )
+
+    _BATTER_STD_FLOOR   = 0.7   # softer than E's 0.4; swept over [0.4–0.7], 0.7 optimal
+    _PITCHER_STD_FLOOR  = 0.4   # unchanged
+    _PITCHER_COMPRESS   = 0.20  # fraction blended toward uniform; 0.20 > 0.30 in sweep
+    _COSTACK_EXP        = 0.40  # own-team boost exponent for pitchers; minimal sensitivity
+    _CAP_PER_BATTER     = 4500  # ~75th-pct batter salary; penalty above this
+
+    df = pool_df.copy().reset_index(drop=True)
+    df["_sv"] = df["mean"] / (df["salary"] / 1000.0)
+
+    # 1. Raw score: mean-only for batters; mean + salary_value for pitchers.
+    # salary_value has Spearman 0.77 vs actual ownership for pitchers (vs 0.23
+    # for batters), so it carries real signal in the pitcher pool.
+    pitcher_mask = df["position"] == "P"
+    df["_raw"] = np.sqrt(df["mean"].clip(lower=0))
+    df.loc[pitcher_mask, "_raw"] = (
+        0.8 * np.sqrt(df.loc[pitcher_mask, "mean"].clip(lower=0))
+        + 0.2 * np.sqrt(df.loc[pitcher_mask, "_sv"].clip(lower=0))
+    )
+
+    # 2. Batting order multiplier (same as E)
+    slot_col = (
+        "lineup_slot" if "lineup_slot" in df.columns
+        else ("slot" if "slot" in df.columns else None)
+    )
+    if slot_col:
+        batter_mask = df["position"] != "P"
+        for batting_slot, mult in _BATTING_ORDER_MULT.items():
+            mask = batter_mask & (df[slot_col] == batting_slot)
+            df.loc[mask, "_raw"] *= mult
+
+    # 3. Salary-cap pressure on batters
+    batter_mask = df["position"] != "P"
+    df.loc[batter_mask, "_raw"] *= np.minimum(
+        1.0,
+        (_CAP_PER_BATTER / df.loc[batter_mask, "salary"]) ** 0.5,
+    )
+
+    # 4. Implied-total boosts (batter team total + pitcher matchup + co-stack)
+    if team_totals:
+        vals = [v for v in team_totals.values() if v and v > 0]
+        mean_total = float(np.mean(vals)) if vals else 1.0
+        batter_mask = df["position"] != "P"
+        pitcher_mask = df["position"] == "P"
+        df["_boost"] = 1.0
+
+        # Pass A: batter team-total boost + pitcher opponent-matchup boost
+        for team, total in team_totals.items():
+            if not (total and total > 0 and mean_total > 0):
+                continue
+            capped = min(total, _BATTER_TOTAL_CAP)
+            mask_b = batter_mask & (df["team"] == team)
+            df.loc[mask_b, "_boost"] = capped / mean_total
+            if "opponent" in df.columns:
+                mask_p = pitcher_mask & (df["opponent"] == team)
+                df.loc[mask_p, "_boost"] = (mean_total / capped) ** _PITCHER_MATCHUP_EXP
+
+        # Pass B: multiply in own-team co-stack boost for pitchers
+        if "opponent" in df.columns:
+            for team, total in team_totals.items():
+                if not (total and total > 0 and mean_total > 0):
+                    continue
+                capped = min(total, _BATTER_TOTAL_CAP)
+                mask_own = pitcher_mask & (df["team"] == team)
+                df.loc[mask_own, "_boost"] *= (capped / mean_total) ** _COSTACK_EXP
+
+        df["_raw"] *= df["_boost"]
+
+    # 5. Per-position softmax with softer floor + pitcher compression
+    use_eligible = "eligible_positions" in df.columns
+    df["ownership"] = 0.0
+
+    if use_eligible:
+        all_pos: set[str] = set()
+        for ep in df["eligible_positions"]:
+            if isinstance(ep, list):
+                all_pos.update(ep)
+            else:
+                all_pos.add(str(ep))
+        pos_iter = all_pos
+    else:
+        pos_iter = set(df["position"].unique())
+
+    for pos in pos_iter:
+        if use_eligible:
+            mask = df["eligible_positions"].apply(
+                lambda ep, p=pos: p in ep if isinstance(ep, list) else str(ep) == p
+            )
+        else:
+            mask = df["position"] == pos
+
+        if not mask.any():
+            continue
+
+        raw_vals = df.loc[mask, "_raw"].values.astype(float)
+        n_slots  = _SLOT_COUNTS.get(pos, 1)
+        is_p     = pos == "P"
+        std_floor = _PITCHER_STD_FLOOR if is_p else _BATTER_STD_FLOOR
+
+        std = raw_vals.std()
+        shifted  = (raw_vals - raw_vals.mean()) / max(std, std_floor)
+        exp_vals = np.exp(shifted)
+        softmax_share = exp_vals / exp_vals.sum()
+
+        if is_p:
+            # Blend softmax toward uniform to flatten the pitcher pool
+            uniform_share = np.ones(len(raw_vals)) / len(raw_vals)
+            share = (1 - _PITCHER_COMPRESS) * softmax_share + _PITCHER_COMPRESS * uniform_share
+        else:
+            share = softmax_share
+
+        contribution = share * n_slots
+
+        if use_eligible:
+            is_primary = (df.loc[mask, "position"] == pos).values
+            discount = np.where(is_primary, 1.0, _SECONDARY_POSITION_DISCOUNT)
+            df.loc[mask, "ownership"] += contribution * discount
+        else:
+            df.loc[mask, "ownership"] += contribution
+
+    return df["ownership"].values.astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
