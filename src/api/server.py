@@ -773,14 +773,42 @@ def projections_players():
                         merged.loc[mask, "lineup_slot"] = slot
                         merged.loc[mask, "slot_confirmed"] = True
 
+        # Players in "both"-excluded games are zeroed out and not factored into
+        # the ownership softmax at all — their projections are irrelevant to the slate.
+        both_excl_pids: set = set()
+        if "game" in slate_df.columns:
+            try:
+                from .slate_exclusions import compute_slate_id
+                _games = [str(g) for g in slate_df["game"].dropna().unique()]
+                _sid = compute_slate_id(_games)
+                _fp = compute_file_fingerprint(_get_slate_file_path())
+                _excl = read_exclusions(_sid, _fp)
+                _both_games = set(_excl.get("excluded_games", []))
+                if _both_games:
+                    both_excl_pids = set(
+                        slate_df.loc[slate_df["game"].isin(_both_games), "player_id"].dropna().astype(int)
+                    )
+            except Exception:
+                pass
+
         # Compute heuristic ownership — Model D if team totals available, else C.
         try:
             from src.optimization.ownership import compute_heuristic_ownership
             from .pipeline import PipelineRunner
             slate_path = _get_slate_file_path()
             team_totals = PipelineRunner._load_team_totals(str(slate_path) if slate_path else "")
-            ow_vec = compute_heuristic_ownership(merged, team_totals)
-            ow_pct = (ow_vec * 100).round(1).tolist()
+            excl_mask = merged["player_id"].isin(both_excl_pids) if both_excl_pids else pd.Series(False, index=merged.index)
+            non_excl = merged[~excl_mask]
+            if non_excl.empty:
+                ow_pct = [0.0] * len(merged)
+            else:
+                ow_sub = compute_heuristic_ownership(non_excl, team_totals)
+                ow_pct = [0.0] * len(merged)
+                sub_i = 0
+                for i, is_excl in enumerate(excl_mask):
+                    if not is_excl:
+                        ow_pct[i] = round(float(ow_sub[sub_i]) * 100, 1)
+                        sub_i += 1
         except Exception:
             ow_pct = [None] * len(merged)
 

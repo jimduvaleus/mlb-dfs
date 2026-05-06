@@ -381,7 +381,7 @@ export default function App() {
           <SlatePanel
             disabled={running}
             projFetchExcluded={projFetchExcluded}
-            onProjFetchFilterChange={setProjFetchExcluded}
+            onProjFetchFilterChange={(excluded) => { setProjFetchExcluded(excluded); refreshProjectionPlayers() }}
             platform={state.config?.platform}
             notifications={state.notifications}
             onDismissNotification={(id) => {
