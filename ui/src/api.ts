@@ -25,6 +25,12 @@ export async function fetchProjectionsStatus(): Promise<ProjectionsStatus> {
   return res.json()
 }
 
+export async function fetchMergeInfoState(): Promise<Record<string, unknown>> {
+  const res = await fetch('/api/projections/merge_info')
+  if (!res.ok) return {}
+  return res.json()
+}
+
 export async function fetchUnconfirmedPlayerIds(): Promise<number[]> {
   const res = await fetch('/api/projections/unconfirmed')
   if (!res.ok) return []

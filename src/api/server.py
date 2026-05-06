@@ -698,6 +698,20 @@ def projections_status() -> ProjectionsStatus:
     )
 
 
+@app.get("/api/projections/merge_info")
+def projections_merge_info():
+    """Return the persisted merge_info state from the last projection fetch."""
+    cfg = read_config()
+    p   = _resolve_proj_path(cfg)
+    state_path = p.parent / (p.stem + "_merge_info.json")
+    if not state_path.exists():
+        return {}
+    try:
+        return json.loads(state_path.read_text())
+    except Exception:
+        return {}
+
+
 @app.get("/api/projections/unconfirmed")
 def projections_unconfirmed():
     cfg = read_config()
@@ -1004,9 +1018,11 @@ async def projections_fetch(request: Request):
         dff_out    = proj_path.parent / "projections_dff.csv"
         rw_out     = proj_path.parent / "projections_rw.csv"
         mo_out     = proj_path.parent / "projections_mo.csv"
-        mo_sidecar        = proj_path.parent / "projections_mo_fallback.json"
-        mo_caps_path      = proj_path.parent / "projections_mo_caps.json"
+        mo_sidecar          = proj_path.parent / "projections_mo_fallback.json"
+        mo_caps_path        = proj_path.parent / "projections_mo_caps.json"
         mo_missing_opt_path = proj_path.parent / "projections_mo_missing_opt.json"
+        # Persistent across partial fetches; overwritten only on a full fetch.
+        merge_info_state_path = proj_path.parent / (proj_path.stem + "_merge_info.json")
 
         def _log(msg: str) -> str:
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
@@ -1054,6 +1070,20 @@ async def projections_fetch(request: Request):
                 return {int(k): v for k, v in raw.items()}
             except Exception:
                 return {}
+
+        def _load_merge_info_state() -> dict:
+            if not merge_info_state_path.exists():
+                return {}
+            try:
+                return json.loads(merge_info_state_path.read_text())
+            except Exception:
+                return {}
+
+        def _save_merge_info_state(state: dict) -> None:
+            try:
+                merge_info_state_path.write_text(json.dumps(state, indent=2))
+            except Exception:
+                pass
 
         # Helper: build the id_to_team map if not already built (non-partial paths).
         def _ensure_id_to_team() -> dict[int, str]:
@@ -1410,7 +1440,26 @@ async def projections_fetch(request: Request):
                                     })
 
                         low_team_projs = _low_team_projections(pool, _itm)
+
+                        # Merge with persisted state for partial fetches: purge
+                        # entries for teams we just re-fetched, keep the rest.
+                        if is_partial and included_teams:
+                            _prev = _load_merge_info_state()
+                            def _purge(lst: list[dict]) -> list[dict]:
+                                return [x for x in lst if x.get("team", "") not in included_teams]
+                            fallback_players    = _purge(_prev.get("players", []))         + fallback_players
+                            capped_players      = _purge(_prev.get("capped_players", []))  + capped_players
+                            missing_opt_players = _purge(_prev.get("missing_opt_players", [])) + missing_opt_players
+
                         fallback_teams = _whole_team_fallbacks(fallback_players, _ensure_team_to_game())
+
+                        _save_merge_info_state({
+                            "players":             fallback_players,
+                            "capped_players":      capped_players,
+                            "missing_opt_players": missing_opt_players,
+                            "fallback_teams":      fallback_teams,
+                            "secondary_source":    "RotoWire",
+                        })
 
                         if fallback_players or capped_players or low_team_projs or missing_opt_players:
                             result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'timestamp': int(time.time() * 1000)})}\n\n"

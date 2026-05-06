@@ -5,7 +5,7 @@ const MARKET_DISPLAY: Record<string, string> = {
   singles: '1B', doubles: '2B', triples: '3B', home_runs: 'HR',
   stolen_bases: 'SB', walks: 'BB', runs: 'R', rbis: 'RBI',
 }
-import { fetchProjectionsStatus, fetchSlatePlayers, savePlayerExclusions } from '../api'
+import { fetchMergeInfoState, fetchProjectionsStatus, fetchSlatePlayers, savePlayerExclusions } from '../api'
 
 interface Props {
   disabled?: boolean
@@ -42,6 +42,22 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
 
   useEffect(() => {
     refreshStatus()
+    fetchMergeInfoState().then(state => {
+      const players = (state.players ?? []) as MergeInfo['players']
+      const cappedPlayers = (state.capped_players ?? []) as CappedPlayer[]
+      const missingOptPlayers = (state.missing_opt_players ?? []) as MissingOptPlayer[]
+      if (players.length || cappedPlayers.length || missingOptPlayers.length) {
+        const fallbackTeams = (state.fallback_teams ?? []) as FallbackTeam[]
+        onMergeInfo({
+          secondarySource: (state.secondary_source as string) || 'RotoWire',
+          count: players.length,
+          players,
+          cappedPlayers,
+          missingOptPlayers,
+          fallbackTeams,
+        })
+      }
+    }).catch(() => {})
     return () => esRef.current?.close()
   }, [])
 
