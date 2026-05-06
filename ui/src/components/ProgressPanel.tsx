@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, OptimizeLineupEvent, GppScoreProgressEvent, GppSelectProgressEvent } from '../types'
+import type { SSEEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -70,6 +70,7 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_generate_done' ||
       last?.stage === 'gpp_score_start' ||
       last?.stage === 'gpp_score_progress' ||
+      last?.stage === 'gpp_score_done' ||
       last?.stage === 'gpp_select_progress'
     if (!isLiveProgressEvent) return
 
@@ -112,6 +113,10 @@ export function ProgressPanel({ events, running }: Props) {
   const lineupEvents = events.filter(e => e.stage === 'optimize_lineup') as OptimizeLineupEvent[]
 
   // --- GPP progress ---
+  const generateStartEvent = events.find(e => e.stage === 'gpp_generate_start') as unknown as { n_candidates: number } | undefined
+  const generateProgressEvents = events.filter(e => e.stage === 'gpp_generate_progress') as unknown as GppGenerateProgressEvent[]
+  const latestGenerateProgress = generateProgressEvents[generateProgressEvents.length - 1]
+  const generateDone = events.some(e => e.stage === 'gpp_generate_done')
   const scoreProgressEvents = events.filter(e => e.stage === 'gpp_score_progress') as unknown as GppScoreProgressEvent[]
   const latestScoreProgress = scoreProgressEvents[scoreProgressEvents.length - 1]
   const selectProgressEvents = events.filter(e => e.stage === 'gpp_select_progress') as unknown as GppSelectProgressEvent[]
@@ -126,7 +131,13 @@ export function ProgressPanel({ events, running }: Props) {
     } else if (latestScoreProgress) {
       gppPct = Math.round((latestScoreProgress.batches_done / latestScoreProgress.batches_total) * 100)
       gppLabel = `Scoring batch ${latestScoreProgress.batches_done} / ${latestScoreProgress.batches_total}`
-    } else if (events.some(e => e.stage === 'gpp_generate_start')) {
+    } else if (generateDone) {
+      gppPct = 100
+      gppLabel = 'Candidates generated'
+    } else if (latestGenerateProgress && generateStartEvent) {
+      gppPct = Math.round((latestGenerateProgress.n / generateStartEvent.n_candidates) * 100)
+      gppLabel = `Generating candidates: ${latestGenerateProgress.n.toLocaleString()} / ${generateStartEvent.n_candidates.toLocaleString()}`
+    } else if (generateStartEvent) {
       gppPct = 0
       gppLabel = 'Generating candidates…'
     }
@@ -135,7 +146,15 @@ export function ProgressPanel({ events, running }: Props) {
   // --- ETA ---
   let etaMs: number | null = null
   if (isGpp) {
-    if (running && latestScoreProgress && !scoreDone) {
+    if (running && latestGenerateProgress && !generateDone && generateStartEvent) {
+      const recent = generateProgressEvents.slice(-4)
+      if (recent.length >= 2) {
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const avgPerChunk = recentElapsed / (recent.length - 1)
+        const remainingChunks = (generateStartEvent.n_candidates - latestGenerateProgress.n) / 500
+        if (remainingChunks > 0) etaMs = avgPerChunk * remainingChunks
+      }
+    } else if (running && latestScoreProgress && !scoreDone) {
       const recent = scoreProgressEvents.slice(-4)
       if (recent.length >= 2) {
         const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp

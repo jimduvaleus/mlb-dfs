@@ -222,6 +222,11 @@ export interface ContestEvCompleteEvent extends SSEEvent {
   ev_results: ContestEvResult[]
 }
 
+export interface GppGenerateProgressEvent extends SSEEvent {
+  stage: 'gpp_generate_progress'
+  n: number
+}
+
 export interface GppScoreProgressEvent extends SSEEvent {
   stage: 'gpp_score_progress'
   batches_done: number
