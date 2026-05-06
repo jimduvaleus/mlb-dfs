@@ -42,6 +42,7 @@ import asyncio
 import difflib
 import json
 import logging
+import os
 import re
 import sys
 import unicodedata
@@ -278,6 +279,15 @@ _SLATE_LINK_RE = _make_slate_link_re(DK_URL_SEGMENT)
 _DATE_LINK_RE  = _make_date_link_re(DK_URL_SEGMENT)
 
 
+def _playwright_proxy() -> dict | None:
+    """Return a Playwright proxy dict from env vars, or None if not set."""
+    for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+        val = os.environ.get(var)
+        if val:
+            return {"server": val}
+    return None
+
+
 def _projections_base(url_segment: str) -> str:
     return f"{BASE_URL}/mlb/projections/{url_segment}"
 
@@ -433,7 +443,7 @@ async def _fetch_rows_playwright(
     proj_base = _projections_base(url_segment)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(headless=True, proxy=_playwright_proxy())
         page = await browser.new_page()
 
         if slate_override and target_date:
@@ -607,7 +617,7 @@ async def _list_slates_playwright(
     proj_base = _projections_base(url_segment)
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(headless=True, proxy=_playwright_proxy())
         page = await browser.new_page()
         await page.goto(proj_base, wait_until="domcontentloaded")
         await page.wait_for_selector("tr.projections-listing", timeout=20000)

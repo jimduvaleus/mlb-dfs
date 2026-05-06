@@ -28,6 +28,10 @@ if [ ! -f "$UI_DIR/dist/index.html" ] || \
     cd "$REPO_ROOT"
 fi
 
+# Forward proxy settings so the server and its subprocesses can reach the internet.
+export HTTP_PROXY="${HTTP_PROXY:-http://localhost:3128}"
+export HTTPS_PROXY="${HTTPS_PROXY:-http://localhost:3128}"
+
 # Activate virtualenv and start the server
 source "$REPO_ROOT/venv/bin/activate"
 

@@ -55,6 +55,7 @@ import difflib
 import json
 import logging
 import math
+import os
 import re
 import sys
 import unicodedata
@@ -1490,6 +1491,13 @@ async def _run_playwright(
     """
     from playwright.async_api import async_playwright
 
+    def _playwright_proxy() -> dict | None:
+        for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
+            val = os.environ.get(var)
+            if val:
+                return {"server": val}
+        return None
+
     if platform == "fanduel":
         slate_date = _extract_date_from_fd_path(slate_path)
         if not slate_date:
@@ -1542,7 +1550,7 @@ async def _run_playwright(
             game_id_map = None
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(headless=True, proxy=_playwright_proxy())
         # One shared context so that the devig cookie set in Phase 0 persists
         # to every page opened in Phases 1-3.  browser.new_page() creates a
         # separate context per call — cookies don't carry over when that page

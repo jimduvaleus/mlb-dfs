@@ -32,6 +32,7 @@ import argparse
 import difflib
 import json
 import logging
+import os
 import re
 import sys
 import unicodedata
@@ -154,8 +155,20 @@ def _load_name_map(path: str | Path | None) -> dict[str, str]:
 # HTTP
 # ---------------------------------------------------------------------------
 
+def _proxies() -> dict | None:
+    """Build a proxies dict from standard env vars (HTTP_PROXY / HTTPS_PROXY)."""
+    result = {}
+    for scheme in ("http", "https"):
+        for var in (f"{scheme}_proxy", f"{scheme.upper()}_PROXY"):
+            val = os.environ.get(var)
+            if val:
+                result[scheme] = val
+                break
+    return result or None
+
+
 def _get(url: str, params: dict | None = None, debug: bool = False) -> dict | list:
-    resp = requests.get(url, params=params, headers=HEADERS, timeout=15)
+    resp = requests.get(url, params=params, headers=HEADERS, timeout=15, proxies=_proxies())
     resp.raise_for_status()
     if debug:
         log.debug("GET %s\n%s", resp.url, resp.text[:3000])
