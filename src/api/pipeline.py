@@ -571,6 +571,7 @@ class PipelineRunner:
 
         # Store raw artifacts for on-demand upload file writing.
         self._raw_portfolio = portfolio
+        self._discarded_lineups: set[frozenset] = set()
         self._all_file_entries = all_file_entries
         self._entry_handlers = entry_handlers
         self._slate_df = slate_df
@@ -646,16 +647,55 @@ class PipelineRunner:
 
         idx = lineup_index - 1
         deleted_lineup, _ = self._raw_portfolio[idx]
-        deleted_player_set = frozenset(deleted_lineup.player_ids)
         remaining = self._raw_portfolio[:idx] + self._raw_portfolio[idx + 1:]
+
+        # Accumulate discarded lineups across repeated replacements so no
+        # deleted lineup is ever re-inserted into the portfolio.
+        if not hasattr(self, '_discarded_lineups'):
+            self._discarded_lineups: set[frozenset] = set()
+        self._discarded_lineups.add(frozenset(deleted_lineup.player_ids))
 
         full_matrix = self._sim_results.results_matrix
         col_map = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
 
-        # Request enough candidates to find one that differs from the deleted lineup.
-        n_candidates = 5
+        if self._objective == "leverage_surplus":
+            # GPP path: pick next-best candidate from the pre-scored pool.
+            if not hasattr(self, '_gpp_candidates') or not hasattr(self, '_gpp_robust_payout'):
+                raise RuntimeError("GPP artifacts unavailable — please re-run the portfolio")
 
-        if self._objective == "marginal_payout":
+            from src.optimization.gpp_portfolio import _compute_marginal_ev as _gpp_marginal_ev
+
+            # Build pid-set → candidate-index map.
+            cand_pid_sets = [frozenset(lu.player_ids) for lu in self._gpp_candidates]
+            pid_set_to_ci = {ps: ci for ci, ps in enumerate(cand_pid_sets)}
+
+            # Excluded = remaining portfolio lineups + all previously discarded lineups.
+            remaining_pid_sets = {frozenset(lu.player_ids) for lu, _ in remaining}
+            excluded = remaining_pid_sets | self._discarded_lineups
+
+            # Seed best_payout from remaining portfolio lineups.
+            n_sims_gpp = self._gpp_robust_payout.shape[1]
+            best_payout = np.zeros(n_sims_gpp, dtype=np.float32)
+            for lu, _ in remaining:
+                ci = pid_set_to_ci.get(frozenset(lu.player_ids))
+                if ci is not None:
+                    np.maximum(best_payout, self._gpp_robust_payout[ci], out=best_payout)
+
+            avail = np.array(
+                [ci for ci, ps in enumerate(cand_pid_sets) if ps not in excluded],
+                dtype=np.int32,
+            )
+            if len(avail) == 0:
+                raise RuntimeError(
+                    "No available candidates remain after excluding discarded lineups"
+                )
+
+            marginal_ev_vals = _gpp_marginal_ev(self._gpp_robust_payout, best_payout, avail)
+            best_local = int(np.argmax(marginal_ev_vals))
+            new_lineup = self._gpp_candidates[int(avail[best_local])]
+            full_score = float(marginal_ev_vals[best_local])
+
+        elif self._objective == "marginal_payout":
             best_scores = np.zeros(self._sim_results.n_sims, dtype=np.float64)
             for lineup, _ in remaining:
                 cols = [col_map[pid] for pid in lineup.player_ids]
@@ -667,6 +707,19 @@ class PipelineRunner:
                 best_scores=best_scores,
                 **self._optimizer_kwargs_replace,
             )
+            # Request more candidates to clear the full discard history.
+            n_candidates = max(10, len(self._discarded_lineups) + 5)
+            candidates = optimizer.optimize_top_k(n_candidates)
+            new_lineup, _ = next(
+                (
+                    (lu, sc) for lu, sc in candidates
+                    if frozenset(lu.player_ids) not in self._discarded_lineups
+                ),
+                candidates[0],
+            )
+            cols = [col_map[pid] for pid in new_lineup.player_ids]
+            full_score = float((full_matrix[:, cols].sum(axis=1) >= self._target).mean())
+
         else:
             active_mask = np.ones(self._sim_results.n_sims, dtype=bool)
             for lineup, _ in remaining:
@@ -682,15 +735,18 @@ class PipelineRunner:
                 target=self._target,
                 **self._optimizer_kwargs_replace,
             )
-
-        candidates = optimizer.optimize_top_k(n_candidates)
-        # Pick the best candidate that is not identical to the deleted lineup.
-        new_lineup, _ = next(
-            ((lu, sc) for lu, sc in candidates if frozenset(lu.player_ids) != deleted_player_set),
-            candidates[0],  # fall back to best if all candidates match (very unlikely)
-        )
-        cols = [col_map[pid] for pid in new_lineup.player_ids]
-        full_score = float((full_matrix[:, cols].sum(axis=1) >= self._target).mean())
+            # Request more candidates to clear the full discard history.
+            n_candidates = max(10, len(self._discarded_lineups) + 5)
+            candidates = optimizer.optimize_top_k(n_candidates)
+            new_lineup, _ = next(
+                (
+                    (lu, sc) for lu, sc in candidates
+                    if frozenset(lu.player_ids) not in self._discarded_lineups
+                ),
+                candidates[0],
+            )
+            cols = [col_map[pid] for pid in new_lineup.player_ids]
+            full_score = float((full_matrix[:, cols].sum(axis=1) >= self._target).mean())
 
         self._raw_portfolio = remaining + [(new_lineup, full_score)]
         result = self._serialize_portfolio(self._raw_portfolio, self._players_df)
