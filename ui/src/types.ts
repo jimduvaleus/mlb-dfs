@@ -163,6 +163,7 @@ export interface LoadSlateEvent extends SSEEvent {
 export interface SimulateEvent extends SSEEvent {
   stage: 'simulate'
   n_sims: number
+  objective?: string
 }
 
 export interface ComputeTargetEvent extends SSEEvent {

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -260,13 +260,13 @@ export function ProgressPanel({ events, running }: Props) {
 }
 
 function buildConfigDetail(events: SSEEvent[]): string {
-  const sim = events.find(e => e.stage === 'simulate') as unknown as { n_sims: number } | undefined
+  const sim = events.find(e => e.stage === 'simulate') as SimulateEvent | undefined
   const target = events.find(e => e.stage === 'compute_target') as unknown as { target: number; percentile: number | null } | undefined
   const beta = [...events].reverse().find(e => e.stage === 'calibrate_beta') as unknown as { payout_beta?: number } | undefined
 
   const parts: string[] = []
   if (sim) parts.push(`${sim.n_sims.toLocaleString()} simulations`)
-  if (target) {
+  if (target && sim?.objective !== 'leverage_surplus') {
     const tStr = target.percentile
       ? `${target.target.toFixed(1)} pts (p${target.percentile})`
       : `${target.target.toFixed(1)} pts (manual)`

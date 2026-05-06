@@ -224,7 +224,7 @@ class PipelineRunner:
         # --- Simulate ---------------------------------------------------
         n_sims = int(sim_cfg.get("n_sims", 10_000))
         logger.info("Running %d simulations...", n_sims)
-        self._cb("simulate", {"n_sims": n_sims})
+        self._cb("simulate", {"n_sims": n_sims, "objective": str(opt_cfg.get("objective", "expected_surplus"))})
         engine = SimulationEngine(
             copula, sim_players_df, batter_pca_model=pca_model, score_grid=score_grid
         )
