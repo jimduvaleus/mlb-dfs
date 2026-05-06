@@ -285,6 +285,12 @@ export interface FallbackTeam {
   count: number
 }
 
+export interface MissingOptPlayer {
+  name: string
+  team: string
+  markets: string[]
+}
+
 export interface MergeInfo {
   secondarySource: string
   count: number
@@ -292,6 +298,7 @@ export interface MergeInfo {
   cappedPlayers?: CappedPlayer[]
   lowTeamProjections?: LowTeamProjection[]
   fallbackTeams?: FallbackTeam[]
+  missingOptPlayers?: MissingOptPlayer[]
 }
 
 // Slate game/team exclusion types

@@ -1337,18 +1337,24 @@ def _compute_batter_projection(
     e_r   = get_lam(MK_RUNS)
     e_rbi = get_mu(MK_RBIS)
 
-    # All 8 batter markets are required. Any absent market means the CNO data
-    # for this player is incomplete (game posted late, props not yet live, etc.)
+    # 7 markets are hard-required. Any absent market means CNO data is incomplete
     # and the projection would be materially wrong — fall back to RotoWire.
+    # SB is soft-optional: players with no steal threat often have no SB prop on
+    # CNO; when absent, e_sb = 0 contributes nothing and the projection is still
+    # reliable. The caller receives the soft-missing list for UI display.
     missing = [
         name for name, val in [
             ("Singles", e_s), ("Doubles", e_d), ("Triples", e_t),
-            ("HR", e_hr), ("SB", e_sb), ("Walks", e_bb),
+            ("HR", e_hr), ("Walks", e_bb),
             ("Runs", e_r), ("RBIs", e_rbi),
         ] if val == 0
     ]
     if missing:
         return None, f"{', '.join(missing)} market{'s' if len(missing) > 1 else ''} unavailable"
+
+    missing_opt: list[str] = []
+    if e_sb == 0:
+        missing_opt.append(MK_SB)
     e_hbp = e_bb * HBP_PER_WALK
 
     mean = (
@@ -1368,7 +1374,7 @@ def _compute_batter_projection(
         + e_sb  * c["sb"]              ** 2
         + e_hbp * c["hbp"]             ** 2
     )
-    return mean, max(math.sqrt(var), 1.0), capped
+    return mean, max(math.sqrt(var), 1.0), capped, missing_opt
 
 
 def _compute_pitcher_projection(
@@ -1811,6 +1817,8 @@ def build_projections_csv(
     fallback_reasons: dict[int, str] = {}
     # player_id → list of market keys that hit the hard cap
     cap_warnings: dict[int, list[str]] = {}
+    # player_id → list of soft-optional market keys that were absent (e.g. SB)
+    missing_opt_warns: dict[int, list[str]] = {}
 
     for (player_name, away, home), player_markets in all_market_data.items():
         source_teams = {away, home}
@@ -1845,9 +1853,12 @@ def build_projections_csv(
                 )
                 fallback_reasons[pid] = reason
                 continue
-            mean, std_dev, capped_markets = (
-                float(batter_result[0]), float(batter_result[1]), list(batter_result[2])  # type: ignore[arg-type]
+            mean, std_dev, capped_markets, missing_opt = (
+                float(batter_result[0]), float(batter_result[1]),
+                list(batter_result[2]), list(batter_result[3])  # type: ignore[arg-type]
             )
+            if missing_opt:
+                missing_opt_warns[pid] = missing_opt
             if capped_markets:
                 display = ", ".join(_MARKET_DISPLAY.get(k, k) for k in capped_markets)
                 log.warning(
@@ -1940,6 +1951,21 @@ def build_projections_csv(
             log.debug("No hard caps applied → %s", caps_path)
     except Exception as e:
         log.warning("Could not write caps sidecar: %s", e)
+
+    missing_opt_path = _op.parent / (_op.stem + "_missing_opt.json")
+    try:
+        missing_opt_path.write_text(
+            json.dumps({str(pid): mkts for pid, mkts in missing_opt_warns.items()}, indent=2)
+        )
+        if missing_opt_warns:
+            log.info(
+                "%d batter(s) missing soft-optional market(s) (e.g. SB) — full MO projection used",
+                len(missing_opt_warns),
+            )
+        else:
+            log.debug("No soft-optional markets absent → %s", missing_opt_path)
+    except Exception as e:
+        log.warning("Could not write missing_opt sidecar: %s", e)
 
     n_pitchers = int(out_df["player_id"].map(dk_pos).apply(
         lambda pos: any(p.upper() in {"P", "SP", "RP"} for p in str(pos).split("/"))

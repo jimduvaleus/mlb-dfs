@@ -1004,14 +1004,15 @@ async def projections_fetch(request: Request):
         dff_out    = proj_path.parent / "projections_dff.csv"
         rw_out     = proj_path.parent / "projections_rw.csv"
         mo_out     = proj_path.parent / "projections_mo.csv"
-        mo_sidecar   = proj_path.parent / "projections_mo_fallback.json"
-        mo_caps_path = proj_path.parent / "projections_mo_caps.json"
+        mo_sidecar        = proj_path.parent / "projections_mo_fallback.json"
+        mo_caps_path      = proj_path.parent / "projections_mo_caps.json"
+        mo_missing_opt_path = proj_path.parent / "projections_mo_missing_opt.json"
 
         def _log(msg: str) -> str:
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
 
         # Clean up any stale temp files left by a prior incomplete fetch.
-        for _p in (dff_out, rw_out, mo_out, mo_sidecar, mo_caps_path):
+        for _p in (dff_out, rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path):
             try:
                 _p.unlink(missing_ok=True)
             except Exception:
@@ -1041,6 +1042,15 @@ async def projections_fetch(request: Request):
                 return {}
             try:
                 raw = json.loads(mo_caps_path.read_text())
+                return {int(k): v for k, v in raw.items()}
+            except Exception:
+                return {}
+
+        def _read_mo_missing_opt() -> dict[int, list[str]]:
+            if not mo_missing_opt_path.exists():
+                return {}
+            try:
+                raw = json.loads(mo_missing_opt_path.read_text())
                 return {int(k): v for k, v in raw.items()}
             except Exception:
                 return {}
@@ -1372,10 +1382,12 @@ async def projections_fetch(request: Request):
                             yield _log(f"Warning: {_stale_warn}")
                         proj_written = True
 
-                        # Build capped_players list from the caps sidecar + pool.
+                        # Build capped_players and missing_opt_players from sidecars + pool.
                         mo_cap_data = _read_mo_caps()
+                        mo_missing_opt_data = _read_mo_missing_opt()
                         capped_players: list[dict] = []
-                        if mo_cap_data and "name" in pool.columns:
+                        missing_opt_players: list[dict] = []
+                        if "name" in pool.columns:
                             pid_to_name = (
                                 pool[["player_id", "name"]]
                                 .drop_duplicates("player_id")
@@ -1389,12 +1401,19 @@ async def projections_fetch(request: Request):
                                         "team": _itm.get(cap_pid, ""),
                                         "markets": cap_mkts,
                                     })
+                            for opt_pid, opt_mkts in mo_missing_opt_data.items():
+                                if opt_pid in pid_to_name:
+                                    missing_opt_players.append({
+                                        "name": pid_to_name[opt_pid],
+                                        "team": _itm.get(opt_pid, ""),
+                                        "markets": opt_mkts,
+                                    })
 
                         low_team_projs = _low_team_projections(pool, _itm)
                         fallback_teams = _whole_team_fallbacks(fallback_players, _ensure_team_to_game())
 
-                        if fallback_players or capped_players or low_team_projs:
-                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'timestamp': int(time.time() * 1000)})}\n\n"
+                        if fallback_players or capped_players or low_team_projs or missing_opt_players:
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'timestamp': int(time.time() * 1000)})}\n\n"
                         elif result_event is None:
                             result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
 
@@ -1402,7 +1421,7 @@ async def projections_fetch(request: Request):
                 returncode = 1
                 result_event = _log(f"Warning: merge error — {exc}")
             finally:
-                for p in (rw_out, mo_out, mo_sidecar, mo_caps_path):
+                for p in (rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path):
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:

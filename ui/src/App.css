@@ -528,6 +528,23 @@ button { cursor: pointer; }
   margin-bottom: 4px;
 }
 
+.merge-info-missing-opt-callout {
+  margin-top: 10px;
+  background: #1e1c0e;
+  border: 1px solid #975a16;
+  border-left: 4px solid #ecc94b;
+  border-radius: 5px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #fefcbf;
+}
+
+.merge-info-missing-opt-callout strong {
+  display: block;
+  color: #ecc94b;
+  margin-bottom: 4px;
+}
+
 .merge-info-players {
   color: #a0aec0;
   line-height: 1.5;

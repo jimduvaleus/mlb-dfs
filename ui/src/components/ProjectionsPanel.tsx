@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { CappedPlayer, ExclusionScope, FallbackTeam, LowTeamProjection, MergeInfo, ProjectionsStatus } from '../types'
+import type { CappedPlayer, ExclusionScope, FallbackTeam, LowTeamProjection, MergeInfo, MissingOptPlayer, ProjectionsStatus } from '../types'
 
 const MARKET_DISPLAY: Record<string, string> = {
   singles: '1B', doubles: '2B', triples: '3B', home_runs: 'HR',
@@ -80,7 +80,8 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         const cappedPlayers = (event.capped_players ?? []) as CappedPlayer[]
         const lowTeamProjections = (event.low_team_projections ?? []) as LowTeamProjection[]
         const fallbackTeams = (event.fallback_teams ?? []) as FallbackTeam[]
-        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams })
+        const missingOptPlayers = (event.missing_opt_players ?? []) as MissingOptPlayer[]
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams, missingOptPlayers })
         // Auto-exclude pitchers that fell back to a secondary source at 'candidates'
         // scope — their projections are lower quality but they still model the field.
         const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
@@ -256,6 +257,39 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
                 <span className="merge-info-reason">{t.total.toFixed(1)} pts</span>
               </span>
             )).reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])}
+          </div>
+        </div>
+      )}
+
+      {mergeInfo && mergeInfo.missingOptPlayers && mergeInfo.missingOptPlayers.length > 0 && (
+        <div className="merge-info-missing-opt-callout">
+          <strong>
+            ⚠ {mergeInfo.missingOptPlayers.length} batter{mergeInfo.missingOptPlayers.length !== 1 ? 's' : ''} missing optional market(s) — full MO projection used
+          </strong>
+          <div className="merge-info-players">
+            {Object.entries(
+              mergeInfo.missingOptPlayers.reduce<Record<string, MissingOptPlayer[]>>((acc, p) => {
+                const key = p.team || '—'
+                ;(acc[key] ??= []).push(p)
+                return acc
+              }, {})
+            )
+              .sort(([a], [b]) => a.localeCompare(b))
+              .map(([team, ps]) => (
+                <span key={team} className="merge-info-team-group">
+                  <span className="merge-info-team-label">{team}</span>
+                  {' ('}
+                  {ps.map((p, i) => (
+                    <span key={p.name}>
+                      {i > 0 && ', '}
+                      {p.name}
+                      <span className="merge-info-reason" title={`Missing: ${p.markets.map(m => MARKET_DISPLAY[m] ?? m).join(', ')}`}> ⓘ</span>
+                    </span>
+                  ))}
+                  {')'}
+                </span>
+              ))
+              .reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])}
           </div>
         </div>
       )}
