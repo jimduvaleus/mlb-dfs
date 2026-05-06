@@ -260,48 +260,59 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         </div>
       )}
 
-      {mergeInfo && mergeInfo.count > 0 && (
-        <div className="merge-info-callout">
-          <strong>{mergeInfo.count} player{mergeInfo.count !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback projection</strong>
-          {mergeInfo.players.some(p => p.is_pitcher) && (
-            <div className="merge-info-pitcher-warning">
-              ⚠ Pitcher(s) using {mergeInfo.secondarySource} fallback projections have been automatically added to candidate exclusions.
-            </div>
-          )}
-          <div className="merge-info-players">
-            {(() => {
-              // Group by team; within each team show name + optional icon
-              const byTeam = mergeInfo.players.reduce<Record<string, typeof mergeInfo.players>>((acc, p) => {
-                const key = p.team || '—'
-                ;(acc[key] ??= []).push(p)
-                return acc
-              }, {})
-              return Object.entries(byTeam)
-                .sort(([a], [b]) => a.localeCompare(b))
-                .map(([team, players]) => (
-                  <span key={team} className="merge-info-team-group">
-                    <span className="merge-info-team-label">{team}</span>
-                    {' ('}
-                    {players.map((p, i) => (
-                      <span key={p.name}>
-                        {i > 0 && ', '}
-                        {p.name}
-                        {p.is_pitcher
-                          ? <span className="merge-info-pitcher-icon" title="Pitcher excluded — no market odds projection available"> ⚠</span>
-                          : p.reason
-                            ? <span className="merge-info-reason" title={p.reason}> ⓘ</span>
-                            : null
-                        }
-                      </span>
-                    ))}
-                    {')'}
+      {(() => {
+        if (!mergeInfo || mergeInfo.count === 0) return null
+        const batters  = mergeInfo.players.filter(p => !p.is_pitcher)
+        const pitchers = mergeInfo.players.filter(p => p.is_pitcher)
+
+        const groupByTeam = (players: typeof mergeInfo.players) => {
+          const byTeam = players.reduce<Record<string, typeof mergeInfo.players>>((acc, p) => {
+            const key = p.team || '—'
+            ;(acc[key] ??= []).push(p)
+            return acc
+          }, {})
+          return Object.entries(byTeam)
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([team, ps]) => (
+              <span key={team} className="merge-info-team-group">
+                <span className="merge-info-team-label">{team}</span>
+                {' ('}
+                {ps.map((p, i) => (
+                  <span key={p.name}>
+                    {i > 0 && ', '}
+                    {p.name}
+                    {p.reason
+                      ? <span className="merge-info-reason" title={p.reason}> ⓘ</span>
+                      : null}
                   </span>
-                ))
-                .reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])
-            })()}
-          </div>
-        </div>
-      )}
+                ))}
+                {')'}
+              </span>
+            ))
+            .reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])
+        }
+
+        return (
+          <>
+            {batters.length > 0 && (
+              <div className="merge-info-player-fallback-callout">
+                <strong>
+                  ⚠ {batters.length} batter{batters.length !== 1 ? 's' : ''} using {mergeInfo.secondarySource} ×0.9 fallback
+                </strong>
+                <div className="merge-info-players">{groupByTeam(batters)}</div>
+              </div>
+            )}
+            {pitchers.length > 0 && (
+              <div className="merge-info-pitcher-fallback-callout">
+                <strong>
+                  ⚠ {pitchers.length} pitcher{pitchers.length !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback — added to candidate exclusions
+                </strong>
+                <div className="merge-info-players">{groupByTeam(pitchers)}</div>
+              </div>
+            )}
+          </>
+        )
+      })()}
     </div>
   )
 }

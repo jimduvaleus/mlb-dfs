@@ -494,6 +494,40 @@ button { cursor: pointer; }
   margin-bottom: 4px;
 }
 
+.merge-info-player-fallback-callout {
+  margin-top: 10px;
+  background: #271e0f;
+  border: 1px solid #b7791f;
+  border-left: 4px solid #f6ad55;
+  border-radius: 5px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #fefcbf;
+}
+
+.merge-info-player-fallback-callout strong {
+  display: block;
+  color: #f6ad55;
+  margin-bottom: 4px;
+}
+
+.merge-info-pitcher-fallback-callout {
+  margin-top: 10px;
+  background: #1e1a2e;
+  border: 1px solid #7c3aed;
+  border-left: 4px solid #b794f4;
+  border-radius: 5px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #e9d8fd;
+}
+
+.merge-info-pitcher-fallback-callout strong {
+  display: block;
+  color: #b794f4;
+  margin-bottom: 4px;
+}
+
 .merge-info-players {
   color: #a0aec0;
   line-height: 1.5;

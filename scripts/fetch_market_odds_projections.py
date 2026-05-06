@@ -1336,18 +1336,18 @@ def _compute_batter_projection(
     e_r   = get_lam(MK_RUNS)
     e_rbi = get_mu(MK_RBIS)
 
-    # Require at least one hit-type market and both rate markets (Runs, RBIs).
-    # Batting Walks is treated as optional — CrazyNinjaOdds does not post walk
-    # props for every player (low-walk players are often omitted).  When absent,
-    # e_bb = 0 and the walk/HBP terms simply don't contribute to the projection.
-    # Triples and Stolen Bases are similarly optional.
-    if e_s == 0 and e_d == 0 and e_t == 0 and e_hr == 0:
-        return None, "no hit market data (Singles/Doubles/Triples/HR all missing)"
+    # All 8 batter markets are required. Any absent market means the CNO data
+    # for this player is incomplete (game posted late, props not yet live, etc.)
+    # and the projection would be materially wrong — fall back to RotoWire.
     missing = [
-        name for name, val in [("Runs", e_r), ("RBIs", e_rbi)] if val == 0
+        name for name, val in [
+            ("Singles", e_s), ("Doubles", e_d), ("Triples", e_t),
+            ("HR", e_hr), ("SB", e_sb), ("Walks", e_bb),
+            ("Runs", e_r), ("RBIs", e_rbi),
+        ] if val == 0
     ]
     if missing:
-        return None, f"{' and '.join(missing)} market{'s' if len(missing) > 1 else ''} unavailable"
+        return None, f"{', '.join(missing)} market{'s' if len(missing) > 1 else ''} unavailable"
     e_hbp = e_bb * HBP_PER_WALK
 
     mean = (
@@ -1399,7 +1399,8 @@ def _compute_pitcher_projection(
     e_bba  = get_lam(MK_BBA)
     e_er   = get_lam(MK_ER)
 
-    if e_outs == 0 and e_k == 0:
+    # All 6 pitcher markets are required.
+    if any(v == 0 for v in (e_outs, e_k, e_win, e_ha, e_bba, e_er)):
         return None
 
     e_ip  = e_outs / 3.0

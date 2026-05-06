@@ -1318,8 +1318,8 @@ async def projections_fetch(request: Request):
                             # Scale RotoWire fallback projections for hitters down to 80%
                             # (RotoWire tends to be more optimistic than market odds for batters)
                             is_hitter_fallback = ~has_pref & (pool.get("lineup_slot", 0) != 10)
-                            pool.loc[is_hitter_fallback, "mean"]    *= 0.8
-                            pool.loc[is_hitter_fallback, "std_dev"] *= 0.8
+                            pool.loc[is_hitter_fallback, "mean"]    *= 0.9
+                            pool.loc[is_hitter_fallback, "std_dev"] *= 0.9
                             fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
 
                             if not fallback_rows.empty:
