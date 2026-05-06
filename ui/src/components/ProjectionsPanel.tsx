@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { CappedPlayer, ExclusionScope, LowTeamProjection, MergeInfo, ProjectionsStatus } from '../types'
+import type { CappedPlayer, ExclusionScope, FallbackTeam, LowTeamProjection, MergeInfo, ProjectionsStatus } from '../types'
 
 const MARKET_DISPLAY: Record<string, string> = {
   singles: '1B', doubles: '2B', triples: '3B', home_runs: 'HR',
@@ -79,7 +79,8 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         const players = event.players as Array<{ name: string; team: string; reason?: string; player_id?: number; is_pitcher?: boolean }>
         const cappedPlayers = (event.capped_players ?? []) as CappedPlayer[]
         const lowTeamProjections = (event.low_team_projections ?? []) as LowTeamProjection[]
-        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections })
+        const fallbackTeams = (event.fallback_teams ?? []) as FallbackTeam[]
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams })
         // Auto-exclude pitchers that fell back to a secondary source at 'candidates'
         // scope — their projections are lower quality but they still model the field.
         const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
@@ -198,6 +199,26 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
               {done.success ? '✓ Done' : `✗ Exited with code ${done.code}`}
             </div>
           )}
+        </div>
+      )}
+
+      {mergeInfo && mergeInfo.fallbackTeams && mergeInfo.fallbackTeams.length > 0 && (
+        <div className="merge-info-fallback-teams-callout">
+          <strong>
+            ⛔ No market odds for {mergeInfo.fallbackTeams.length} team{mergeInfo.fallbackTeams.length !== 1 ? 's' : ''} — entire lineup on {mergeInfo.secondarySource} ×0.8 fallback
+          </strong>
+          <div className="merge-info-fallback-teams-list">
+            {mergeInfo.fallbackTeams.map((ft, i) => (
+              <span key={i} className="merge-info-fallback-team-chip">
+                <span className="chip-team">{ft.team}</span>
+                {ft.game && <span className="chip-game">({ft.game})</span>}
+                <span className="chip-count">{ft.count} batters</span>
+              </span>
+            ))}
+          </div>
+          <div style={{ marginTop: 6, fontSize: '0.8em', color: '#fc8181', opacity: 0.85 }}>
+            Fetch projections for {mergeInfo.fallbackTeams.length > 1 ? 'these games' : 'this game'} to get market odds coverage.
+          </div>
         </div>
       )}
 

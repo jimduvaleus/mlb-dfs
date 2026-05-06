@@ -131,6 +131,12 @@ def compute_heuristic_ownership(
     )
 
     # --- Implied-total boosts (batters and pitchers) -------------------------
+    # Restrict team_totals to teams present in this player pool so that stale
+    # data (e.g. implied totals for postponed games removed from the slate)
+    # does not distort mean_total and bleed into boosts for active teams.
+    if team_totals and "team" in df.columns:
+        active_teams = set(df["team"].dropna().unique())
+        team_totals = {t: v for t, v in team_totals.items() if t in active_teams}
     if team_totals:
         vals = [v for v in team_totals.values() if v and v > 0]
         mean_total = float(np.mean(vals)) if vals else 1.0

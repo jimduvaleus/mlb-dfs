@@ -649,3 +649,95 @@ class TestProjectionsMetaComputeFreshness:
         # Non-existent files → exception → None
         result = compute_freshness(tmp_path / "nope.csv", tmp_path / "nope2.csv")
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# PPD stale-projection filtering (regression tests for the PPD fix)
+# ---------------------------------------------------------------------------
+
+def _make_pipeline_slate_df() -> pd.DataFrame:
+    """Minimal slate DataFrame with active-game players only."""
+    return pd.DataFrame([
+        {"player_id": 101, "name": "Active Pitcher",  "position": "P",  "salary": 9000, "team": "PHI", "game": "ARI@PHI"},
+        {"player_id": 201, "name": "Active Batter 1", "position": "OF", "salary": 4500, "team": "ARI", "game": "ARI@PHI"},
+        {"player_id": 301, "name": "Active Batter 2", "position": "1B", "salary": 4000, "team": "PHI", "game": "ARI@PHI"},
+    ])
+
+
+def _make_proj_df_with_ppd() -> pd.DataFrame:
+    """proj_df containing three active players plus two from postponed games."""
+    return pd.DataFrame([
+        {"player_id": 101, "name": "Active Pitcher",  "mean": 20.0, "std_dev": 8.0, "lineup_slot": 10, "slot_confirmed": True},
+        {"player_id": 201, "name": "Active Batter 1", "mean": 12.0, "std_dev": 5.0, "lineup_slot": 3,  "slot_confirmed": True},
+        {"player_id": 301, "name": "Active Batter 2", "mean": 10.0, "std_dev": 4.5, "lineup_slot": 5,  "slot_confirmed": True},
+        # PPD players — IDs 901/902 are not in the DK slate
+        {"player_id": 901, "name": "Jordan Walker",  "mean": 11.0, "std_dev": 5.0, "lineup_slot": 2,  "slot_confirmed": True},
+        {"player_id": 902, "name": "Tyrone Taylor",  "mean":  9.0, "std_dev": 4.0, "lineup_slot": 4,  "slot_confirmed": True},
+    ])
+
+
+class TestBuildPlayersDfPPDExclusion:
+    """PipelineRunner._build_players_df must silently drop stale PPD players."""
+
+    def test_ppd_players_not_in_output(self):
+        from src.api.pipeline import PipelineRunner
+        runner = PipelineRunner("dummy_config.yaml")
+        result = runner._build_players_df(_make_pipeline_slate_df(), _make_proj_df_with_ppd())
+        assert 901 not in result["player_id"].values
+        assert 902 not in result["player_id"].values
+
+    def test_active_players_retained(self):
+        from src.api.pipeline import PipelineRunner
+        runner = PipelineRunner("dummy_config.yaml")
+        result = runner._build_players_df(_make_pipeline_slate_df(), _make_proj_df_with_ppd())
+        assert set(result["player_id"].values) == {101, 201, 301}
+
+    def test_stale_projection_warning_logged(self, caplog):
+        import logging
+        from src.api.pipeline import PipelineRunner
+        runner = PipelineRunner("dummy_config.yaml")
+        with caplog.at_level(logging.WARNING, logger="src.api.pipeline"):
+            runner._build_players_df(_make_pipeline_slate_df(), _make_proj_df_with_ppd())
+        messages = " ".join(r.message for r in caplog.records)
+        assert "postponed" in messages or "not on the current slate" in messages
+
+    def test_no_warning_when_projections_match_slate(self, caplog):
+        import logging
+        from src.api.pipeline import PipelineRunner
+        runner = PipelineRunner("dummy_config.yaml")
+        proj_df = _make_proj_df_with_ppd().query("player_id <= 301")
+        with caplog.at_level(logging.WARNING, logger="src.api.pipeline"):
+            runner._build_players_df(_make_pipeline_slate_df(), proj_df)
+        assert not any("postponed" in r.message or "not on the current slate" in r.message
+                       for r in caplog.records)
+
+
+class TestOwnershipPPDTeamTotals:
+    """compute_heuristic_ownership must ignore implied totals for PPD teams."""
+
+    def _players(self) -> pd.DataFrame:
+        return pd.DataFrame([
+            {"player_id": 1, "position": "P",  "mean": 20.0, "salary": 9000, "team": "PHI", "slot": 10},
+            {"player_id": 2, "position": "OF", "mean": 12.0, "salary": 4500, "team": "ARI", "slot": 3},
+            {"player_id": 3, "position": "1B", "mean": 10.0, "salary": 4000, "team": "PHI", "slot": 5},
+            {"player_id": 4, "position": "OF", "mean":  9.0, "salary": 3800, "team": "ARI", "slot": 2},
+        ])
+
+    def test_ppd_team_extreme_total_does_not_change_ownership(self):
+        import numpy as np
+        from src.optimization.ownership import compute_heuristic_ownership
+        df = self._players()
+        ow_active = compute_heuristic_ownership(df, team_totals={"PHI": 4.5, "ARI": 5.0})
+        # STL and MIL have no players in df — their extreme totals must be filtered
+        ow_with_ppd = compute_heuristic_ownership(
+            df, team_totals={"PHI": 4.5, "ARI": 5.0, "STL": 999.0, "MIL": 999.0}
+        )
+        np.testing.assert_array_almost_equal(ow_active, ow_with_ppd)
+
+    def test_ownership_vector_length_matches_players_df(self):
+        from src.optimization.ownership import compute_heuristic_ownership
+        df = self._players()
+        ow = compute_heuristic_ownership(
+            df, team_totals={"PHI": 4.5, "ARI": 5.0, "STL": 999.0}
+        )
+        assert len(ow) == len(df)

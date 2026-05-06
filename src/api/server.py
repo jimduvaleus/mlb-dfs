@@ -927,11 +927,18 @@ async def projections_fetch(request: Request):
     included_teams: set[str] = set()
     included_pids:  set[int] = set()
     id_to_team: dict[int, str] = {}
+    team_to_game: dict[str, str] = {}
 
     if excluded_pairs and dk_path is not None:
         try:
             dk_gi = pd.read_csv(dk_path, usecols=["ID", "TeamAbbrev", "Game Info"])
             id_to_team = {int(r["ID"]): str(r["TeamAbbrev"]) for _, r in dk_gi.iterrows()}
+            for _, r in dk_gi.iterrows():
+                team = str(r["TeamAbbrev"])
+                gi   = str(r.get("Game Info", ""))
+                _gm  = _re.match(r"(\w+)@(\w+)\s", gi.strip())
+                if _gm and team not in team_to_game:
+                    team_to_game[team] = f"{_gm.group(1).upper()}@{_gm.group(2).upper()}"
             all_pairs: set[tuple[str, str]] = set()
             for gi in dk_gi["Game Info"].dropna().unique():
                 m = _re.match(r"(\w+)@(\w+)\s", str(gi).strip())
@@ -1021,6 +1028,41 @@ async def projections_fetch(request: Request):
                 except Exception:
                     pass
             return {}
+
+        def _ensure_team_to_game() -> dict[str, str]:
+            if team_to_game:
+                return team_to_game
+            if dk_path is not None:
+                try:
+                    dk_df3 = pd.read_csv(dk_path, usecols=["TeamAbbrev", "Game Info"])
+                    t2g: dict[str, str] = {}
+                    for _, r in dk_df3.iterrows():
+                        team = str(r["TeamAbbrev"])
+                        gi   = str(r.get("Game Info", ""))
+                        _gm  = _re.match(r"(\w+)@(\w+)\s", gi.strip())
+                        if _gm and team not in t2g:
+                            t2g[team] = f"{_gm.group(1).upper()}@{_gm.group(2).upper()}"
+                    return t2g
+                except Exception:
+                    pass
+            return {}
+
+        def _whole_team_fallbacks(
+            fallback_players: list[dict],
+            t2g: dict[str, str],
+            threshold: int = 5,
+        ) -> list[dict]:
+            """Return teams where ≥ threshold batters fell back to the secondary source."""
+            counts: dict[str, int] = {}
+            for p in fallback_players:
+                if not p.get("is_pitcher") and p.get("team"):
+                    counts[p["team"]] = counts.get(p["team"], 0) + 1
+            result = [
+                {"team": team, "game": t2g.get(team, ""), "count": count}
+                for team, count in counts.items()
+                if count >= threshold
+            ]
+            return sorted(result, key=lambda x: -x["count"])
 
         # Helper: return teams whose total batter projection mean is below threshold.
         def _low_team_projections(
@@ -1321,9 +1363,10 @@ async def projections_fetch(request: Request):
                                     })
 
                         low_team_projs = _low_team_projections(pool, _itm)
+                        fallback_teams = _whole_team_fallbacks(fallback_players, _ensure_team_to_game())
 
                         if fallback_players or capped_players or low_team_projs:
-                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'timestamp': int(time.time() * 1000)})}\n\n"
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'timestamp': int(time.time() * 1000)})}\n\n"
                         elif result_event is None:
                             result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
 
@@ -1470,9 +1513,10 @@ async def projections_fetch(request: Request):
                     proj_written = True
 
                     low_team_projs2 = _low_team_projections(pool, _itm2)
+                    fallback_teams2 = _whole_team_fallbacks(fallback_players2, _ensure_team_to_game())
 
                     if fallback_players2 or low_team_projs2:
-                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'timestamp': int(time.time() * 1000)})}\n\n"
+                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'timestamp': int(time.time() * 1000)})}\n\n"
                     else:
                         result_event2 = _log(f"All player projections sourced from {preferred_label}.")
 
