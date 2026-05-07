@@ -350,6 +350,12 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
     except Exception as exc:
         print(f"  [Model F skipped: {exc}]")
 
+    # Model G: Model F + stack-value batter boost + game start-time multiplier.
+    try:
+        models["G_stack_time"] = _compute_model_g(pool_df, team_totals)
+    except Exception as exc:
+        print(f"  [Model G skipped: {exc}]")
+
     return models
 
 
@@ -494,6 +500,201 @@ def _compute_model_f(
         if use_eligible:
             is_primary = (df.loc[mask, "position"] == pos).values
             discount = np.where(is_primary, 1.0, _SECONDARY_POSITION_DISCOUNT)
+            df.loc[mask, "ownership"] += contribution * discount
+        else:
+            df.loc[mask, "ownership"] += contribution
+
+    return df["ownership"].values.astype(np.float64)
+
+
+def _compute_model_g(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+) -> np.ndarray:
+    """
+    Model G — Model F + two new signals:
+
+    1. Stack-value batter boost: scales the implied-total batter boost by
+       (mean_slot_salary / team_slot_salary) ^ STACK_EXP, where slot_salary
+       is the average salary of the top-5 batting-order slots for each team.
+       Teams with cheap top-of-order bats relative to their implied total are
+       more attractive stacking targets — the field can pair them with
+       expensive pitchers and still build a competitive lineup.
+
+    2. Game start-time multiplier: earlier games get confirmed batting lineups
+       sooner, so DFS players building before late-game announcements gravitate
+       toward those players. Applied as (1 + TIME_FACTOR * relative_earliness)
+       to all players in the game, where relative_earliness = 1.0 for the
+       earliest game and 0.0 for the latest game on the slate.
+    """
+    import re as _re
+
+    from src.optimization.ownership import (
+        _BATTING_ORDER_MULT, _SLOT_COUNTS, _SECONDARY_POSITION_DISCOUNT,
+        _BATTER_TOTAL_CAP, _PITCHER_MATCHUP_EXP,
+    )
+
+    _BATTER_STD_FLOOR  = 0.7
+    _PITCHER_STD_FLOOR = 0.4
+    _PITCHER_COMPRESS  = 0.20
+    _COSTACK_EXP       = 0.40
+    _CAP_PER_BATTER    = 4500
+    _STACK_EXP         = 0.25   # strength of stack-value salary signal; swept [0.25–0.70], 0.25 optimal
+    _TIME_FACTOR       = 0.08   # max fractional boost for earliest game; swept [0.08–0.16], 0.08 optimal
+    _STACK_THRESHOLD   = 4.5    # implied total below which cheap salaries don't drive stacking interest
+
+    df = pool_df.copy().reset_index(drop=True)
+    df["_sv"] = df["mean"] / (df["salary"] / 1000.0)
+
+    pitcher_mask = df["position"] == "P"
+    batter_mask  = ~pitcher_mask
+
+    # Raw scores (identical to F)
+    df["_raw"] = np.sqrt(df["mean"].clip(lower=0))
+    df.loc[pitcher_mask, "_raw"] = (
+        0.8 * np.sqrt(df.loc[pitcher_mask, "mean"].clip(lower=0))
+        + 0.2 * np.sqrt(df.loc[pitcher_mask, "_sv"].clip(lower=0))
+    )
+
+    # Batting order multiplier
+    slot_col = (
+        "lineup_slot" if "lineup_slot" in df.columns
+        else ("slot" if "slot" in df.columns else None)
+    )
+    if slot_col:
+        for batting_slot, mult in _BATTING_ORDER_MULT.items():
+            mask = batter_mask & (df[slot_col] == batting_slot)
+            df.loc[mask, "_raw"] *= mult
+
+    # Salary-cap pressure on batters
+    df.loc[batter_mask, "_raw"] *= np.minimum(
+        1.0,
+        (_CAP_PER_BATTER / df.loc[batter_mask, "salary"]) ** 0.5,
+    )
+
+    # --- Signal 1: game start-time multiplier --------------------------------
+    # Parse HH:MM from the game string and compute per-game minutesfrom-midnight.
+    def _game_minutes(game_str: str) -> float | None:
+        m = _re.search(r'(\d{1,2}):(\d{2})(AM|PM)', str(game_str))
+        if not m:
+            return None
+        h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
+        if ap == "PM" and h != 12:
+            h += 12
+        elif ap == "AM" and h == 12:
+            h = 0
+        return float(h * 60 + mi)
+
+    if "game" in df.columns:
+        game_mins = {g: _game_minutes(g) for g in df["game"].unique()}
+        valid_mins = [v for v in game_mins.values() if v is not None]
+        if len(valid_mins) > 1:
+            min_t, max_t = min(valid_mins), max(valid_mins)
+            time_range = max_t - min_t
+            df["_time_mult"] = df["game"].map(
+                lambda g: 1.0 + _TIME_FACTOR * (max_t - (game_mins.get(g) or max_t)) / time_range
+            )
+        else:
+            df["_time_mult"] = 1.0
+    else:
+        df["_time_mult"] = 1.0
+
+    df["_raw"] *= df["_time_mult"]
+
+    # Implied-total boosts (same as F) + stack-value batter adjustment
+    if team_totals:
+        vals = [v for v in team_totals.values() if v and v > 0]
+        mean_total = float(np.mean(vals)) if vals else 1.0
+        df["_boost"] = 1.0
+
+        # Per-team: average salary of top-5 batting-order slots (stack cost proxy)
+        bdf = df[batter_mask]
+        team_slot5_salary: dict[str, float] = {}
+        for team, grp in bdf.groupby("team"):
+            if slot_col and grp[slot_col].notna().sum() >= 3:
+                slotted = grp.dropna(subset=[slot_col]).sort_values(slot_col)
+                top5 = slotted.head(5)
+            else:
+                top5 = grp.nlargest(min(5, len(grp)), "mean")
+            if len(top5):
+                team_slot5_salary[team] = float(top5["salary"].mean())
+
+        mean_slot5_sal = float(np.mean(list(team_slot5_salary.values()))) if team_slot5_salary else 4500.0
+
+        for team, total in team_totals.items():
+            if not (total and total > 0 and mean_total > 0):
+                continue
+            capped = min(total, _BATTER_TOTAL_CAP)
+            mask_b = batter_mask & (df["team"] == team)
+
+            # Implied-total boost, scaled by stack-value salary signal only when
+            # the team's total clears the threshold — below it the field doesn't
+            # care about cheap salaries regardless of stack cost efficiency.
+            slot5_sal = team_slot5_salary.get(team, mean_slot5_sal)
+            stack_mult = (mean_slot5_sal / slot5_sal) ** _STACK_EXP if total >= _STACK_THRESHOLD else 1.0
+            df.loc[mask_b, "_boost"] = (capped / mean_total) * stack_mult
+
+            if "opponent" in df.columns:
+                mask_p = pitcher_mask & (df["opponent"] == team)
+                df.loc[mask_p, "_boost"] = (mean_total / capped) ** _PITCHER_MATCHUP_EXP
+
+        if "opponent" in df.columns:
+            for team, total in team_totals.items():
+                if not (total and total > 0 and mean_total > 0):
+                    continue
+                capped = min(total, _BATTER_TOTAL_CAP)
+                mask_own = pitcher_mask & (df["team"] == team)
+                df.loc[mask_own, "_boost"] *= (capped / mean_total) ** _COSTACK_EXP
+
+        df["_raw"] *= df["_boost"]
+
+    # Per-position softmax with std floor + pitcher compression (identical to F)
+    use_eligible = "eligible_positions" in df.columns
+    df["ownership"] = 0.0
+
+    if use_eligible:
+        all_pos: set[str] = set()
+        for ep in df["eligible_positions"]:
+            if isinstance(ep, list):
+                all_pos.update(ep)
+            else:
+                all_pos.add(str(ep))
+        pos_iter = all_pos
+    else:
+        pos_iter = set(df["position"].unique())
+
+    for pos in pos_iter:
+        if use_eligible:
+            mask = df["eligible_positions"].apply(
+                lambda ep, p=pos: p in ep if isinstance(ep, list) else str(ep) == p
+            )
+        else:
+            mask = df["position"] == pos
+
+        if not mask.any():
+            continue
+
+        raw_vals  = df.loc[mask, "_raw"].values.astype(float)
+        n_slots   = _SLOT_COUNTS.get(pos, 1)
+        is_p      = pos == "P"
+        std_floor = _PITCHER_STD_FLOOR if is_p else _BATTER_STD_FLOOR
+
+        std     = raw_vals.std()
+        shifted = (raw_vals - raw_vals.mean()) / max(std, std_floor)
+        exp_v   = np.exp(shifted)
+        softmax_share = exp_v / exp_v.sum()
+
+        if is_p:
+            uniform_share = np.ones(len(raw_vals)) / len(raw_vals)
+            share = (1 - _PITCHER_COMPRESS) * softmax_share + _PITCHER_COMPRESS * uniform_share
+        else:
+            share = softmax_share
+
+        contribution = share * n_slots
+
+        if use_eligible:
+            is_primary = (df.loc[mask, "position"] == pos).values
+            discount   = np.where(is_primary, 1.0, _SECONDARY_POSITION_DISCOUNT)
             df.loc[mask, "ownership"] += contribution * discount
         else:
             df.loc[mask, "ownership"] += contribution

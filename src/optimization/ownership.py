@@ -1,7 +1,8 @@
 """Heuristic ownership estimation for GPP contest simulation.
 
-Batters: softmax(sqrt(mean)) within position group, with salary-cap pressure
-         and batting-order multiplier.
+Batters: softmax(sqrt(mean)) within position group, with salary-cap pressure,
+         batting-order multiplier, game start-time multiplier, and stack-value
+         batter boost.
 Pitchers: softmax(0.8*sqrt(mean) + 0.2*sqrt(salary_value)), with opponent
           implied-total matchup boost, own-team co-stack boost, and post-softmax
           compression toward uniform.
@@ -16,12 +17,20 @@ Key design choices:
   batter salary. Accounts for field fading $6k+ superstars.
 - Batter std floor raised to 0.7: prevents one outlier from consuming the
   entire position pool through softmax concentration.
+- Game start-time multiplier: earlier games have confirmed batting lineups
+  sooner, attracting DFS players building before late-game announcements.
+- Stack-value batter boost: teams with cheap top-of-order bats relative to
+  their implied total are more attractive stacking targets — the field can
+  pair them with expensive pitchers within the $50k cap. Only fires when the
+  implied total is >= 4.5 (psychological threshold below which cheap salaries
+  don't attract stacking interest regardless of salary efficiency).
 - Pitcher co-stack boost: pitchers on high-implied teams see elevated
   ownership because the field stacks that offense and often correlates
   the pitcher alongside their batters.
 - Pitcher pool compression: post-softmax 20% blend toward uniform —
   empirical pitcher ownership is flatter than pure softmax produces.
 """
+import re
 import numpy as np
 import pandas as pd
 
@@ -72,6 +81,18 @@ _PITCHER_COMPRESS = 0.20
 # see elevated ownership because the field stacks that offense and often
 # pairs the pitcher. (own_team_total / mean_total) ** this_exp.
 _PITCHER_COSTACK_EXP = 0.40
+
+# Stack-value batter boost: (mean_slot5_salary / team_slot5_salary) ** this_exp
+# amplifies ownership for teams with cheap top-of-order bats.
+_STACK_VALUE_EXP = 0.25
+
+# Implied total threshold below which the stack-value signal does not fire.
+# Below ~4.5 the field doesn't stack regardless of salary efficiency.
+_STACK_THRESHOLD = 4.5
+
+# Maximum fractional ownership boost for the earliest game on the slate.
+# Applied as 1 + _TIME_FACTOR * relative_earliness (1.0 = earliest, 0.0 = latest).
+_TIME_FACTOR = 0.08
 
 
 def compute_heuristic_ownership(
@@ -130,6 +151,31 @@ def compute_heuristic_ownership(
         (_BATTER_SALARY_PRESSURE_BASE / df.loc[batter_mask, "salary"]) ** 0.5,
     )
 
+    # --- Game start-time multiplier ------------------------------------------
+    # Earlier games get confirmed batting lineups sooner; DFS players building
+    # before late-game announcements concentrate on those games.
+    if "game" in df.columns:
+        def _game_minutes(game_str: str) -> float | None:
+            m = re.search(r'(\d{1,2}):(\d{2})(AM|PM)', str(game_str))
+            if not m:
+                return None
+            h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
+            if ap == "PM" and h != 12:
+                h += 12
+            elif ap == "AM" and h == 12:
+                h = 0
+            return float(h * 60 + mi)
+
+        game_mins = {g: _game_minutes(g) for g in df["game"].unique()}
+        valid_mins = [v for v in game_mins.values() if v is not None]
+        if len(valid_mins) > 1:
+            min_t, max_t = min(valid_mins), max(valid_mins)
+            time_range = max_t - min_t
+            df["_time_mult"] = df["game"].map(
+                lambda g: 1.0 + _TIME_FACTOR * (max_t - (game_mins.get(g) or max_t)) / time_range
+            )
+            df["_raw"] *= df["_time_mult"]
+
     # --- Implied-total boosts (batters and pitchers) -------------------------
     # Restrict team_totals to teams present in this player pool so that stale
     # data (e.g. implied totals for postponed games removed from the slate)
@@ -142,13 +188,28 @@ def compute_heuristic_ownership(
         mean_total = float(np.mean(vals)) if vals else 1.0
         df["_boost"] = 1.0
 
+        # Pre-compute per-team average salary of top-5 batting-order slots
+        # for the stack-value signal (cheap top-of-order → more stacking interest).
+        bdf = df[batter_mask]
+        team_slot5_salary: dict[str, float] = {}
+        for team_s, grp in bdf.groupby("team"):
+            if slot_col and grp[slot_col].notna().sum() >= 3:
+                top5 = grp.dropna(subset=[slot_col]).sort_values(slot_col).head(5)
+            else:
+                top5 = grp.nlargest(min(5, len(grp)), "mean")
+            if len(top5):
+                team_slot5_salary[team_s] = float(top5["salary"].mean())
+        mean_slot5_sal = float(np.mean(list(team_slot5_salary.values()))) if team_slot5_salary else 4500.0
+
         # Pass A: batter team-total boost + pitcher opponent-matchup boost
         for team, total in team_totals.items():
             if not (total and total > 0 and mean_total > 0):
                 continue
             capped = min(total, _BATTER_TOTAL_CAP)
             mask_b = batter_mask & (df["team"] == team)
-            df.loc[mask_b, "_boost"] = capped / mean_total
+            slot5_sal = team_slot5_salary.get(team, mean_slot5_sal)
+            stack_mult = (mean_slot5_sal / slot5_sal) ** _STACK_VALUE_EXP if total >= _STACK_THRESHOLD else 1.0
+            df.loc[mask_b, "_boost"] = (capped / mean_total) * stack_mult
             if "opponent" in df.columns:
                 mask_p = pitcher_mask & (df["opponent"] == team)
                 df.loc[mask_p, "_boost"] = (mean_total / capped) ** _PITCHER_MATCHUP_EXP
