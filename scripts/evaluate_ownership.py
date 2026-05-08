@@ -534,14 +534,15 @@ def _compute_model_g(
         _BATTER_TOTAL_CAP, _PITCHER_MATCHUP_EXP,
     )
 
-    _BATTER_STD_FLOOR  = 0.7
-    _PITCHER_STD_FLOOR = 0.4
-    _PITCHER_COMPRESS  = 0.20
-    _COSTACK_EXP       = 0.40
-    _CAP_PER_BATTER    = 4500
-    _STACK_EXP         = 0.25   # strength of stack-value salary signal; swept [0.25–0.70], 0.25 optimal
-    _TIME_FACTOR       = 0.08   # max fractional boost for earliest game; swept [0.08–0.16], 0.08 optimal
-    _STACK_THRESHOLD   = 4.5    # implied total below which cheap salaries don't drive stacking interest
+    _BATTER_STD_FLOOR    = 0.7
+    _PITCHER_STD_FLOOR   = 0.4
+    _PITCHER_COMPRESS    = 0.20
+    _COSTACK_EXP         = 0.40
+    _CAP_PER_BATTER      = 4500
+    _STACK_EXP           = 0.15  # strength of stack-value salary signal; swept 0.15–0.40, 0.15 optimal
+    _TIME_FACTOR         = 0.12  # max fractional boost for earliest-bucket games; swept, 0.12 optimal
+    _TIME_NEUTRAL_WINDOW = 30    # minute bucket width; games in same 30-min window get identical boost
+    _STACK_THRESHOLD     = 4.0   # implied total below which stack-value signal does not fire
 
     df = pool_df.copy().reset_index(drop=True)
     df["_sv"] = df["mean"] / (df["salary"] / 1000.0)
@@ -572,8 +573,12 @@ def _compute_model_g(
         (_CAP_PER_BATTER / df.loc[batter_mask, "salary"]) ** 0.5,
     )
 
-    # --- Signal 1: game start-time multiplier --------------------------------
-    # Parse HH:MM from the game string and compute per-game minutesfrom-midnight.
+    # --- Signal 1: game start-time penalty (batters only) --------------------
+    # Pitcher lineup slots are confirmed earlier in the day regardless of game
+    # time, so this only applies to batters. Games within the neutral window of
+    # slate lock (earliest game) are treated equally — no penalty. Only games
+    # starting 60+ minutes after slate lock get a penalty, scaling linearly to
+    # -_TIME_FACTOR for the latest game on the slate.
     def _game_minutes(game_str: str) -> float | None:
         m = _re.search(r'(\d{1,2}):(\d{2})(AM|PM)', str(game_str))
         if not m:
@@ -589,17 +594,29 @@ def _compute_model_g(
         game_mins = {g: _game_minutes(g) for g in df["game"].unique()}
         valid_mins = [v for v in game_mins.values() if v is not None]
         if len(valid_mins) > 1:
-            min_t, max_t = min(valid_mins), max(valid_mins)
-            time_range = max_t - min_t
-            df["_time_mult"] = df["game"].map(
-                lambda g: 1.0 + _TIME_FACTOR * (max_t - (game_mins.get(g) or max_t)) / time_range
-            )
+            min_t = min(valid_mins)
+            # Snap each game to a 60-minute bucket from slate lock so that games
+            # within the same hour window get identical boosts.
+            game_buckets = {
+                g: min_t + _TIME_NEUTRAL_WINDOW * int((t - min_t) // _TIME_NEUTRAL_WINDOW)
+                for g, t in game_mins.items() if t is not None
+            }
+            bucket_vals = list(game_buckets.values())
+            min_b, max_b = min(bucket_vals), max(bucket_vals)
+            bucket_range = max_b - min_b
+            if bucket_range > 0:
+                df["_time_mult"] = df["game"].map(
+                    lambda g: 1.0 + _TIME_FACTOR * (max_b - game_buckets.get(g, max_b)) / bucket_range
+                )
+            else:
+                df["_time_mult"] = 1.0  # all games same bucket — no differentiation
         else:
             df["_time_mult"] = 1.0
     else:
         df["_time_mult"] = 1.0
 
-    df["_raw"] *= df["_time_mult"]
+    # Apply only to batters — pitchers are confirmed before the slate regardless
+    df.loc[batter_mask, "_raw"] *= df.loc[batter_mask, "_time_mult"]
 
     # Implied-total boosts (same as F) + stack-value batter adjustment
     if team_totals:

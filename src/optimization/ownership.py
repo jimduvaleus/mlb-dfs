@@ -19,11 +19,13 @@ Key design choices:
   entire position pool through softmax concentration.
 - Game start-time multiplier: earlier games have confirmed batting lineups
   sooner, attracting DFS players building before late-game announcements.
+  Games are bucketed into 30-minute windows; all games in the same window
+  receive the same boost. Only applied to batters — pitcher slots are
+  confirmed earlier in the day regardless of game time.
 - Stack-value batter boost: teams with cheap top-of-order bats relative to
   their implied total are more attractive stacking targets — the field can
   pair them with expensive pitchers within the $50k cap. Only fires when the
-  implied total is >= 4.5 (psychological threshold below which cheap salaries
-  don't attract stacking interest regardless of salary efficiency).
+  team's implied total is >= 4.0.
 - Pitcher co-stack boost: pitchers on high-implied teams see elevated
   ownership because the field stacks that offense and often correlates
   the pitcher alongside their batters.
@@ -84,15 +86,18 @@ _PITCHER_COSTACK_EXP = 0.40
 
 # Stack-value batter boost: (mean_slot5_salary / team_slot5_salary) ** this_exp
 # amplifies ownership for teams with cheap top-of-order bats.
-_STACK_VALUE_EXP = 0.25
+_STACK_VALUE_EXP = 0.15
 
 # Implied total threshold below which the stack-value signal does not fire.
-# Below ~4.5 the field doesn't stack regardless of salary efficiency.
-_STACK_THRESHOLD = 4.5
+_STACK_THRESHOLD = 4.0
 
-# Maximum fractional ownership boost for the earliest game on the slate.
-# Applied as 1 + _TIME_FACTOR * relative_earliness (1.0 = earliest, 0.0 = latest).
-_TIME_FACTOR = 0.08
+# Maximum fractional boost for the earliest-bucket batter games on the slate.
+# Applied only to batters; pitchers are confirmed before the slate regardless.
+_TIME_FACTOR = 0.12
+
+# Games are bucketed into this-minute windows from slate lock. All games in
+# the same window receive the same time boost.
+_TIME_NEUTRAL_WINDOW = 30
 
 
 def compute_heuristic_ownership(
@@ -151,9 +156,11 @@ def compute_heuristic_ownership(
         (_BATTER_SALARY_PRESSURE_BASE / df.loc[batter_mask, "salary"]) ** 0.5,
     )
 
-    # --- Game start-time multiplier ------------------------------------------
-    # Earlier games get confirmed batting lineups sooner; DFS players building
-    # before late-game announcements concentrate on those games.
+    # --- Game start-time penalty (batters only) ------------------------------
+    # Pitcher lineup slots are confirmed earlier in the day regardless of game
+    # time. For batters, games within _TIME_NEUTRAL_WINDOW minutes of slate lock
+    # (the earliest game) are treated as neutral. Only games starting beyond that
+    # window get a penalty, scaling linearly to -_TIME_FACTOR at the latest game.
     if "game" in df.columns:
         def _game_minutes(game_str: str) -> float | None:
             m = re.search(r'(\d{1,2}):(\d{2})(AM|PM)', str(game_str))
@@ -169,12 +176,21 @@ def compute_heuristic_ownership(
         game_mins = {g: _game_minutes(g) for g in df["game"].unique()}
         valid_mins = [v for v in game_mins.values() if v is not None]
         if len(valid_mins) > 1:
-            min_t, max_t = min(valid_mins), max(valid_mins)
-            time_range = max_t - min_t
-            df["_time_mult"] = df["game"].map(
-                lambda g: 1.0 + _TIME_FACTOR * (max_t - (game_mins.get(g) or max_t)) / time_range
-            )
-            df["_raw"] *= df["_time_mult"]
+            min_t = min(valid_mins)
+            # Snap each game to a 60-minute bucket from slate lock so that
+            # games within the same hour window receive identical boosts.
+            game_buckets = {
+                g: min_t + _TIME_NEUTRAL_WINDOW * int((t - min_t) // _TIME_NEUTRAL_WINDOW)
+                for g, t in game_mins.items() if t is not None
+            }
+            bucket_vals = list(game_buckets.values())
+            min_b, max_b = min(bucket_vals), max(bucket_vals)
+            bucket_range = max_b - min_b
+            if bucket_range > 0:
+                df["_time_mult"] = df["game"].map(
+                    lambda g: 1.0 + _TIME_FACTOR * (max_b - game_buckets.get(g, max_b)) / bucket_range
+                )
+                df.loc[batter_mask, "_raw"] *= df.loc[batter_mask, "_time_mult"]
 
     # --- Implied-total boosts (batters and pitchers) -------------------------
     # Restrict team_totals to teams present in this player pool so that stale
