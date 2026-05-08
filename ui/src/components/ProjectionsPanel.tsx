@@ -222,7 +222,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       {mergeInfo && mergeInfo.fallbackTeams && mergeInfo.fallbackTeams.length > 0 && (
         <div className="merge-info-fallback-teams-callout">
           <strong>
-            ⛔ No market odds for {mergeInfo.fallbackTeams.length} team{mergeInfo.fallbackTeams.length !== 1 ? 's' : ''} — entire lineup on {mergeInfo.secondarySource} ×0.8 fallback
+            ⛔ No market odds for {mergeInfo.fallbackTeams.length} team{mergeInfo.fallbackTeams.length !== 1 ? 's' : ''} — entire lineup on {mergeInfo.secondarySource} ×0.9 fallback
           </strong>
           <div className="merge-info-fallback-teams-list">
             {mergeInfo.fallbackTeams.map((ft, i) => (
@@ -277,7 +277,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         </div>
       )}
 
-      {mergeInfo && mergeInfo.missingOptPlayers && mergeInfo.missingOptPlayers.length > 0 && (
+      {mergeInfo && status?.is_fresh !== false && mergeInfo.missingOptPlayers && mergeInfo.missingOptPlayers.length > 0 && (
         <div className="merge-info-missing-opt-callout">
           <strong>
             ⚠ {mergeInfo.missingOptPlayers.length} batter{mergeInfo.missingOptPlayers.length !== 1 ? 's' : ''} missing optional market(s) — full MO projection used
@@ -311,8 +311,9 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       )}
 
       {(() => {
-        if (!mergeInfo || mergeInfo.count === 0) return null
-        const batters  = mergeInfo.players.filter(p => !p.is_pitcher)
+        if (!mergeInfo || mergeInfo.count === 0 || status?.is_fresh === false) return null
+        const wholeTeams = new Set((mergeInfo.fallbackTeams ?? []).map(ft => ft.team))
+        const batters  = mergeInfo.players.filter(p => !p.is_pitcher && !wholeTeams.has(p.team))
         const pitchers = mergeInfo.players.filter(p => p.is_pitcher)
 
         const groupByTeam = (players: typeof mergeInfo.players) => {

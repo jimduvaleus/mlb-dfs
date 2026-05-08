@@ -1118,9 +1118,9 @@ async def projections_fetch(request: Request):
         def _whole_team_fallbacks(
             fallback_players: list[dict],
             t2g: dict[str, str],
-            threshold: int = 5,
+            total_per_team: dict[str, int] | None = None,
         ) -> list[dict]:
-            """Return teams where ≥ threshold batters fell back to the secondary source."""
+            """Return teams where every batter in the slate fell back to the secondary source."""
             counts: dict[str, int] = {}
             for p in fallback_players:
                 if not p.get("is_pitcher") and p.get("team"):
@@ -1128,7 +1128,7 @@ async def projections_fetch(request: Request):
             result = [
                 {"team": team, "game": t2g.get(team, ""), "count": count}
                 for team, count in counts.items()
-                if count >= threshold
+                if total_per_team and count == total_per_team.get(team)
             ]
             return sorted(result, key=lambda x: -x["count"])
 
@@ -1383,7 +1383,7 @@ async def projections_fetch(request: Request):
                             pool.loc[has_pref, "mean"]    = pool.loc[has_pref, "_pm"]
                             pool.loc[has_pref, "std_dev"] = pool.loc[has_pref, "_ps"]
                             pool = pool.drop(columns=["_pm", "_ps"])
-                            # Scale RotoWire fallback projections for hitters down to 80%
+                            # Scale RotoWire fallback projections for hitters down to 90%
                             # (RotoWire tends to be more optimistic than market odds for batters)
                             is_hitter_fallback = ~has_pref & (pool.get("lineup_slot", 0) != 10)
                             pool.loc[is_hitter_fallback, "mean"]    *= 0.9
@@ -1451,7 +1451,13 @@ async def projections_fetch(request: Request):
                             capped_players      = _purge(_prev.get("capped_players", []))  + capped_players
                             missing_opt_players = _purge(_prev.get("missing_opt_players", [])) + missing_opt_players
 
-                        fallback_teams = _whole_team_fallbacks(fallback_players, _ensure_team_to_game())
+                        _total_batters: dict[str, int] = {}
+                        if "lineup_slot" in pool.columns:
+                            for _pid in pool.loc[pool["lineup_slot"] != 10, "player_id"].astype(int):
+                                _t = _itm.get(_pid, "")
+                                if _t:
+                                    _total_batters[_t] = _total_batters.get(_t, 0) + 1
+                        fallback_teams = _whole_team_fallbacks(fallback_players, _ensure_team_to_game(), _total_batters)
 
                         _save_merge_info_state({
                             "players":             fallback_players,
@@ -1609,7 +1615,13 @@ async def projections_fetch(request: Request):
                     proj_written = True
 
                     low_team_projs2 = _low_team_projections(pool, _itm2)
-                    fallback_teams2 = _whole_team_fallbacks(fallback_players2, _ensure_team_to_game())
+                    _total_batters2: dict[str, int] = {}
+                    if "lineup_slot" in pool.columns:
+                        for _pid2 in pool.loc[pool["lineup_slot"] != 10, "player_id"].astype(int):
+                            _t2 = _itm2.get(_pid2, "")
+                            if _t2:
+                                _total_batters2[_t2] = _total_batters2.get(_t2, 0) + 1
+                    fallback_teams2 = _whole_team_fallbacks(fallback_players2, _ensure_team_to_game(), _total_batters2)
 
                     if fallback_players2 or low_team_projs2:
                         result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'timestamp': int(time.time() * 1000)})}\n\n"
