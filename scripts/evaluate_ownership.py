@@ -1,34 +1,48 @@
 """
-Evaluate heuristic ownership models against actual DraftKings %Drafted data.
+Benchmark the production ownership model against baselines and experimental
+candidates using actual DraftKings %Drafted data from archived slates.
 
-Run this on 5+ archived slates to decide whether a heuristic ownership model
-is accurate enough (Spearman ≥ 0.60) to justify adding a leverage_surplus
-objective to the live optimizer (Phase 2).
+The primary evaluation question is: does compute_heuristic_ownership()
+(the live optimizer's model, labeled E_production) achieve Spearman ≥ 0.60
+across 5+ slates? All other rows in the output table exist to provide context
+for how much each signal contributes.
 
 Usage
 -----
     python scripts/evaluate_ownership.py archive/04072026
     python scripts/evaluate_ownership.py archive/04072026 archive/04082026 ...
-    python scripts/evaluate_ownership.py archive/*/   # all archived slates
+    python scripts/evaluate_ownership.py archive/*/
 
 Output
 ------
-  - Per-slate and aggregate evaluation table printed to stdout.
-  - archive/MMDDYYYY/ownership_eval.csv  (per-player data for each slate).
+  - Per-slate and aggregate table printed to stdout.
+  - archive/MMDDYYYY/ownership_eval.csv  (per-player predictions vs actuals).
   - archive/ownership_summary.csv        (one row per slate, aggregate metrics).
 
-Models evaluated
-----------------
-  A. Uniform — equal ownership within each position group (baseline).
-  B. Salary-value softmax — softmax(salary_value) within position group.
-  C. Mean + salary-value softmax — softmax(w_mean*mean + w_sv*sv) within position.
-  D. Model C + team-total boost — batters on high-implied teams get a multiplier.
-     Only runs when dff_team_totals.csv is present in the archive directory.
-  E. compute_heuristic_ownership() — full model with sqrt compression, batting
-     order multiplier, pitcher matchup boost, and multi-position eligibility.
-     Requires dff_team_totals.csv and lineup_slot in dff_projections.csv.
-  F. Model E + mean-only batters + salary-cap pressure + softer softmax +
-     pitcher co-stack boost + pitcher pool compression.
+Models
+------
+  Baselines — naive approaches that establish a performance floor:
+    A_uniform      Equal weight within each position group.
+    B_salary_value softmax(salary_value) per position.
+    C_mean_sv      softmax(0.6·mean + 0.4·salary_value) per position.
+    D_team_total   C with batter boost proportional to implied team total.
+
+  Production — the model used by the live optimizer at runtime:
+    E_production   compute_heuristic_ownership() from
+                   src/optimization/ownership.py. Includes sqrt compression,
+                   batting-order multiplier, salary-cap pressure, game-time
+                   multiplier, stack-value batter boost, pitcher matchup and
+                   co-stack boosts, and post-softmax pitcher compression.
+
+  Incremental development history — intermediate steps showing per-signal gains;
+  kept for longitudinal tracking but not candidates to replace production:
+    F_salary_cap   E without game-time or stack-value signals.
+    G_stack_time   E without ISO game_start_time support (game-string fallback).
+
+  Experimental — candidates being evaluated as potential replacements:
+    H_pitcher_avg  Production + AvgPPG ratio boost for hot-streak pitchers.
+                   Pulled from production after 05082026 misranking; still
+                   tracked to accumulate evidence over more slates.
 """
 
 import argparse
@@ -294,29 +308,31 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
     Return a dict of {model_name: ownership_array} aligned to pool_df index.
 
     Ownership arrays are probabilities within each position group (sum to 1 per pos).
+    Read all output rows relative to E_production — that is the live optimizer's model.
     """
     models: dict[str, np.ndarray] = {}
 
-    # Model A: uniform within position
+    # ── Baselines ─────────────────────────────────────────────────────────────
+
+    # A: uniform within position
     uniform = np.zeros(len(pool_df))
     for pos, grp in pool_df.groupby("position"):
         idx = grp.index.to_numpy()
         uniform[idx] = 1.0 / len(idx)
     models["A_uniform"] = uniform
 
-    # Model B: softmax(salary_value) within position
+    # B: softmax(salary_value) within position
     models["B_salary_value"] = _apply_per_position(pool_df, "salary_value")
 
-    # Model C: softmax(0.6*mean + 0.4*salary_value) within position
+    # C: softmax(0.6*mean + 0.4*salary_value) within position
     pool_df = pool_df.copy()
     pool_df["_score_C"] = 0.6 * pool_df["mean"] + 0.4 * pool_df["salary_value"]
     models["C_mean_sv"] = _apply_per_position(pool_df, "_score_C")
 
-    # Model D: Model C + team-total boost for batters (only when implied_total available)
+    # D: C + team-total boost for batters (only when implied_total available)
     if pool_df["implied_total"].notna().any():
         pool_df = pool_df.copy()
         is_batter = pool_df["position"] != "P"
-        # Scale implied total to [0, 2] range as a multiplier
         total_vals = pool_df.loc[is_batter, "implied_total"].fillna(
             pool_df["implied_total"].median()
         )
@@ -329,8 +345,7 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
         pool_df.loc[~is_batter, "_score_D"] = pool_df.loc[~is_batter, "_score_C"]
         models["D_team_total"] = _apply_per_position(pool_df, "_score_D")
 
-    # Model E: compute_heuristic_ownership — sqrt compression, batting order
-    # multiplier, pitcher matchup boost, multi-position eligibility.
+    # Build team_totals dict for models that accept it (E–H)
     team_totals: dict[str, float] | None = None
     if pool_df["implied_total"].notna().any():
         team_totals = (
@@ -340,30 +355,34 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
             .set_index("team")["implied_total"]
             .to_dict()
         )
+
+    # ── Production ────────────────────────────────────────────────────────────
+    # compute_heuristic_ownership is what the live optimizer calls at runtime.
+    # This is the row all other results should be read relative to.
     try:
         from src.optimization.ownership import compute_heuristic_ownership
-        models["E_full"] = compute_heuristic_ownership(pool_df, team_totals)
+        models["E_production"] = compute_heuristic_ownership(pool_df, team_totals)
     except Exception as exc:
-        print(f"  [Model E skipped: {exc}]")
+        print(f"  [E_production skipped: {exc}]")
 
-    # Model F: mean-only raw score, salary cap pressure, softer softmax,
-    # pitcher own-team co-stack boost, pitcher pool compression.
+    # ── Development history ───────────────────────────────────────────────────
+    # Intermediate steps whose signals were merged into production; kept for
+    # longitudinal tracking to confirm per-signal Spearman gains hold over time.
     try:
-        models["F_new"] = _compute_model_f(pool_df, team_totals)
+        models["F_salary_cap"] = _compute_model_f(pool_df, team_totals)
     except Exception as exc:
-        print(f"  [Model F skipped: {exc}]")
+        print(f"  [F_salary_cap skipped: {exc}]")
 
-    # Model G: Model F + stack-value batter boost + game start-time multiplier.
     try:
         models["G_stack_time"] = _compute_model_g(pool_df, team_totals)
     except Exception as exc:
-        print(f"  [Model G skipped: {exc}]")
+        print(f"  [G_stack_time skipped: {exc}]")
 
-    # Model H: Model G + pitcher hot-streak boost (AvgPointsPerGame > projection).
+    # ── Experimental ──────────────────────────────────────────────────────────
     try:
         models["H_pitcher_avg"] = _compute_model_h(pool_df, team_totals)
     except Exception as exc:
-        print(f"  [Model H skipped: {exc}]")
+        print(f"  [H_pitcher_avg skipped: {exc}]")
 
     return models
 
@@ -373,21 +392,15 @@ def _compute_model_f(
     team_totals: dict[str, float] | None,
 ) -> np.ndarray:
     """
-    Model F — experimental improvements over E:
+    F_salary_cap — production signals minus game-time and stack-value batter boost.
 
-    1. Mean-only raw score: drop salary_value (Spearman vs actual = 0.23 for
-       batters; it adds noise rather than signal).
-    2. Salary-cap pressure: soft batter penalty (4500/salary)^0.5 for players
-       priced above the ~75th-percentile batter salary ($4500). Accounts for
-       the $50k cap making expensive players harder to roster alongside stacks.
-    3. Softer within-position softmax: std floor raised to 0.7 for batters
-       (from 0.4 in E) to prevent one outlier from consuming the position pool.
-    4. Pitcher own-team co-stack boost: pitchers on high-implied teams see
-       elevated ownership because the field stacks that offense and often
-       correlates the pitcher. Boost = (own_team_total / mean_total)^0.5.
-    5. Pitcher pool compression: post-softmax blend of 70% softmax + 30% uniform
-       within the pitcher position. Empirical pitcher ownership is much flatter
-       than softmax alone produces.
+    Included for longitudinal tracking to show the marginal Spearman gain from
+    those two signals. Not a candidate to replace production (G and E both
+    outperform it).
+
+    Identical to production except:
+    - No game start-time multiplier (added in G_stack_time)
+    - No stack-value batter boost (added in G_stack_time)
     """
     from src.optimization.ownership import (
         _BATTING_ORDER_MULT, _SLOT_COUNTS, _SECONDARY_POSITION_DISCOUNT,
@@ -521,20 +534,16 @@ def _compute_model_g(
     team_totals: dict[str, float] | None,
 ) -> np.ndarray:
     """
-    Model G — Model F + two new signals:
+    G_stack_time — production signals using game-string time parsing.
 
-    1. Stack-value batter boost: scales the implied-total batter boost by
-       (mean_slot_salary / team_slot_salary) ^ STACK_EXP, where slot_salary
-       is the average salary of the top-5 batting-order slots for each team.
-       Teams with cheap top-of-order bats relative to their implied total are
-       more attractive stacking targets — the field can pair them with
-       expensive pitchers and still build a competitive lineup.
+    Identical to compute_heuristic_ownership() except it derives game times by
+    regex-parsing the "HH:MMam/pm" token from the DK game string rather than
+    using the game_start_time ISO column. In the eval context, the player pool
+    has no game_start_time column, so E_production also falls back to
+    game-string parsing — meaning G and E should produce identical results
+    when game_start_time is absent, and diverge only when it is present.
 
-    2. Game start-time multiplier: earlier games get confirmed batting lineups
-       sooner, so DFS players building before late-game announcements gravitate
-       toward those players. Applied as (1 + TIME_FACTOR * relative_earliness)
-       to all players in the game, where relative_earliness = 1.0 for the
-       earliest game and 0.0 for the latest game on the slate.
+    Kept for longitudinal tracking to confirm this parity holds across slates.
     """
     import re as _re
 
@@ -733,27 +742,23 @@ def _compute_model_h(
     team_totals: dict[str, float] | None,
 ) -> np.ndarray:
     """
-    Model H — Model G + pitcher hot-streak boost.
+    H_pitcher_avg — production model + pitcher hot-streak boost.
 
     When a pitcher's DK AvgPointsPerGame exceeds their current projection
-    (avg_ratio > 1), their raw score is scaled up by avg_ratio^0.50 before
-    softmax. No fade applied when ratio < 1 — cold recent outings are noise.
+    (avg_ratio > 1), their mean is scaled by avg_ratio before passing to
+    compute_heuristic_ownership. No fade for ratio < 1 — cold recent outings
+    are treated as noise.
 
-    Rationale: the DFS field chases pitchers coming off strong recent games
-    more than the forward projection alone accounts for. Partial correlation
-    of avg_ratio with ownership (controlling for projection) = +0.21, p=0.048
-    across 5 slates.
+    Rationale: DFS players chase pitchers with strong recent games beyond what
+    forward projections capture. Partial correlation of avg_ratio with ownership
+    (controlling for projection) = +0.21, p=0.048 across 5 slates.
 
-    NOTE: removed from production (compute_heuristic_ownership) after the
-    05082026 slate showed it significantly misranked pitchers. Kept here for
-    continued evaluation on future slates.
+    Status: experimental. Misranked pitchers on 05082026; not yet in production.
     """
     from src.optimization.ownership import _PITCHER_AVG_RATIO_EXP, compute_heuristic_ownership
 
     if "avg_pts" not in pool_df.columns:
         return compute_heuristic_ownership(pool_df, team_totals)
-
-    import numpy as np
 
     df = pool_df.copy().reset_index(drop=True)
     pitcher_mask = df["position"] == "P"
@@ -936,6 +941,15 @@ def evaluate_slate(archive_dir: Path) -> pd.DataFrame | None:
         eval_df[f"pred_{model_name}"] = eval_df["player_id"].map(pid_map)
     eval_df.to_csv(archive_dir / "ownership_eval.csv", index=False)
     print(f"[{slate_label}] Wrote per-player data → {archive_dir / 'ownership_eval.csv'}")
+
+    # Sanity check: top 3 players by E_production projected ownership
+    if "E_production" in pid_to_model:
+        prod_col = "pred_E_production"
+        top3 = eval_df.nlargest(3, prod_col)[["player_name", "position", "team", prod_col, "pct_drafted"]]
+        print(f"[{slate_label}] Top 3 by E_production projected ownership:")
+        for _, r in top3.iterrows():
+            print(f"  {r['player_name']:<22} {r['position']:<3} {r['team']:<4}"
+                  f"  pred={r[prod_col]:.3f}  actual={r['pct_drafted']:.3f}")
 
     return results_df
 
