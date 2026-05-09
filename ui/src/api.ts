@@ -44,6 +44,12 @@ export async function fetchProjectionPlayers(): Promise<ProjectionPlayerRow[]> {
   return res.json()
 }
 
+export async function fetchTeamTotals(): Promise<Record<string, number>> {
+  const res = await fetch('/api/projections/team_totals')
+  if (!res.ok) return {}
+  return res.json()
+}
+
 export async function fetchProjectionSlates(): Promise<SlateListResponse> {
   const res = await fetch('/api/projections/slates')
   if (!res.ok) throw new Error(`Failed to load projection slates: ${res.statusText}`)

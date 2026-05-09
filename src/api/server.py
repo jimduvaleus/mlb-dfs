@@ -845,6 +845,18 @@ def projections_players():
         return []
 
 
+@app.get("/api/projections/team_totals")
+def projections_team_totals():
+    """Return implied run totals per team from dff_team_totals.csv, or {} if unavailable."""
+    try:
+        from .pipeline import PipelineRunner
+        slate_path = _get_slate_file_path()
+        totals = PipelineRunner._load_team_totals(str(slate_path) if slate_path else "")
+        return totals or {}
+    except Exception:
+        return {}
+
+
 @app.get("/api/projections/slates")
 async def projections_slates() -> SlateListResponse:
     cfg = read_config()

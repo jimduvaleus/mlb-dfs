@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import type { AppConfig, LineupResult, MergeInfo, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
-import { dismissNotification, dismissTwitterLineup, fetchConfig, fetchNotifications, fetchPortfolio, fetchProjectionPlayers, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
+import { dismissNotification, dismissTwitterLineup, fetchConfig, fetchNotifications, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -68,6 +68,7 @@ export default function App() {
   const [state, dispatch] = useReducer(reducer, initial)
   const [configError, setConfigError] = useState<string | null>(null)
   const [projectionPlayers, setProjectionPlayers] = useState<ProjectionPlayerRow[]>([])
+  const [teamTotals, setTeamTotals] = useState<Record<string, number>>({})
   const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
   // Games (as "AWAY@HOME" strings) to exclude from projection fetches.
   // Empty = fetch all games (default). Non-empty = partial fetch + merge.
@@ -97,6 +98,9 @@ export default function App() {
   const refreshProjectionPlayers = () => {
     fetchProjectionPlayers()
       .then(setProjectionPlayers)
+      .catch(() => {})
+    fetchTeamTotals()
+      .then(setTeamTotals)
       .catch(() => {})
   }
 
@@ -374,7 +378,7 @@ export default function App() {
         </div>
 
         {state.activeTab === 'projections' && (
-          <ProjectionsTable players={projectionPlayers} platform={state.config?.platform} />
+          <ProjectionsTable players={projectionPlayers} platform={state.config?.platform} teamTotals={teamTotals} />
         )}
 
         {state.activeTab === 'slate' && (

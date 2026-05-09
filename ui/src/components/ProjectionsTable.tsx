@@ -4,9 +4,10 @@ import TeamBadge from './TeamBadge'
 interface Props {
   players: ProjectionPlayerRow[]
   platform?: PlatformType
+  teamTotals?: Record<string, number>
 }
 
-export function ProjectionsTable({ players }: Props) {
+export function ProjectionsTable({ players, teamTotals }: Props) {
   if (players.length === 0) {
     return (
       <div className="projections-table-wrap">
@@ -40,6 +41,9 @@ export function ProjectionsTable({ players }: Props) {
                 <TeamBadge team={team} />
                 <div className="lineup-card-header-right">
                   <span className="projections-team-total">{hitterProj.toFixed(1)} pts</span>
+                  {teamTotals?.[team] != null && (
+                    <span className="projections-implied-total" title="Implied team run total (betting market)">{teamTotals[team].toFixed(1)} R</span>
+                  )}
                 </div>
               </div>
               <div className="lineup-card-players projections-card-players">
