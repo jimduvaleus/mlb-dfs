@@ -99,9 +99,8 @@ _TIME_FACTOR = 0.12
 # the same window receive the same time boost.
 _TIME_NEUTRAL_WINDOW = 30
 
-# Pitcher hot-streak boost: when a pitcher's DK AvgPointsPerGame exceeds their
-# current projection (avg_ratio > 1), ownership scales up by avg_ratio^this_exp.
-# No fade applied when ratio < 1 — cold streaks are noise, not signal.
+# Pitcher hot-streak boost exponent — used by evaluate_ownership.py (Model H)
+# but not applied in production until validated on more slates.
 _PITCHER_AVG_RATIO_EXP = 0.50
 
 
@@ -178,7 +177,25 @@ def compute_heuristic_ownership(
                 h = 0
             return float(h * 60 + mi)
 
-        game_mins = {g: _game_minutes(g) for g in df["game"].unique()}
+        def _iso_minutes(iso_str: str) -> float | None:
+            try:
+                from datetime import datetime as _dt
+                dt = _dt.fromisoformat(str(iso_str))
+                return float(dt.hour * 60 + dt.minute)
+            except (ValueError, TypeError):
+                return None
+
+        # Prefer game_start_time (ISO datetime written by dk_slate.py) over
+        # trying to parse time out of the game ID string ("LAA@TOR").
+        if "game_start_time" in df.columns:
+            _time_lookup = (
+                df[["game", "game_start_time"]]
+                .drop_duplicates("game")
+                .set_index("game")["game_start_time"]
+            )
+            game_mins = {g: _iso_minutes(t) for g, t in _time_lookup.items()}
+        else:
+            game_mins = {g: _game_minutes(g) for g in df["game"].unique()}
         valid_mins = [v for v in game_mins.values() if v is not None]
         if len(valid_mins) > 1:
             min_t = min(valid_mins)
@@ -245,15 +262,6 @@ def compute_heuristic_ownership(
                 df.loc[mask_own, "_boost"] *= (capped / mean_total) ** _PITCHER_COSTACK_EXP
 
         df["_raw"] *= df["_boost"]
-
-    # --- Pitcher hot-streak boost (Model H) ----------------------------------
-    # Pitchers coming off strong recent outings draw more ownership than their
-    # forward projection alone predicts. When avg_pts (DK AvgPointsPerGame) > mean,
-    # scale the pitcher raw score up by (avg_pts/mean)^exp. No fade below 1.
-    if "avg_pts" in df.columns:
-        avg_ratio = (df["avg_pts"] / df["mean"].clip(lower=0.5)).clip(upper=5.0)
-        hot = pitcher_mask & df["avg_pts"].notna() & (df["avg_pts"] > 0) & (avg_ratio > 1.0)
-        df.loc[hot, "_raw"] *= avg_ratio[hot] ** _PITCHER_AVG_RATIO_EXP
 
     # --- Per-position softmax, respecting multi-position eligibility ---------
     use_eligible = "eligible_positions" in df.columns

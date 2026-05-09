@@ -764,9 +764,10 @@ def projections_players():
             return []
         for df in (slate_df, proj_df):
             df["player_id"] = pd.to_numeric(df["player_id"], errors="coerce").astype("Int64")
-        slate_cols = ["player_id", "name", "position", "team", "opponent", "salary"]
-        if "eligible_positions" in slate_df.columns:
-            slate_cols.append("eligible_positions")
+        slate_cols = ["player_id", "name", "position", "team", "opponent", "salary", "game"]
+        for _opt in ("game_start_time", "eligible_positions", "avg_pts"):
+            if _opt in slate_df.columns:
+                slate_cols.append(_opt)
         slate_sub = slate_df[slate_cols]
         proj_sub  = proj_df[["player_id", "mean", "lineup_slot", "slot_confirmed"]]
         merged = slate_sub.merge(proj_sub, on="player_id", how="inner")

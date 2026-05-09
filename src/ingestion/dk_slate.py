@@ -111,7 +111,15 @@ class DraftKingsSlateIngestor(BaseSlateIngestor):
             df['game'] = ""
             df['game_start_time'] = ""
 
-        df['opponent'] = ""
+        # Derive opponent from the parsed game ID (e.g. "LAA@TOR") and team.
+        def _opponent_from_game(row) -> str:
+            g = str(row['game'])
+            if '@' not in g:
+                return ""
+            away, home = g.split('@', 1)
+            return home if row['team'] == away else away
+
+        df['opponent'] = df.apply(_opponent_from_game, axis=1)
 
         # Drop players whose game was removed from the slate (Game Info is "-" or otherwise unparseable).
         df = df[df['game'] != ""].reset_index(drop=True)

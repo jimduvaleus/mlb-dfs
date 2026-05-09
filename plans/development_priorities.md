@@ -1,3 +1,2 @@
 - BIG late swap?
 - Add manual projection override to projection panel
-- Add implied totals to Projections panel
