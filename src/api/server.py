@@ -1084,6 +1084,24 @@ async def projections_fetch(request: Request):
             except Exception:
                 return {}
 
+        def _copy_proj_to_mo_archive() -> None:
+            """Overwrite the archive market_odds_projections.csv with the final
+            merged projections.csv so fallback players are included."""
+            if dk_path is None or not proj_path.exists():
+                return
+            try:
+                import shutil as _sh
+                _gi = pd.read_csv(dk_path, usecols=["Game Info"])
+                _m = re.search(r"(\d{2})/(\d{2})/(\d{4})", str(_gi["Game Info"].dropna().iloc[0]))
+                if not _m:
+                    return
+                _mo, _dy, _yr = _m.groups()
+                _dest = PROJECT_ROOT / "archive" / f"{_mo}{_dy}{_yr}" / "market_odds_projections.csv"
+                if _dest.exists():
+                    _sh.copy2(proj_path, _dest)
+            except Exception:
+                pass
+
         def _load_merge_info_state() -> dict:
             if not merge_info_state_path.exists():
                 return {}
@@ -1424,6 +1442,7 @@ async def projections_fetch(request: Request):
                         if _stale_warn:
                             yield _log(f"Warning: {_stale_warn}")
                         proj_written = True
+                        _copy_proj_to_mo_archive()
 
                         # Build capped_players and missing_opt_players from sidecars + pool.
                         mo_cap_data = _read_mo_caps()
