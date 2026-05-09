@@ -189,7 +189,8 @@ def _build_player_pool(
     sal_df = pd.read_csv(salary_path)
     sal_df.rename(
         columns={"ID": "player_id", "Name": "name", "Salary": "salary",
-                 "TeamAbbrev": "team", "Game Info": "game", "Position": "raw_position"},
+                 "TeamAbbrev": "team", "Game Info": "game", "Position": "raw_position",
+                 "AvgPointsPerGame": "avg_pts"},
         inplace=True,
     )
     sal_df["player_id"] = sal_df["player_id"].astype(int)
@@ -205,8 +206,9 @@ def _build_player_pool(
         return ""
 
     sal_df["opponent"] = sal_df.apply(_opponent, axis=1)
+    avg_pts_col = ["avg_pts"] if "avg_pts" in sal_df.columns else []
     sal_df = sal_df[
-        ["player_id", "name", "salary", "position", "eligible_positions", "team", "opponent", "game"]
+        ["player_id", "name", "salary", "position", "eligible_positions", "team", "opponent", "game"] + avg_pts_col
     ].drop_duplicates("player_id")
 
     # Load DFF for lineup_slot (and as mean/std_dev fallback).
@@ -355,6 +357,12 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
         models["G_stack_time"] = _compute_model_g(pool_df, team_totals)
     except Exception as exc:
         print(f"  [Model G skipped: {exc}]")
+
+    # Model H: Model G + pitcher hot-streak boost (AvgPointsPerGame > projection).
+    try:
+        models["H_pitcher_avg"] = _compute_model_h(pool_df, team_totals)
+    except Exception as exc:
+        print(f"  [Model H skipped: {exc}]")
 
     return models
 
@@ -717,6 +725,31 @@ def _compute_model_g(
             df.loc[mask, "ownership"] += contribution
 
     return df["ownership"].values.astype(np.float64)
+
+
+def _compute_model_h(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+) -> np.ndarray:
+    """
+    Model H — Model G + pitcher hot-streak boost.
+
+    When a pitcher's DK AvgPointsPerGame exceeds their current projection
+    (avg_ratio > 1), their raw score is scaled up by avg_ratio^0.50 before
+    softmax. No fade applied when ratio < 1 — cold recent outings are noise.
+
+    Rationale: the DFS field chases pitchers coming off strong recent games
+    more than the forward projection alone accounts for. Partial correlation
+    of avg_ratio with ownership (controlling for projection) = +0.21, p=0.048
+    across 5 slates.
+    """
+    from src.optimization.ownership import _PITCHER_AVG_RATIO_EXP
+
+    # Build on Model G output by delegating raw computation, then applying
+    # the avg_ratio boost on top via the production function which already
+    # contains the full Model H logic.
+    from src.optimization.ownership import compute_heuristic_ownership
+    return compute_heuristic_ownership(pool_df, team_totals)
 
 
 # ---------------------------------------------------------------------------

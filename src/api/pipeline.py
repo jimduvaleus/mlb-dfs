@@ -426,6 +426,10 @@ class PipelineRunner:
                 _gpp_payout_arr = payout_table_to_array(
                     load_payout_structure("dk_classic_gpp")
                 ).astype(np.float32)
+                _cand_excluded_pids = (
+                    set(sim_players_df["player_id"].tolist())
+                    - set(cand_players_df["player_id"].tolist())
+                )
                 scorer = ContestScorer(
                     sim_results=sim_results,
                     players_df=cand_players_df,
@@ -438,6 +442,7 @@ class PipelineRunner:
                     team_totals=team_totals_gpp,
                     candidate_batch_size=cand_batch,
                     portfolio_size=portfolio_size,
+                    cand_excluded_player_ids=_cand_excluded_pids,
                 )
                 candidates, robust_payout = scorer.score_candidates(
                     candidates,

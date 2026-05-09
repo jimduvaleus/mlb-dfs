@@ -1727,7 +1727,8 @@ def _date_to_archive_dir(date_str: str) -> str:
 
 
 def _archive_market_odds_slate(slate_path: str, proj_df: pd.DataFrame) -> None:
-    """Mirror market odds projections into archive/MMDDYYYY/ for later evaluation."""
+    """Mirror market odds projections and fair odds cache into archive/MMDDYYYY/."""
+    import shutil
     try:
         slate_date = _extract_date_from_dk(slate_path) or _extract_date_from_fd_path(slate_path)
         if not slate_date:
@@ -1737,6 +1738,9 @@ def _archive_market_odds_slate(slate_path: str, proj_df: pd.DataFrame) -> None:
         dest = archive_dir / "market_odds_projections.csv"
         proj_df.to_csv(dest, index=False)
         log.info("Archived market odds projections → %s", dest)
+        if FAIR_ODDS_CACHE_PATH.exists():
+            shutil.copy2(FAIR_ODDS_CACHE_PATH, archive_dir / "market_odds_fair_odds.json")
+            log.info("Archived fair odds cache → %s", archive_dir / "market_odds_fair_odds.json")
     except Exception as exc:
         log.warning("Could not archive market odds projections: %s", exc)
 

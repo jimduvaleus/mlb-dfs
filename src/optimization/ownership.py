@@ -99,6 +99,11 @@ _TIME_FACTOR = 0.12
 # the same window receive the same time boost.
 _TIME_NEUTRAL_WINDOW = 30
 
+# Pitcher hot-streak boost: when a pitcher's DK AvgPointsPerGame exceeds their
+# current projection (avg_ratio > 1), ownership scales up by avg_ratio^this_exp.
+# No fade applied when ratio < 1 — cold streaks are noise, not signal.
+_PITCHER_AVG_RATIO_EXP = 0.50
+
 
 def compute_heuristic_ownership(
     players_df: pd.DataFrame,
@@ -240,6 +245,15 @@ def compute_heuristic_ownership(
                 df.loc[mask_own, "_boost"] *= (capped / mean_total) ** _PITCHER_COSTACK_EXP
 
         df["_raw"] *= df["_boost"]
+
+    # --- Pitcher hot-streak boost (Model H) ----------------------------------
+    # Pitchers coming off strong recent outings draw more ownership than their
+    # forward projection alone predicts. When avg_pts (DK AvgPointsPerGame) > mean,
+    # scale the pitcher raw score up by (avg_pts/mean)^exp. No fade below 1.
+    if "avg_pts" in df.columns:
+        avg_ratio = (df["avg_pts"] / df["mean"].clip(lower=0.5)).clip(upper=5.0)
+        hot = pitcher_mask & df["avg_pts"].notna() & (df["avg_pts"] > 0) & (avg_ratio > 1.0)
+        df.loc[hot, "_raw"] *= avg_ratio[hot] ** _PITCHER_AVG_RATIO_EXP
 
     # --- Per-position softmax, respecting multi-position eligibility ---------
     use_eligible = "eligible_positions" in df.columns

@@ -124,6 +124,9 @@ class ContestScorer:
     inject_field_lineups : if True and portfolio_size > 0, score field sample 0 lineups
                            and promote any that crack the top portfolio_size EV into
                            the candidate pool, replacing the bottom performers
+    cand_excluded_player_ids : player IDs excluded from the candidate pool (both + candidates
+                               scope). Injected field lineups containing any of these players
+                               are skipped so exclusions are always honoured.
     """
 
     def __init__(
@@ -140,6 +143,7 @@ class ContestScorer:
         candidate_batch_size: int = 500,
         portfolio_size: int = 0,
         inject_field_lineups: bool = True,
+        cand_excluded_player_ids: Optional[set] = None,
     ) -> None:
         self._sim_results = sim_results
         self._players_df = players_df
@@ -149,6 +153,9 @@ class ContestScorer:
         self._batch_size = candidate_batch_size
         self._portfolio_size = portfolio_size
         self._inject_field_lineups = inject_field_lineups
+        self._cand_excluded_pids: set[int] = (
+            {int(p) for p in cand_excluded_player_ids} if cand_excluded_player_ids else set()
+        )
         self.last_injected_count: int = 0
 
         if payout_arr is None:
@@ -393,6 +400,8 @@ class ContestScorer:
                 break  # sorted descending; nothing further will beat it either
 
             raw_pids = [int(p) for p in field_lineups[fi]]
+            if self._cand_excluded_pids and any(p in self._cand_excluded_pids for p in raw_pids):
+                continue  # contains a candidate-excluded player
             pid_set = frozenset(raw_pids)
             if pid_set in existing_pid_sets:
                 continue  # already in pool

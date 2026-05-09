@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -47,7 +48,8 @@ class DraftKingsSlateIngestor(BaseSlateIngestor):
             "Salary": "salary",
             "TeamAbbrev": "team",
             "Game Info": "game_info",
-            "Name + ID": "name_plus_id" # Keep this for potential future use or validation
+            "Name + ID": "name_plus_id",
+            "AvgPointsPerGame": "avg_pts",
         }, inplace=True)
 
         # Data cleaning and validation
@@ -114,7 +116,9 @@ class DraftKingsSlateIngestor(BaseSlateIngestor):
         # Drop players whose game was removed from the slate (Game Info is "-" or otherwise unparseable).
         df = df[df['game'] != ""].reset_index(drop=True)
 
-        return df[['player_id', 'name', 'position', 'eligible_positions', 'roster_position', 'salary', 'team', 'opponent', 'game', 'game_start_time']]
+        if 'avg_pts' not in df.columns:
+            df['avg_pts'] = np.nan
+        return df[['player_id', 'name', 'position', 'eligible_positions', 'roster_position', 'salary', 'team', 'opponent', 'game', 'game_start_time', 'avg_pts']]
 
     def get_players(self) -> List[Player]:
         players = []

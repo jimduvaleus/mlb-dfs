@@ -1,3 +1,3 @@
 - BIG late swap?
-- I think we're overestimating ownership % at top implied total end. might need to stop scaling after some cap of like 6.5 runs
-- I think we're underestimating ownership % for pitchers with low opposing implied total
+- Add manual projection override to projection panel
+- Add implied totals to Projections panel
