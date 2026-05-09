@@ -111,6 +111,8 @@ PITCHER_MARKETS = [
     "Player Earned Runs Allowed",
 ]
 
+TEAM_TOTAL_MARKET = "Team Total Runs"
+
 # Internal market key names
 MK_RUNS    = "runs"
 MK_RBIS    = "rbis"
@@ -877,7 +879,7 @@ async def _parse_market_ids(
     from the market dropdown, filtered to markets in BATTER_MARKETS + PITCHER_MARKETS.
     Returns empty dict on failure.
     """
-    _wanted = set(BATTER_MARKETS + PITCHER_MARKETS)
+    _wanted = set(BATTER_MARKETS + PITCHER_MARKETS + [TEAM_TOTAL_MARKET])
     url = GAME_URL.format(game_id)
     try:
         await page.goto(url, wait_until="domcontentloaded")
@@ -1091,6 +1093,91 @@ async def _fetch_game_odds(
         "game_id=%d: collected market data for %d players", game_id, len(market_data)
     )
     return market_data, seen_players, sidecar_rows
+
+
+async def _fetch_team_total_lines(
+    page,
+    game_id: int,
+    market_id: str,
+) -> dict[str, float]:
+    """
+    Fetch the Team Total Runs market for one game and return {team_abbr: implied_total}.
+
+    Parses the same column layout as player props (col 0 = "Team Name Over/Under Line",
+    col 2 = fair odds after devig).  Fits a Poisson distribution across all O/U lines
+    where P(Over) is in [0.05, 0.95] and returns the mean lambda as the implied total.
+
+    Returns {} on failure or if no valid lines are found.
+    """
+    url = GAME_MARKET_URL.format(game_id=game_id, market_id=market_id)
+    log.info("Fetching team totals for game_id=%d", game_id)
+    try:
+        await page.goto(url, wait_until="domcontentloaded")
+        await page.wait_for_selector('[id*="GridView1"] tr', timeout=20_000)
+    except Exception as e:
+        log.warning("Team Total table did not load for game_id=%d: %s", game_id, e)
+        return {}
+
+    rows: list[list[str]] = await page.evaluate(_TABLE_JS)
+    if not rows:
+        log.warning("Team Total table empty for game_id=%d", game_id)
+        return {}
+
+    # Collect Over/Under pairs per (team_name, line), same logic as player props.
+    # Skip ⚠️-flagged cells (one-way devigged lines — no reliable price discovery).
+    raw: dict[tuple[str, float], dict[str, float]] = {}
+    for row in rows:
+        if len(row) <= _FAIR_ODDS_COL:
+            continue
+        parsed = _parse_bet_name(row[_BET_NAME_COL])
+        if parsed is None:
+            continue
+        team_name, outcome, line = parsed
+        odds_cell = row[_FAIR_ODDS_COL]
+        if "⚠" in odds_cell:
+            continue
+        prob = _parse_fair_odds(odds_cell.strip())
+        if prob is None:
+            continue
+        raw.setdefault((team_name, line), {})[outcome] = prob
+
+    # Normalize each Over/Under pair and fit Poisson to get lambda per team.
+    team_lambdas: dict[str, list[float]] = {}
+    for (team_name, line), sides in raw.items():
+        p_over_raw = sides.get("over")
+        p_under_raw = sides.get("under")
+        if p_over_raw is None or p_under_raw is None:
+            continue
+        total = p_over_raw + p_under_raw
+        p_over = p_over_raw / total if total > 0 else p_over_raw
+        # Only use lines with reasonable price discovery (near even-money).
+        if not (0.05 <= p_over <= 0.95):
+            continue
+        lam = _poisson_lambda(line, p_over)
+        if lam is not None and lam > 0:
+            team_lambdas.setdefault(team_name, []).append(lam)
+
+    if not team_lambdas:
+        log.warning("No valid Team Total lines found for game_id=%d", game_id)
+        return {}
+
+    result: dict[str, float] = {}
+    for team_name, lambdas in team_lambdas.items():
+        abbr = FULL_NAME_TO_ABBR.get(team_name)
+        if abbr is None:
+            last_word = team_name.split()[-1].lower()
+            abbr = _NICKNAME_TO_ABBR.get(last_word)
+        if abbr is None:
+            log.warning("Could not map team name %r to abbreviation", team_name)
+            continue
+        implied_total = round(sum(lambdas) / len(lambdas), 2)
+        result[abbr] = implied_total
+        log.info(
+            "Team total %s (%s): %.2f runs (%d lines averaged)",
+            abbr, team_name, implied_total, len(lambdas),
+        )
+
+    return result
 
 
 async def _find_game_ids(
@@ -1481,16 +1568,17 @@ async def _run_playwright(
 ) -> tuple[
     dict[tuple[str, str, str], dict[str, list[tuple[float, float]]]],
     set[tuple[str, str, str]],
+    dict[str, float],
 ]:
     """
     Launch headless Chromium, find slate games on CrazyNinjaOdds, and scrape
     all relevant markets. Games are fetched in parallel (up to
     _MAX_CONCURRENT_GAMES simultaneous pages).
 
-    Returns (all_market_data, all_seen_players) where both are keyed/tagged by
-    (player_name, away_team, home_team) so that same-name players in different
-    games (e.g. Max Muncy on LAD and ATH) are kept as separate entries and
-    matched to the correct DK player_id at projection time.
+    Returns (all_market_data, all_seen_players, team_totals) where the first
+    two are keyed/tagged by (player_name, away_team, home_team) so that
+    same-name players in different games are kept as separate entries, and
+    team_totals is {team_abbr: implied_run_total}.
 
     games_filter: if provided, only fetch these (away, home) matchups.
     platform: 'draftkings' or 'fanduel' — controls date/game extraction path.
@@ -1508,12 +1596,12 @@ async def _run_playwright(
         slate_date = _extract_date_from_fd_path(slate_path)
         if not slate_date:
             log.error("Could not extract date from FD filename: %s", Path(slate_path).name)
-            return {}, set()
+            return {}, set(), {}
     else:
         slate_date = _extract_date_from_dk(slate_path)
         if not slate_date:
             log.error("Could not extract date from DK file.")
-            return {}, set()
+            return {}, set(), {}
     log.info("Slate date: %s", slate_date)
 
     if platform == "fanduel":
@@ -1522,7 +1610,7 @@ async def _run_playwright(
         slate_games = _extract_game_info_from_dk(slate_path)
     if not slate_games:
         log.error("Could not extract games from %s file.", platform.upper())
-        return {}, set()
+        return {}, set(), {}
 
     full_slate_games = dict(slate_games)  # full slate before games_filter for cache key
 
@@ -1536,7 +1624,7 @@ async def _run_playwright(
         slate_games = {k: v for k, v in slate_games.items() if k in games_filter}
         if not slate_games:
             log.error("No requested games found in DK slate.")
-            return {}, set()
+            return {}, set(), {}
 
     log.info("Fetching for games: %s", [f"{a}@{h}" for a, h in slate_games.keys()])
 
@@ -1586,7 +1674,7 @@ async def _run_playwright(
                 log.error("No slate games matched on CrazyNinjaOdds.")
                 await context.close()
                 await browser.close()
-                return {}, set()
+                return {}, set(), {}
             _save_game_id_cache(cache_key, game_id_map)
         else:
             log.info("Skipping games.aspx — using %d cached game IDs.", len(game_id_map))
@@ -1600,10 +1688,15 @@ async def _run_playwright(
 
         for (away, home), game_id in game_id_map.items():
             cached_mids = raw_market_cache.get(str(game_id))
-            if cached_mids:
+            if cached_mids and TEAM_TOTAL_MARKET in cached_mids:
                 game_market_ids[game_id] = cached_mids
                 log.info("Using cached market IDs for game_id=%d (%s@%s)", game_id, away, home)
             else:
+                if cached_mids:
+                    log.info(
+                        "Market ID cache for game_id=%d missing %r — re-fetching",
+                        game_id, TEAM_TOTAL_MARKET,
+                    )
                 games_needing_mids.append((away, home, game_id))
 
         if games_needing_mids:
@@ -1678,6 +1771,27 @@ async def _run_playwright(
         ]
         results = await asyncio.gather(*tasks)
 
+        # Phase 3.5: fetch Team Total Runs for each game (sequential to be gentle
+        # on the site — one page load per game, much lighter than player markets).
+        team_totals: dict[str, float] = {}
+        for (away, home), game_id in game_id_map.items():
+            tt_market_id = game_market_ids.get(game_id, {}).get(TEAM_TOTAL_MARKET)
+            if tt_market_id is None:
+                log.info(
+                    "No %r market ID for game_id=%d (%s@%s) — skipping team totals",
+                    TEAM_TOTAL_MARKET, game_id, away, home,
+                )
+                continue
+            p = await context.new_page()
+            _install_rate_limit_handler(p, f"team_total:{away}@{home}")
+            try:
+                game_totals = await _fetch_team_total_lines(p, game_id, tt_market_id)
+                team_totals.update(game_totals)
+            except Exception as e:
+                log.warning("Error fetching team totals for %s@%s: %s", away, home, e)
+            finally:
+                await p.close()
+
         await context.close()
         await browser.close()
 
@@ -1714,7 +1828,7 @@ async def _run_playwright(
             fair_odds_data[f"{away}@{home}"] = raw_odds
     _save_fair_odds_cache(full_cache_key, fair_odds_data)
 
-    return all_market_data, all_seen_players
+    return all_market_data, all_seen_players, team_totals
 
 
 # ---------------------------------------------------------------------------
@@ -1724,6 +1838,35 @@ async def _run_playwright(
 def _date_to_archive_dir(date_str: str) -> str:
     yr, mo, dy = date_str.split("-")
     return f"{mo}{dy}{yr}"
+
+
+def _archive_team_totals(slate_path: str, team_totals: dict[str, float]) -> None:
+    """Write CNO-derived implied run totals to archive/MMDDYYYY/cno_team_totals.csv.
+
+    Merges with any existing file so that partial fetches (--games subset) only
+    update the teams that were re-fetched and preserve the others.
+    """
+    try:
+        slate_date = _extract_date_from_dk(slate_path) or _extract_date_from_fd_path(slate_path)
+        if not slate_date:
+            return
+        archive_dir = PROJECT_ROOT / "archive" / _date_to_archive_dir(slate_date)
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        dest = archive_dir / "cno_team_totals.csv"
+        existing: dict[str, float] = {}
+        if dest.exists():
+            try:
+                df_ex = pd.read_csv(dest)
+                existing = dict(zip(df_ex["team"], df_ex["implied_total"].astype(float)))
+            except Exception:
+                pass
+        existing.update(team_totals)  # newly fetched values overwrite stale ones
+        pd.DataFrame(
+            [{"team": t, "implied_total": v} for t, v in sorted(existing.items())]
+        ).to_csv(dest, index=False)
+        log.info("Archived CNO team totals (%d teams) → %s", len(existing), dest)
+    except Exception as exc:
+        log.warning("Could not archive CNO team totals: %s", exc)
 
 
 def _archive_market_odds_slate(slate_path: str, proj_df: pd.DataFrame) -> None:
@@ -1801,8 +1944,8 @@ def build_projections_csv(
             dk_pos = {int(r["player_id"]): str(r["Position"]) for _, r in dk_df.iterrows()}
         slate_path = dk_path
 
-    # Fetch market data
-    all_market_data, all_seen_players = asyncio.run(
+    # Fetch market data and team totals
+    all_market_data, all_seen_players, team_totals = asyncio.run(
         _run_playwright(
             slate_path, name_map, debug=debug,
             games_filter=games_filter, platform=platform,
@@ -1929,6 +2072,8 @@ def build_projections_csv(
 
     # Auto-archive for historical ownership evaluation
     _archive_market_odds_slate(slate_path, out_df)
+    if team_totals:
+        _archive_team_totals(slate_path, team_totals)
 
     # Write sidecar JSONs read by the server to annotate the UI merge_info callout.
     _op = Path(output_path)

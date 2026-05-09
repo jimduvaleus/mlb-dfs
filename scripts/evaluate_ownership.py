@@ -236,15 +236,16 @@ def _build_player_pool(
 
     merged["salary_value"] = merged["mean"] / merged["salary"] * 1000
 
-    # Optionally attach team implied totals
-    totals_path = archive_dir / "dff_team_totals.csv"
-    if totals_path.exists():
-        totals_df = pd.read_csv(totals_path)
-        totals_df.columns = [c.lower() for c in totals_df.columns]
-        merged = merged.merge(
-            totals_df.rename(columns={"implied_total": "implied_total"}),
-            on="team", how="left",
-        )
+    # Optionally attach team implied totals — prefer CNO (live), fall back to DFF (legacy).
+    totals_df = None
+    for totals_fname in ("cno_team_totals.csv", "dff_team_totals.csv"):
+        totals_path = archive_dir / totals_fname
+        if totals_path.exists():
+            totals_df = pd.read_csv(totals_path)
+            totals_df.columns = [c.lower() for c in totals_df.columns]
+            break
+    if totals_df is not None:
+        merged = merged.merge(totals_df[["team", "implied_total"]], on="team", how="left")
     else:
         merged["implied_total"] = np.nan
 

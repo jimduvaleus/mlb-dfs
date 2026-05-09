@@ -1088,9 +1088,11 @@ class PipelineRunner:
 
     @staticmethod
     def _load_team_totals(slate_path: str) -> Optional[dict]:
-        """Try to load dff_team_totals.csv from the archive for the slate date.
+        """Load implied run totals from the archive for the slate date.
 
-        Returns {team: implied_total} or None if not found.
+        Prefers cno_team_totals.csv (live CNO-derived); falls back to
+        dff_team_totals.csv for legacy archived slates.
+        Returns {team: implied_total} or None if neither file is found.
         """
         import re as _re
         from pathlib import Path as _Path
@@ -1117,15 +1119,18 @@ class PipelineRunner:
                                 break
                 except Exception:
                     pass
-        totals_path = archive_dir / "dff_team_totals.csv" if archive_dir else None
-        if totals_path is None or not totals_path.exists():
+        if archive_dir is None:
             return None
-        try:
-            df = pd.read_csv(totals_path)
-            if "team" in df.columns and "implied_total" in df.columns:
-                return dict(zip(df["team"], df["implied_total"].astype(float)))
-        except Exception:
-            pass
+        for filename in ("cno_team_totals.csv", "dff_team_totals.csv"):
+            totals_path = archive_dir / filename
+            if not totals_path.exists():
+                continue
+            try:
+                df = pd.read_csv(totals_path)
+                if "team" in df.columns and "implied_total" in df.columns:
+                    return dict(zip(df["team"], df["implied_total"].astype(float)))
+            except Exception:
+                pass
         return None
 
     @staticmethod
