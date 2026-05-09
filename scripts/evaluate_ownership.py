@@ -743,14 +743,34 @@ def _compute_model_h(
     more than the forward projection alone accounts for. Partial correlation
     of avg_ratio with ownership (controlling for projection) = +0.21, p=0.048
     across 5 slates.
-    """
-    from src.optimization.ownership import _PITCHER_AVG_RATIO_EXP
 
-    # Build on Model G output by delegating raw computation, then applying
-    # the avg_ratio boost on top via the production function which already
-    # contains the full Model H logic.
-    from src.optimization.ownership import compute_heuristic_ownership
-    return compute_heuristic_ownership(pool_df, team_totals)
+    NOTE: removed from production (compute_heuristic_ownership) after the
+    05082026 slate showed it significantly misranked pitchers. Kept here for
+    continued evaluation on future slates.
+    """
+    from src.optimization.ownership import _PITCHER_AVG_RATIO_EXP, compute_heuristic_ownership
+
+    if "avg_pts" not in pool_df.columns:
+        return compute_heuristic_ownership(pool_df, team_totals)
+
+    import numpy as np
+
+    df = pool_df.copy().reset_index(drop=True)
+    pitcher_mask = df["position"] == "P"
+
+    avg_ratio = (df["avg_pts"] / df["mean"].clip(lower=0.5)).clip(upper=5.0)
+    hot = pitcher_mask & df["avg_pts"].notna() & (df["avg_pts"] > 0) & (avg_ratio > 1.0)
+
+    # The production function computes pitcher _raw as:
+    #   0.8*sqrt(mean) + 0.2*sqrt(salary_value)
+    # where salary_value = mean/salary*1000.  Both terms contain sqrt(mean),
+    # so multiplying mean by `ratio` gives _raw *= sqrt(ratio) = ratio^0.5,
+    # which exactly replicates the original Model H boost of _raw *= ratio^exp
+    # (exp=0.50).  Drop avg_pts so the production function can't double-apply
+    # the signal if it's ever re-introduced there.
+    df.loc[hot, "mean"] = df.loc[hot, "mean"] * avg_ratio[hot]
+
+    return compute_heuristic_ownership(df.drop(columns=["avg_pts"]), team_totals)
 
 
 # ---------------------------------------------------------------------------
