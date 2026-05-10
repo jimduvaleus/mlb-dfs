@@ -290,10 +290,22 @@ class PipelineRunner:
         if objective == "leverage_surplus":
             from src.optimization.ownership import compute_heuristic_ownership
             team_totals = self._load_team_totals(slate_path)
+            hr_odds = self._load_hr_fair_odds(slate_path)
+            if hr_odds:
+                import unicodedata as _ud, re as _re
+                def _norm(n: str) -> str:
+                    nfkd = _ud.normalize("NFKD", n)
+                    return _re.sub(r"[^a-z ]", "", nfkd.encode("ascii", "ignore").decode("ascii").lower()).strip()
+                cand_players_df = cand_players_df.copy()
+                name_col = "name" if "name" in cand_players_df.columns else None
+                cand_players_df["hr_prob"] = (
+                    cand_players_df[name_col].apply(lambda n: hr_odds.get(_norm(str(n))))
+                    if name_col else np.nan
+                )
             ownership_vector = compute_heuristic_ownership(cand_players_df, team_totals)
             logger.info(
-                "Computed heuristic ownership — model %s, %d players",
-                "D" if team_totals else "C", len(ownership_vector),
+                "Computed heuristic ownership — model %s%s, %d players",
+                "D" if team_totals else "C", "+HR" if hr_odds else "", len(ownership_vector),
             )
 
         # Store simulation artifacts for post-run operations (lineup replacement).
@@ -1132,6 +1144,62 @@ class PipelineRunner:
             except Exception:
                 pass
         return None
+
+    @staticmethod
+    def _load_hr_fair_odds(slate_path: str) -> dict[str, float]:
+        """Load HR fair-implied-probability data from the archive for the slate date.
+
+        Returns {normalised_name: hr_over_0.5_implied_prob} from
+        market_odds_fair_odds.json, or an empty dict if unavailable.
+        """
+        import re as _re
+        import unicodedata as _ud
+        import json as _json
+        from pathlib import Path as _Path
+
+        def _norm(name: str) -> str:
+            nfkd = _ud.normalize("NFKD", name)
+            ascii_n = nfkd.encode("ascii", "ignore").decode("ascii")
+            return _re.sub(r"[^a-z ]", "", ascii_n.lower()).strip()
+
+        fname = _Path(slate_path).name if slate_path else ""
+        archive_dir = None
+        m = _re.search(r'(\d{1,2})[_\-](\d{1,2})[_\-](\d{4})', fname)
+        if m:
+            mm, dd, yyyy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+            archive_dir = _Path(__file__).resolve().parents[2] / "archive" / f"{mm}{dd}{yyyy}"
+        if archive_dir is None or not archive_dir.exists():
+            slate_file = _Path(slate_path) if slate_path else None
+            if slate_file and slate_file.exists():
+                try:
+                    import csv as _csv
+                    with open(slate_file, newline="") as _f:
+                        for row in _csv.DictReader(_f):
+                            game_info = row.get("Game Info", "")
+                            dm = _re.search(r'(\d{2})/(\d{2})/(\d{4})', game_info)
+                            if dm:
+                                mm, dd, yyyy = dm.group(1), dm.group(2), dm.group(3)
+                                archive_dir = _Path(__file__).resolve().parents[2] / "archive" / f"{mm}{dd}{yyyy}"
+                                break
+                except Exception:
+                    pass
+        if archive_dir is None:
+            return {}
+        odds_path = archive_dir / "market_odds_fair_odds.json"
+        if not odds_path.exists():
+            return {}
+        try:
+            with open(odds_path) as _f:
+                d = _json.load(_f)
+            result: dict[str, float] = {}
+            for players in d.get("data", {}).values():
+                for name, markets in players.items():
+                    for entry in markets.get("Player Home Runs", []):
+                        if entry["line"] == 0.5 and entry["outcome"] == "over" and not entry["flagged"]:
+                            result[_norm(name)] = float(entry["implied_prob"])
+            return result
+        except Exception:
+            return {}
 
     @staticmethod
     def _load_cash_threshold() -> float:

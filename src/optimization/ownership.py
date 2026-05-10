@@ -120,6 +120,10 @@ def compute_heuristic_ownership(
         - ``eligible_positions``: list of DK-eligible positions; multi-eligible
           players receive full credit from their primary pool and a discounted
           contribution from each secondary eligible pool.
+        - ``hr_prob``: market fair implied probability of 0.5+ HRs (from
+          market_odds_fair_odds.json).  When present, each batter's raw score
+          is multiplied by (hr_prob / mean_hr_prob)^0.25 before softmax.
+          Batters with null hr_prob are left unchanged.  Pitchers are unaffected.
     team_totals:
         Optional {team_abbrev: implied_run_total} dict.  When provided,
         batter ownership is boosted proportional to the team's implied total
@@ -159,6 +163,20 @@ def compute_heuristic_ownership(
         1.0,
         (_BATTER_SALARY_PRESSURE_BASE / df.loc[batter_mask, "salary"]) ** 0.5,
     )
+
+    # --- HR-probability batter boost -----------------------------------------
+    # DFS players pay an ownership premium for HR upside beyond what E[fpts]
+    # captures.  When hr_prob (fair implied prob of 0.5+ HRs) is available,
+    # scale each batter's raw score by (hr_prob / mean_hr_prob)^0.125.
+    # Exponent is 0.125 because _raw = sqrt(mean): multiplying mean by ratio^0.25
+    # (the eval-tested strength) propagates as ratio^0.125 on _raw.
+    # Calibrated from I_hr_025 eval across 05082026–05092026; revisit with more data.
+    if "hr_prob" in df.columns:
+        hr_valid = batter_mask & df["hr_prob"].notna()
+        if hr_valid.any():
+            mean_hr = float(df.loc[hr_valid, "hr_prob"].mean())
+            if mean_hr > 0:
+                df.loc[hr_valid, "_raw"] *= (df.loc[hr_valid, "hr_prob"] / mean_hr) ** 0.125
 
     # --- Game start-time penalty (batters only) ------------------------------
     # Pitcher lineup slots are confirmed earlier in the day regardless of game

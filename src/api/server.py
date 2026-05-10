@@ -817,6 +817,14 @@ def projections_players():
             if non_excl.empty:
                 ow_pct = [0.0] * len(merged)
             else:
+                hr_odds = PipelineRunner._load_hr_fair_odds(str(slate_path) if slate_path else "")
+                if hr_odds and "name" in non_excl.columns:
+                    import unicodedata as _ud, re as _re
+                    def _norm_hr(n: str) -> str:
+                        nfkd = _ud.normalize("NFKD", n)
+                        return _re.sub(r"[^a-z ]", "", nfkd.encode("ascii", "ignore").decode("ascii").lower()).strip()
+                    non_excl = non_excl.copy()
+                    non_excl["hr_prob"] = non_excl["name"].apply(lambda n: hr_odds.get(_norm_hr(str(n))))
                 ow_sub = compute_heuristic_ownership(non_excl, team_totals)
                 ow_pct = [0.0] * len(merged)
                 sub_i = 0

@@ -30,9 +30,11 @@ Models
   Production — the model used by the live optimizer at runtime:
     E_production   compute_heuristic_ownership() from
                    src/optimization/ownership.py. Includes sqrt compression,
-                   batting-order multiplier, salary-cap pressure, game-time
-                   multiplier, stack-value batter boost, pitcher matchup and
-                   co-stack boosts, and post-softmax pitcher compression.
+                   batting-order multiplier, salary-cap pressure, HR-probability
+                   batter boost (exp=0.25, when hr_prob column present),
+                   game-time multiplier, stack-value batter boost, pitcher
+                   matchup and co-stack boosts, and post-softmax pitcher
+                   compression.
 
   Incremental development history — intermediate steps showing per-signal gains;
   kept for longitudinal tracking but not candidates to replace production:
@@ -292,6 +294,15 @@ def _build_player_pool(
             if dropped:
                 names = excl_df.loc[excl_df["player_id"].isin(excl_ids), "name"].tolist() if "name" in excl_df.columns else []
                 print(f"  Excluded {dropped} player(s) via exclusions.csv: {names}")
+
+    # Attach HR fair-odds implied probability for batters (I_hr_* models).
+    hr_odds = _load_hr_fair_odds(archive_dir)
+    if hr_odds:
+        merged["hr_prob"] = merged["name"].apply(lambda n: hr_odds.get(_normalise(str(n))))
+        n_matched = merged["hr_prob"].notna().sum()
+        print(f"  HR odds: {n_matched}/{len(merged)} players matched")
+    else:
+        merged["hr_prob"] = np.nan
 
     return merged.reset_index(drop=True)
 
@@ -805,6 +816,30 @@ def _normalise(name: str) -> str:
     ascii_name = nfkd.encode("ascii", "ignore").decode("ascii")
     import re
     return re.sub(r"[^a-z ]", "", ascii_name.lower()).strip()
+
+
+def _load_hr_fair_odds(archive_dir: Path) -> dict[str, float]:
+    """Return {normalised_name: hr_over_0.5_implied_prob} from market_odds_fair_odds.json.
+
+    Only returns unflagged 0.5-line 'over' entries.  Returns empty dict if the
+    file is absent or malformed.
+    """
+    odds_path = archive_dir / "market_odds_fair_odds.json"
+    if not odds_path.exists():
+        return {}
+    try:
+        import json as _json
+        with open(odds_path) as f:
+            d = _json.load(f)
+        result: dict[str, float] = {}
+        for players in d.get("data", {}).values():
+            for name, markets in players.items():
+                for entry in markets.get("Player Home Runs", []):
+                    if entry["line"] == 0.5 and entry["outcome"] == "over" and not entry["flagged"]:
+                        result[_normalise(name)] = float(entry["implied_prob"])
+        return result
+    except Exception:
+        return {}
 
 
 def _match_ownership(
