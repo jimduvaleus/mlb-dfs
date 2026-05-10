@@ -1,4 +1,4 @@
-import type { AppConfig, ExclusionsUpdate, PlayerExclusionsUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -41,6 +41,12 @@ export async function fetchUnconfirmedPlayerIds(): Promise<number[]> {
 export async function fetchProjectionPlayers(): Promise<ProjectionPlayerRow[]> {
   const res = await fetch('/api/projections/players')
   if (!res.ok) return []
+  return res.json()
+}
+
+export async function fetchOwnershipSync(): Promise<OwnershipSyncResult> {
+  const res = await fetch('/api/projections/ownership_sync')
+  if (!res.ok) return { status: 'error', reason: res.statusText }
   return res.json()
 }
 

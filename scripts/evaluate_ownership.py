@@ -241,7 +241,24 @@ def _build_player_pool(
         has_mo = dff_df["player_id"].isin(mo_lookup.index)
         dff_df.loc[has_mo, "mean"]    = dff_df.loc[has_mo, "player_id"].map(mo_lookup["mean"])
         dff_df.loc[has_mo, "std_dev"] = dff_df.loc[has_mo, "player_id"].map(mo_lookup["std_dev"])
-        print(f"  Projections: market_odds for {has_mo.sum()} players, DFF fallback for {(~has_mo).sum()}")
+
+        # Players present in MO but absent from DFF were still in the live RW player
+        # pool (market_odds_projections.csv is a copy of the final merged projections).
+        # Add them so they're not silently dropped at the dropna step — without this,
+        # exclusions.csv entries for MO-only players have no effect.
+        mo_only_mask = ~mo_df["player_id"].isin(dff_df["player_id"])
+        if mo_only_mask.any():
+            mo_extra_cols = ["player_id", "mean", "std_dev"]
+            for col in ("lineup_slot",):
+                if col in mo_df.columns and col in dff_cols:
+                    mo_extra_cols.append(col)
+            mo_extra = mo_df.loc[mo_only_mask, [c for c in mo_extra_cols if c in mo_df.columns]]
+            dff_df = pd.concat([dff_df, mo_extra], ignore_index=True)
+
+        n_mo_only = mo_only_mask.sum()
+        print(f"  Projections: market_odds for {has_mo.sum()} players, "
+              f"DFF fallback for {(~has_mo).sum()}, "
+              f"{n_mo_only} MO-only player(s) added")
     else:
         print(f"  Projections: DFF only (no market_odds_projections.csv)")
 
@@ -250,9 +267,9 @@ def _build_player_pool(
 
     merged["salary_value"] = merged["mean"] / merged["salary"] * 1000
 
-    # Optionally attach team implied totals — prefer CNO (live), fall back to DFF (legacy).
+    # Optionally attach team implied totals — prefer FL (live), then CNO (legacy), then DFF.
     totals_df = None
-    for totals_fname in ("cno_team_totals.csv", "dff_team_totals.csv"):
+    for totals_fname in ("team_totals.csv", "cno_team_totals.csv", "dff_team_totals.csv"):
         totals_path = archive_dir / totals_fname
         if totals_path.exists():
             totals_df = pd.read_csv(totals_path)
@@ -955,6 +972,75 @@ def evaluate_slate(archive_dir: Path) -> pd.DataFrame | None:
 
 
 # ---------------------------------------------------------------------------
+# Dry run (projections only, no actuals required)
+# ---------------------------------------------------------------------------
+
+def dry_run_slate(archive_dir: Path) -> None:
+    """
+    Compute and display ownership projections without a contest standings file.
+
+    Prints a per-position table ranked by E_production projected ownership and
+    writes archive_dir/ownership_projections.csv with all model predictions.
+    """
+    archive_dir = Path(archive_dir)
+    slate_label = archive_dir.name
+
+    try:
+        pool_df = _build_player_pool(archive_dir)
+    except FileNotFoundError as exc:
+        print(f"[{slate_label}] {exc}")
+        return
+
+    print(f"\n[{slate_label}] {len(pool_df)} projected starters in pool")
+
+    models = compute_models(pool_df)
+    if not models:
+        print(f"[{slate_label}] No models computed.")
+        return
+
+    # Build output DataFrame with all model predictions attached
+    base_cols = ["player_id", "name", "position", "team", "salary", "mean", "salary_value"]
+    optional_cols = ["lineup_slot", "implied_total", "avg_pts"]
+    out = pool_df[[c for c in base_cols + optional_cols if c in pool_df.columns]].copy()
+    for model_name, arr in models.items():
+        out[f"pred_{model_name}"] = arr
+
+    prod_col = "pred_E_production" if "E_production" in models else f"pred_{next(iter(models))}"
+    d_col = "pred_D_team_total" if "D_team_total" in models else None
+    has_slot = "lineup_slot" in out.columns
+
+    # Print per-position table sorted by E_production descending
+    W = 74
+    print(f"\n{'='*W}")
+    print(f"DRY RUN — {slate_label} — projected ownership (sorted by E_production)")
+    print(f"{'='*W}")
+    hdr_d = f"  {'D_team':>7}" if d_col else ""
+    print(f"{'Pos':<4} {'Name':<24} {'Team':<5} {'Salary':>7} {'Proj':>5}  {'Slot':>4}  {'E_prod':>7}{hdr_d}")
+    print("-" * W)
+
+    pos_order = ["P", "C", "1B", "2B", "3B", "SS", "OF"]
+    all_positions = pos_order + [p for p in sorted(out["position"].unique()) if p not in pos_order]
+
+    for pos in all_positions:
+        grp = out[out["position"] == pos].sort_values(prod_col, ascending=False)
+        if grp.empty:
+            continue
+        for _, row in grp.iterrows():
+            slot_str = str(int(row["lineup_slot"])) if has_slot and pd.notna(row.get("lineup_slot")) else "-"
+            d_str = f"  {row[d_col]:>7.3f}" if d_col else ""
+            print(
+                f"{row['position']:<4} {str(row['name']):<24} {str(row['team']):<5}"
+                f" {row['salary']:>7,.0f} {row['mean']:>5.1f}  {slot_str:>4}"
+                f"  {row[prod_col]:>7.3f}{d_str}"
+            )
+        print()
+
+    out_path = archive_dir / "ownership_projections.csv"
+    out.to_csv(out_path, index=False)
+    print(f"[{slate_label}] Projections written → {out_path}")
+
+
+# ---------------------------------------------------------------------------
 # Multi-slate aggregate
 # ---------------------------------------------------------------------------
 
@@ -1020,6 +1106,14 @@ def main() -> None:
         metavar="ARCHIVE_DIR",
         help="One or more archive directories (e.g. archive/04072026)",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Print projected ownership without comparing to actuals. "
+            "No contest-standings zip required — useful for pre-contest sanity checks."
+        ),
+    )
     args = parser.parse_args()
 
     dirs = []
@@ -1037,7 +1131,11 @@ def main() -> None:
         print("No valid archive directories found.")
         sys.exit(1)
 
-    run_evaluation(dirs)
+    if args.dry_run:
+        for d in dirs:
+            dry_run_slate(d)
+    else:
+        run_evaluation(dirs)
 
 
 if __name__ == "__main__":

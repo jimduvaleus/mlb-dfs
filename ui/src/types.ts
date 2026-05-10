@@ -291,6 +291,12 @@ export interface MissingOptPlayer {
   markets: string[]
 }
 
+export interface TeamNameWarning {
+  game: string       // e.g. "NYY@MIL"
+  team_name: string  // raw name CNO used, e.g. "Milwaukee Brewers"
+  market: string     // "Run Line" or "Total Runs"
+}
+
 export interface MergeInfo {
   secondarySource: string
   count: number
@@ -299,6 +305,15 @@ export interface MergeInfo {
   lowTeamProjections?: LowTeamProjection[]
   fallbackTeams?: FallbackTeam[]
   missingOptPlayers?: MissingOptPlayer[]
+  teamNameWarnings?: TeamNameWarning[]
+}
+
+export interface OwnershipSyncResult {
+  status: 'synced' | 'out_of_sync' | 'unavailable' | 'error'
+  spearman_r?: number
+  max_diff?: number
+  n_checked?: number
+  reason?: string
 }
 
 // Slate game/team exclusion types

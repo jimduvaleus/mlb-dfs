@@ -1090,9 +1090,9 @@ class PipelineRunner:
     def _load_team_totals(slate_path: str) -> Optional[dict]:
         """Load implied run totals from the archive for the slate date.
 
-        Prefers cno_team_totals.csv (live CNO-derived); falls back to
-        dff_team_totals.csv for legacy archived slates.
-        Returns {team: implied_total} or None if neither file is found.
+        Prefers team_totals.csv (FantasyLabs-derived); then cno_team_totals.csv
+        (legacy CNO-derived); falls back to dff_team_totals.csv for older archives.
+        Returns {team: implied_total} or None if no file is found.
         """
         import re as _re
         from pathlib import Path as _Path
@@ -1121,7 +1121,7 @@ class PipelineRunner:
                     pass
         if archive_dir is None:
             return None
-        for filename in ("cno_team_totals.csv", "dff_team_totals.csv"):
+        for filename in ("team_totals.csv", "cno_team_totals.csv", "dff_team_totals.csv"):
             totals_path = archive_dir / filename
             if not totals_path.exists():
                 continue

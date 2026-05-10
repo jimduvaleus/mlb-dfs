@@ -1,11 +1,11 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { CappedPlayer, ExclusionScope, FallbackTeam, LowTeamProjection, MergeInfo, MissingOptPlayer, ProjectionsStatus } from '../types'
+import type { CappedPlayer, ExclusionScope, FallbackTeam, LowTeamProjection, MergeInfo, MissingOptPlayer, OwnershipSyncResult, ProjectionsStatus, TeamNameWarning } from '../types'
 
 const MARKET_DISPLAY: Record<string, string> = {
   singles: '1B', doubles: '2B', triples: '3B', home_runs: 'HR',
   stolen_bases: 'SB', walks: 'BB', runs: 'R', rbis: 'RBI',
 }
-import { fetchMergeInfoState, fetchProjectionsStatus, fetchSlatePlayers, savePlayerExclusions } from '../api'
+import { fetchMergeInfoState, fetchOwnershipSync, fetchProjectionsStatus, fetchSlatePlayers, savePlayerExclusions } from '../api'
 
 interface Props {
   disabled?: boolean
@@ -33,8 +33,13 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
   const [done, setDone] = useState<{ success: boolean; code: number } | null>(null)
+  const [ownershipSync, setOwnershipSync] = useState<OwnershipSyncResult | null>(null)
   const logRef = useRef<HTMLDivElement>(null)
   const esRef = useRef<EventSource | null>(null)
+
+  const checkOwnershipSync = () => {
+    fetchOwnershipSync().then(setOwnershipSync).catch(() => {})
+  }
 
   const refreshStatus = () => {
     fetchProjectionsStatus().then(setStatus).catch(console.error)
@@ -42,11 +47,13 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
 
   useEffect(() => {
     refreshStatus()
+    checkOwnershipSync()
     fetchMergeInfoState().then(state => {
       const players = (state.players ?? []) as MergeInfo['players']
       const cappedPlayers = (state.capped_players ?? []) as CappedPlayer[]
       const missingOptPlayers = (state.missing_opt_players ?? []) as MissingOptPlayer[]
-      if (players.length || cappedPlayers.length || missingOptPlayers.length) {
+      const teamNameWarnings = (state.team_name_warnings ?? []) as TeamNameWarning[]
+      if (players.length || cappedPlayers.length || missingOptPlayers.length || teamNameWarnings.length) {
         const fallbackTeams = (state.fallback_teams ?? []) as FallbackTeam[]
         onMergeInfo({
           secondarySource: (state.secondary_source as string) || 'RotoWire',
@@ -55,6 +62,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
           cappedPlayers,
           missingOptPlayers,
           fallbackTeams,
+          teamNameWarnings,
         })
       }
     }).catch(() => {})
@@ -97,7 +105,8 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         const lowTeamProjections = (event.low_team_projections ?? []) as LowTeamProjection[]
         const fallbackTeams = (event.fallback_teams ?? []) as FallbackTeam[]
         const missingOptPlayers = (event.missing_opt_players ?? []) as MissingOptPlayer[]
-        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams, missingOptPlayers })
+        const teamNameWarnings = (event.team_name_warnings ?? []) as TeamNameWarning[]
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams, missingOptPlayers, teamNameWarnings })
         // Auto-exclude pitchers that fell back to a secondary source at 'candidates'
         // scope — their projections are lower quality but they still model the field.
         const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
@@ -128,7 +137,10 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         es.close()
         esRef.current = null
         refreshStatus()
-        if (event.returncode === 0) onFetched?.()
+        if (event.returncode === 0) {
+          onFetched?.()
+          checkOwnershipSync()
+        }
       }
     }
 
@@ -219,6 +231,16 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         </div>
       )}
 
+      {ownershipSync && ownershipSync.status !== 'unavailable' && (
+        <div className={`ownership-sync-banner${ownershipSync.status === 'synced' ? ' ownership-sync-banner--ok' : ''}`}>
+          {ownershipSync.status === 'synced'
+            ? `Ownership model in sync — eval script and pipeline agree (ρ = ${ownershipSync.spearman_r})`
+            : ownershipSync.status === 'out_of_sync'
+            ? `Ownership model out of sync — eval script and pipeline disagree (ρ = ${ownershipSync.spearman_r?.toFixed(3) ?? '?'}, n = ${ownershipSync.n_checked})`
+            : `Ownership sync check failed${ownershipSync.reason ? ` — ${ownershipSync.reason}` : ''}`}
+        </div>
+      )}
+
       {mergeInfo && mergeInfo.fallbackTeams && mergeInfo.fallbackTeams.length > 0 && (
         <div className="merge-info-fallback-teams-callout">
           <strong>
@@ -306,6 +328,24 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
                 </span>
               ))
               .reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])}
+          </div>
+        </div>
+      )}
+
+      {mergeInfo && (mergeInfo.teamNameWarnings ?? []).length > 0 && (
+        <div className="merge-info-callout merge-info-team-name-warn-callout">
+          <strong>⚠ Team name mapping failed — {mergeInfo.teamNameWarnings!.length} team{mergeInfo.teamNameWarnings!.length !== 1 ? 's' : ''} not matched</strong>
+          <div className="merge-info-players">
+            {mergeInfo.teamNameWarnings!.map((w, i) => (
+              <span key={i} className="merge-info-team-group">
+                <span className="merge-info-team-label">{w.team_name}</span>
+                {' '}
+                <span className="merge-info-reason">({w.market}, {w.game})</span>
+              </span>
+            )).reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])}
+          </div>
+          <div style={{ marginTop: 6, fontSize: '0.8em', color: '#fc8181', opacity: 0.85 }}>
+            Add the correct name to <code>FULL_NAME_TO_ABBR</code> in fetch_market_odds_projections.py.
           </div>
         </div>
       )}

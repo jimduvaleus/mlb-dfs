@@ -846,9 +846,100 @@ def projections_players():
         return []
 
 
+@app.get("/api/projections/ownership_sync")
+async def projections_ownership_sync():
+    """
+    Run evaluate_ownership.py --dry-run on today's archive and compare its
+    E_production ownership against the live compute_heuristic_ownership output.
+
+    Only meaningful when projections_source == "market_odds" (returns
+    status="unavailable" otherwise).  The dry-run writes ownership_projections.csv
+    to the archive dir; we then match players by ID and compute Spearman ρ.
+    """
+    import re as _re
+    import pandas as pd
+    from scipy.stats import spearmanr
+
+    cfg = read_config()
+    source = (cfg.paths.projections_source or "rotowire").strip().lower()
+    if source != "market_odds":
+        return {"status": "unavailable", "reason": "not_market_odds"}
+
+    dk_raw = cfg.paths.dk_slate
+    if not dk_raw:
+        return {"status": "unavailable", "reason": "no_slate"}
+    dk_path = PROJECT_ROOT / dk_raw if not Path(dk_raw).is_absolute() else Path(dk_raw)
+    if not dk_path.exists():
+        return {"status": "unavailable", "reason": "slate_missing"}
+
+    # Derive archive directory from slate game date (e.g. "05/09/2026" → "05092026")
+    try:
+        gi_df = pd.read_csv(dk_path, usecols=["Game Info"])
+        m = _re.search(r'(\d{2})/(\d{2})/(\d{4})', str(gi_df["Game Info"].dropna().iloc[0]))
+        if not m:
+            return {"status": "unavailable", "reason": "no_date_in_slate"}
+        mo, dy, yr = m.groups()
+        archive_dir = PROJECT_ROOT / "archive" / f"{mo}{dy}{yr}"
+        if not archive_dir.exists():
+            return {"status": "unavailable", "reason": "no_archive_dir"}
+    except Exception:
+        return {"status": "unavailable", "reason": "date_parse_error"}
+
+    # Run the dry-run subprocess — writes ownership_projections.csv to archive_dir
+    python = PROJECT_ROOT / "venv" / "bin" / "python"
+    eval_script = PROJECT_ROOT / "scripts" / "evaluate_ownership.py"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(python), str(eval_script), "--dry-run", str(archive_dir),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            cwd=str(PROJECT_ROOT),
+        )
+        await asyncio.wait_for(proc.wait(), timeout=60)
+    except asyncio.TimeoutError:
+        return {"status": "error", "reason": "dry_run_timeout"}
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
+
+    proj_csv = archive_dir / "ownership_projections.csv"
+    if not proj_csv.exists():
+        return {"status": "error", "reason": "no_dry_run_output"}
+
+    try:
+        dry_df = pd.read_csv(proj_csv)
+        if "pred_E_production" not in dry_df.columns or "player_id" not in dry_df.columns:
+            return {"status": "error", "reason": "missing_columns_in_output"}
+        dry_df = dry_df[["player_id", "pred_E_production"]].dropna()
+        dry_df["player_id"] = dry_df["player_id"].astype(int)
+
+        # Live ownership comes from the same function the pipeline uses at runtime
+        live_rows = projections_players()
+        if not live_rows:
+            return {"status": "unavailable", "reason": "no_live_projections"}
+        live_df = pd.DataFrame(live_rows)[["player_id", "ownership_pct"]].dropna()
+        live_df["player_id"] = live_df["player_id"].astype(int)
+        live_df["ownership_frac"] = live_df["ownership_pct"] / 100.0
+
+        merged = dry_df.merge(live_df[["player_id", "ownership_frac"]], on="player_id", how="inner")
+        if len(merged) < 5:
+            return {"status": "unavailable", "reason": "too_few_matched_players"}
+
+        r, _ = spearmanr(merged["pred_E_production"], merged["ownership_frac"])
+        max_diff = float((merged["pred_E_production"] - merged["ownership_frac"]).abs().max())
+
+        return {
+            "status": "synced" if float(r) >= 0.95 else "out_of_sync",
+            "spearman_r": round(float(r), 3),
+            "max_diff": round(max_diff, 4),
+            "n_checked": len(merged),
+        }
+    except Exception as exc:
+        return {"status": "error", "reason": str(exc)}
+
+
 @app.get("/api/projections/team_totals")
 def projections_team_totals():
-    """Return implied run totals per team from dff_team_totals.csv, or {} if unavailable."""
+    """Return implied run totals per team from team_totals.csv (FL), or {} if unavailable."""
     try:
         from .pipeline import PipelineRunner
         slate_path = _get_slate_file_path()
@@ -1031,9 +1122,10 @@ async def projections_fetch(request: Request):
         dff_out    = proj_path.parent / "projections_dff.csv"
         rw_out     = proj_path.parent / "projections_rw.csv"
         mo_out     = proj_path.parent / "projections_mo.csv"
-        mo_sidecar          = proj_path.parent / "projections_mo_fallback.json"
-        mo_caps_path        = proj_path.parent / "projections_mo_caps.json"
-        mo_missing_opt_path = proj_path.parent / "projections_mo_missing_opt.json"
+        mo_sidecar           = proj_path.parent / "projections_mo_fallback.json"
+        mo_caps_path         = proj_path.parent / "projections_mo_caps.json"
+        mo_missing_opt_path  = proj_path.parent / "projections_mo_missing_opt.json"
+        mo_team_warn_path    = proj_path.parent / "projections_mo_team_warnings.json"
         # Persistent across partial fetches; overwritten only on a full fetch.
         merge_info_state_path = proj_path.parent / (proj_path.stem + "_merge_info.json")
 
@@ -1041,7 +1133,7 @@ async def projections_fetch(request: Request):
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
 
         # Clean up any stale temp files left by a prior incomplete fetch.
-        for _p in (dff_out, rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path):
+        for _p in (dff_out, rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path, mo_team_warn_path):
             try:
                 _p.unlink(missing_ok=True)
             except Exception:
@@ -1083,6 +1175,14 @@ async def projections_fetch(request: Request):
                 return {int(k): v for k, v in raw.items()}
             except Exception:
                 return {}
+
+        def _read_mo_team_warnings() -> list[dict]:
+            if not mo_team_warn_path.exists():
+                return []
+            try:
+                return json.loads(mo_team_warn_path.read_text())
+            except Exception:
+                return []
 
         def _copy_proj_to_mo_archive() -> None:
             """Overwrite the archive market_odds_projections.csv with the final
@@ -1444,9 +1544,10 @@ async def projections_fetch(request: Request):
                         proj_written = True
                         _copy_proj_to_mo_archive()
 
-                        # Build capped_players and missing_opt_players from sidecars + pool.
+                        # Build capped_players, missing_opt_players, and team_name_warnings from sidecars.
                         mo_cap_data = _read_mo_caps()
                         mo_missing_opt_data = _read_mo_missing_opt()
+                        team_name_warnings: list[dict] = _read_mo_team_warnings()
                         capped_players: list[dict] = []
                         missing_opt_players: list[dict] = []
                         if "name" in pool.columns:
@@ -1479,9 +1580,14 @@ async def projections_fetch(request: Request):
                             _prev = _load_merge_info_state()
                             def _purge(lst: list[dict]) -> list[dict]:
                                 return [x for x in lst if x.get("team", "") not in included_teams]
+                            def _purge_warnings(lst: list[dict]) -> list[dict]:
+                                return [x for x in lst if x.get("game", "") not in {
+                                    f"{a}@{h}" for a, h in included_pairs
+                                }]
                             fallback_players    = _purge(_prev.get("players", []))         + fallback_players
                             capped_players      = _purge(_prev.get("capped_players", []))  + capped_players
                             missing_opt_players = _purge(_prev.get("missing_opt_players", [])) + missing_opt_players
+                            team_name_warnings  = _purge_warnings(_prev.get("team_name_warnings", [])) + team_name_warnings
 
                         _total_batters: dict[str, int] = {}
                         if "lineup_slot" in pool.columns:
@@ -1496,11 +1602,12 @@ async def projections_fetch(request: Request):
                             "capped_players":      capped_players,
                             "missing_opt_players": missing_opt_players,
                             "fallback_teams":      fallback_teams,
+                            "team_name_warnings":  team_name_warnings,
                             "secondary_source":    "RotoWire",
                         })
 
-                        if fallback_players or capped_players or low_team_projs or missing_opt_players:
-                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'timestamp': int(time.time() * 1000)})}\n\n"
+                        if fallback_players or capped_players or low_team_projs or missing_opt_players or team_name_warnings:
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'team_name_warnings': team_name_warnings, 'timestamp': int(time.time() * 1000)})}\n\n"
                         elif result_event is None:
                             result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
 
@@ -1508,7 +1615,7 @@ async def projections_fetch(request: Request):
                 returncode = 1
                 result_event = _log(f"Warning: merge error — {exc}")
             finally:
-                for p in (rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path):
+                for p in (rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path, mo_team_warn_path):
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:

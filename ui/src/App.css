@@ -705,6 +705,23 @@ button { cursor: pointer; }
   color: #48bb78;
 }
 
+.ownership-sync-banner {
+  margin-top: 10px;
+  padding: 6px 12px;
+  background: rgba(246, 173, 85, 0.15);
+  border: 1px solid rgba(246, 173, 85, 0.4);
+  border-radius: 6px;
+  color: #f6ad55;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ownership-sync-banner--ok {
+  background: rgba(72, 187, 120, 0.15);
+  border-color: rgba(72, 187, 120, 0.4);
+  color: #48bb78;
+}
+
 .portfolio-filter {
   position: relative;
   margin-bottom: 12px;
