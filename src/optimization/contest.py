@@ -30,6 +30,29 @@ _MAX_HITTERS_PER_TEAM = 5
 _MIN_GAMES = 2
 
 
+def _load_field_calibration() -> dict:
+    """Load calibration params from data/processed/contest_stats.json if present."""
+    import json
+    from pathlib import Path
+    p = Path(__file__).resolve().parent.parent.parent / "data" / "processed" / "contest_stats.json"
+    if not p.exists():
+        return {}
+    try:
+        with open(p) as f:
+            return json.load(f).get("calibration_params", {})
+    except Exception:
+        return {}
+
+
+_CAL = _load_field_calibration()
+# P(4-batter primary stack | lineup is stacked). Calibrated from 10-slate contest
+# analysis: real DK entries use 5-stacks ~73.5% of the time among stacked lineups.
+_STACK_SIZE_4_PROB: float = float(_CAL.get("stack_size_4_prob", 0.265))
+# Minimum total salary for a generated field lineup. Rejects lineups below the
+# empirical p10 of real contest entries (~$49,200), rounded to the nearest $500.
+_FIELD_SALARY_FLOOR: float = float(_CAL.get("salary_floor_field", 49_000))
+
+
 def _build_pos_pools(
     players_df: pd.DataFrame,
     ownership_vec: np.ndarray,
@@ -118,7 +141,7 @@ def _sample_stacked_lineup(
     if len(primary_pool) < 4:
         return None
 
-    stack_size = 4 if rng.random() < 0.5 else 5
+    stack_size = 4 if rng.random() < _STACK_SIZE_4_PROB else 5
     if len(primary_pool) < stack_size:
         stack_size = len(primary_pool)
 
@@ -246,6 +269,18 @@ class ContestSimulator:
                 team_batters.setdefault(t, []).append(pid)
                 team_stack_w[t] = team_stack_w.get(t, 0.0) + float(w)
 
+        # Empirical salary floor: only apply when the player pool can achieve it.
+        # If the best-case lineup salary (top-2 pitchers + top-8 batters) falls below
+        # _FIELD_SALARY_FLOOR, the pool is a toy/test fixture and we skip the floor.
+        pitcher_sals = sorted(
+            [v["salary"] for v in pmeta.values() if v["position"] == "P"], reverse=True
+        )
+        batter_sals = sorted(
+            [v["salary"] for v in pmeta.values() if v["position"] != "P"], reverse=True
+        )
+        max_feasible_sal = sum(pitcher_sals[:2]) + sum(batter_sals[:8])
+        effective_floor = _FIELD_SALARY_FLOOR if max_feasible_sal >= _FIELD_SALARY_FLOOR else 0.0
+
         field: list[list[int]] = []
         total_attempts = 0
         max_total = n_lineups * max_attempts_per_lineup
@@ -260,6 +295,11 @@ class ContestSimulator:
             except Exception:
                 ids = None
 
+            if ids is not None:
+                if effective_floor > 0:
+                    total_sal = sum(pmeta[pid]["salary"] for pid in ids)
+                    if total_sal < effective_floor:
+                        ids = None
             if ids is not None:
                 field.append(ids)
 
