@@ -1464,14 +1464,15 @@ def _compute_batter_projection(
     e_r   = get_lam(MK_RUNS)
     e_rbi = get_mu(MK_RBIS)
 
-    # 7 markets are hard-required. Any absent market means CNO data is incomplete
+    # 6 markets are hard-required. Any absent market means CNO data is incomplete
     # and the projection would be materially wrong — fall back to RotoWire.
-    # SB is soft-optional: players with no steal threat often have no SB prop on
-    # CNO; when absent, e_sb = 0 contributes nothing and the projection is still
-    # reliable. The caller receives the soft-missing list for UI display.
+    # SB and Triples are soft-optional: players with no steal threat or few triples
+    # often have no prop on CNO; when absent, e_sb/e_t = 0 contributes nothing and
+    # the projection is still reliable. The caller receives the soft-missing list
+    # for UI display.
     missing = [
         name for name, val in [
-            ("Singles", e_s), ("Doubles", e_d), ("Triples", e_t),
+            ("Singles", e_s), ("Doubles", e_d),
             ("HR", e_hr), ("Walks", e_bb),
             ("Runs", e_r), ("RBIs", e_rbi),
         ] if val == 0
@@ -1480,6 +1481,8 @@ def _compute_batter_projection(
         return None, f"{', '.join(missing)} market{'s' if len(missing) > 1 else ''} unavailable"
 
     missing_opt: list[str] = []
+    if e_t == 0:
+        missing_opt.append(MK_TRIPLES)
     if e_sb == 0:
         missing_opt.append(MK_SB)
     e_hbp = e_bb * HBP_PER_WALK

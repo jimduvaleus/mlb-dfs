@@ -22,10 +22,8 @@ Output
 Models
 ------
   Baselines — naive approaches that establish a performance floor:
-    A_uniform      Equal weight within each position group.
-    B_salary_value softmax(salary_value) per position.
-    C_mean_sv      softmax(0.6·mean + 0.4·salary_value) per position.
-    D_team_total   C with batter boost proportional to implied team total.
+    D_team_total   softmax(0.6·mean + 0.4·salary_value) per position,
+                   with batter boost proportional to implied team total.
 
   Production — the model used by the live optimizer at runtime:
     E_production   compute_heuristic_ownership() from
@@ -304,6 +302,49 @@ def _build_player_pool(
     else:
         merged["hr_prob"] = np.nan
 
+    # Load static handedness table (bats L/R/S, throws L/R).
+    handedness_path = PROJECT_ROOT / "data" / "handedness.csv"
+    if handedness_path.exists():
+        hand_df = pd.read_csv(handedness_path, dtype=str)
+        # Stage 1: (norm_name, team) exact match
+        hand_by_team = hand_df.set_index(["name", "team"])[["bats", "throws"]]
+        # Stage 2: name-only fallback for players with exactly one entry
+        unique_mask = ~hand_df.duplicated(subset="name", keep=False)
+        hand_by_name = hand_df[unique_mask].set_index("name")[["bats", "throws"]]
+
+        def _lookup_hand(row: pd.Series) -> pd.Series:
+            key = (_normalise(str(row["name"])), str(row["team"]))
+            if key in hand_by_team.index:
+                return hand_by_team.loc[key]
+            norm = key[0]
+            if norm in hand_by_name.index:
+                return hand_by_name.loc[norm]
+            return pd.Series({"bats": pd.NA, "throws": pd.NA})
+
+        hand_cols = merged.apply(_lookup_hand, axis=1)
+        merged["bats"]   = hand_cols["bats"].values
+        merged["throws"] = hand_cols["throws"].values
+        n_hand = merged["bats"].notna().sum()
+        print(f"  Handedness: {n_hand}/{len(merged)} players matched")
+    else:
+        merged["bats"]   = pd.NA
+        merged["throws"] = pd.NA
+
+    # Derive opposing starting pitcher's throwing hand for each batter.
+    pitchers = merged[merged["position"] == "P"]
+    slot_col = "lineup_slot" if "lineup_slot" in merged.columns else None
+    starter_throws: dict[str, str] = {}
+    for team, grp in pitchers.groupby("team"):
+        grp_h = grp.dropna(subset=["throws"])
+        if grp_h.empty:
+            continue
+        if slot_col and grp_h[slot_col].notna().any():
+            row = grp_h.dropna(subset=[slot_col]).sort_values(slot_col).iloc[0]
+        else:
+            row = grp_h.loc[grp_h["mean"].idxmax()]
+        starter_throws[team] = str(row["throws"])
+    merged["opp_pitcher_throws"] = merged["opponent"].map(starter_throws)
+
     return merged.reset_index(drop=True)
 
 
@@ -342,22 +383,10 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
 
     # ── Baselines ─────────────────────────────────────────────────────────────
 
-    # A: uniform within position
-    uniform = np.zeros(len(pool_df))
-    for pos, grp in pool_df.groupby("position"):
-        idx = grp.index.to_numpy()
-        uniform[idx] = 1.0 / len(idx)
-    models["A_uniform"] = uniform
-
-    # B: softmax(salary_value) within position
-    models["B_salary_value"] = _apply_per_position(pool_df, "salary_value")
-
-    # C: softmax(0.6*mean + 0.4*salary_value) within position
     pool_df = pool_df.copy()
     pool_df["_score_C"] = 0.6 * pool_df["mean"] + 0.4 * pool_df["salary_value"]
-    models["C_mean_sv"] = _apply_per_position(pool_df, "_score_C")
 
-    # D: C + team-total boost for batters (only when implied_total available)
+    # D: softmax(0.6*mean + 0.4*salary_value) + team-total boost for batters
     if pool_df["implied_total"].notna().any():
         pool_df = pool_df.copy()
         is_batter = pool_df["position"] != "P"
@@ -411,6 +440,16 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
         models["H_pitcher_avg"] = _compute_model_h(pool_df, team_totals)
     except Exception as exc:
         print(f"  [H_pitcher_avg skipped: {exc}]")
+
+    # J: sweep _PITCHER_MATCHUP_EXP to find the right calibration.
+    # Current production value is 2.0; sweep covers 0.25–1.75 below it.
+    _MATCHUP_EXPS = [0.75, 1.00]
+    for _exp in _MATCHUP_EXPS:
+        _label = f"J_mexp_{int(_exp * 100):03d}"
+        try:
+            models[_label] = _compute_model_j(pool_df, team_totals, _exp)
+        except Exception as exc:
+            print(f"  [{_label} skipped: {exc}]")
 
     return models
 
@@ -806,6 +845,61 @@ def _compute_model_h(
     return compute_heuristic_ownership(df.drop(columns=["avg_pts"]), team_totals)
 
 
+def _compute_model_i(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    boost: float,
+) -> np.ndarray:
+    """
+    I_rhlhp — production model + right-handed batter vs left-handed pitcher boost.
+
+    Batters with bats=="R" and opp_pitcher_throws=="L" have their projected mean
+    scaled by `boost` before passing to compute_heuristic_ownership.  Scaling
+    mean propagates through sqrt(mean) in the raw score, giving an effective
+    raw-score multiplier of sqrt(boost).
+
+    Falls back to unmodified production output when handedness columns are absent.
+    """
+    from src.optimization.ownership import compute_heuristic_ownership
+
+    if "bats" not in pool_df.columns or "opp_pitcher_throws" not in pool_df.columns:
+        return compute_heuristic_ownership(pool_df, team_totals)
+
+    rh_vs_lhp = (pool_df["bats"] == "R") & (pool_df["opp_pitcher_throws"] == "L")
+    if not rh_vs_lhp.any():
+        return compute_heuristic_ownership(pool_df, team_totals)
+
+    df = pool_df.copy()
+    df.loc[rh_vs_lhp, "mean"] *= boost
+    df.loc[rh_vs_lhp, "salary_value"] = df.loc[rh_vs_lhp, "mean"] / df.loc[rh_vs_lhp, "salary"] * 1000
+    return compute_heuristic_ownership(df, team_totals)
+
+
+def _compute_model_j(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    matchup_exp: float,
+) -> np.ndarray:
+    """
+    J_mexp_* — production model with _PITCHER_MATCHUP_EXP swept to matchup_exp.
+
+    Temporarily patches the module-level constant so compute_heuristic_ownership
+    uses the candidate exponent, then restores the original value.  Isolates the
+    effect of the matchup exponent without duplicating the rest of the model.
+
+    Current production value is 2.0; sweep covers 0.25–1.75.
+    """
+    import src.optimization.ownership as _own_mod
+    from src.optimization.ownership import compute_heuristic_ownership
+
+    old_exp = _own_mod._PITCHER_MATCHUP_EXP
+    try:
+        _own_mod._PITCHER_MATCHUP_EXP = matchup_exp
+        return compute_heuristic_ownership(pool_df, team_totals)
+    finally:
+        _own_mod._PITCHER_MATCHUP_EXP = old_exp
+
+
 # ---------------------------------------------------------------------------
 # Name matching (ownership_df → pool_df)
 # ---------------------------------------------------------------------------
@@ -1129,6 +1223,19 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
 # CLI
 # ---------------------------------------------------------------------------
 
+def _find_recent_full_slates(n: int) -> list[Path]:
+    """
+    Return the N most recent archive subdirectories that contain a
+    contest-standings-*.zip file, sorted oldest-first by directory name.
+    """
+    archive_root = PROJECT_ROOT / "archive"
+    full = sorted(
+        d for d in archive_root.iterdir()
+        if d.is_dir() and any(d.glob("contest-standings-*.zip"))
+    )
+    return full[-n:]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Evaluate heuristic ownership models against actual DK %Drafted data.",
@@ -1137,9 +1244,18 @@ def main() -> None:
     )
     parser.add_argument(
         "archive_dirs",
-        nargs="+",
+        nargs="*",
         metavar="ARCHIVE_DIR",
-        help="One or more archive directories (e.g. archive/04072026)",
+        help="Archive directories to evaluate (e.g. archive/04072026). "
+             "Omit when using --recent.",
+    )
+    parser.add_argument(
+        "--recent",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Evaluate the N most recent slates that have a contest-standings zip. "
+             "Mutually exclusive with positional ARCHIVE_DIR arguments.",
     )
     parser.add_argument(
         "--dry-run",
@@ -1151,20 +1267,29 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    dirs = []
-    for raw in args.archive_dirs:
-        p = Path(raw)
-        if not p.exists():
-            print(f"Warning: {p} does not exist — skipping.")
-            continue
-        if not p.is_dir():
-            print(f"Warning: {p} is not a directory — skipping.")
-            continue
-        dirs.append(p)
+    if args.recent and args.archive_dirs:
+        parser.error("--recent and positional ARCHIVE_DIR arguments are mutually exclusive.")
 
-    if not dirs:
-        print("No valid archive directories found.")
-        sys.exit(1)
+    if args.recent:
+        dirs = _find_recent_full_slates(args.recent)
+        if not dirs:
+            print(f"No full slates (with contest-standings zip) found in {PROJECT_ROOT / 'archive'}.")
+            sys.exit(1)
+        print(f"--recent {args.recent}: selected {[d.name for d in dirs]}")
+    else:
+        dirs = []
+        for raw in args.archive_dirs:
+            p = Path(raw)
+            if not p.exists():
+                print(f"Warning: {p} does not exist — skipping.")
+                continue
+            if not p.is_dir():
+                print(f"Warning: {p} is not a directory — skipping.")
+                continue
+            dirs.append(p)
+        if not dirs:
+            print("No valid archive directories found.")
+            sys.exit(1)
 
     if args.dry_run:
         for d in dirs:

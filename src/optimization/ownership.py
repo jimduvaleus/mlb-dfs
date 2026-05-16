@@ -62,7 +62,9 @@ _BATTER_TOTAL_CAP = 5.5
 
 # Pitcher opponent-matchup boost exponent. Higher values amplify the signal
 # from low opponent implied totals — tuned against empirical ownership data.
-_PITCHER_MATCHUP_EXP = 2.0
+# Swept 0.25–2.0 across 7 slates; 1.0 minimises RMSE and maximises top-20%
+# precision without meaningful Spearman loss vs the previous value of 2.0.
+_PITCHER_MATCHUP_EXP = 1.0
 
 # Salary above which batters receive a soft cap penalty: (4500/salary)^0.5.
 # Represents the ~75th percentile of batter salaries; above this, the $50k

@@ -147,6 +147,8 @@ export default function App() {
       all[platform] = []
       localStorage.setItem('projFetchExcluded', JSON.stringify(all))
       setProjFetchExcluded([])
+      setMergeInfo(null)
+      setProjStatusTrigger(t => t + 1)
     } else {
       setProjFetchExcluded(Array.isArray(all[platform]) ? all[platform] : [])
     }

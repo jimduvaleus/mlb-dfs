@@ -1408,6 +1408,15 @@ async def projections_fetch(request: Request):
             new_df["player_id"] = new_df["player_id"].astype("Int64")
             return pd.concat([pool, new_df], ignore_index=True)
 
+        # Clear stale merge-info state at the start of every full (non-partial)
+        # fetch so that server restarts don't resurface banners from a prior slate.
+        # Partial fetches preserve the file so the purge+accumulate logic works.
+        if not is_partial:
+            try:
+                merge_info_state_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
         # ---- Market Odds path -----------------------------------------------
         if is_market_preferred:
             returncode = 0
@@ -1769,6 +1778,22 @@ async def projections_fetch(request: Request):
                             if _t2:
                                 _total_batters2[_t2] = _total_batters2.get(_t2, 0) + 1
                     fallback_teams2 = _whole_team_fallbacks(fallback_players2, _ensure_team_to_game(), _total_batters2)
+
+                    # Merge with persisted state for partial fetches.
+                    if is_partial and included_teams:
+                        _prev2 = _load_merge_info_state()
+                        def _purge2(lst: list[dict]) -> list[dict]:
+                            return [x for x in lst if x.get("team", "") not in included_teams]
+                        fallback_players2 = _purge2(_prev2.get("players", [])) + fallback_players2
+
+                    _save_merge_info_state({
+                        "players":             fallback_players2,
+                        "capped_players":      [],
+                        "missing_opt_players": [],
+                        "fallback_teams":      fallback_teams2,
+                        "team_name_warnings":  [],
+                        "secondary_source":    fallback_label,
+                    })
 
                     if fallback_players2 or low_team_projs2:
                         result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'timestamp': int(time.time() * 1000)})}\n\n"

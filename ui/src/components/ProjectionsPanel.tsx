@@ -241,7 +241,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         </div>
       )}
 
-      {mergeInfo && mergeInfo.fallbackTeams && mergeInfo.fallbackTeams.length > 0 && (
+      {mergeInfo && status?.is_fresh !== false && mergeInfo.fallbackTeams && mergeInfo.fallbackTeams.length > 0 && (
         <div className="merge-info-fallback-teams-callout">
           <strong>
             ⛔ No market odds for {mergeInfo.fallbackTeams.length} team{mergeInfo.fallbackTeams.length !== 1 ? 's' : ''} — entire lineup on {mergeInfo.secondarySource} ×0.9 fallback
@@ -261,7 +261,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         </div>
       )}
 
-      {mergeInfo && mergeInfo.cappedPlayers && mergeInfo.cappedPlayers.length > 0 && (
+      {mergeInfo && status?.is_fresh !== false && mergeInfo.cappedPlayers && mergeInfo.cappedPlayers.length > 0 && (
         <div className="merge-info-callout merge-info-caps-callout">
           <strong>⚠ Hard cap applied — {mergeInfo.cappedPlayers.length} player{mergeInfo.cappedPlayers.length !== 1 ? 's' : ''}</strong>
           <div className="merge-info-cap-note">
@@ -284,7 +284,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         </div>
       )}
 
-      {mergeInfo && mergeInfo.lowTeamProjections && mergeInfo.lowTeamProjections.length > 0 && (
+      {mergeInfo && status?.is_fresh !== false && mergeInfo.lowTeamProjections && mergeInfo.lowTeamProjections.length > 0 && (
         <div className="merge-info-callout merge-info-low-team-callout">
           <strong>⚠ Low team projection — {mergeInfo.lowTeamProjections.length} team{mergeInfo.lowTeamProjections.length !== 1 ? 's' : ''} below 40 pts</strong>
           <div className="merge-info-players">
