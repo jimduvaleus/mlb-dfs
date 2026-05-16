@@ -6,7 +6,6 @@ import pytest
 from src.optimization.gpp_portfolio import (
     ContestScorer,
     EVPortfolioSelector,
-    _compute_marginal_ev,
     _compute_payout_from_sorted_field,
 )
 from src.optimization.lineup import Lineup
@@ -254,41 +253,10 @@ def test_scorer_different_seeds_vary(sim_results, players_df, candidates, owners
     assert not np.allclose(r1, r2)
 
 
+
 # ------------------------------------------------------------------ #
-#  EVPortfolioSelector / _compute_marginal_ev tests                   #
+#  EVPortfolioSelector tests                                          #
 # ------------------------------------------------------------------ #
-
-def test_marginal_ev_kernel_matches_reference():
-    """_compute_marginal_ev must match naive Python computation."""
-    rng = np.random.default_rng(7)
-    M, n_sims = 20, 300
-    robust_payout = np.ascontiguousarray(
-        rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32)
-    )
-    best_payout = rng.uniform(0, 0.05, n_sims).astype(np.float32)
-    remaining = np.arange(M, dtype=np.int32)
-
-    result = _compute_marginal_ev(robust_payout, best_payout, remaining)
-
-    # Reference
-    expected = np.array([
-        np.maximum(robust_payout[c] - best_payout, 0.0).mean()
-        for c in remaining
-    ])
-    np.testing.assert_allclose(result, expected, rtol=1e-5)
-
-
-def test_marginal_ev_kernel_with_subset():
-    rng = np.random.default_rng(8)
-    M, n_sims = 50, 200
-    robust_payout = np.ascontiguousarray(rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32))
-    best_payout = np.zeros(n_sims, dtype=np.float32)
-    remaining = np.array([3, 7, 15, 22, 41], dtype=np.int32)
-
-    result = _compute_marginal_ev(robust_payout, best_payout, remaining)
-    expected = np.array([robust_payout[c].mean() for c in remaining])
-    np.testing.assert_allclose(result, expected, rtol=1e-5)
-
 
 def test_selector_round0_picks_highest_mean_ev():
     """Round 0 must select the candidate with the highest mean payout."""
@@ -334,15 +302,15 @@ def test_selector_round1_picks_marginal_maximizer():
     )
 
 
-def test_selector_round1_not_second_highest_mean():
-    """Explicitly verify round 1 picks marginal max over second-highest mean."""
+def test_selector_round1_picks_by_mean_ev():
+    """Round 1 selects by mean EV on uncovered sims (without beat_rate_fn = all sims)."""
     n_sims = 1000
     robust_payout = np.zeros((3, n_sims), dtype=np.float32)
-    # Candidate 0: wins first half strongly (highest mean)
+    # Candidate 0: wins first half strongly (mean=0.1)
     robust_payout[0, :500] = 0.2
-    # Candidate 1: second-highest mean, but wins in same sims as 0 → low marginal
+    # Candidate 1: same sims as 0, lower EV (mean=0.075)
     robust_payout[1, :500] = 0.15
-    # Candidate 2: lower mean, but wins entirely in second half → high marginal
+    # Candidate 2: second half, higher mean than 1 (mean=0.09)
     robust_payout[2, 500:] = 0.18
 
     stubs = [Lineup(player_ids=list(range(i, i + 10))) for i in range(3)]
@@ -351,7 +319,7 @@ def test_selector_round1_not_second_highest_mean():
 
     assert result[0][0] is stubs[0], "Round 0 picks highest mean"
     assert result[1][0] is stubs[2], (
-        "Round 1 picks candidate 2 (higher marginal) over candidate 1 (higher mean)"
+        "Round 1 picks candidate 2 (higher mean EV) over candidate 1 (lower mean EV)"
     )
 
 
@@ -382,8 +350,8 @@ def test_selector_all_distinct(sim_results, players_df, candidates, ownership_ve
     assert len(set(pid_sets)) == len(pid_sets), "All portfolio lineups must be distinct"
 
 
-def test_selector_marginal_ev_decreasing(sim_results, players_df, candidates, ownership_vec):
-    """Each added lineup's marginal EV should be non-increasing."""
+def test_selector_lineup_ev_non_increasing(sim_results, players_df, candidates, ownership_vec):
+    """Each lineup's EV (on uncovered sims) should be non-increasing across rounds."""
     scorer = ContestScorer(
         sim_results, players_df,
         n_field_lineups=30, n_field_samples=1,
@@ -394,10 +362,10 @@ def test_selector_marginal_ev_decreasing(sim_results, players_df, candidates, ow
     selector = EVPortfolioSelector(robust_payout, candidates, portfolio_size=8)
     result = selector.select()
 
-    evs = [marginal_ev for _, marginal_ev in result]
+    evs = [lineup_ev for _, lineup_ev in result]
     for i in range(1, len(evs)):
         assert evs[i] <= evs[i - 1] + 1e-8, (
-            f"Marginal EV increased at round {i}: {evs[i-1]:.6f} → {evs[i]:.6f}"
+            f"Lineup EV increased at round {i}: {evs[i-1]:.6f} → {evs[i]:.6f}"
         )
 
 

@@ -32,7 +32,6 @@ const STAGE_LABELS: Record<string, string> = {
   gpp_generate_done: 'Generate candidates',
   gpp_score_start: 'Score candidates',
   gpp_score_done: 'Score candidates',
-  gpp_field_inject: 'Field injection',
   gpp_holdout: 'Holdout evaluation',
   complete: 'Complete',
   stopped: 'Stopped',
@@ -126,8 +125,9 @@ export function ProgressPanel({ events, running }: Props) {
   let gppLabel = ''
   if (isGpp) {
     if (selectProgressEvents.length > 0) {
+      const lastSel = selectProgressEvents[selectProgressEvents.length - 1]
       gppPct = 100
-      gppLabel = `Portfolio selection: round ${selectProgressEvents[selectProgressEvents.length - 1].round + 1}`
+      gppLabel = `Portfolio selection: round ${lastSel.round + 1} — ${lastSel.pct_covered.toFixed(1)}% covered`
     } else if (latestScoreProgress) {
       gppPct = Math.round((latestScoreProgress.batches_done / latestScoreProgress.batches_total) * 100)
       gppLabel = `Scoring batch ${latestScoreProgress.batches_done} / ${latestScoreProgress.batches_total}`
@@ -250,7 +250,9 @@ export function ProgressPanel({ events, running }: Props) {
           {selectProgressEvents.map((ev, i) => (
             <div key={i} className="event-row event-gpp_select_progress">
               <span className="event-stage event-stage-lineup">{ev.round + 1}</span>
-              <span className="event-detail">${ev.marginal_ev.toFixed(2)}</span>
+              <span className="event-detail">
+                EV ${ev.lineup_ev.toFixed(2)} · {ev.n_covered.toLocaleString()} sims ({ev.pct_covered.toFixed(1)}%)
+              </span>
             </div>
           ))}
         </div>
@@ -364,10 +366,6 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'gpp_score_done':
       return 'Scoring complete'
-    case 'gpp_field_inject': {
-      const ev = e as unknown as { n_injected: number }
-      return `${ev.n_injected} field lineup${ev.n_injected !== 1 ? 's' : ''} promoted to candidate pool`
-    }
     case 'gpp_holdout': {
       const ev = e as unknown as { holdout_mean_payout: number }
       return `Holdout mean payout: ${ev.holdout_mean_payout.toFixed(4)}`

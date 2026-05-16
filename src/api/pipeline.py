@@ -465,13 +465,33 @@ class PipelineRunner:
                     ),
                 )
                 self._cb("gpp_score_done", {})
-                if scorer.last_injected_count > 0:
-                    self._cb("gpp_field_inject", {"n_injected": scorer.last_injected_count})
 
                 if _gpp_stopped and self._stop_check():
                     portfolio = []
                 else:
-                    # Phase 3: greedy marginal-EV portfolio selection
+                    # Phase 3: simulation-coverage portfolio selection
+                    _field_sorted = scorer.last_field_sorted    # (n_sims, N_field) float32
+                    _col_lineups = scorer.last_col_lineups       # (M, 10) int32
+                    _sim_mat = scorer._sim_matrix                # (n_sims, n_players) float32
+                    _n_field = _field_sorted.shape[1]
+                    _BATCH = 1000
+
+                    def _beat_rate_fn(candidate_idx: int) -> np.ndarray:
+                        cols = _col_lineups[candidate_idx]
+                        scores = _sim_mat[:, cols].sum(axis=1)
+                        n_s = scores.shape[0]
+                        beat_counts = np.empty(n_s, dtype=np.float32)
+                        for _s in range(0, n_s, _BATCH):
+                            _e = min(_s + _BATCH, n_s)
+                            beat_counts[_s:_e] = (
+                                _field_sorted[_s:_e] < scores[_s:_e, np.newaxis]
+                            ).sum(axis=1)
+                        return beat_counts / _n_field
+
+                    _coverage_pct = (
+                        int(port_cfg.get("target_percentile", 97)) / 100.0
+                    )
+
                     selector = EVPortfolioSelector(
                         robust_payout=robust_payout,
                         candidates=candidates,
@@ -481,9 +501,17 @@ class PipelineRunner:
                     )
                     gpp_result = selector.select(
                         stop_check=self._stop_check,
-                        progress_cb=lambda k, idx, ev: self._cb(
+                        beat_rate_fn=_beat_rate_fn,
+                        coverage_percentile=_coverage_pct,
+                        progress_cb=lambda k, idx, ev, n_cov, pct_cov: self._cb(
                             "gpp_select_progress",
-                            {"round": k, "lineup_index": idx, "marginal_ev": round(ev, 6)},
+                            {
+                                "round": k,
+                                "lineup_index": idx,
+                                "lineup_ev": round(ev, 6),
+                                "n_covered": n_cov,
+                                "pct_covered": round(pct_cov, 2),
+                            },
                         ),
                     )
                     if selector.holdout_score() is not None:

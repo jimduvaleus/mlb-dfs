@@ -238,7 +238,9 @@ export interface GppSelectProgressEvent extends SSEEvent {
   stage: 'gpp_select_progress'
   round: number
   lineup_index: number
-  marginal_ev: number
+  lineup_ev: number
+  n_covered: number
+  pct_covered: number
 }
 
 export interface CompleteEvent extends SSEEvent {
