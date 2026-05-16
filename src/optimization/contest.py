@@ -48,6 +48,12 @@ _CAL = _load_field_calibration()
 # P(4-batter primary stack | lineup is stacked). Calibrated from 10-slate contest
 # analysis: real DK entries use 5-stacks ~73.5% of the time among stacked lineups.
 _STACK_SIZE_4_PROB: float = float(_CAL.get("stack_size_4_prob", 0.265))
+# P(secondary stack ≥2 | lineup is primary-stacked). Empirically ~82% of stacked
+# lineups also have ≥2 batters from a second team.
+_SECONDARY_STACK_PROB: float = float(_CAL.get("secondary_stack_prob", 0.822))
+# P(secondary size == 2 | has secondary stack). Roughly 52.5% use 2-man secondary,
+# the rest use 3-man.
+_SECONDARY_SIZE_2_PROB: float = float(_CAL.get("secondary_size_2_prob", 0.525))
 # Minimum total salary for a generated field lineup. Rejects lineups below the
 # empirical p10 of real contest entries (~$49,200), rounded to the nearest $500.
 _FIELD_SALARY_FLOOR: float = float(_CAL.get("salary_floor_field", 49_000))
@@ -178,11 +184,52 @@ def _sample_stacked_lineup(
     pitcher_ids = [int(pitcher_pool[i]) for i in pit_idx]
 
     used = set(pitcher_ids) | stack_ids
+
+    # Secondary stack: fill 2-3 batter slots from a second team before the
+    # generic remaining-positions pass.
+    secondary_ids: list[int] = []
+    if rng.random() < _SECONDARY_STACK_PROB and len(teams) > 1:
+        sec_teams = [t for t in teams if t != primary_team]
+        if sec_teams:
+            sec_tw = np.array([team_weights[t] for t in sec_teams])
+            sec_tw = sec_tw / sec_tw.sum()
+            secondary_team = sec_teams[int(rng.choice(len(sec_teams), p=sec_tw))]
+            secondary_target = 2 if rng.random() < _SECONDARY_SIZE_2_PROB else 3
+
+            for pos_name in ("C", "1B", "2B", "3B", "SS", "OF"):
+                if len(secondary_ids) >= secondary_target:
+                    break
+                p_ids_pos, p_w_pos = pos_pools.get(pos_name, ([], np.array([])))
+                covered = sum(
+                    1 for pid in (stack_ids | set(secondary_ids))
+                    if pmeta[pid]["position"] == pos_name
+                )
+                need = ROSTER_REQUIREMENTS.get(pos_name, 0) - covered
+                if need <= 0:
+                    continue
+                sec_cands = [
+                    pid for pid in p_ids_pos
+                    if pmeta[pid]["team"] == secondary_team and pid not in used
+                ]
+                if not sec_cands:
+                    continue
+                cw_dict = dict(zip(p_ids_pos, p_w_pos))
+                cw = np.array([cw_dict.get(pid, 1.0 / len(sec_cands)) for pid in sec_cands])
+                cw = cw / cw.sum()
+                n_pick = min(need, secondary_target - len(secondary_ids), len(sec_cands))
+                chosen = [
+                    int(sec_cands[i])
+                    for i in rng.choice(len(sec_cands), size=n_pick, replace=False, p=cw)
+                ]
+                secondary_ids.extend(chosen)
+                used.update(chosen)
+
+    all_stacked = stack_ids | set(secondary_ids)
     remaining: list[int] = []
     for pos_name in ("C", "1B", "2B", "3B", "SS", "OF"):
         p_ids_pos, p_w_pos = pos_pools.get(pos_name, ([], np.array([])))
         already_covered = sum(
-            1 for pid in stack_ids
+            1 for pid in all_stacked
             if pmeta[pid]["position"] == pos_name
         )
         need = ROSTER_REQUIREMENTS.get(pos_name, 0) - already_covered
@@ -199,7 +246,7 @@ def _sample_stacked_lineup(
         remaining.extend(chosen)
         used.update(chosen)
 
-    all_ids = pitcher_ids + list(stack_ids) + remaining
+    all_ids = pitcher_ids + list(stack_ids) + secondary_ids + remaining
     if len(set(all_ids)) != 10 or len(all_ids) != 10:
         return None
     if not _is_valid_field_lineup(all_ids, pmeta):

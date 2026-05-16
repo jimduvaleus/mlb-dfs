@@ -131,6 +131,7 @@ def analyze_slate(slate_dir: Path) -> dict | None:
     n_salary_miss = 0
 
     primary_stacks: list[int] = []
+    secondary_stacks: list[int] = []
     salaries: list[int] = []
     bringbacks: list[bool] = []
 
@@ -156,8 +157,11 @@ def analyze_slate(slate_dir: Path) -> dict | None:
             else:
                 pitcher_opps.append(opp_map.get(name, ""))
 
-        primary_stack = max(team_batter_counts.values()) if team_batter_counts else 0
+        sorted_counts = sorted(team_batter_counts.values(), reverse=True)
+        primary_stack = sorted_counts[0] if sorted_counts else 0
+        secondary_stack = sorted_counts[1] if len(sorted_counts) > 1 else 0
         primary_stacks.append(primary_stack)
+        secondary_stacks.append(secondary_stack)
 
         total_sal = sum(salary_map.get(name, 0) for _, name in players)
         if total_sal > 0:
@@ -173,6 +177,7 @@ def analyze_slate(slate_dir: Path) -> dict | None:
     print(f"  {slate_dir.name}: {n_entries:,} entries, {n_parsed:,} parsed, {n_salary_miss} salary misses")
 
     stacks_arr = np.array(primary_stacks)
+    sec_arr = np.array(secondary_stacks)
     sals_arr = np.array(salaries)
     bb_arr = np.array(bringbacks)
 
@@ -182,6 +187,15 @@ def analyze_slate(slate_dir: Path) -> dict | None:
     stack_probability = float(stacked_mask.mean())
     stacked_stacks = stacks_arr[stacked_mask]
     stack_size_4_prob = float((stacked_stacks == 4).mean()) if len(stacked_stacks) > 0 else 0.5
+
+    # Secondary stack: computed conditional on the lineup being primary-stacked
+    stacked_sec = sec_arr[stacked_mask]
+    secondary_stack_prob = float((stacked_sec >= 2).mean()) if len(stacked_sec) > 0 else 0.5
+    has_sec_mask = stacked_sec >= 2
+    secondary_size_2_prob = (
+        float((stacked_sec[has_sec_mask] == 2).mean()) if has_sec_mask.any() else 0.6
+    )
+    secondary_dist = {str(k): float((sec_arr == k).mean()) for k in range(0, 5)}
 
     at_cap = float((sals_arr >= SALARY_CAP).mean())
     under_cap = sals_arr[sals_arr < SALARY_CAP]
@@ -195,6 +209,9 @@ def analyze_slate(slate_dir: Path) -> dict | None:
         "stack_dist": stack_dist,
         "stack_probability": stack_probability,
         "stack_size_4_prob": stack_size_4_prob,
+        "secondary_stack_prob": secondary_stack_prob,
+        "secondary_size_2_prob": secondary_size_2_prob,
+        "secondary_dist": secondary_dist,
         "bringback_rate": float(bb_arr.mean()),
         "salary_mean": float(sals_arr.mean()),
         "salary_median": float(np.median(sals_arr)),
@@ -212,6 +229,7 @@ def analyze_slate(slate_dir: Path) -> dict | None:
         "underspend_p90": float(np.percentile(underspend, 90)),
         # Raw arrays preserved for aggregate pooling; stripped before JSON output.
         "_primary_stacks": primary_stacks,
+        "_secondary_stacks": secondary_stacks,
         "_salaries": salaries,
         "_bringbacks": [bool(b) for b in bringbacks],
     }
@@ -224,15 +242,18 @@ def analyze_slate(slate_dir: Path) -> dict | None:
 def aggregate_stats(slate_results: list[dict]) -> dict:
     """Pool raw data across all slates and compute aggregate distributions."""
     all_stacks: list[int] = []
+    all_secondary: list[int] = []
     all_sals: list[int] = []
     all_bb: list[bool] = []
 
     for r in slate_results:
         all_stacks.extend(r["_primary_stacks"])
+        all_secondary.extend(r["_secondary_stacks"])
         all_sals.extend(r["_salaries"])
         all_bb.extend(r["_bringbacks"])
 
     stacks_arr = np.array(all_stacks)
+    sec_arr = np.array(all_secondary)
     sals_arr = np.array(all_sals)
     bb_arr = np.array(all_bb)
 
@@ -242,6 +263,14 @@ def aggregate_stats(slate_results: list[dict]) -> dict:
     stack_probability = float(stacked_mask.mean())
     stacked_stacks = stacks_arr[stacked_mask]
     stack_size_4_prob = float((stacked_stacks == 4).mean()) if len(stacked_stacks) > 0 else 0.5
+
+    stacked_sec = sec_arr[stacked_mask]
+    secondary_stack_prob = float((stacked_sec >= 2).mean()) if len(stacked_sec) > 0 else 0.5
+    has_sec_mask = stacked_sec >= 2
+    secondary_size_2_prob = (
+        float((stacked_sec[has_sec_mask] == 2).mean()) if has_sec_mask.any() else 0.6
+    )
+    secondary_dist = {str(k): float((sec_arr == k).mean()) for k in range(0, 5)}
 
     at_cap = float((sals_arr >= SALARY_CAP).mean())
     under_cap = sals_arr[sals_arr < SALARY_CAP]
@@ -254,6 +283,9 @@ def aggregate_stats(slate_results: list[dict]) -> dict:
         "stack_dist": stack_dist,
         "stack_probability": stack_probability,
         "stack_size_4_prob": stack_size_4_prob,
+        "secondary_stack_prob": secondary_stack_prob,
+        "secondary_size_2_prob": secondary_size_2_prob,
+        "secondary_dist": secondary_dist,
         "bringback_rate": float(bb_arr.mean()),
         "salary_mean": float(sals_arr.mean()),
         "salary_median": float(np.median(sals_arr)),
@@ -282,6 +314,8 @@ def derive_calibration_params(agg: dict) -> dict:
     return {
         "stack_probability": round(agg["stack_probability"], 4),
         "stack_size_4_prob": round(agg["stack_size_4_prob"], 4),
+        "secondary_stack_prob": round(agg["secondary_stack_prob"], 4),
+        "secondary_size_2_prob": round(agg["secondary_size_2_prob"], 4),
         "salary_floor_field": salary_floor,
         "bringback_rate": round(agg["bringback_rate"], 4),
         "calibrated_from": str(date.today()),
@@ -322,6 +356,15 @@ def _print_aggregate(agg: dict, cal: dict) -> None:
     print(f"\nStack probability (≥4 batters from one team): {agg['stack_probability']:.1%}")
     print(f"  Of stacked lineups — 4-stack: {agg['stack_size_4_prob']:.1%}  "
           f"5-stack: {1 - agg['stack_size_4_prob']:.1%}")
+
+    print(f"\nSecondary stack (among stacked lineups):")
+    print(f"  Has secondary ≥2 batters: {agg['secondary_stack_prob']:.1%}")
+    print(f"  Of those — size 2: {agg['secondary_size_2_prob']:.1%}  "
+          f"size 3+: {1 - agg['secondary_size_2_prob']:.1%}")
+    print(f"  Secondary size distribution (all lineups):")
+    for k in sorted(agg["secondary_dist"].keys(), key=int):
+        bar = "█" * int(agg["secondary_dist"][k] * 40)
+        print(f"    {k}: {agg['secondary_dist'][k]:>6.1%}  {bar}")
 
     print(f"\nSalary usage:")
     print(f"  Mean: {agg['salary_mean']:,.0f}  Median: {agg['salary_median']:,.0f}  "
