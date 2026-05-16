@@ -1,36 +1,36 @@
 """Heuristic ownership estimation for GPP contest simulation.
 
 Batters: softmax(sqrt(mean)) within position group, with salary-cap pressure,
-         batting-order multiplier, game start-time multiplier, and stack-value
-         batter boost.
-Pitchers: softmax(0.8*sqrt(mean) + 0.2*sqrt(salary_value)), with opponent
-          implied-total matchup boost, own-team co-stack boost, and post-softmax
-          compression toward uniform.
+         batting-order multiplier, HR-probability boost, game start-time
+         multiplier, and stack-value batter boost.
+Pitchers: softmax(0.98*sqrt(mean) + 0.02*sqrt(salary_value)), with opponent
+          implied-total matchup boost and own-team co-stack boost.
 
 Key design choices:
 - sqrt(mean): diminishing returns at high projections — doubling projected
   points doesn't double ownership.
-- Salary_value dropped for batters (Spearman vs actual = 0.23; noise, not
-  signal) but kept at 0.2 weight for pitchers (Spearman = 0.77).
-- Salary-cap pressure on batters: expensive players are harder to pair with
-  a full competitive lineup; (4500/salary)^0.5 penalty above the ~75th-pct
-  batter salary. Accounts for field fading $6k+ superstars.
-- Batter std floor raised to 0.7: prevents one outlier from consuming the
-  entire position pool through softmax concentration.
-- Game start-time multiplier: earlier games have confirmed batting lineups
-  sooner, attracting DFS players building before late-game announcements.
-  Games are bucketed into 30-minute windows; all games in the same window
-  receive the same boost. Only applied to batters — pitcher slots are
-  confirmed earlier in the day regardless of game time.
-- Stack-value batter boost: teams with cheap top-of-order bats relative to
-  their implied total are more attractive stacking targets — the field can
-  pair them with expensive pitchers within the $50k cap. Only fires when the
-  team's implied total is >= 4.0.
+- Salary_value near-zero for pitchers (weight 0.02) and dropped entirely for
+  batters: 10-slate DE regression found salary_value adds negligible signal
+  for pitchers once projection quality is high.
+- Batter std floor 1.19: field spreads batter ownership much more evenly than
+  raw softmax predicts; raising the floor significantly flattens the
+  distribution and matches empirical ownership patterns.
+- Pitcher std floor 0.29: pitchers are more concentrated than batters — field
+  tends to anchor on the top arm.
+- Pitcher compression 0.00: actual pitcher ownership is not flat; the
+  uniform-blend hurt accuracy. Disabled after 10-slate regression.
+- Game start-time multiplier (factor 0.04): weak signal; field builds
+  regardless of game time for most contests. Kept at low weight.
+- Stack-value batter boost: teams with cheap top-of-order bats are more
+  attractive stacking targets within the $50k cap. Fires only when implied
+  total >= 4.0.
 - Pitcher co-stack boost: pitchers on high-implied teams see elevated
-  ownership because the field stacks that offense and often correlates
-  the pitcher alongside their batters.
-- Pitcher pool compression: post-softmax 20% blend toward uniform —
-  empirical pitcher ownership is flatter than pure softmax produces.
+  ownership because the field stacks that offense.
+- Secondary position discount 0.10: multi-eligible players (e.g. 3B/SS) are
+  almost entirely owned at their primary position; minimal credit for the
+  secondary pool.
+
+Constants last tuned: 10-slate differential-evolution regression, 2026-05-15.
 """
 import re
 import numpy as np
@@ -53,18 +53,19 @@ _BATTING_ORDER_MULT: dict[int, float] = {
 
 # Fraction of secondary-pool ownership credited to multi-eligible players.
 # A 3B/SS player gets full credit from their primary pool plus this fraction
-# of whatever the SS pool would award them (and vice-versa).
-_SECONDARY_POSITION_DISCOUNT = 0.5
+# of whatever the SS pool would award them. Regression found 0.10: field
+# overwhelmingly owns multi-eligible players at their primary position.
+_SECONDARY_POSITION_DISCOUNT = 0.10
 
-# Batter implied-total boost cap: above ~5.5 runs the field diversifies enough
+# Batter implied-total boost cap: above this value the field diversifies enough
 # that ownership stops climbing proportionally with implied total.
-_BATTER_TOTAL_CAP = 5.5
+_BATTER_TOTAL_CAP = 6.0
 
 # Pitcher opponent-matchup boost exponent. Higher values amplify the signal
-# from low opponent implied totals — tuned against empirical ownership data.
-# Swept 0.25–2.0 across 7 slates; 1.0 minimises RMSE and maximises top-20%
-# precision without meaningful Spearman loss vs the previous value of 2.0.
-_PITCHER_MATCHUP_EXP = 1.0
+# from low opponent implied totals. DE regression found 0.95; but across 8
+# recent slates J_mexp_075 tied Spearman while improving RMSE ~3% and precision
+# on both ends — indicating 0.95 was over-differentiating by matchup quality.
+_PITCHER_MATCHUP_EXP = 0.75
 
 # Salary above which batters receive a soft cap penalty: (4500/salary)^0.5.
 # Represents the ~75th percentile of batter salaries; above this, the $50k
@@ -73,29 +74,35 @@ _BATTER_SALARY_PRESSURE_BASE = 4500
 
 # Std floor for within-position softmax normalization.
 # Higher floor → flatter distribution → less concentration on one player.
-_BATTER_STD_FLOOR  = 0.7
-_PITCHER_STD_FLOOR = 0.4
+# Batter floor 1.19: field spreads ownership far more evenly across batters
+# than raw softmax predicts. Pitcher floor 0.29: pitchers are more
+# concentrated — field tends to anchor on the top arm.
+_BATTER_STD_FLOOR  = 1.19
+_PITCHER_STD_FLOOR = 0.29
 
 # Pitcher pool compression: blend this fraction of uniform into the
-# post-softmax pitcher distribution. Empirical pitcher ownership is much
-# flatter than pure softmax produces.
-_PITCHER_COMPRESS = 0.20
+# post-softmax pitcher distribution. DE regression found 0.00: actual pitcher
+# ownership is not flat — the field concentrates on the top arm. Kept as a
+# tunable parameter for future regressions.
+_PITCHER_COMPRESS = 0.00
 
 # Pitcher own-team co-stack boost exponent. Pitchers on high-implied teams
 # see elevated ownership because the field stacks that offense and often
 # pairs the pitcher. (own_team_total / mean_total) ** this_exp.
-_PITCHER_COSTACK_EXP = 0.40
+_PITCHER_COSTACK_EXP = 0.30
 
 # Stack-value batter boost: (mean_slot5_salary / team_slot5_salary) ** this_exp
 # amplifies ownership for teams with cheap top-of-order bats.
-_STACK_VALUE_EXP = 0.15
+_STACK_VALUE_EXP = 0.17
 
 # Implied total threshold below which the stack-value signal does not fire.
 _STACK_THRESHOLD = 4.0
 
 # Maximum fractional boost for the earliest-bucket batter games on the slate.
 # Applied only to batters; pitchers are confirmed before the slate regardless.
-_TIME_FACTOR = 0.12
+# Regression found 0.04: signal is real but weak — field builds regardless of
+# game time for most contests.
+_TIME_FACTOR = 0.04
 
 # Games are bucketed into this-minute windows from slate lock. All games in
 # the same window receive the same time boost.
@@ -104,6 +111,15 @@ _TIME_NEUTRAL_WINDOW = 30
 # Pitcher hot-streak boost exponent — used by evaluate_ownership.py (Model H)
 # but not applied in production until validated on more slates.
 _PITCHER_AVG_RATIO_EXP = 0.50
+
+# Fraction of sqrt(mean) in the pitcher raw-score composite.
+# The remaining (1 - fraction) weight goes to sqrt(salary_value). Regression
+# found 0.98: salary_value adds negligible signal for pitchers.
+_PITCHER_MEAN_FRAC = 0.98
+
+# HR-probability batter boost exponent, applied directly to _raw = sqrt(mean).
+# (hr_prob / mean_hr_prob) ** _HR_PROB_EXP on _raw ≡ ratio ** (2·exp) on mean.
+_HR_PROB_EXP = 0.11
 
 
 def compute_heuristic_ownership(
@@ -124,7 +140,7 @@ def compute_heuristic_ownership(
           contribution from each secondary eligible pool.
         - ``hr_prob``: market fair implied probability of 0.5+ HRs (from
           market_odds_fair_odds.json).  When present, each batter's raw score
-          is multiplied by (hr_prob / mean_hr_prob)^0.25 before softmax.
+          is multiplied by (hr_prob / mean_hr_prob)^_HR_PROB_EXP before softmax.
           Batters with null hr_prob are left unchanged.  Pitchers are unaffected.
     team_totals:
         Optional {team_abbrev: implied_run_total} dict.  When provided,
@@ -145,8 +161,8 @@ def compute_heuristic_ownership(
     # --- Raw scores: mean-only for batters; mean + salary_value for pitchers ---
     df["_raw"] = np.sqrt(df["mean"].clip(lower=0))
     df.loc[pitcher_mask, "_raw"] = (
-        0.8 * np.sqrt(df.loc[pitcher_mask, "mean"].clip(lower=0))
-        + 0.2 * np.sqrt(salary_value.loc[pitcher_mask].clip(lower=0))
+        _PITCHER_MEAN_FRAC * np.sqrt(df.loc[pitcher_mask, "mean"].clip(lower=0))
+        + (1.0 - _PITCHER_MEAN_FRAC) * np.sqrt(salary_value.loc[pitcher_mask].clip(lower=0))
     )
 
     # --- Batting order multiplier --------------------------------------------
@@ -178,7 +194,7 @@ def compute_heuristic_ownership(
         if hr_valid.any():
             mean_hr = float(df.loc[hr_valid, "hr_prob"].mean())
             if mean_hr > 0:
-                df.loc[hr_valid, "_raw"] *= (df.loc[hr_valid, "hr_prob"] / mean_hr) ** 0.125
+                df.loc[hr_valid, "_raw"] *= (df.loc[hr_valid, "hr_prob"] / mean_hr) ** _HR_PROB_EXP
 
     # --- Game start-time penalty (batters only) ------------------------------
     # Pitcher lineup slots are confirmed earlier in the day regardless of game

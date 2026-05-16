@@ -441,15 +441,28 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
     except Exception as exc:
         print(f"  [H_pitcher_avg skipped: {exc}]")
 
-    # J: sweep _PITCHER_MATCHUP_EXP to find the right calibration.
-    # Current production value is 2.0; sweep covers 0.25–1.75 below it.
-    _MATCHUP_EXPS = [0.75, 1.00]
+    # J: sweep _PITCHER_MATCHUP_EXP around current production value (0.75).
+    _MATCHUP_EXPS = [0.50, 0.60, 1.00]
     for _exp in _MATCHUP_EXPS:
         _label = f"J_mexp_{int(_exp * 100):03d}"
         try:
             models[_label] = _compute_model_j(pool_df, team_totals, _exp)
         except Exception as exc:
             print(f"  [{_label} skipped: {exc}]")
+
+    # K: regressed constants from optimize_ownership_params.py.
+    # Silently skipped if the regression results file does not exist yet.
+    _regressed_path = PROJECT_ROOT / "archive" / "ownership_regression_results.json"
+    if _regressed_path.exists():
+        try:
+            import json as _json
+            with open(_regressed_path) as _f:
+                _reg = _json.load(_f)
+            _reg_params: dict[str, float] = _reg.get("params", {})
+            if _reg_params:
+                models["K_regressed"] = _compute_model_k(pool_df, team_totals, _reg_params)
+        except Exception as exc:
+            print(f"  [K_regressed skipped: {exc}]")
 
     return models
 
@@ -898,6 +911,35 @@ def _compute_model_j(
         return compute_heuristic_ownership(pool_df, team_totals)
     finally:
         _own_mod._PITCHER_MATCHUP_EXP = old_exp
+
+
+def _compute_model_k(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    params: dict[str, float],
+) -> np.ndarray:
+    """
+    K_regressed — production model with constants tuned by optimize_ownership_params.py.
+
+    Temporarily patches all module-level constants listed in params, calls
+    compute_heuristic_ownership, then restores originals.  Mirrors the pattern
+    used by _compute_model_j but accepts a full constant dict rather than a
+    single exponent.
+
+    params comes from archive/ownership_regression_results.json → "params".
+    """
+    import src.optimization.ownership as _own_mod
+
+    old_vals = {name: getattr(_own_mod, name) for name in params if hasattr(_own_mod, name)}
+    for name, val in params.items():
+        if hasattr(_own_mod, name):
+            setattr(_own_mod, name, float(val))
+    try:
+        from src.optimization.ownership import compute_heuristic_ownership
+        return compute_heuristic_ownership(pool_df, team_totals)
+    finally:
+        for name, old_val in old_vals.items():
+            setattr(_own_mod, name, old_val)
 
 
 # ---------------------------------------------------------------------------
