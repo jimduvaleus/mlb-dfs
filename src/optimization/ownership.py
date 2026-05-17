@@ -62,10 +62,10 @@ _SECONDARY_POSITION_DISCOUNT = 0.10
 _BATTER_TOTAL_CAP = 6.0
 
 # Pitcher opponent-matchup boost exponent. Higher values amplify the signal
-# from low opponent implied totals. DE regression found 0.95; but across 8
-# recent slates J_mexp_075 tied Spearman while improving RMSE ~3% and precision
-# on both ends — indicating 0.95 was over-differentiating by matchup quality.
-_PITCHER_MATCHUP_EXP = 0.75
+# from low opponent implied totals. Swept 0.30–0.75 across 11 slates; 0.40
+# minimises composite rank (Spearman + 2×RMSE + precision) — lower values
+# flatten the matchup signal without improving RMSE further.
+_PITCHER_MATCHUP_EXP = 0.40
 
 # Salary above which batters receive a soft cap penalty: (4500/salary)^0.5.
 # Represents the ~75th percentile of batter salaries; above this, the $50k
@@ -85,6 +85,14 @@ _PITCHER_STD_FLOOR = 0.29
 # ownership is not flat — the field concentrates on the top arm. Kept as a
 # tunable parameter for future regressions.
 _PITCHER_COMPRESS = 0.00
+
+# Post-softmax power-law calibration exponent for batters.
+# ownership^b (renormalised per position) corrects the systematic magnitude
+# compression: the softmax over-assigns to low-owned players and undershoots
+# highly-owned ones.  b=1.02 chosen by RMSE sweep over 10 historical slates;
+# wins on RMSE in 8/10, corrects ~6% salary under-bias to ~0%, Spearman cost
+# is −0.004.  Pitchers excluded — their magnitudes are already well-calibrated.
+_BATTER_CALIB_EXP = 1.02
 
 # Pitcher own-team co-stack boost exponent. Pitchers on high-implied teams
 # see elevated ownership because the field stacks that offense and often
@@ -125,6 +133,8 @@ _HR_PROB_EXP = 0.11
 def compute_heuristic_ownership(
     players_df: pd.DataFrame,
     team_totals: dict[str, float] | None = None,
+    batting_order_mult: dict[int, float] | None = None,
+    batter_std_floor: float | None = None,
 ) -> np.ndarray:
     """Return ownership probability array aligned with players_df row order.
 
@@ -171,7 +181,8 @@ def compute_heuristic_ownership(
         else ("slot" if "slot" in df.columns else None)
     )
     if slot_col:
-        for batting_slot, mult in _BATTING_ORDER_MULT.items():
+        bom = batting_order_mult if batting_order_mult is not None else _BATTING_ORDER_MULT
+        for batting_slot, mult in bom.items():
             mask = batter_mask & (df[slot_col] == batting_slot)
             df.loc[mask, "_raw"] *= mult
 
@@ -328,7 +339,7 @@ def compute_heuristic_ownership(
         raw_vals  = df.loc[mask, "_raw"].values.astype(float)
         n_slots   = _SLOT_COUNTS.get(pos, 1)
         is_p      = pos == "P"
-        std_floor = _PITCHER_STD_FLOOR if is_p else _BATTER_STD_FLOOR
+        std_floor = _PITCHER_STD_FLOOR if is_p else (batter_std_floor if batter_std_floor is not None else _BATTER_STD_FLOOR)
 
         std     = raw_vals.std()
         shifted = (raw_vals - raw_vals.mean()) / max(std, std_floor)
@@ -351,4 +362,20 @@ def compute_heuristic_ownership(
         else:
             df.loc[mask, "ownership"] += contribution
 
-    return df["ownership"].values.astype(np.float64)
+    # Post-hoc power-law magnitude calibration for batters.  Applied after the
+    # full multi-position accumulation so all contributions are included before
+    # sharpening.  Corrects systematic under-assignment to high-owned players.
+    result = df["ownership"].values.astype(np.float64)
+    pos_vals = df["position"].values
+    for pos, n_slots in _SLOT_COUNTS.items():
+        if pos == "P":
+            continue
+        pmask = pos_vals == pos
+        if not pmask.any():
+            continue
+        vals = result[pmask]
+        total = vals.sum()
+        if total > 0:
+            cal = vals ** _BATTER_CALIB_EXP
+            result[pmask] = cal / cal.sum() * n_slots
+    return result

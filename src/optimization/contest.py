@@ -59,6 +59,86 @@ _SECONDARY_SIZE_2_PROB: float = float(_CAL.get("secondary_size_2_prob", 0.525))
 _FIELD_SALARY_FLOOR: float = float(_CAL.get("salary_floor_field", 49_000))
 
 
+def compute_emergent_ownership(
+    players_df: pd.DataFrame,
+    team_totals: dict[str, float] | None = None,
+    n_sims: int = 10_000,
+    rng_seed: int | None = 42,
+) -> np.ndarray:
+    """Estimate per-player ownership by simulating n_sims realistic DFS lineups.
+
+    Team selection is driven by team_totals (implied runs). Player selection
+    within stacks uses sqrt(projected_fpts). The salary floor, stacking
+    structure, and calibrated probabilities are the same as generate_field().
+
+    Returns array shape (len(players_df),) with same semantics as
+    compute_heuristic_ownership(): values sum to slot_count per position group.
+    """
+    rng = np.random.default_rng(rng_seed)
+    df = players_df.reset_index(drop=True)
+
+    proj_w = np.sqrt(np.maximum(df["mean"].values.astype(float), 0.0))
+    pos_pools = _build_pos_pools(df, proj_w)
+    pmeta = _player_meta_from_df(df)
+
+    team_batters: dict[str, list[int]] = {}
+    team_stack_w: dict[str, float] = {}
+    for pos_name in ("C", "1B", "2B", "3B", "SS", "OF"):
+        p_ids, _ = pos_pools.get(pos_name, ([], np.array([])))
+        for pid in p_ids:
+            t = pmeta[pid]["team"]
+            team_batters.setdefault(t, []).append(pid)
+    for team in team_batters:
+        team_stack_w[team] = float((team_totals or {}).get(team, 4.5))
+
+    p_sals = sorted([v["salary"] for v in pmeta.values() if v["position"] == "P"], reverse=True)
+    b_sals = sorted([v["salary"] for v in pmeta.values() if v["position"] != "P"], reverse=True)
+    effective_floor = (
+        _FIELD_SALARY_FLOOR if (sum(p_sals[:2]) + sum(b_sals[:8])) >= _FIELD_SALARY_FLOOR else 0.0
+    )
+
+    sp = float(_CAL.get("stack_probability", 0.775))
+    pid_to_idx = {int(pid): i for i, pid in enumerate(df["player_id"].tolist())}
+    counts = np.zeros(len(df), dtype=float)
+    n_generated = 0
+    attempts = 0
+
+    while n_generated < n_sims and attempts < n_sims * 200:
+        attempts += 1
+        try:
+            ids = (
+                _sample_stacked_lineup(rng, pos_pools, pmeta, team_batters, team_stack_w)
+                if rng.random() < sp
+                else _sample_random_lineup(rng, pos_pools, pmeta)
+            )
+        except Exception:
+            ids = None
+        if ids is not None and effective_floor > 0:
+            if sum(pmeta[pid]["salary"] for pid in ids) < effective_floor:
+                ids = None
+        if ids is not None:
+            for pid in ids:
+                if (idx := pid_to_idx.get(int(pid))) is not None:
+                    counts[idx] += 1
+            n_generated += 1
+
+    if n_generated < n_sims:
+        logger.warning("compute_emergent_ownership: only %d / %d sims", n_generated, n_sims)
+
+    _SLOT_COUNTS = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+    result = np.zeros(len(df), dtype=float)
+    positions = df["position"].values
+    for pos, n_slots in _SLOT_COUNTS.items():
+        mask = positions == pos
+        if not mask.any():
+            continue
+        pos_total = counts[mask].sum()
+        result[mask] = (
+            counts[mask] / pos_total * n_slots if pos_total > 0 else np.full(mask.sum(), n_slots / mask.sum())
+        )
+    return result
+
+
 def _build_pos_pools(
     players_df: pd.DataFrame,
     ownership_vec: np.ndarray,

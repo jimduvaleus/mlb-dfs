@@ -21,10 +21,6 @@ Output
 
 Models
 ------
-  Baselines — naive approaches that establish a performance floor:
-    D_team_total   softmax(0.6·mean + 0.4·salary_value) per position,
-                   with batter boost proportional to implied team total.
-
   Production — the model used by the live optimizer at runtime:
     E_production   compute_heuristic_ownership() from
                    src/optimization/ownership.py. Includes sqrt compression,
@@ -33,11 +29,6 @@ Models
                    game-time multiplier, stack-value batter boost, pitcher
                    matchup and co-stack boosts, and post-softmax pitcher
                    compression.
-
-  Incremental development history — intermediate steps showing per-signal gains;
-  kept for longitudinal tracking but not candidates to replace production:
-    F_salary_cap   E without game-time or stack-value signals.
-    G_stack_time   E without ISO game_start_time support (game-string fallback).
 
   Experimental — candidates being evaluated as potential replacements:
     H_pitcher_avg  Production + AvgPPG ratio boost for hot-streak pitchers.
@@ -352,55 +343,23 @@ def _build_player_pool(
 # Ownership models
 # ---------------------------------------------------------------------------
 
-def _softmax(vals: np.ndarray, temperature: float = 1.0) -> np.ndarray:
-    """Numerically stable softmax with optional temperature scaling."""
-    v = np.asarray(vals, dtype=float)
-    if v.std() < 1e-9:
-        return np.ones(len(v)) / len(v)
-    scaled = (v - v.mean()) / (v.std() * temperature)
-    exp_v = np.exp(scaled)
-    return exp_v / exp_v.sum()
 
-
-def _apply_per_position(df: pd.DataFrame, score_col: str) -> np.ndarray:
-    """Apply softmax within each position group using score_col, return ownership array."""
-    ownership = np.zeros(len(df))
-    for pos, grp in df.groupby("position"):
-        idx = grp.index.to_numpy()
-        scores = df.loc[idx, score_col].values
-        ownership[idx] = _softmax(scores)
-    return ownership
-
-
-def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
+def compute_models(
+    pool_df: pd.DataFrame,
+    historical_tier_spend: dict[str, float] | None = None,
+) -> dict[str, np.ndarray]:
     """
     Return a dict of {model_name: ownership_array} aligned to pool_df index.
 
     Ownership arrays are probabilities within each position group (sum to 1 per pos).
     Read all output rows relative to E_production — that is the live optimizer's model.
+
+    historical_tier_spend: from fit_historical_tier_spend(); when provided,
+        N_fwd_tier (forward-looking, production-eligible) is computed.
     """
     models: dict[str, np.ndarray] = {}
 
-    # ── Baselines ─────────────────────────────────────────────────────────────
-
     pool_df = pool_df.copy()
-    pool_df["_score_C"] = 0.6 * pool_df["mean"] + 0.4 * pool_df["salary_value"]
-
-    # D: softmax(0.6*mean + 0.4*salary_value) + team-total boost for batters
-    if pool_df["implied_total"].notna().any():
-        pool_df = pool_df.copy()
-        is_batter = pool_df["position"] != "P"
-        total_vals = pool_df.loc[is_batter, "implied_total"].fillna(
-            pool_df["implied_total"].median()
-        )
-        min_t, max_t = total_vals.min(), total_vals.max()
-        if max_t > min_t:
-            scaled = 1.0 + (total_vals - min_t) / (max_t - min_t)
-        else:
-            scaled = pd.Series(1.0, index=total_vals.index)
-        pool_df.loc[is_batter, "_score_D"] = pool_df.loc[is_batter, "_score_C"] * scaled
-        pool_df.loc[~is_batter, "_score_D"] = pool_df.loc[~is_batter, "_score_C"]
-        models["D_team_total"] = _apply_per_position(pool_df, "_score_D")
 
     # Build team_totals dict for models that accept it (E–H)
     team_totals: dict[str, float] | None = None
@@ -422,19 +381,6 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
     except Exception as exc:
         print(f"  [E_production skipped: {exc}]")
 
-    # ── Development history ───────────────────────────────────────────────────
-    # Intermediate steps whose signals were merged into production; kept for
-    # longitudinal tracking to confirm per-signal Spearman gains hold over time.
-    try:
-        models["F_salary_cap"] = _compute_model_f(pool_df, team_totals)
-    except Exception as exc:
-        print(f"  [F_salary_cap skipped: {exc}]")
-
-    try:
-        models["G_stack_time"] = _compute_model_g(pool_df, team_totals)
-    except Exception as exc:
-        print(f"  [G_stack_time skipped: {exc}]")
-
     # ── Experimental ──────────────────────────────────────────────────────────
     try:
         models["H_pitcher_avg"] = _compute_model_h(pool_df, team_totals)
@@ -442,7 +388,7 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
         print(f"  [H_pitcher_avg skipped: {exc}]")
 
     # J: sweep _PITCHER_MATCHUP_EXP around current production value (0.75).
-    _MATCHUP_EXPS = [0.50, 0.60, 1.00]
+    _MATCHUP_EXPS = [0.30, 0.50]
     for _exp in _MATCHUP_EXPS:
         _label = f"J_mexp_{int(_exp * 100):03d}"
         try:
@@ -464,357 +410,24 @@ def compute_models(pool_df: pd.DataFrame) -> dict[str, np.ndarray]:
         except Exception as exc:
             print(f"  [K_regressed skipped: {exc}]")
 
+    # L: salary-calibrated ownership — tilts E_production toward expensive
+    # players until implied lineup salary hits the historical field mean from
+    # contest_stats.json.  Silently skipped if the stats file is absent.
+    try:
+        models["L_sal_calibrated"] = _compute_model_l(pool_df, team_totals)
+    except Exception as exc:
+        print(f"  [L_sal_calibrated skipped: {exc}]")
+
+    # N_fwd_tier: salary-tier tilt using historical average tier spend from prior
+    # slates (forward-looking, no look-ahead into current contest standings).
+    if historical_tier_spend:
+        try:
+            models["N_fwd_tier"] = _compute_model_n_forward(pool_df, team_totals, historical_tier_spend)
+        except Exception as exc:
+            print(f"  [N_fwd_tier skipped: {exc}]")
+
     return models
 
-
-def _compute_model_f(
-    pool_df: pd.DataFrame,
-    team_totals: dict[str, float] | None,
-) -> np.ndarray:
-    """
-    F_salary_cap — production signals minus game-time and stack-value batter boost.
-
-    Included for longitudinal tracking to show the marginal Spearman gain from
-    those two signals. Not a candidate to replace production (G and E both
-    outperform it).
-
-    Identical to production except:
-    - No game start-time multiplier (added in G_stack_time)
-    - No stack-value batter boost (added in G_stack_time)
-    """
-    from src.optimization.ownership import (
-        _BATTING_ORDER_MULT, _SLOT_COUNTS, _SECONDARY_POSITION_DISCOUNT,
-        _BATTER_TOTAL_CAP, _PITCHER_MATCHUP_EXP,
-    )
-
-    _BATTER_STD_FLOOR   = 0.7   # softer than E's 0.4; swept over [0.4–0.7], 0.7 optimal
-    _PITCHER_STD_FLOOR  = 0.4   # unchanged
-    _PITCHER_COMPRESS   = 0.20  # fraction blended toward uniform; 0.20 > 0.30 in sweep
-    _COSTACK_EXP        = 0.40  # own-team boost exponent for pitchers; minimal sensitivity
-    _CAP_PER_BATTER     = 4500  # ~75th-pct batter salary; penalty above this
-
-    df = pool_df.copy().reset_index(drop=True)
-    df["_sv"] = df["mean"] / (df["salary"] / 1000.0)
-
-    # 1. Raw score: mean-only for batters; mean + salary_value for pitchers.
-    # salary_value has Spearman 0.77 vs actual ownership for pitchers (vs 0.23
-    # for batters), so it carries real signal in the pitcher pool.
-    pitcher_mask = df["position"] == "P"
-    df["_raw"] = np.sqrt(df["mean"].clip(lower=0))
-    df.loc[pitcher_mask, "_raw"] = (
-        0.8 * np.sqrt(df.loc[pitcher_mask, "mean"].clip(lower=0))
-        + 0.2 * np.sqrt(df.loc[pitcher_mask, "_sv"].clip(lower=0))
-    )
-
-    # 2. Batting order multiplier (same as E)
-    slot_col = (
-        "lineup_slot" if "lineup_slot" in df.columns
-        else ("slot" if "slot" in df.columns else None)
-    )
-    if slot_col:
-        batter_mask = df["position"] != "P"
-        for batting_slot, mult in _BATTING_ORDER_MULT.items():
-            mask = batter_mask & (df[slot_col] == batting_slot)
-            df.loc[mask, "_raw"] *= mult
-
-    # 3. Salary-cap pressure on batters
-    batter_mask = df["position"] != "P"
-    df.loc[batter_mask, "_raw"] *= np.minimum(
-        1.0,
-        (_CAP_PER_BATTER / df.loc[batter_mask, "salary"]) ** 0.5,
-    )
-
-    # 4. Implied-total boosts (batter team total + pitcher matchup + co-stack)
-    if team_totals:
-        vals = [v for v in team_totals.values() if v and v > 0]
-        mean_total = float(np.mean(vals)) if vals else 1.0
-        batter_mask = df["position"] != "P"
-        pitcher_mask = df["position"] == "P"
-        df["_boost"] = 1.0
-
-        # Pass A: batter team-total boost + pitcher opponent-matchup boost
-        for team, total in team_totals.items():
-            if not (total and total > 0 and mean_total > 0):
-                continue
-            capped = min(total, _BATTER_TOTAL_CAP)
-            mask_b = batter_mask & (df["team"] == team)
-            df.loc[mask_b, "_boost"] = capped / mean_total
-            if "opponent" in df.columns:
-                mask_p = pitcher_mask & (df["opponent"] == team)
-                df.loc[mask_p, "_boost"] = (mean_total / capped) ** _PITCHER_MATCHUP_EXP
-
-        # Pass B: multiply in own-team co-stack boost for pitchers
-        if "opponent" in df.columns:
-            for team, total in team_totals.items():
-                if not (total and total > 0 and mean_total > 0):
-                    continue
-                capped = min(total, _BATTER_TOTAL_CAP)
-                mask_own = pitcher_mask & (df["team"] == team)
-                df.loc[mask_own, "_boost"] *= (capped / mean_total) ** _COSTACK_EXP
-
-        df["_raw"] *= df["_boost"]
-
-    # 5. Per-position softmax with softer floor + pitcher compression
-    use_eligible = "eligible_positions" in df.columns
-    df["ownership"] = 0.0
-
-    if use_eligible:
-        all_pos: set[str] = set()
-        for ep in df["eligible_positions"]:
-            if isinstance(ep, list):
-                all_pos.update(ep)
-            else:
-                all_pos.add(str(ep))
-        pos_iter = all_pos
-    else:
-        pos_iter = set(df["position"].unique())
-
-    for pos in pos_iter:
-        if use_eligible:
-            mask = df["eligible_positions"].apply(
-                lambda ep, p=pos: p in ep if isinstance(ep, list) else str(ep) == p
-            )
-        else:
-            mask = df["position"] == pos
-
-        if not mask.any():
-            continue
-
-        raw_vals = df.loc[mask, "_raw"].values.astype(float)
-        n_slots  = _SLOT_COUNTS.get(pos, 1)
-        is_p     = pos == "P"
-        std_floor = _PITCHER_STD_FLOOR if is_p else _BATTER_STD_FLOOR
-
-        std = raw_vals.std()
-        shifted  = (raw_vals - raw_vals.mean()) / max(std, std_floor)
-        exp_vals = np.exp(shifted)
-        softmax_share = exp_vals / exp_vals.sum()
-
-        if is_p:
-            # Blend softmax toward uniform to flatten the pitcher pool
-            uniform_share = np.ones(len(raw_vals)) / len(raw_vals)
-            share = (1 - _PITCHER_COMPRESS) * softmax_share + _PITCHER_COMPRESS * uniform_share
-        else:
-            share = softmax_share
-
-        contribution = share * n_slots
-
-        if use_eligible:
-            is_primary = (df.loc[mask, "position"] == pos).values
-            discount = np.where(is_primary, 1.0, _SECONDARY_POSITION_DISCOUNT)
-            df.loc[mask, "ownership"] += contribution * discount
-        else:
-            df.loc[mask, "ownership"] += contribution
-
-    return df["ownership"].values.astype(np.float64)
-
-
-def _compute_model_g(
-    pool_df: pd.DataFrame,
-    team_totals: dict[str, float] | None,
-) -> np.ndarray:
-    """
-    G_stack_time — production signals using game-string time parsing.
-
-    Identical to compute_heuristic_ownership() except it derives game times by
-    regex-parsing the "HH:MMam/pm" token from the DK game string rather than
-    using the game_start_time ISO column. In the eval context, the player pool
-    has no game_start_time column, so E_production also falls back to
-    game-string parsing — meaning G and E should produce identical results
-    when game_start_time is absent, and diverge only when it is present.
-
-    Kept for longitudinal tracking to confirm this parity holds across slates.
-    """
-    import re as _re
-
-    from src.optimization.ownership import (
-        _BATTING_ORDER_MULT, _SLOT_COUNTS, _SECONDARY_POSITION_DISCOUNT,
-        _BATTER_TOTAL_CAP, _PITCHER_MATCHUP_EXP,
-    )
-
-    _BATTER_STD_FLOOR    = 0.7
-    _PITCHER_STD_FLOOR   = 0.4
-    _PITCHER_COMPRESS    = 0.20
-    _COSTACK_EXP         = 0.40
-    _CAP_PER_BATTER      = 4500
-    _STACK_EXP           = 0.15  # strength of stack-value salary signal; swept 0.15–0.40, 0.15 optimal
-    _TIME_FACTOR         = 0.12  # max fractional boost for earliest-bucket games; swept, 0.12 optimal
-    _TIME_NEUTRAL_WINDOW = 30    # minute bucket width; games in same 30-min window get identical boost
-    _STACK_THRESHOLD     = 4.0   # implied total below which stack-value signal does not fire
-
-    df = pool_df.copy().reset_index(drop=True)
-    df["_sv"] = df["mean"] / (df["salary"] / 1000.0)
-
-    pitcher_mask = df["position"] == "P"
-    batter_mask  = ~pitcher_mask
-
-    # Raw scores (identical to F)
-    df["_raw"] = np.sqrt(df["mean"].clip(lower=0))
-    df.loc[pitcher_mask, "_raw"] = (
-        0.8 * np.sqrt(df.loc[pitcher_mask, "mean"].clip(lower=0))
-        + 0.2 * np.sqrt(df.loc[pitcher_mask, "_sv"].clip(lower=0))
-    )
-
-    # Batting order multiplier
-    slot_col = (
-        "lineup_slot" if "lineup_slot" in df.columns
-        else ("slot" if "slot" in df.columns else None)
-    )
-    if slot_col:
-        for batting_slot, mult in _BATTING_ORDER_MULT.items():
-            mask = batter_mask & (df[slot_col] == batting_slot)
-            df.loc[mask, "_raw"] *= mult
-
-    # Salary-cap pressure on batters
-    df.loc[batter_mask, "_raw"] *= np.minimum(
-        1.0,
-        (_CAP_PER_BATTER / df.loc[batter_mask, "salary"]) ** 0.5,
-    )
-
-    # --- Signal 1: game start-time penalty (batters only) --------------------
-    # Pitcher lineup slots are confirmed earlier in the day regardless of game
-    # time, so this only applies to batters. Games within the neutral window of
-    # slate lock (earliest game) are treated equally — no penalty. Only games
-    # starting 60+ minutes after slate lock get a penalty, scaling linearly to
-    # -_TIME_FACTOR for the latest game on the slate.
-    def _game_minutes(game_str: str) -> float | None:
-        m = _re.search(r'(\d{1,2}):(\d{2})(AM|PM)', str(game_str))
-        if not m:
-            return None
-        h, mi, ap = int(m.group(1)), int(m.group(2)), m.group(3)
-        if ap == "PM" and h != 12:
-            h += 12
-        elif ap == "AM" and h == 12:
-            h = 0
-        return float(h * 60 + mi)
-
-    if "game" in df.columns:
-        game_mins = {g: _game_minutes(g) for g in df["game"].unique()}
-        valid_mins = [v for v in game_mins.values() if v is not None]
-        if len(valid_mins) > 1:
-            min_t = min(valid_mins)
-            # Snap each game to a 60-minute bucket from slate lock so that games
-            # within the same hour window get identical boosts.
-            game_buckets = {
-                g: min_t + _TIME_NEUTRAL_WINDOW * int((t - min_t) // _TIME_NEUTRAL_WINDOW)
-                for g, t in game_mins.items() if t is not None
-            }
-            bucket_vals = list(game_buckets.values())
-            min_b, max_b = min(bucket_vals), max(bucket_vals)
-            bucket_range = max_b - min_b
-            if bucket_range > 0:
-                df["_time_mult"] = df["game"].map(
-                    lambda g: 1.0 + _TIME_FACTOR * (max_b - game_buckets.get(g, max_b)) / bucket_range
-                )
-            else:
-                df["_time_mult"] = 1.0  # all games same bucket — no differentiation
-        else:
-            df["_time_mult"] = 1.0
-    else:
-        df["_time_mult"] = 1.0
-
-    # Apply only to batters — pitchers are confirmed before the slate regardless
-    df.loc[batter_mask, "_raw"] *= df.loc[batter_mask, "_time_mult"]
-
-    # Implied-total boosts (same as F) + stack-value batter adjustment
-    if team_totals:
-        vals = [v for v in team_totals.values() if v and v > 0]
-        mean_total = float(np.mean(vals)) if vals else 1.0
-        df["_boost"] = 1.0
-
-        # Per-team: average salary of top-5 batting-order slots (stack cost proxy)
-        bdf = df[batter_mask]
-        team_slot5_salary: dict[str, float] = {}
-        for team, grp in bdf.groupby("team"):
-            if slot_col and grp[slot_col].notna().sum() >= 3:
-                slotted = grp.dropna(subset=[slot_col]).sort_values(slot_col)
-                top5 = slotted.head(5)
-            else:
-                top5 = grp.nlargest(min(5, len(grp)), "mean")
-            if len(top5):
-                team_slot5_salary[team] = float(top5["salary"].mean())
-
-        mean_slot5_sal = float(np.mean(list(team_slot5_salary.values()))) if team_slot5_salary else 4500.0
-
-        for team, total in team_totals.items():
-            if not (total and total > 0 and mean_total > 0):
-                continue
-            capped = min(total, _BATTER_TOTAL_CAP)
-            mask_b = batter_mask & (df["team"] == team)
-
-            # Implied-total boost, scaled by stack-value salary signal only when
-            # the team's total clears the threshold — below it the field doesn't
-            # care about cheap salaries regardless of stack cost efficiency.
-            slot5_sal = team_slot5_salary.get(team, mean_slot5_sal)
-            stack_mult = (mean_slot5_sal / slot5_sal) ** _STACK_EXP if total >= _STACK_THRESHOLD else 1.0
-            df.loc[mask_b, "_boost"] = (capped / mean_total) * stack_mult
-
-            if "opponent" in df.columns:
-                mask_p = pitcher_mask & (df["opponent"] == team)
-                df.loc[mask_p, "_boost"] = (mean_total / capped) ** _PITCHER_MATCHUP_EXP
-
-        if "opponent" in df.columns:
-            for team, total in team_totals.items():
-                if not (total and total > 0 and mean_total > 0):
-                    continue
-                capped = min(total, _BATTER_TOTAL_CAP)
-                mask_own = pitcher_mask & (df["team"] == team)
-                df.loc[mask_own, "_boost"] *= (capped / mean_total) ** _COSTACK_EXP
-
-        df["_raw"] *= df["_boost"]
-
-    # Per-position softmax with std floor + pitcher compression (identical to F)
-    use_eligible = "eligible_positions" in df.columns
-    df["ownership"] = 0.0
-
-    if use_eligible:
-        all_pos: set[str] = set()
-        for ep in df["eligible_positions"]:
-            if isinstance(ep, list):
-                all_pos.update(ep)
-            else:
-                all_pos.add(str(ep))
-        pos_iter = all_pos
-    else:
-        pos_iter = set(df["position"].unique())
-
-    for pos in pos_iter:
-        if use_eligible:
-            mask = df["eligible_positions"].apply(
-                lambda ep, p=pos: p in ep if isinstance(ep, list) else str(ep) == p
-            )
-        else:
-            mask = df["position"] == pos
-
-        if not mask.any():
-            continue
-
-        raw_vals  = df.loc[mask, "_raw"].values.astype(float)
-        n_slots   = _SLOT_COUNTS.get(pos, 1)
-        is_p      = pos == "P"
-        std_floor = _PITCHER_STD_FLOOR if is_p else _BATTER_STD_FLOOR
-
-        std     = raw_vals.std()
-        shifted = (raw_vals - raw_vals.mean()) / max(std, std_floor)
-        exp_v   = np.exp(shifted)
-        softmax_share = exp_v / exp_v.sum()
-
-        if is_p:
-            uniform_share = np.ones(len(raw_vals)) / len(raw_vals)
-            share = (1 - _PITCHER_COMPRESS) * softmax_share + _PITCHER_COMPRESS * uniform_share
-        else:
-            share = softmax_share
-
-        contribution = share * n_slots
-
-        if use_eligible:
-            is_primary = (df.loc[mask, "position"] == pos).values
-            discount   = np.where(is_primary, 1.0, _SECONDARY_POSITION_DISCOUNT)
-            df.loc[mask, "ownership"] += contribution * discount
-        else:
-            df.loc[mask, "ownership"] += contribution
-
-    return df["ownership"].values.astype(np.float64)
 
 
 def _compute_model_h(
@@ -942,6 +555,220 @@ def _compute_model_k(
             setattr(_own_mod, name, old_val)
 
 
+def _compute_model_l(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+) -> np.ndarray:
+    """
+    L_sal_calibrated — E_production with a post-hoc salary tilt to hit the
+    historical field mean lineup salary from contest_stats.json.
+
+    After computing base ownership from compute_heuristic_ownership, applies:
+
+        o'_j = o_j × (s_j / mean_s)^α × C
+
+    where C normalises to preserve Σ o'_j = 10 (total slots unchanged), and
+    α is found by bisection so that Σ(o'_j × s_j) = target_mean_sal.
+
+    α = 0 → identical to E_production.  α > 0 → expensive players gain share;
+    α < 0 → cheap players gain share.  The bisection converges in 50 iterations
+    (~1e-14 precision) over a search range of [−5, 5].
+
+    Skipped (exception raised) if data/processed/contest_stats.json is absent —
+    call analyze_contest_lineups.py first to generate it.
+    """
+    import json as _json
+
+    stats_path = PROJECT_ROOT / "data" / "processed" / "contest_stats.json"
+    with open(stats_path) as _f:
+        target_mean_sal = float(_json.load(_f)["aggregate"]["salary_mean"])
+
+    from src.optimization.ownership import compute_heuristic_ownership
+    base     = compute_heuristic_ownership(pool_df, team_totals)
+    salaries = pool_df["salary"].values.astype(float)
+    mean_s   = salaries.mean()
+    total    = base.sum()  # sum of all ownership values = total roster slots = 10
+
+    def _tilt(alpha: float) -> np.ndarray:
+        w = base * (salaries / mean_s) ** alpha
+        return w * total / w.sum()
+
+    lo, hi = -5.0, 5.0
+    for _ in range(50):
+        mid = (lo + hi) / 2.0
+        if float(np.sum(_tilt(mid) * salaries)) < target_mean_sal:
+            lo = mid
+        else:
+            hi = mid
+
+    return _tilt((lo + hi) / 2.0)
+
+
+
+
+def fit_batter_calibration_exp(training_dirs: list[Path]) -> float:
+    """Fit power-law exponent b on training slates to minimise batter RMSE.
+
+    For each position group on each slate, calibrated ownership =
+    (pred^b) / sum(pred^b) * n_slots.  Pitchers are excluded — they are
+    already well-calibrated.  Returns the scalar b that minimises the summed
+    squared error across all training batter observations.
+    """
+    from scipy.optimize import minimize_scalar
+
+    _SLOT_COUNTS = {"C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+
+    dfs = []
+    for d in training_dirs:
+        fp = d / "ownership_eval.csv"
+        if fp.exists():
+            df = pd.read_csv(fp)
+            df["_slate"] = d.name
+            dfs.append(df)
+
+    if not dfs:
+        return 1.0
+
+    all_df = pd.concat(dfs, ignore_index=True)
+    batters = all_df[all_df["position"] != "P"].copy()
+
+    def loss(b: float) -> float:
+        total = 0.0
+        for (slate, pos), grp in batters.groupby(["_slate", "position"]):
+            n_slots = _SLOT_COUNTS.get(pos, 1)
+            pred = grp["pred_E_production"].values.astype(float)
+            actual = grp["pct_drafted"].values.astype(float)
+            if len(pred) == 0 or pred.sum() == 0:
+                continue
+            cal = pred ** b
+            cal = cal / cal.sum() * n_slots
+            total += float(np.sum((cal - actual) ** 2))
+        return total
+
+    result = minimize_scalar(loss, bounds=(0.3, 5.0), method="bounded")
+    return float(result.x)
+
+
+def _compute_model_u(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    calib_exp: float,
+) -> np.ndarray:
+    """
+    U_calibrated — E_production with post-hoc power-law magnitude calibration.
+
+    Applies ownership^b per position group (renormalised to slot counts).
+    b is fitted on held-out training slates to minimise batter RMSE.
+    Spearman is unchanged (monotone transform preserves rank order exactly).
+    Pitchers inherit the same transform for consistency, though their bias
+    is small — could be excluded in a future refinement.
+    """
+    from src.optimization.ownership import compute_heuristic_ownership
+
+    _SLOT_COUNTS = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+
+    base = compute_heuristic_ownership(pool_df, team_totals)
+    result = np.zeros_like(base)
+    positions = pool_df["position"].values
+
+    for pos, n_slots in _SLOT_COUNTS.items():
+        mask = positions == pos
+        if not mask.any():
+            continue
+        vals = base[mask]
+        cal = vals ** calib_exp
+        total = cal.sum()
+        result[mask] = cal / total * n_slots if total > 0 else vals
+    return result
+
+
+def fit_historical_tier_spend(training_dirs: list[Path]) -> dict[str, float]:
+    """
+    Compute average per-lineup tier spend from prior contest standings ZIPs.
+
+    For each tier (cheap/mid/expensive), returns the mean amount spent on that
+    tier across all lineups in all training slates.  Used by N_fwd_tier to apply
+    a forward-looking salary-tier tilt without look-ahead into the current slate.
+
+    Returns empty dict if no training data is available.
+    """
+    tier_totals: dict[str, list[float]] = {"cheap": [], "mid": [], "expensive": []}
+    for d in training_dirs:
+        zips = sorted(d.glob("contest-standings-*.zip"))
+        if not zips:
+            continue
+        try:
+            standings_df, _ = _parse_contest_zip(zips[0])
+            stats = _compute_actual_salary_stats(standings_df, d)
+            if stats is None:
+                continue
+            for t in ("cheap", "mid", "expensive"):
+                v = stats.get("tier_mean_spend", {}).get(t)
+                if v is not None:
+                    tier_totals[t].append(v)
+        except Exception:
+            continue
+
+    return {
+        t: float(np.mean(vals))
+        for t, vals in tier_totals.items()
+        if vals
+    }
+
+
+def _compute_model_n_forward(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    historical_tier_spend: dict[str, float],
+) -> np.ndarray:
+    """
+    N_fwd_tier — E_production with per-salary-tier tilt using historical averages.
+
+    Same mechanism as N_tier_tilt but uses historical average tier spend from
+    prior slates instead of the current slate's actuals.  Forward-looking:
+    valid for pre-contest projection.
+
+    Tier definitions match N_tier_tilt:
+        cheap    : salary ≤ $3,500
+        mid      : $3,501 – $5,000
+        expensive: salary > $5,000
+    """
+    from src.optimization.ownership import compute_heuristic_ownership
+
+    _TIER_CUTOFFS = (3_500, 5_000)
+
+    def _tier(sal: float) -> str:
+        return "cheap" if sal <= _TIER_CUTOFFS[0] else ("mid" if sal <= _TIER_CUTOFFS[1] else "expensive")
+
+    base = compute_heuristic_ownership(pool_df, team_totals).copy()
+    if not historical_tier_spend:
+        return base
+
+    salaries = pool_df["salary"].values.astype(float)
+    positions = pool_df["position"].values
+    batter_mask = positions != "P"
+    tiers = np.array([_tier(s) for s in salaries])
+    orig_batter_sum = float(base[batter_mask].sum())
+
+    for tier_name in ("cheap", "mid", "expensive"):
+        actual_spend = historical_tier_spend.get(tier_name)
+        if actual_spend is None:
+            continue
+        mask = batter_mask & (tiers == tier_name)
+        if not mask.any():
+            continue
+        implied_spend = float(np.sum(base[mask] * salaries[mask]))
+        if implied_spend <= 0:
+            continue
+        base[mask] *= actual_spend / implied_spend
+
+    new_batter_sum = float(base[batter_mask].sum())
+    if new_batter_sum > 0:
+        base[batter_mask] *= orig_batter_sum / new_batter_sum
+
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Name matching (ownership_df → pool_df)
 # ---------------------------------------------------------------------------
@@ -1061,15 +888,200 @@ def _evaluate(
 
 
 # ---------------------------------------------------------------------------
+# Salary-bias diagnostics
+# ---------------------------------------------------------------------------
+
+def _compute_actual_salary_stats(
+    standings_df: pd.DataFrame,
+    archive_dir: Path,
+) -> dict | None:
+    """
+    Parse contest lineup strings into per-lineup total salaries and per-position
+    mean salaries.
+
+    Returns None if DKSalaries.csv is missing or no lineups parse successfully.
+    Lineups where more than 2 players can't be salary-matched are skipped.
+
+    Return dict keys:
+        lineup_salaries  — float array of per-lineup total salaries
+        pos_mean_salary  — {pos: mean_salary_per_slot} for P/C/1B/2B/3B/SS/OF.
+                           OF is averaged across all 3 OF slots ($/slot, not total).
+        pos_n_samples    — {pos: int} number of lineup observations per position.
+    """
+    sal_path = archive_dir / "DKSalaries.csv"
+    if not sal_path.exists():
+        return None
+
+    # Local import avoids circular-import risk (analyze_contest_lineups already
+    # imports from evaluate_ownership at module level).
+    from analyze_contest_lineups import _parse_lineup_string  # noqa: PLC0415
+
+    sal_df = pd.read_csv(sal_path)
+    sal_df.rename(
+        columns={"Name": "name", "Salary": "salary", "TeamAbbrev": "team"},
+        inplace=True,
+    )
+    salary_map: dict[str, int] = dict(
+        zip(sal_df["name"].str.strip(), sal_df["salary"].astype(int))
+    )
+    team_map: dict[str, str] = (
+        dict(zip(sal_df["name"].str.strip(), sal_df["team"].str.strip()))
+        if "team" in sal_df.columns else {}
+    )
+
+    _BATTER_POSITIONS = {"C", "1B", "2B", "3B", "SS", "OF"}
+    _TIER_CUTOFFS = (3_500, 5_000)  # cheap ≤ 3500, mid 3501-5000, expensive > 5000
+
+    def _tier(sal: int) -> str:
+        return "cheap" if sal <= _TIER_CUTOFFS[0] else ("mid" if sal <= _TIER_CUTOFFS[1] else "expensive")
+
+    totals: list[float] = []
+    pos_salary_lists: dict[str, list[float]] = {
+        p: [] for p in ("P", "C", "1B", "2B", "3B", "SS", "OF")
+    }
+    tier_spend_per_lineup: dict[str, list[float]] = {
+        "cheap": [], "mid": [], "expensive": [],
+    }
+    team_primary_stack_count: dict[str, int] = {}
+    n_parsed_for_stack = 0
+
+    for _, row in standings_df.iterrows():
+        players = _parse_lineup_string(str(row.get("lineup_str", "")))
+        if not players:
+            continue
+        miss = sum(1 for _, name in players if name not in salary_map)
+        if miss > 2:
+            continue
+        total = sum(salary_map.get(name, 0) for _, name in players)
+        if total <= 0:
+            continue
+        totals.append(float(total))
+        n_parsed_for_stack += 1
+
+        lineup_tier_spend: dict[str, float] = {"cheap": 0.0, "mid": 0.0, "expensive": 0.0}
+        team_batter_counts: dict[str, int] = {}
+        for pos, name in players:
+            sal = salary_map.get(name, 0)
+            if sal > 0 and pos in pos_salary_lists:
+                pos_salary_lists[pos].append(float(sal))
+            if sal > 0 and pos in _BATTER_POSITIONS:
+                lineup_tier_spend[_tier(sal)] += sal
+                team = team_map.get(name, "")
+                if team:
+                    team_batter_counts[team] = team_batter_counts.get(team, 0) + 1
+        for t, spend in lineup_tier_spend.items():
+            tier_spend_per_lineup[t].append(spend)
+
+        # Record primary stack team if ≥ 4 batters from one team.
+        if team_batter_counts:
+            primary_team = max(team_batter_counts, key=team_batter_counts.get)
+            if team_batter_counts[primary_team] >= 4:
+                team_primary_stack_count[primary_team] = (
+                    team_primary_stack_count.get(primary_team, 0) + 1
+                )
+
+    if not totals:
+        return None
+
+    pos_mean = {
+        pos: float(np.mean(sals)) for pos, sals in pos_salary_lists.items() if sals
+    }
+    pos_n = {pos: len(sals) for pos, sals in pos_salary_lists.items() if sals}
+    tier_mean_spend = {
+        t: float(np.mean(spends)) for t, spends in tier_spend_per_lineup.items() if spends
+    }
+    team_stack_rate: dict[str, float] = (
+        {team: count / n_parsed_for_stack for team, count in team_primary_stack_count.items()}
+        if n_parsed_for_stack > 0 else {}
+    )
+
+    return {
+        "lineup_salaries": np.array(totals),
+        "pos_mean_salary":  pos_mean,
+        "pos_n_samples":    pos_n,
+        "tier_mean_spend":  tier_mean_spend,
+        "team_stack_rate":  team_stack_rate,
+    }
+
+
+def _salary_bias_metrics(
+    pool_df: pd.DataFrame,
+    predicted_ownership: np.ndarray,
+    salary_stats: dict,
+) -> dict:
+    """
+    Compare implied lineup salary (from ownership predictions) to actual contest salary.
+
+    implied_mean = Σ(o_j × s_j) — exact by linearity of expectation; no
+    independence assumption needed for the mean.
+
+    implied_std = √(Σ(o_j(1−o_j)s_j²)) — approximation under independence;
+    will over-estimate the actual spread because the $50k cap anti-correlates
+    expensive players.
+
+    Also computes per-position implied salary ($/slot) vs. actual field mean
+    salary ($/slot) stored under key "pos_bias".
+    """
+    actual_salaries = salary_stats["lineup_salaries"]
+
+    o = predicted_ownership.astype(float)
+    s = pool_df["salary"].values.astype(float)
+
+    implied_mean = float(np.sum(o * s))
+    implied_std  = float(np.sqrt(np.sum(o * (1.0 - o) * s ** 2)))
+
+    actual_mean = float(actual_salaries.mean())
+    actual_std  = float(actual_salaries.std())
+    salary_bias = implied_mean - actual_mean
+    salary_bias_pct = salary_bias / actual_mean if actual_mean > 0 else float("nan")
+
+    # Per-position implied salary ($/slot) vs actual ($/slot).
+    pos_mean_actual: dict[str, float] = salary_stats.get("pos_mean_salary", {})
+    pos_bias: dict[str, dict] = {}
+    slot_counts = {"P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3}
+    positions = pool_df["position"].values
+    for pos, n_slots in slot_counts.items():
+        mask = positions == pos
+        if not mask.any() or pos not in pos_mean_actual:
+            continue
+        implied_pos_total = float(np.sum(o[mask] * s[mask]))
+        implied_per_slot  = implied_pos_total / n_slots
+        actual_per_slot   = pos_mean_actual[pos]
+        bias              = implied_per_slot - actual_per_slot
+        pos_bias[pos] = {
+            "implied": round(implied_per_slot),
+            "actual":  round(actual_per_slot),
+            "bias":    round(bias),
+            "bias_pct": round(bias / actual_per_slot, 4) if actual_per_slot else float("nan"),
+        }
+
+    return {
+        "implied_mean_sal": round(implied_mean),
+        "actual_mean_sal":  round(actual_mean),
+        "salary_bias":      round(salary_bias),
+        "salary_bias_pct":  round(salary_bias_pct, 4),
+        "implied_std_sal":  round(implied_std),
+        "actual_std_sal":   round(actual_std),
+        "pos_bias":         pos_bias,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Single-slate evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_slate(archive_dir: Path) -> pd.DataFrame | None:
+def evaluate_slate(
+    archive_dir: Path,
+    historical_tier_spend: dict[str, float] | None = None,
+) -> pd.DataFrame | None:
     """
     Run ownership model evaluation for one archive directory.
 
     Returns a DataFrame with one row per model (metrics), or None on failure.
     Side effect: writes archive_dir/ownership_eval.csv with per-player data.
+
+    historical_tier_spend: from fit_historical_tier_spend(); when provided,
+        N_fwd_tier (forward-looking tier tilt) is computed alongside other models.
     """
     archive_dir = Path(archive_dir)
     slate_label = archive_dir.name
@@ -1082,7 +1094,7 @@ def evaluate_slate(archive_dir: Path) -> pd.DataFrame | None:
 
     print(f"\n[{slate_label}] Loading contest standings from {zips[0].name}")
     try:
-        _, ownership_df = _parse_contest_zip(zips[0])
+        standings_df, ownership_df = _parse_contest_zip(zips[0])
     except Exception as exc:
         print(f"[{slate_label}] Error parsing contest zip: {exc}")
         return None
@@ -1106,8 +1118,17 @@ def evaluate_slate(archive_dir: Path) -> pd.DataFrame | None:
 
     print(f"[{slate_label}] Matched {len(merged)} players to DK IDs")
 
-    # Compute model predictions
-    models = compute_models(pool_df)
+    # Pre-compute actual salary stats — needed by model M inside compute_models
+    # and by salary-bias diagnostics afterward.
+    salary_stats = _compute_actual_salary_stats(standings_df, archive_dir)
+    if salary_stats is not None:
+        actual_lineup_salaries = salary_stats["lineup_salaries"]
+        print(f"[{slate_label}] Salary diagnostics: {len(actual_lineup_salaries):,} lineups parsed "
+              f"(mean=${actual_lineup_salaries.mean():,.0f})")
+    else:
+        actual_lineup_salaries = None
+
+    models = compute_models(pool_df, historical_tier_spend=historical_tier_spend or {})
 
     # Add predicted ownership columns to merged
     pid_to_model: dict[str, dict[int, float]] = {}
@@ -1116,10 +1137,76 @@ def evaluate_slate(archive_dir: Path) -> pd.DataFrame | None:
 
     actual = merged["pct_drafted"].values
     rows = []
+    e_prod_pos_bias: dict | None = None
+    e_prod_ownership: np.ndarray | None = None
     for model_name, pid_map in pid_to_model.items():
         predicted = merged["player_id"].map(pid_map).values.astype(float)
         metrics = _evaluate(actual, predicted)
+        if salary_stats is not None:
+            sal_metrics = _salary_bias_metrics(pool_df, models[model_name], salary_stats)
+            pos_bias = sal_metrics.pop("pos_bias", {})
+            metrics.update(sal_metrics)
+            if model_name == "E_production":
+                e_prod_pos_bias = pos_bias
+                e_prod_ownership = models[model_name]
         rows.append({"slate": slate_label, "model": model_name, **metrics})
+
+    # Print per-position salary bias table for E_production.
+    if e_prod_pos_bias:
+        pos_order = ["P", "C", "1B", "2B", "3B", "SS", "OF"]
+        print(f"[{slate_label}] Per-position salary bias (E_production vs. actual field, $/slot):")
+        print(f"  {'Pos':<4} {'Implied':>8} {'Actual':>8} {'Bias($)':>8} {'Bias%':>7}")
+        for pos in pos_order:
+            if pos not in e_prod_pos_bias:
+                continue
+            d = e_prod_pos_bias[pos]
+            print(f"  {pos:<4} {d['implied']:>8,} {d['actual']:>8,} "
+                  f"  {d['bias']:>+,}  {d['bias_pct']:>+.1%}")
+
+    # Print per-tier batter salary bias table for E_production.
+    if salary_stats is not None and e_prod_ownership is not None:
+        tier_mean_spend = salary_stats.get("tier_mean_spend", {})
+        if tier_mean_spend:
+            _TIER_CUTOFFS = (3_500, 5_000)
+            def _tier(sal: float) -> str:
+                return "cheap" if sal <= _TIER_CUTOFFS[0] else ("mid" if sal <= _TIER_CUTOFFS[1] else "expensive")
+            sals = pool_df["salary"].values.astype(float)
+            poss = pool_df["position"].values
+            tiers_arr = np.array([_tier(s) for s in sals])
+            batter_mask = poss != "P"
+            print(f"[{slate_label}] Per-tier batter salary bias (E_production vs. actual field):")
+            print(f"  {'Tier':<10} {'Implied':>9} {'Actual':>9} {'Bias($)':>8} {'Bias%':>7}")
+            for tier_name in ("cheap", "mid", "expensive"):
+                actual_spend = tier_mean_spend.get(tier_name)
+                if actual_spend is None:
+                    continue
+                mask = batter_mask & (tiers_arr == tier_name)
+                if not mask.any():
+                    continue
+                implied_spend = float(np.sum(e_prod_ownership[mask] * sals[mask]))
+                bias = implied_spend - actual_spend
+                bias_pct = bias / actual_spend if actual_spend else float("nan")
+                print(f"  {tier_name:<10} {implied_spend:>9,.0f} {actual_spend:>9,.0f} "
+                      f"  {bias:>+,.0f}  {bias_pct:>+.1%}")
+
+    # Print per-team stack rate diagnostic vs. E_production implied batter ownership.
+    if salary_stats is not None and e_prod_ownership is not None:
+        team_stack_rate: dict[str, float] = salary_stats.get("team_stack_rate", {})
+        if team_stack_rate:
+            sals = pool_df["salary"].values.astype(float)
+            poss = pool_df["position"].values
+            teams_arr = pool_df["team"].values if "team" in pool_df.columns else None
+            top_teams = sorted(team_stack_rate, key=lambda t: team_stack_rate[t], reverse=True)[:8]
+            print(f"[{slate_label}] Team stack rates (actual) vs. E_production implied batter ownership:")
+            print(f"  {'Team':<6} {'StackRate':>10} {'ImplBatOwn':>11} {'Exp(×4.6)':>10}")
+            for tm in top_teams:
+                rate = team_stack_rate[tm]
+                if teams_arr is not None:
+                    bm = (poss != "P") & (teams_arr == tm)
+                    impl_bat_own = float(e_prod_ownership[bm].sum()) if bm.any() else 0.0
+                else:
+                    impl_bat_own = float("nan")
+                print(f"  {tm:<6} {rate:>10.3f} {impl_bat_own:>11.3f} {rate * 4.6:>10.3f}")
 
     results_df = pd.DataFrame(rows)
 
@@ -1177,16 +1264,14 @@ def dry_run_slate(archive_dir: Path) -> None:
         out[f"pred_{model_name}"] = arr
 
     prod_col = "pred_E_production" if "E_production" in models else f"pred_{next(iter(models))}"
-    d_col = "pred_D_team_total" if "D_team_total" in models else None
     has_slot = "lineup_slot" in out.columns
 
     # Print per-position table sorted by E_production descending
-    W = 74
+    W = 70
     print(f"\n{'='*W}")
     print(f"DRY RUN — {slate_label} — projected ownership (sorted by E_production)")
     print(f"{'='*W}")
-    hdr_d = f"  {'D_team':>7}" if d_col else ""
-    print(f"{'Pos':<4} {'Name':<24} {'Team':<5} {'Salary':>7} {'Proj':>5}  {'Slot':>4}  {'E_prod':>7}{hdr_d}")
+    print(f"{'Pos':<4} {'Name':<24} {'Team':<5} {'Salary':>7} {'Proj':>5}  {'Slot':>4}  {'E_prod':>7}")
     print("-" * W)
 
     pos_order = ["P", "C", "1B", "2B", "3B", "SS", "OF"]
@@ -1198,11 +1283,10 @@ def dry_run_slate(archive_dir: Path) -> None:
             continue
         for _, row in grp.iterrows():
             slot_str = str(int(row["lineup_slot"])) if has_slot and pd.notna(row.get("lineup_slot")) else "-"
-            d_str = f"  {row[d_col]:>7.3f}" if d_col else ""
             print(
                 f"{row['position']:<4} {str(row['name']):<24} {str(row['team']):<5}"
                 f" {row['salary']:>7,.0f} {row['mean']:>5.1f}  {slot_str:>4}"
-                f"  {row[prod_col]:>7.3f}{d_str}"
+                f"  {row[prod_col]:>7.3f}"
             )
         print()
 
@@ -1216,9 +1300,28 @@ def dry_run_slate(archive_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def run_evaluation(archive_dirs: list[Path]) -> None:
+    # Discover all full slates in the archive for computing historical tier spend.
+    archive_root = PROJECT_ROOT / "archive"
+    all_full_slates = sorted(
+        d for d in archive_root.iterdir()
+        if d.is_dir() and any(d.glob("contest-standings-*.zip"))
+    )
+
     all_results = []
     for d in archive_dirs:
-        result = evaluate_slate(d)
+        # Forward-looking: train on all slates strictly older than the current one.
+        # Leave-one-out keeps each slate out of its own calibration, which avoids
+        # circular influence and gives better out-of-sample Spearman.
+        prior_slates = [s for s in all_full_slates if s.name < d.name]
+        if prior_slates:
+            print(f"[{d.name}] Computing historical tier spend from {len(prior_slates)} prior slate(s)...")
+            hist_tier = fit_historical_tier_spend(prior_slates)
+            print(f"[{d.name}] Historical tier spend: {hist_tier}")
+        else:
+            hist_tier = {}
+            print(f"[{d.name}] No prior slates for historical tier spend — N_fwd_tier will be skipped.")
+
+        result = evaluate_slate(d, historical_tier_spend=hist_tier)
         if result is not None:
             all_results.append(result)
 
@@ -1234,26 +1337,49 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
     print("=" * 70)
     print(combined.to_string(index=False))
 
-    # Aggregate table
+    # Aggregate table — include salary_bias_pct when available.
+    base_metric_cols = ["spearman_r", "rmse", "top_precision", "bottom_precision"]
+    sal_cols = [c for c in ["salary_bias_pct"] if c in combined.columns]
     agg = (
-        combined.groupby("model")[["spearman_r", "rmse", "top_precision", "bottom_precision"]]
+        combined.groupby("model")[base_metric_cols + sal_cols]
         .mean()
         .round(4)
         .reset_index()
     )
-    agg.columns = ["model", "mean_spearman_r", "mean_rmse", "mean_top_prec", "mean_bot_prec"]
+    col_names = ["model", "mean_spearman_r", "mean_rmse", "mean_top_prec", "mean_bot_prec"]
+    if sal_cols:
+        col_names.append("mean_sal_bias_pct")
+    agg.columns = col_names
 
     print("\n" + "=" * 70)
     print(f"AGGREGATE RESULTS ({len(all_results)} slate(s))")
     print("=" * 70)
     print(agg.to_string(index=False))
 
-    go_nogo = agg.loc[agg["mean_spearman_r"].idxmax()]
+    # Composite rank score: rank each model per metric, sum ranks.
+    # RMSE is double-weighted (magnitude accuracy drives opponent field quality).
+    # Lower composite = better overall model.
+    agg["_r_spearman"] = agg["mean_spearman_r"].rank(ascending=False)
+    agg["_r_rmse"]     = agg["mean_rmse"].rank(ascending=True)
+    agg["_r_top_prec"] = agg["mean_top_prec"].rank(ascending=False)
+    agg["_r_bot_prec"] = agg["mean_bot_prec"].rank(ascending=False)
+    agg["composite_rank"] = (
+        agg["_r_spearman"] + 2 * agg["_r_rmse"] + agg["_r_top_prec"] + agg["_r_bot_prec"]
+    )
+    agg = agg.drop(columns=["_r_spearman", "_r_rmse", "_r_top_prec", "_r_bot_prec"])
+
+    print("\n" + "=" * 70)
+    print("COMPOSITE RANKING (Spearman + 2×RMSE + top_prec + bot_prec, lower = better)")
+    print("=" * 70)
+    ranked = agg.sort_values("composite_rank")[["model", "mean_spearman_r", "mean_rmse", "mean_top_prec", "mean_bot_prec", "composite_rank"]]
+    print(ranked.to_string(index=False))
+
+    best = agg.loc[agg["composite_rank"].idxmin()]
     threshold = 0.60
-    verdict = "GO ✓" if go_nogo["mean_spearman_r"] >= threshold else "NO-GO ✗"
-    print(f"\nBest model: {go_nogo['model']}  "
-          f"Spearman={go_nogo['mean_spearman_r']:.4f}  "
-          f"Threshold={threshold:.2f}  →  Phase 2: {verdict}")
+    verdict = "GO ✓" if best["mean_spearman_r"] >= threshold else "NO-GO ✗"
+    print(f"\nBest model: {best['model']}  "
+          f"Spearman={best['mean_spearman_r']:.4f}  RMSE={best['mean_rmse']:.4f}  "
+          f"composite_rank={best['composite_rank']:.1f}  →  Phase 2: {verdict}")
 
     # Save aggregate summary
     summary_path = PROJECT_ROOT / "archive" / "ownership_summary.csv"
