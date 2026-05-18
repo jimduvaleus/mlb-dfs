@@ -339,7 +339,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
           const gameKey = `${g.away}@${g.home}`
           const fetchSkipped = projFetchExcluded.includes(gameKey)
           return (
-          <div key={g.game} className={`game-card game-card--${g.exclusion_scope}`}>
+          <div key={g.game} className={`game-card game-card--${g.exclusion_scope}${parseFloat(ppdPcts[g.game] ?? '0') > 0 ? ' game-card--ppd' : ''}`}>
             <div className="game-card-header">
               <div className="game-label-group">
                 <span className="game-label">{g.away} @ {g.home}</span>

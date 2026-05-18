@@ -35,6 +35,22 @@ Models
                    avg_ratio = clip(avg_pts/mean, 1, 5); mean scaled by
                    avg_ratio^exp (exp=0.15).  No fade
                    for cold batters.  Requires avg_pts column in pool.
+    R_scoring      Production + batter scoring-participation composite boost.
+                   scoring = runs_over_0.5_prob + rbi_over_0.5_prob;
+                   boost = (scoring/mean_scoring)^exp clipped to [0.5, 3.0]
+                   (exp ∈ {0.10, 0.20}).  Requires "Player Runs" and/or
+                   "Player RBIs" markets in market_odds_fair_odds.json.
+    R_boost        Same as R_scoring but boost-only: ratio clipped to [1.0, 3.0]
+                   so below-average scoring batters are unchanged (no explicit
+                   fade).  Mirrors the P_bavg "no fade for cold batters" design.
+    R_salpres      R_scoring with salary-cap pressure applied to the scoring
+                   composite before ranking.  Discounts expensive batters'
+                   scoring props by the same cap-pressure factor used by
+                   compute_heuristic_ownership: min(1, (4500/salary)^0.5).
+                   Aligns the scoring-participation signal with DFS ownership
+                   patterns and preserves bot_prec relative to R_scoring.
+                   exp ∈ {0.10, 0.20}.
+
 """
 
 import argparse
@@ -294,6 +310,30 @@ def _build_player_pool(
     else:
         merged["hr_prob"] = np.nan
 
+    # Pitcher K-prop expected-K score (Q models).
+    k_props = _load_pitcher_k_props(archive_dir)
+    if k_props:
+        merged["k_prop"] = merged["name"].apply(lambda n: k_props.get(_normalise(str(n))))
+        n_k = merged["k_prop"].notna().sum()
+        print(f"  K-props: {n_k}/{len(merged)} players matched")
+    else:
+        merged["k_prop"] = np.nan
+
+    # Batter scoring participation props: runs + RBIs over-0.5 (R models).
+    scoring_props = _load_batter_scoring_props(archive_dir)
+    if scoring_props:
+        merged["runs_prop"] = merged["name"].apply(
+            lambda n: scoring_props.get(_normalise(str(n)), (None, None))[0]
+        )
+        merged["rbi_prop"] = merged["name"].apply(
+            lambda n: scoring_props.get(_normalise(str(n)), (None, None))[1]
+        )
+        n_sc = merged["runs_prop"].notna().sum()
+        print(f"  Scoring props: {n_sc}/{len(merged)} players matched")
+    else:
+        merged["runs_prop"] = np.nan
+        merged["rbi_prop"]  = np.nan
+
     # Load static handedness table (bats L/R/S, throws L/R).
     handedness_path = PROJECT_ROOT / "data" / "handedness.csv"
     if handedness_path.exists():
@@ -417,6 +457,32 @@ def compute_models(
         _label = f"U_calib_{int(_exp * 100):03d}"
         try:
             models[_label] = _compute_model_u(pool_df, team_totals, _exp)
+        except Exception as exc:
+            print(f"  [{_label} skipped: {exc}]")
+
+    # R: batter scoring-participation composite (runs + RBIs over-0.5 props).
+    # Also sweep boost-only variant (no fade for below-average scoring batters).
+    _SCORING_EXPS = [0.10, 0.20]
+    for _exp in _SCORING_EXPS:
+        _label = f"R_scoring_{int(_exp * 100):03d}"
+        try:
+            models[_label] = _compute_model_r(pool_df, team_totals, _exp)
+        except Exception as exc:
+            print(f"  [{_label} skipped: {exc}]")
+
+    for _exp in _SCORING_EXPS:
+        _label = f"R_boost_{int(_exp * 100):03d}"
+        try:
+            models[_label] = _compute_model_r(pool_df, team_totals, _exp, boost_only=True)
+        except Exception as exc:
+            print(f"  [{_label} skipped: {exc}]")
+
+    # R_salpres: R_scoring with salary-cap pressure applied to scoring composite.
+    # Expensive batters' scoring props are discounted to align with DFS ownership.
+    for _exp in _SCORING_EXPS:
+        _label = f"R_salpres_{int(_exp * 100):03d}"
+        try:
+            models[_label] = _compute_model_r(pool_df, team_totals, _exp, sal_pressure=True)
         except Exception as exc:
             print(f"  [{_label} skipped: {exc}]")
 
@@ -675,6 +741,79 @@ def _compute_model_u(
     return result
 
 
+def _compute_model_r(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    scoring_exp: float,
+    boost_only: bool = False,
+    sal_pressure: bool = False,
+) -> np.ndarray:
+    """
+    R_scoring — production model + batter scoring-participation composite boost.
+
+    Individual batter "Player Runs" and "Player RBIs" over-0.5 implied probs
+    encode expected scoring participation beyond batting-order × team-implied-total.
+
+    scoring_i = runs_prob + rbi_prob  (NA treated as 0; skipped if both NA)
+    boost     = (scoring_i / mean_scoring)^scoring_exp
+
+    When boost_only=False (default): ratio clipped to [0.5, 3.0] — below-average
+    scoring batters are faded as well as boosted.
+    When boost_only=True (R_boost_*): ratio clipped to [1.0, 3.0] — only batters
+    with above-average scoring participation receive a boost; below-average are
+    unchanged (implicit fade through softmax renormalisation only).  Mirrors the
+    P_bavg "no fade for cold batters" design.
+    When sal_pressure=True (R_salpres_*): the scoring composite is first discounted
+    by the same salary-cap pressure factor used by compute_heuristic_ownership
+    [min(1, (4500/salary)^0.5)].  Aligns scoring prop signal with DFS ownership
+    patterns — expensive players' scoring participation is partially discounted to
+    reflect their lower DFS ownership share from salary constraints.
+
+    Falls back to unmodified production when both props are absent.
+    """
+    from src.optimization.ownership import compute_heuristic_ownership
+
+    has_runs = "runs_prop" in pool_df.columns and pool_df["runs_prop"].notna().any()
+    has_rbi  = "rbi_prop"  in pool_df.columns and pool_df["rbi_prop"].notna().any()
+    if not has_runs and not has_rbi:
+        return compute_heuristic_ownership(pool_df, team_totals)
+
+    df = pool_df.copy().reset_index(drop=True)
+    batter_mask = df["position"] != "P"
+
+    runs_vals = df["runs_prop"].fillna(0) if has_runs else pd.Series(0.0, index=df.index)
+    rbi_vals  = df["rbi_prop"].fillna(0)  if has_rbi  else pd.Series(0.0, index=df.index)
+    df["_scoring"] = runs_vals + rbi_vals
+
+    if sal_pressure:
+        # Discount scoring composite for expensive batters (mirrors production's cap penalty).
+        pressure = np.minimum(1.0, (4500.0 / df["salary"].clip(lower=3000)) ** 0.5)
+        df["_scoring"] *= pressure
+
+    scoring_valid = batter_mask & (df["_scoring"] > 0)
+    if scoring_valid.any():
+        mean_sc = float(df.loc[scoring_valid, "_scoring"].mean())
+        if mean_sc > 0:
+            if boost_only:
+                # Only boost above-average scorers; leave below-average unchanged.
+                hot = scoring_valid & (df["_scoring"] > mean_sc)
+                if hot.any():
+                    ratio = (df.loc[hot, "_scoring"] / mean_sc).clip(upper=3.0)
+                    df.loc[hot, "mean"] *= ratio ** scoring_exp
+                    df.loc[hot, "salary_value"] = (
+                        df.loc[hot, "mean"] / df.loc[hot, "salary"] * 1000
+                    )
+            else:
+                # Two-sided: boost above-average, fade below-average.
+                ratio = (df.loc[scoring_valid, "_scoring"] / mean_sc).clip(lower=0.5, upper=3.0)
+                df.loc[scoring_valid, "mean"] *= ratio ** scoring_exp
+                df.loc[scoring_valid, "salary_value"] = (
+                    df.loc[scoring_valid, "mean"] / df.loc[scoring_valid, "salary"] * 1000
+                )
+
+    return compute_heuristic_ownership(df.drop(columns=["_scoring"], errors="ignore"), team_totals)
+
+
 def fit_historical_tier_spend(training_dirs: list[Path]) -> dict[str, float]:
     """
     Compute average per-lineup tier spend from prior contest standings ZIPs.
@@ -793,6 +932,67 @@ def _load_hr_fair_odds(archive_dir: Path) -> dict[str, float]:
                 for entry in markets.get("Player Home Runs", []):
                     if entry["line"] == 0.5 and entry["outcome"] == "over" and not entry["flagged"]:
                         result[_normalise(name)] = float(entry["implied_prob"])
+        return result
+    except Exception:
+        return {}
+
+
+def _load_pitcher_k_props(archive_dir: Path) -> dict[str, float]:
+    """Return {normalised_name: expected_k_score} from market_odds_fair_odds.json.
+
+    Expected K score = Σ P(K > n.5) across all non-flagged over lines in
+    "Player Pitching Strikeouts".  Uses the summation identity E[K] ≈ Σ P(K ≥ n)
+    to aggregate multi-line props into a single comparable signal per pitcher.
+    Returns empty dict if the file is absent or malformed.
+    """
+    odds_path = archive_dir / "market_odds_fair_odds.json"
+    if not odds_path.exists():
+        return {}
+    try:
+        import json as _json
+        with open(odds_path) as f:
+            d = _json.load(f)
+        result: dict[str, float] = {}
+        for players in d.get("data", {}).values():
+            for name, markets in players.items():
+                entries = [
+                    e for e in markets.get("Player Pitching Strikeouts", [])
+                    if e["outcome"] == "over" and not e["flagged"]
+                ]
+                if entries:
+                    result[_normalise(name)] = sum(float(e["implied_prob"]) for e in entries)
+        return result
+    except Exception:
+        return {}
+
+
+def _load_batter_scoring_props(
+    archive_dir: Path,
+) -> dict[str, tuple[float | None, float | None]]:
+    """Return {normalised_name: (runs_over_0.5_prob, rbi_over_0.5_prob)} from fair_odds.
+
+    Returns empty dict if the file is absent or malformed.  Players with neither
+    market are excluded from the result.
+    """
+    odds_path = archive_dir / "market_odds_fair_odds.json"
+    if not odds_path.exists():
+        return {}
+    try:
+        import json as _json
+        with open(odds_path) as f:
+            d = _json.load(f)
+        result: dict[str, tuple[float | None, float | None]] = {}
+        for players in d.get("data", {}).values():
+            for name, markets in players.items():
+                def _prob(market_name: str, _m: dict = markets) -> float | None:
+                    for e in _m.get(market_name, []):
+                        if e["line"] == 0.5 and e["outcome"] == "over" and not e["flagged"]:
+                            return float(e["implied_prob"])
+                    return None
+                runs_p = _prob("Player Runs")
+                rbi_p  = _prob("Player RBIs")
+                if runs_p is not None or rbi_p is not None:
+                    result[_normalise(name)] = (runs_p, rbi_p)
         return result
     except Exception:
         return {}

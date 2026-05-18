@@ -1216,6 +1216,21 @@ button { cursor: pointer; }
   border-color: #744210;
 }
 
+.game-card--ppd {
+  border-color: #b7791f;
+  background: #1a160a;
+}
+
+.game-card--ppd.game-card--candidates {
+  border-color: #975a16;
+  background: #150f06;
+}
+
+.game-card--ppd.game-card--both {
+  border-color: #744210;
+  background: #110c04;
+}
+
 .game-card--both {
   opacity: 0.45;
   border-style: dashed;
