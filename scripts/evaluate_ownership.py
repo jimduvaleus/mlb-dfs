@@ -31,9 +31,10 @@ Models
                    compression.
 
   Experimental — candidates being evaluated as potential replacements:
-    H_pitcher_avg  Production + AvgPPG ratio boost for hot-streak pitchers.
-                   Pulled from production after 05082026 misranking; still
-                   tracked to accumulate evidence over more slates.
+    P_batter_avg   Production + AvgPPG ratio boost for hot-streak batters.
+                   avg_ratio = clip(avg_pts/mean, 1, 5); mean scaled by
+                   avg_ratio^exp (exp=0.15).  No fade
+                   for cold batters.  Requires avg_pts column in pool.
 """
 
 import argparse
@@ -382,10 +383,14 @@ def compute_models(
         print(f"  [E_production skipped: {exc}]")
 
     # ── Experimental ──────────────────────────────────────────────────────────
-    try:
-        models["H_pitcher_avg"] = _compute_model_h(pool_df, team_totals)
-    except Exception as exc:
-        print(f"  [H_pitcher_avg skipped: {exc}]")
+    # P: sweep avg_ratio_exp for batter AvgPointsPerGame hot-streak boost.
+    _BATTER_AVG_EXPS = [0.15]
+    for _exp in _BATTER_AVG_EXPS:
+        _label = f"P_bavg_{int(_exp * 100):03d}"
+        try:
+            models[_label] = _compute_model_p(pool_df, team_totals, _exp)
+        except Exception as exc:
+            print(f"  [{_label} skipped: {exc}]")
 
     # J: sweep _PITCHER_MATCHUP_EXP around current production value (0.75).
     _MATCHUP_EXPS = [0.30, 0.50]
@@ -396,20 +401,6 @@ def compute_models(
         except Exception as exc:
             print(f"  [{_label} skipped: {exc}]")
 
-    # K: regressed constants from optimize_ownership_params.py.
-    # Silently skipped if the regression results file does not exist yet.
-    _regressed_path = PROJECT_ROOT / "archive" / "ownership_regression_results.json"
-    if _regressed_path.exists():
-        try:
-            import json as _json
-            with open(_regressed_path) as _f:
-                _reg = _json.load(_f)
-            _reg_params: dict[str, float] = _reg.get("params", {})
-            if _reg_params:
-                models["K_regressed"] = _compute_model_k(pool_df, team_totals, _reg_params)
-        except Exception as exc:
-            print(f"  [K_regressed skipped: {exc}]")
-
     # L: salary-calibrated ownership — tilts E_production toward expensive
     # players until implied lineup salary hits the historical field mean from
     # contest_stats.json.  Silently skipped if the stats file is absent.
@@ -418,55 +409,57 @@ def compute_models(
     except Exception as exc:
         print(f"  [L_sal_calibrated skipped: {exc}]")
 
-    # N_fwd_tier: salary-tier tilt using historical average tier spend from prior
-    # slates (forward-looking, no look-ahead into current contest standings).
-    if historical_tier_spend:
+    # U: post-hoc power-law calibration sweep to address chalk under-prediction.
+    # Applies ownership^b per position group (renormalised), including pitchers.
+    # Spearman is unchanged (monotone transform); targets RMSE and chalk accuracy.
+    _CALIB_EXPS = [1.1, 1.2]
+    for _exp in _CALIB_EXPS:
+        _label = f"U_calib_{int(_exp * 100):03d}"
         try:
-            models["N_fwd_tier"] = _compute_model_n_forward(pool_df, team_totals, historical_tier_spend)
+            models[_label] = _compute_model_u(pool_df, team_totals, _exp)
         except Exception as exc:
-            print(f"  [N_fwd_tier skipped: {exc}]")
+            print(f"  [{_label} skipped: {exc}]")
 
     return models
 
 
 
-def _compute_model_h(
+def _compute_model_p(
     pool_df: pd.DataFrame,
     team_totals: dict[str, float] | None,
+    avg_ratio_exp: float,
 ) -> np.ndarray:
     """
-    H_pitcher_avg — production model + pitcher hot-streak boost.
+    P_batter_avg — production model + batter hot-streak boost via AvgPointsPerGame.
 
-    When a pitcher's DK AvgPointsPerGame exceeds their current projection
-    (avg_ratio > 1), their mean is scaled by avg_ratio before passing to
-    compute_heuristic_ownership. No fade for ratio < 1 — cold recent outings
-    are treated as noise.
+    When a batter's DK AvgPointsPerGame exceeds their current forward projection
+    (avg_ratio > 1), their projected mean is scaled by avg_ratio^avg_ratio_exp
+    before passing to compute_heuristic_ownership.  No fade for cold batters
+    (avg_ratio <= 1) — underperformance vs. projection is treated as noise.
 
-    Rationale: DFS players chase pitchers with strong recent games beyond what
-    forward projections capture. Partial correlation of avg_ratio with ownership
-    (controlling for projection) = +0.21, p=0.048 across 5 slates.
+    avg_ratio = clip(avg_pts / mean, 1, 5):
+      - floor at 1  : only boost, never fade
+      - cap at 5    : prevents extreme outliers (injured player returning, tiny samples)
 
-    Status: experimental. Misranked pitchers on 05082026; not yet in production.
+    avg_pts is dropped before calling compute_heuristic_ownership so the
+    production function cannot double-apply the signal if it is ever introduced there.
+
+    Falls back to unmodified production output when avg_pts column is absent.
     """
-    from src.optimization.ownership import _PITCHER_AVG_RATIO_EXP, compute_heuristic_ownership
+    from src.optimization.ownership import compute_heuristic_ownership
 
     if "avg_pts" not in pool_df.columns:
         return compute_heuristic_ownership(pool_df, team_totals)
 
     df = pool_df.copy().reset_index(drop=True)
-    pitcher_mask = df["position"] == "P"
+    batter_mask = df["position"] != "P"
 
     avg_ratio = (df["avg_pts"] / df["mean"].clip(lower=0.5)).clip(upper=5.0)
-    hot = pitcher_mask & df["avg_pts"].notna() & (df["avg_pts"] > 0) & (avg_ratio > 1.0)
+    hot = batter_mask & df["avg_pts"].notna() & (df["avg_pts"] > 0) & (avg_ratio > 1.0)
 
-    # The production function computes pitcher _raw as:
-    #   0.8*sqrt(mean) + 0.2*sqrt(salary_value)
-    # where salary_value = mean/salary*1000.  Both terms contain sqrt(mean),
-    # so multiplying mean by `ratio` gives _raw *= sqrt(ratio) = ratio^0.5,
-    # which exactly replicates the original Model H boost of _raw *= ratio^exp
-    # (exp=0.50).  Drop avg_pts so the production function can't double-apply
-    # the signal if it's ever re-introduced there.
-    df.loc[hot, "mean"] = df.loc[hot, "mean"] * avg_ratio[hot]
+    if hot.any():
+        df.loc[hot, "mean"] = df.loc[hot, "mean"] * (avg_ratio[hot] ** avg_ratio_exp)
+        df.loc[hot, "salary_value"] = df.loc[hot, "mean"] / df.loc[hot, "salary"] * 1000
 
     return compute_heuristic_ownership(df.drop(columns=["avg_pts"]), team_totals)
 
@@ -1359,10 +1352,20 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
     # Composite rank score: rank each model per metric, sum ranks.
     # RMSE is double-weighted (magnitude accuracy drives opponent field quality).
     # Lower composite = better overall model.
-    agg["_r_spearman"] = agg["mean_spearman_r"].rank(ascending=False)
-    agg["_r_rmse"]     = agg["mean_rmse"].rank(ascending=True)
-    agg["_r_top_prec"] = agg["mean_top_prec"].rank(ascending=False)
-    agg["_r_bot_prec"] = agg["mean_bot_prec"].rank(ascending=False)
+    #
+    # Tolerance-binned ranking: values within the tolerance band are treated as
+    # ties (same rank) so that noise-level differences don't award rank points.
+    #   Spearman  tol=0.005 — differences below this are measurement noise
+    #   RMSE      tol=0.001 — e.g. 0.0308 vs 0.0309 are the same bin
+    #   precision tol=0.025 — half the step of correctly calling one more player
+    def _rank_tol(series: pd.Series, ascending: bool, tol: float) -> pd.Series:
+        binned = (series / tol).round(0) * tol
+        return binned.rank(ascending=ascending, method="min")
+
+    agg["_r_spearman"] = _rank_tol(agg["mean_spearman_r"], ascending=False, tol=0.005)
+    agg["_r_rmse"]     = _rank_tol(agg["mean_rmse"],       ascending=True,  tol=0.001)
+    agg["_r_top_prec"] = _rank_tol(agg["mean_top_prec"],   ascending=False, tol=0.025)
+    agg["_r_bot_prec"] = _rank_tol(agg["mean_bot_prec"],   ascending=False, tol=0.025)
     agg["composite_rank"] = (
         agg["_r_spearman"] + 2 * agg["_r_rmse"] + agg["_r_top_prec"] + agg["_r_bot_prec"]
     )
@@ -1370,6 +1373,7 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
 
     print("\n" + "=" * 70)
     print("COMPOSITE RANKING (Spearman + 2×RMSE + top_prec + bot_prec, lower = better)")
+    print("  Ties within: Spearman ±0.005, RMSE ±0.001, precision ±0.025")
     print("=" * 70)
     ranked = agg.sort_values("composite_rank")[["model", "mean_spearman_r", "mean_rmse", "mean_top_prec", "mean_bot_prec", "composite_rank"]]
     print(ranked.to_string(index=False))

@@ -89,10 +89,15 @@ _PITCHER_COMPRESS = 0.00
 # Post-softmax power-law calibration exponent for batters.
 # ownership^b (renormalised per position) corrects the systematic magnitude
 # compression: the softmax over-assigns to low-owned players and undershoots
-# highly-owned ones.  b=1.02 chosen by RMSE sweep over 10 historical slates;
-# wins on RMSE in 8/10, corrects ~6% salary under-bias to ~0%, Spearman cost
-# is −0.004.  Pitchers excluded — their magnitudes are already well-calibrated.
-_BATTER_CALIB_EXP = 1.02
+# highly-owned ones.  b=1.12 chosen by 8-slate composite ranking evaluation
+# (evaluate_ownership.py X_both_112); previous value was 1.02.
+_BATTER_CALIB_EXP = 1.12
+
+# Post-softmax power-law calibration exponent for pitchers.
+# Same mechanism as _BATTER_CALIB_EXP.  b=1.12 promoted alongside batter
+# exponent after 8-slate evaluation showing meaningful improvement on chalk
+# pitcher predictions (notably top-owned starters).
+_PITCHER_CALIB_EXP = 1.12
 
 # Pitcher own-team co-stack boost exponent. Pitchers on high-implied teams
 # see elevated ownership because the field stacks that offense and often
@@ -362,13 +367,14 @@ def compute_heuristic_ownership(
         else:
             df.loc[mask, "ownership"] += contribution
 
-    # Post-hoc power-law magnitude calibration for batters.  Applied after the
-    # full multi-position accumulation so all contributions are included before
+    # Post-hoc power-law magnitude calibration.  Applied after the full
+    # multi-position accumulation so all contributions are included before
     # sharpening.  Corrects systematic under-assignment to high-owned players.
     result = df["ownership"].values.astype(np.float64)
     pos_vals = df["position"].values
     for pos, n_slots in _SLOT_COUNTS.items():
-        if pos == "P":
+        exp = _PITCHER_CALIB_EXP if pos == "P" else _BATTER_CALIB_EXP
+        if exp == 1.0:
             continue
         pmask = pos_vals == pos
         if not pmask.any():
@@ -376,6 +382,6 @@ def compute_heuristic_ownership(
         vals = result[pmask]
         total = vals.sum()
         if total > 0:
-            cal = vals ** _BATTER_CALIB_EXP
+            cal = vals ** exp
             result[pmask] = cal / cal.sum() * n_slots
     return result
