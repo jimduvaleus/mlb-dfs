@@ -6,6 +6,7 @@ interface Props {
   disabled?: boolean
   projFetchExcluded?: string[]
   onProjFetchFilterChange?: (excluded: string[]) => void
+  onOwnershipSettingsChanged?: () => void
   platform?: PlatformType
   notifications?: TwitterNotification[]
   onDismissNotification?: (id: string) => void
@@ -38,7 +39,7 @@ function scopeLabel(scope: ExclusionScope): string {
 }
 
 
-export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
+export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, onOwnershipSettingsChanged, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
@@ -50,6 +51,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
   const [searchFullOpen, setSearchFullOpen] = useState(false)
   const searchFullRef = useRef<HTMLDivElement>(null)
   const [ppdPcts, setPpdPcts] = useState<Record<string, string>>({})
+  const [ownershipRedPcts, setOwnershipRedPcts] = useState<Record<string, string>>({})
 
   const syncPpdFromSlate = useCallback((data: SlateGamesResponse) => {
     const pcts: Record<string, string> = {}
@@ -61,15 +63,27 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     setPpdPcts(pcts)
   }, [])
 
+  const syncOwnershipRedFromSlate = useCallback((data: SlateGamesResponse) => {
+    const reds: Record<string, string> = {}
+    for (const g of data.games) {
+      if (g.ownership_reduction != null && g.ownership_reduction > 0) {
+        reds[g.game] = String(g.ownership_reduction)
+      }
+    }
+    setOwnershipRedPcts(reds)
+  }, [])
+
   useEffect(() => {
     setSlate(null)
     setPlayers(null)
     setError(null)
     setPpdPcts({})
+    setOwnershipRedPcts({})
     fetchSlateGames()
       .then(data => {
         setSlate(data)
         syncPpdFromSlate(data)
+        syncOwnershipRedFromSlate(data)
         if (onProjFetchFilterChange) {
           // Only "both"-excluded games auto-sync to projFetchExcluded
           const slateExcluded = data.games
@@ -86,6 +100,17 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
       .then(setPlayers)
       .catch(e => setError(String(e)))
   }, [platform])
+
+  // Auto-dismiss lineup notifications for teams not on the current slate
+  useEffect(() => {
+    if (!slate || !onDismissNotification) return
+    const teams = new Set(slate.games.flatMap(g => [g.away, g.home]))
+    for (const n of notifications) {
+      if (n.lineup_team && !teams.has(n.lineup_team)) {
+        onDismissNotification(n.id)
+      }
+    }
+  }, [notifications, slate])
 
   // Close search dropdowns when clicking outside
   useEffect(() => {
@@ -114,9 +139,14 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         const n = parseFloat(val)
         if (!isNaN(n) && n > 0) game_ppd_pcts[gameKey] = n
       }
-      return { slate_id: slate?.slate_id ?? '', game_scopes, team_scopes, game_ppd_pcts }
+      const game_ownership_reductions: Record<string, number> = {}
+      for (const [gameKey, val] of Object.entries(ownershipRedPcts)) {
+        const n = parseFloat(val)
+        if (!isNaN(n) && n >= 1 && n <= 99) game_ownership_reductions[gameKey] = n
+      }
+      return { slate_id: slate?.slate_id ?? '', game_scopes, team_scopes, game_ppd_pcts, game_ownership_reductions }
     },
-    [slate, ppdPcts]
+    [slate, ppdPcts, ownershipRedPcts]
   )
 
   const persist = useCallback(
@@ -127,6 +157,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         const result = await saveSlateExclusions(buildUpdate(updated.games))
         setSlate(result)
         syncPpdFromSlate(result)
+        syncOwnershipRedFromSlate(result)
         // Refresh player list since team/game scopes affect the pool
         const updatedPlayers = await fetchSlatePlayers()
         setPlayers(updatedPlayers)
@@ -136,7 +167,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         setSaving(false)
       }
     },
-    [buildUpdate, syncPpdFromSlate]
+    [buildUpdate, syncPpdFromSlate, syncOwnershipRedFromSlate]
   )
 
   const persistPpd = useCallback(
@@ -148,13 +179,34 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         const result = await saveSlateExclusions(buildUpdate(slate.games))
         setSlate(result)
         syncPpdFromSlate(result)
+        syncOwnershipRedFromSlate(result)
       } catch (e) {
         setError(String(e))
       } finally {
         setSaving(false)
       }
     },
-    [slate, disabled, saving, buildUpdate, syncPpdFromSlate]
+    [slate, disabled, saving, buildUpdate, syncPpdFromSlate, syncOwnershipRedFromSlate]
+  )
+
+  const persistOwnershipReduction = useCallback(
+    async () => {
+      if (!slate || disabled || saving) return
+      setSaving(true)
+      setError(null)
+      try {
+        const result = await saveSlateExclusions(buildUpdate(slate.games))
+        setSlate(result)
+        syncPpdFromSlate(result)
+        syncOwnershipRedFromSlate(result)
+        onOwnershipSettingsChanged?.()
+      } catch (e) {
+        setError(String(e))
+      } finally {
+        setSaving(false)
+      }
+    },
+    [slate, disabled, saving, buildUpdate, syncPpdFromSlate, syncOwnershipRedFromSlate, onOwnershipSettingsChanged]
   )
 
   const cycleGameScope = useCallback(
@@ -291,6 +343,9 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
 
   if (error) return <p className="slate-error">{error}</p>
   if (!slate) return <p className="slate-muted">Loading slate…</p>
+
+  const slateTeams = new Set(slate.games.flatMap(g => [g.away, g.home]))
+
   if (slate.games.length === 0)
     return <p className="slate-muted">No slate loaded. Set the {platform === 'fanduel' ? 'FD' : 'DK'} Slate CSV path in Config.</p>
 
@@ -339,7 +394,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
           const gameKey = `${g.away}@${g.home}`
           const fetchSkipped = projFetchExcluded.includes(gameKey)
           return (
-          <div key={g.game} className={`game-card game-card--${g.exclusion_scope}${parseFloat(ppdPcts[g.game] ?? '0') > 0 ? ' game-card--ppd' : ''}`}>
+          <div key={g.game} className={`game-card game-card--${g.exclusion_scope}${parseFloat(ppdPcts[g.game] ?? '0') > 0 ? ' game-card--ppd' : ''}${parseFloat(ownershipRedPcts[g.game] ?? '0') > 0 ? ' game-card--own-red' : ''}`}>
             <div className="game-card-header">
               <div className="game-label-group">
                 <span className="game-label">{g.away} @ {g.home}</span>
@@ -381,6 +436,23 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
                     value={ppdPcts[g.game] ?? ''}
                     onChange={e => setPpdPcts(prev => ({ ...prev, [g.game]: e.target.value }))}
                     onBlur={() => persistPpd()}
+                    onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
+                    disabled={disabled || saving}
+                  />
+                  %
+                </label>
+                <label className="ppd-label own-red-label">
+                  Own Red
+                  <input
+                    className="ppd-input own-red-input"
+                    type="number"
+                    min={1}
+                    max={99}
+                    step={1}
+                    placeholder="0"
+                    value={ownershipRedPcts[g.game] ?? ''}
+                    onChange={e => setOwnershipRedPcts(prev => ({ ...prev, [g.game]: e.target.value }))}
+                    onBlur={() => persistOwnershipReduction()}
                     onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
                     disabled={disabled || saving}
                   />
@@ -596,7 +668,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
                       {n.body && <span className="twitter-notif-text">{n.body}</span>}
                     </div>
                     <div className="twitter-notif-actions">
-                      {n.could_be_lineup && (
+                      {n.could_be_lineup && (!n.lineup_team || slateTeams.has(n.lineup_team)) && (
                         <button
                           className="twitter-notif-parse"
                           onClick={() => onParseNotification?.(n)}

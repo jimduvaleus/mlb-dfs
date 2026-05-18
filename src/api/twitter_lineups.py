@@ -54,6 +54,11 @@ def looks_like_lineup(body: str) -> bool:
 
     Checks for a recognized team name using the same scan as parse_notification_body.
     """
+    return extract_lineup_team(body) is not None
+
+
+def extract_lineup_team(body: str) -> Optional[str]:
+    """Return the team abbreviation if the body contains a recognized team header, else None."""
     for line in body.splitlines():
         line = line.strip()
         if not line or _NOTIF_META_RE.match(line):
@@ -61,8 +66,8 @@ def looks_like_lineup(body: str) -> bool:
         candidate = re.sub(r"^Updated\s+", "", line, flags=re.IGNORECASE).strip()
         candidate = re.sub(r"\s+\d+/\d+(?:/\d+)?\s*$", "", candidate).strip().lower()
         if candidate in TEAM_NAME_MAP:
-            return True
-    return False
+            return TEAM_NAME_MAP[candidate]
+    return None
 
 
 def parse_notification_body(body: str) -> tuple[Optional[str], list[dict]]:

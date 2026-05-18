@@ -32,6 +32,7 @@ from .twitter_lineups import (
     delete_twitter_lineup,
     get_twitter_overrides,
     load_twitter_lineups,
+    extract_lineup_team,
     looks_like_lineup,
     match_player_name,
     parse_notification_body,
@@ -264,7 +265,14 @@ def get_notifications():
     with _notifications_lock:
         items = list(_notifications)
     items.sort(key=lambda n: n['captured_at'], reverse=True)
-    return [{**n, 'could_be_lineup': looks_like_lineup(n.get('body', ''))} for n in items]
+    return [
+        {
+            **n,
+            'could_be_lineup': looks_like_lineup(n.get('body', '')),
+            'lineup_team': extract_lineup_team(n.get('body', '')),
+        }
+        for n in items
+    ]
 
 
 @app.delete("/api/notifications/{notification_id}")
@@ -456,6 +464,30 @@ def _get_slate_file_path() -> Path | None:
     return p if p.exists() else None
 
 
+def _get_archive_dir() -> Path | None:
+    """Return archive/MMDDYYYY path derived from the slate CSV Game Info date.
+
+    Creates the directory if it does not yet exist.  Returns None when the
+    slate is missing, the date cannot be parsed, or any other error occurs.
+    """
+    import re as _re
+    import pandas as _pd
+    slate_path = _get_slate_file_path()
+    if slate_path is None:
+        return None
+    try:
+        gi_df = _pd.read_csv(slate_path, usecols=["Game Info"])
+        m = _re.search(r'(\d{2})/(\d{2})/(\d{4})', str(gi_df["Game Info"].dropna().iloc[0]))
+        if not m:
+            return None
+        mo, dy, yr = m.groups()
+        d = PROJECT_ROOT / "archive" / f"{mo}{dy}{yr}"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    except Exception:
+        return None
+
+
 def _load_slate_df():
     """Parse the configured slate CSV and return a DataFrame (or None)."""
     p = _get_slate_file_path()
@@ -538,7 +570,23 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
         candidate_excluded_games=cand_games,
         candidate_excluded_player_ids=existing_cand_pids,
         game_ppd_pcts=update.game_ppd_pcts,
+        game_ownership_reductions=update.game_ownership_reductions,
     )
+    # Archive ownership settings whenever they are non-empty or have been cleared.
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        _archive = _get_archive_dir()
+        if _archive is not None:
+            _settings = {
+                "game_ownership_reductions": update.game_ownership_reductions,
+                "saved_at": _dt.utcnow().isoformat(timespec="seconds"),
+            }
+            (_archive / "ownership_settings.json").write_text(
+                _json.dumps(_settings, indent=2)
+            )
+    except Exception:
+        pass
     game_times = _load_slate_games()
     if not game_times:
         return SlateGamesResponse(slate_id=update.slate_id, games=[], excluded_player_ids=[])
@@ -791,6 +839,7 @@ def projections_players():
         # Players in "both"-excluded games are zeroed out and not factored into
         # the ownership softmax at all — their projections are irrelevant to the slate.
         both_excl_pids: set = set()
+        _game_ownership_reductions: dict = {}
         if "game" in slate_df.columns:
             try:
                 from .slate_exclusions import compute_slate_id
@@ -803,6 +852,7 @@ def projections_players():
                     both_excl_pids = set(
                         slate_df.loc[slate_df["game"].isin(_both_games), "player_id"].dropna().astype(int)
                     )
+                _game_ownership_reductions = _excl.get("game_ownership_reductions", {}) or {}
             except Exception:
                 pass
 
@@ -825,7 +875,10 @@ def projections_players():
                         return _re.sub(r"[^a-z ]", "", nfkd.encode("ascii", "ignore").decode("ascii").lower()).strip()
                     non_excl = non_excl.copy()
                     non_excl["hr_prob"] = non_excl["name"].apply(lambda n: hr_odds.get(_norm_hr(str(n))))
-                ow_sub = compute_heuristic_ownership(non_excl, team_totals)
+                ow_sub = compute_heuristic_ownership(
+                    non_excl, team_totals,
+                    game_ownership_reductions=_game_ownership_reductions or None,
+                )
                 ow_pct = [0.0] * len(merged)
                 sub_i = 0
                 for i, is_excl in enumerate(excl_mask):
@@ -849,6 +902,30 @@ def projections_players():
                 "mean":           float(row["mean"]),
                 "ownership_pct":  ow_pct[i],
             })
+
+        # Archive ownership projections whenever game reductions are active so
+        # post-contest evaluation can reconstruct what the model projected.
+        if _game_ownership_reductions:
+            try:
+                _arc = _get_archive_dir()
+                if _arc is not None:
+                    _proj_rows = [
+                        {
+                            "player_id": r["player_id"],
+                            "name": r["name"],
+                            "team": r["team"],
+                            "game": str(merged.iloc[i].get("game", "")),
+                            "position": r["position"],
+                            "ownership_pct": r["ownership_pct"],
+                        }
+                        for i, r in enumerate(result)
+                    ]
+                    pd.DataFrame(_proj_rows).to_csv(
+                        _arc / "ownership_projections.csv", index=False
+                    )
+            except Exception:
+                pass
+
         return result
     except Exception:
         return []

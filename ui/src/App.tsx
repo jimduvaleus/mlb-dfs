@@ -388,6 +388,7 @@ export default function App() {
             disabled={running}
             projFetchExcluded={projFetchExcluded}
             onProjFetchFilterChange={(excluded) => { setProjFetchExcluded(excluded); refreshProjectionPlayers() }}
+            onOwnershipSettingsChanged={refreshProjectionPlayers}
             platform={state.config?.platform}
             notifications={state.notifications}
             onDismissNotification={(id) => {

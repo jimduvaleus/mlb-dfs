@@ -334,6 +334,7 @@ export interface GameStatus {
   excluded: boolean
   exclusion_scope: ExclusionScope
   ppd_pct?: number | null
+  ownership_reduction?: number | null
   teams: TeamStatus[]
   game_start_time?: string | null
 }
@@ -349,6 +350,7 @@ export interface ExclusionsUpdate {
   game_scopes: Record<string, ExclusionScope>
   team_scopes: Record<string, ExclusionScope>
   game_ppd_pcts?: Record<string, number>
+  game_ownership_reductions?: Record<string, number>
 }
 
 // Player-level exclusion types
@@ -380,6 +382,7 @@ export interface TwitterNotification {
   app_name: string
   captured_at: number
   could_be_lineup?: boolean
+  lineup_team?: string | null
 }
 
 export interface PlayerMatch {

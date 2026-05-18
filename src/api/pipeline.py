@@ -289,6 +289,11 @@ class PipelineRunner:
         ownership_vector: Optional[np.ndarray] = None
         if objective == "leverage_surplus":
             from src.optimization.ownership import compute_heuristic_ownership
+            from src.api.slate_exclusions import (
+                compute_slate_id as _compute_slate_id,
+                compute_file_fingerprint as _compute_fp,
+                read_exclusions as _read_exclusions,
+            )
             team_totals = self._load_team_totals(slate_path)
             hr_odds = self._load_hr_fair_odds(slate_path)
             if hr_odds:
@@ -302,10 +307,32 @@ class PipelineRunner:
                     cand_players_df[name_col].apply(lambda n: hr_odds.get(_norm(str(n))))
                     if name_col else np.nan
                 )
-            ownership_vector = compute_heuristic_ownership(cand_players_df, team_totals)
+            # Load per-game ownership reductions from persisted exclusions.
+            _game_ownership_reductions: dict = {}
+            try:
+                _slate_games = [
+                    str(g) for g in cand_players_df["game"].dropna().unique()
+                    if g
+                ]
+                if _slate_games and slate_path:
+                    from pathlib import Path as _Path
+                    _sid = _compute_slate_id(_slate_games)
+                    _fp = _compute_fp(_Path(slate_path) if slate_path else None)
+                    _game_ownership_reductions = (
+                        _read_exclusions(_sid, _fp).get("game_ownership_reductions", {}) or {}
+                    )
+            except Exception:
+                pass
+            ownership_vector = compute_heuristic_ownership(
+                cand_players_df, team_totals,
+                game_ownership_reductions=_game_ownership_reductions or None,
+            )
             logger.info(
-                "Computed heuristic ownership — model %s%s, %d players",
-                "D" if team_totals else "C", "+HR" if hr_odds else "", len(ownership_vector),
+                "Computed heuristic ownership — model %s%s%s, %d players",
+                "D" if team_totals else "C",
+                "+HR" if hr_odds else "",
+                f"+RED({len(_game_ownership_reductions)})" if _game_ownership_reductions else "",
+                len(ownership_vector),
             )
 
         # Store simulation artifacts for post-run operations (lineup replacement).
