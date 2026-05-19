@@ -124,7 +124,6 @@ class GameStatus(BaseModel):
     excluded: bool
     exclusion_scope: str = "none"   # 'none' | 'candidates' | 'both'
     ppd_pct: float | None = None
-    ownership_reduction: float | None = None
     teams: list[TeamStatus]
     game_start_time: str | None = None
 
@@ -140,7 +139,16 @@ class ExclusionsUpdate(BaseModel):
     game_scopes: dict[str, str] = {}    # game_str → 'none'|'candidates'|'both'
     team_scopes: dict[str, str] = {}    # team_str → 'none'|'candidates'|'both'
     game_ppd_pcts: dict[str, float] = {}
-    game_ownership_reductions: dict[str, float] = {}
+
+
+class TeamOwnershipReductionsUpdate(BaseModel):
+    slate_id: str
+    team_ownership_reductions: dict[str, float] = {}
+
+
+class TeamOwnershipReductionsResponse(BaseModel):
+    slate_id: str
+    team_ownership_reductions: dict[str, float] = {}
 
 
 class PlayerExclusionStatus(BaseModel):

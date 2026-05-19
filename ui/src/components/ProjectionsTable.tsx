@@ -1,13 +1,47 @@
+import { useState, useEffect, useCallback } from 'react'
 import type { ProjectionPlayerRow, PlatformType } from '../types'
+import { fetchTeamOwnershipReductions, saveTeamOwnershipReductions } from '../api'
 import TeamBadge from './TeamBadge'
 
 interface Props {
   players: ProjectionPlayerRow[]
   platform?: PlatformType
   teamTotals?: Record<string, number>
+  onOwnershipSettingsChanged?: () => void
 }
 
-export function ProjectionsTable({ players, teamTotals }: Props) {
+export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChanged }: Props) {
+  const [reductionSlateId, setReductionSlateId] = useState<string>('')
+  const [teamReductions, setTeamReductions] = useState<Record<string, string>>({})
+  const [reductionSaving, setReductionSaving] = useState(false)
+
+  useEffect(() => {
+    fetchTeamOwnershipReductions().then(r => {
+      setReductionSlateId(r.slate_id)
+      const s: Record<string, string> = {}
+      for (const [t, v] of Object.entries(r.team_ownership_reductions)) {
+        if (v > 0) s[t] = String(v)
+      }
+      setTeamReductions(s)
+    }).catch(() => {})
+  }, [players])
+
+  const persistReductions = useCallback(async () => {
+    if (reductionSaving) return
+    setReductionSaving(true)
+    const parsed: Record<string, number> = {}
+    for (const [t, v] of Object.entries(teamReductions)) {
+      const n = parseFloat(v)
+      if (!isNaN(n) && n >= 1 && n <= 99) parsed[t] = n
+    }
+    try {
+      const r = await saveTeamOwnershipReductions({ slate_id: reductionSlateId, team_ownership_reductions: parsed })
+      setReductionSlateId(r.slate_id)
+      onOwnershipSettingsChanged?.()
+    } catch {}
+    finally { setReductionSaving(false) }
+  }, [reductionSlateId, teamReductions, reductionSaving, onOwnershipSettingsChanged])
+
   if (players.length === 0) {
     return (
       <div className="projections-table-wrap">
@@ -34,13 +68,31 @@ export function ProjectionsTable({ players, teamTotals }: Props) {
             .filter(p => p.position !== 'P')
             .sort((a, b) => (a.slot ?? 99) - (b.slot ?? 99))
           const hitterProj = batters.reduce((sum, p) => sum + p.mean, 0)
+          const hasReduction = parseFloat(teamReductions[team] ?? '0') > 0
 
           return (
-            <div key={team} className="lineup-card">
+            <div key={team} className={`lineup-card${hasReduction ? ' lineup-card--own-red' : ''}`}>
               <div className="lineup-card-header">
                 <TeamBadge team={team} />
                 <div className="lineup-card-header-right">
                   <span className="projections-team-total">{hitterProj.toFixed(1)} pts</span>
+                  <label className="own-red-label" title="Reduce projected field ownership for this team">
+                    Own Red
+                    <input
+                      className="own-red-input ppd-input"
+                      type="number"
+                      min={1}
+                      max={99}
+                      step={1}
+                      placeholder="—"
+                      value={teamReductions[team] ?? ''}
+                      onChange={e => setTeamReductions(prev => ({ ...prev, [team]: e.target.value }))}
+                      onBlur={persistReductions}
+                      onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
+                      disabled={reductionSaving}
+                    />
+                    %
+                  </label>
                   {teamTotals?.[team] != null && (
                     <span className="projections-implied-total" title="Implied team run total (betting market)">{teamTotals[team].toFixed(1)} R</span>
                   )}

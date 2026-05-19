@@ -6,7 +6,6 @@ interface Props {
   disabled?: boolean
   projFetchExcluded?: string[]
   onProjFetchFilterChange?: (excluded: string[]) => void
-  onOwnershipSettingsChanged?: () => void
   platform?: PlatformType
   notifications?: TwitterNotification[]
   onDismissNotification?: (id: string) => void
@@ -39,7 +38,7 @@ function scopeLabel(scope: ExclusionScope): string {
 }
 
 
-export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, onOwnershipSettingsChanged, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
+export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
@@ -51,7 +50,6 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
   const [searchFullOpen, setSearchFullOpen] = useState(false)
   const searchFullRef = useRef<HTMLDivElement>(null)
   const [ppdPcts, setPpdPcts] = useState<Record<string, string>>({})
-  const [ownershipRedPcts, setOwnershipRedPcts] = useState<Record<string, string>>({})
 
   const syncPpdFromSlate = useCallback((data: SlateGamesResponse) => {
     const pcts: Record<string, string> = {}
@@ -63,27 +61,15 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
     setPpdPcts(pcts)
   }, [])
 
-  const syncOwnershipRedFromSlate = useCallback((data: SlateGamesResponse) => {
-    const reds: Record<string, string> = {}
-    for (const g of data.games) {
-      if (g.ownership_reduction != null && g.ownership_reduction > 0) {
-        reds[g.game] = String(g.ownership_reduction)
-      }
-    }
-    setOwnershipRedPcts(reds)
-  }, [])
-
   useEffect(() => {
     setSlate(null)
     setPlayers(null)
     setError(null)
     setPpdPcts({})
-    setOwnershipRedPcts({})
     fetchSlateGames()
       .then(data => {
         setSlate(data)
         syncPpdFromSlate(data)
-        syncOwnershipRedFromSlate(data)
         if (onProjFetchFilterChange) {
           // Only "both"-excluded games auto-sync to projFetchExcluded
           const slateExcluded = data.games
@@ -139,14 +125,9 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         const n = parseFloat(val)
         if (!isNaN(n) && n > 0) game_ppd_pcts[gameKey] = n
       }
-      const game_ownership_reductions: Record<string, number> = {}
-      for (const [gameKey, val] of Object.entries(ownershipRedPcts)) {
-        const n = parseFloat(val)
-        if (!isNaN(n) && n >= 1 && n <= 99) game_ownership_reductions[gameKey] = n
-      }
-      return { slate_id: slate?.slate_id ?? '', game_scopes, team_scopes, game_ppd_pcts, game_ownership_reductions }
+      return { slate_id: slate?.slate_id ?? '', game_scopes, team_scopes, game_ppd_pcts }
     },
-    [slate, ppdPcts, ownershipRedPcts]
+    [slate, ppdPcts]
   )
 
   const persist = useCallback(
@@ -157,7 +138,6 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         const result = await saveSlateExclusions(buildUpdate(updated.games))
         setSlate(result)
         syncPpdFromSlate(result)
-        syncOwnershipRedFromSlate(result)
         // Refresh player list since team/game scopes affect the pool
         const updatedPlayers = await fetchSlatePlayers()
         setPlayers(updatedPlayers)
@@ -167,7 +147,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         setSaving(false)
       }
     },
-    [buildUpdate, syncPpdFromSlate, syncOwnershipRedFromSlate]
+    [buildUpdate, syncPpdFromSlate]
   )
 
   const persistPpd = useCallback(
@@ -179,34 +159,13 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         const result = await saveSlateExclusions(buildUpdate(slate.games))
         setSlate(result)
         syncPpdFromSlate(result)
-        syncOwnershipRedFromSlate(result)
       } catch (e) {
         setError(String(e))
       } finally {
         setSaving(false)
       }
     },
-    [slate, disabled, saving, buildUpdate, syncPpdFromSlate, syncOwnershipRedFromSlate]
-  )
-
-  const persistOwnershipReduction = useCallback(
-    async () => {
-      if (!slate || disabled || saving) return
-      setSaving(true)
-      setError(null)
-      try {
-        const result = await saveSlateExclusions(buildUpdate(slate.games))
-        setSlate(result)
-        syncPpdFromSlate(result)
-        syncOwnershipRedFromSlate(result)
-        onOwnershipSettingsChanged?.()
-      } catch (e) {
-        setError(String(e))
-      } finally {
-        setSaving(false)
-      }
-    },
-    [slate, disabled, saving, buildUpdate, syncPpdFromSlate, syncOwnershipRedFromSlate, onOwnershipSettingsChanged]
+    [slate, disabled, saving, buildUpdate, syncPpdFromSlate]
   )
 
   const cycleGameScope = useCallback(
@@ -394,7 +353,7 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
           const gameKey = `${g.away}@${g.home}`
           const fetchSkipped = projFetchExcluded.includes(gameKey)
           return (
-          <div key={g.game} className={`game-card game-card--${g.exclusion_scope}${parseFloat(ppdPcts[g.game] ?? '0') > 0 ? ' game-card--ppd' : ''}${parseFloat(ownershipRedPcts[g.game] ?? '0') > 0 ? ' game-card--own-red' : ''}`}>
+          <div key={g.game} className={`game-card game-card--${g.exclusion_scope}${parseFloat(ppdPcts[g.game] ?? '0') > 0 ? ' game-card--ppd' : ''}`}>
             <div className="game-card-header">
               <div className="game-label-group">
                 <span className="game-label">{g.away} @ {g.home}</span>
@@ -436,23 +395,6 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
                     value={ppdPcts[g.game] ?? ''}
                     onChange={e => setPpdPcts(prev => ({ ...prev, [g.game]: e.target.value }))}
                     onBlur={() => persistPpd()}
-                    onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
-                    disabled={disabled || saving}
-                  />
-                  %
-                </label>
-                <label className="ppd-label own-red-label">
-                  Own Red
-                  <input
-                    className="ppd-input own-red-input"
-                    type="number"
-                    min={1}
-                    max={99}
-                    step={1}
-                    placeholder="0"
-                    value={ownershipRedPcts[g.game] ?? ''}
-                    onChange={e => setOwnershipRedPcts(prev => ({ ...prev, [g.game]: e.target.value }))}
-                    onBlur={() => persistOwnershipReduction()}
                     onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
                     disabled={disabled || saving}
                   />

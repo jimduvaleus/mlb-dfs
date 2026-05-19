@@ -380,7 +380,7 @@ export default function App() {
         </div>
 
         {state.activeTab === 'projections' && (
-          <ProjectionsTable players={projectionPlayers} platform={state.config?.platform} teamTotals={teamTotals} />
+          <ProjectionsTable players={projectionPlayers} platform={state.config?.platform} teamTotals={teamTotals} onOwnershipSettingsChanged={refreshProjectionPlayers} />
         )}
 
         {state.activeTab === 'slate' && (
@@ -388,7 +388,6 @@ export default function App() {
             disabled={running}
             projFetchExcluded={projFetchExcluded}
             onProjFetchFilterChange={(excluded) => { setProjFetchExcluded(excluded); refreshProjectionPlayers() }}
-            onOwnershipSettingsChanged={refreshProjectionPlayers}
             platform={state.config?.platform}
             notifications={state.notifications}
             onDismissNotification={(id) => {

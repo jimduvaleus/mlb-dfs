@@ -1153,7 +1153,7 @@ button { cursor: pointer; }
 
 .slate-panel {
   padding: 24px;
-  max-width: 1400px;
+  max-width: 960px;
 }
 
 .slate-header {
@@ -1191,7 +1191,7 @@ button { cursor: pointer; }
 
 .slate-games-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 12px;
 }
 
@@ -1231,28 +1231,19 @@ button { cursor: pointer; }
   background: #110c04;
 }
 
-.game-card--own-red {
+.lineup-card--own-red {
   border-color: #553c9a;
   background: #120d1e;
 }
 
-.game-card--own-red.game-card--candidates {
-  border-color: #44337a;
-  background: #0e0a18;
-}
-
-.game-card--own-red.game-card--both {
-  border-color: #322659;
-  background: #0a0814;
-}
-
-.game-card--ppd.game-card--own-red {
-  border-color: #8b5e3c;
-  background: #160f0e;
-}
-
 .own-red-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
   color: #b794f4;
+  white-space: nowrap;
+  cursor: default;
 }
 
 .own-red-input {

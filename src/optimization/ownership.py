@@ -9,8 +9,8 @@ Pitchers: softmax(0.98*sqrt(mean) + 0.02*sqrt(salary_value)), with opponent
 Key design choices:
 - sqrt(mean): diminishing returns at high projections — doubling projected
   points doesn't double ownership.
-- game_ownership_reductions: per-game ownership reduction applied after the
-  full softmax + power-law calibration.  Reduced-game players are locked at
+- team_ownership_reductions: per-team ownership reduction applied after the
+  full softmax + power-law calibration.  Reduced-team players are locked at
   exactly (1 - pct/100) × baseline; the remaining (non-reduced) players in
   each position group are then scaled up to absorb the freed ownership,
   preserving slot-count sums.  Entered % maps directly to the output drop.
@@ -145,7 +145,7 @@ def compute_heuristic_ownership(
     team_totals: dict[str, float] | None = None,
     batting_order_mult: dict[int, float] | None = None,
     batter_std_floor: float | None = None,
-    game_ownership_reductions: dict[str, float] | None = None,
+    team_ownership_reductions: dict[str, float] | None = None,
 ) -> np.ndarray:
     """Return ownership probability array aligned with players_df row order.
 
@@ -391,30 +391,30 @@ def compute_heuristic_ownership(
             cal = vals ** exp
             result[pmask] = cal / cal.sum() * n_slots
 
-    # --- Per-game ownership reductions (post-calibration) --------------------
+    # --- Per-team ownership reductions (post-calibration) -------------------
     # Applied after the full softmax + power-law calibration.  Per-position:
-    #   1. Lock reduced-game players at exactly (1 - pct/100) × baseline.
+    #   1. Lock reduced-team players at exactly (1 - pct/100) × baseline.
     #   2. Scale the non-reduced remainder to absorb the freed ownership so
     #      the position slot-count sum is preserved.
     # This gives an exact pct% drop for the affected players.  If no
     # non-reduced players exist in a position, the reduction is still applied
     # and the position sum is allowed to fall below its slot count.
-    if game_ownership_reductions and "game" in df.columns:
-        game_vals = df["game"].values
-        active_reductions = {g: p for g, p in game_ownership_reductions.items() if 0 < p < 100}
+    if team_ownership_reductions and "team" in df.columns:
+        team_vals = df["team"].values
+        active_reductions = {t: p for t, p in team_ownership_reductions.items() if 0 < p < 100}
         if active_reductions:
             for pos, n_slots in _SLOT_COUNTS.items():
                 pmask = pos_vals == pos
                 if not pmask.any():
                     continue
-                pos_games = game_vals[pmask]
+                pos_teams = team_vals[pmask]
                 pos_result = result[pmask].copy()
-                # Identify which position-group entries are in a reduced game.
+                # Identify which position-group entries belong to a reduced team.
                 in_reduced = np.zeros(pmask.sum(), dtype=bool)
-                for _g, _pct in active_reductions.items():
-                    gin = pos_games == _g
-                    pos_result[gin] *= (1.0 - _pct / 100.0)
-                    in_reduced |= gin
+                for _t, _pct in active_reductions.items():
+                    tin = pos_teams == _t
+                    pos_result[tin] *= (1.0 - _pct / 100.0)
+                    in_reduced |= tin
                 # Scale non-reduced players to absorb the freed ownership.
                 not_reduced = ~in_reduced
                 if not_reduced.any():

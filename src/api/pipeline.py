@@ -307,8 +307,8 @@ class PipelineRunner:
                     cand_players_df[name_col].apply(lambda n: hr_odds.get(_norm(str(n))))
                     if name_col else np.nan
                 )
-            # Load per-game ownership reductions from persisted exclusions.
-            _game_ownership_reductions: dict = {}
+            # Load per-team ownership reductions from persisted exclusions.
+            _team_ownership_reductions: dict = {}
             try:
                 _slate_games = [
                     str(g) for g in cand_players_df["game"].dropna().unique()
@@ -318,20 +318,20 @@ class PipelineRunner:
                     from pathlib import Path as _Path
                     _sid = _compute_slate_id(_slate_games)
                     _fp = _compute_fp(_Path(slate_path) if slate_path else None)
-                    _game_ownership_reductions = (
-                        _read_exclusions(_sid, _fp).get("game_ownership_reductions", {}) or {}
+                    _team_ownership_reductions = (
+                        _read_exclusions(_sid, _fp).get("team_ownership_reductions", {}) or {}
                     )
             except Exception:
                 pass
             ownership_vector = compute_heuristic_ownership(
                 cand_players_df, team_totals,
-                game_ownership_reductions=_game_ownership_reductions or None,
+                team_ownership_reductions=_team_ownership_reductions or None,
             )
             logger.info(
                 "Computed heuristic ownership — model %s%s%s, %d players",
                 "D" if team_totals else "C",
                 "+HR" if hr_odds else "",
-                f"+RED({len(_game_ownership_reductions)})" if _game_ownership_reductions else "",
+                f"+RED({len(_team_ownership_reductions)})" if _team_ownership_reductions else "",
                 len(ownership_vector),
             )
 
@@ -563,6 +563,12 @@ class PipelineRunner:
                     # Cache GPP artifacts for potential future use.
                     self._gpp_robust_payout = robust_payout
                     self._gpp_candidates = candidates
+                    # Per-sim score threshold that corresponds to beating
+                    # coverage_percentile of the field — used by replace_lineup
+                    # to faithfully reproduce the EVPortfolioSelector coverage mask.
+                    self._gpp_coverage_threshold = np.percentile(
+                        scorer.last_field_sorted, _coverage_pct * 100, axis=1
+                    ).astype(np.float32)
 
         else:
             # ----------------------------------------------------------------
@@ -760,14 +766,34 @@ class PipelineRunner:
                     "No available candidates remain after excluding discarded lineups"
                 )
 
-            # Marginal EV: mean incremental payout each candidate adds over the
-            # remaining portfolio's per-sim best payout — same criterion used by
-            # EVPortfolioSelector for rounds 1+.
-            avail_payout = self._gpp_robust_payout[avail]  # (n_avail, n_sims)
-            marginal_ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
-            best_local = int(np.argmax(marginal_ev_vals))
+            # Reproduce the EVPortfolioSelector coverage mask: a sim is covered
+            # when at least one remaining lineup beats >= coverage_percentile of
+            # the field there. The stored threshold is the per-sim score needed
+            # to achieve that beat rate, so we just compare scores directly.
+            if hasattr(self, '_gpp_coverage_threshold'):
+                covered_mask = np.zeros(n_sims_gpp, dtype=bool)
+                pid_to_col = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
+                sim_mat_f32 = self._sim_results.results_matrix.astype(np.float32)
+                for lu, _ in remaining:
+                    cols = np.array([pid_to_col[pid] for pid in lu.player_ids], dtype=np.int32)
+                    lu_scores = sim_mat_f32[:, cols].sum(axis=1)
+                    covered_mask |= (lu_scores >= self._gpp_coverage_threshold)
+                active_mask = ~covered_mask
+                n_active = int(active_mask.sum())
+                avail_payout = self._gpp_robust_payout[avail]
+                ev_vals = (
+                    avail_payout[:, active_mask].mean(axis=1)
+                    if n_active > 0
+                    else avail_payout.mean(axis=1)
+                )
+            else:
+                # Portfolio built before threshold was stored — fall back to marginal EV.
+                avail_payout = self._gpp_robust_payout[avail]
+                ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
+
+            best_local = int(np.argmax(ev_vals))
             new_lineup = self._gpp_candidates[int(avail[best_local])]
-            full_score = float(marginal_ev_vals[best_local])
+            full_score = float(ev_vals[best_local])
 
         elif self._objective == "marginal_payout":
             best_scores = np.zeros(self._sim_results.n_sims, dtype=np.float64)

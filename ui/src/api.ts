@@ -1,4 +1,4 @@
-import type { AppConfig, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -182,4 +182,23 @@ export async function saveTwitterLineup(req: TwitterLineupSaveRequest): Promise<
 
 export async function dismissTwitterLineup(team: string): Promise<void> {
   await fetch(`/api/twitter-lineups/${encodeURIComponent(team)}`, { method: 'DELETE' })
+}
+
+export async function fetchTeamOwnershipReductions(): Promise<TeamOwnershipReductionsResponse> {
+  const res = await fetch('/api/slate/ownership-reductions')
+  if (!res.ok) return { slate_id: '', team_ownership_reductions: {} }
+  return res.json()
+}
+
+export async function saveTeamOwnershipReductions(update: TeamOwnershipReductionsUpdate): Promise<TeamOwnershipReductionsResponse> {
+  const res = await fetch('/api/slate/ownership-reductions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  })
+  if (!res.ok) {
+    const detail = await res.text()
+    throw new Error(`Failed to save ownership reductions: ${detail}`)
+  }
+  return res.json()
 }

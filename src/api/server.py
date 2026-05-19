@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config_io import read_config, write_config
-from .models import AppConfig, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
+from .models import AppConfig, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
 from .twitter_lineups import (
     delete_twitter_lineup,
     get_twitter_overrides,
@@ -560,6 +560,7 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
             candidate_excluded_games=set(cand_games),
         )
 
+    stored_reductions = stored.get("team_ownership_reductions", {})
     write_exclusions(
         slate_id=update.slate_id,
         file_fingerprint=fingerprint,
@@ -570,23 +571,8 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
         candidate_excluded_games=cand_games,
         candidate_excluded_player_ids=existing_cand_pids,
         game_ppd_pcts=update.game_ppd_pcts,
-        game_ownership_reductions=update.game_ownership_reductions,
+        team_ownership_reductions=stored_reductions,
     )
-    # Archive ownership settings whenever they are non-empty or have been cleared.
-    try:
-        import json as _json
-        from datetime import datetime as _dt
-        _archive = _get_archive_dir()
-        if _archive is not None:
-            _settings = {
-                "game_ownership_reductions": update.game_ownership_reductions,
-                "saved_at": _dt.utcnow().isoformat(timespec="seconds"),
-            }
-            (_archive / "ownership_settings.json").write_text(
-                _json.dumps(_settings, indent=2)
-            )
-    except Exception:
-        pass
     game_times = _load_slate_games()
     if not game_times:
         return SlateGamesResponse(slate_id=update.slate_id, games=[], excluded_player_ids=[])
@@ -665,6 +651,58 @@ def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersRespon
     return SlatePlayersResponse(
         slate_id=update.slate_id,
         players=[PlayerExclusionStatus(**p) for p in player_dicts],
+    )
+
+
+@app.get("/api/slate/ownership-reductions")
+def get_team_ownership_reductions() -> TeamOwnershipReductionsResponse:
+    """Return the current per-team ownership reductions for the active slate."""
+    from .slate_exclusions import compute_slate_id
+    game_times = _load_slate_games()
+    if not game_times:
+        return TeamOwnershipReductionsResponse(slate_id="", team_ownership_reductions={})
+    fingerprint = compute_file_fingerprint(_get_slate_file_path())
+    slate_id = compute_slate_id(list(game_times.keys()))
+    stored = read_exclusions(slate_id, fingerprint)
+    return TeamOwnershipReductionsResponse(
+        slate_id=slate_id,
+        team_ownership_reductions=stored.get("team_ownership_reductions", {}),
+    )
+
+
+@app.post("/api/slate/ownership-reductions")
+def post_team_ownership_reductions(update: TeamOwnershipReductionsUpdate) -> TeamOwnershipReductionsResponse:
+    """Update per-team ownership reductions without touching any other exclusion state."""
+    fingerprint = compute_file_fingerprint(_get_slate_file_path())
+    stored = read_exclusions(update.slate_id, fingerprint)
+    write_exclusions(
+        slate_id=update.slate_id,
+        file_fingerprint=fingerprint,
+        excluded_teams=stored.get("excluded_teams", []),
+        excluded_games=stored.get("excluded_games", []),
+        excluded_player_ids=stored.get("excluded_player_ids"),
+        candidate_excluded_teams=stored.get("candidate_excluded_teams"),
+        candidate_excluded_games=stored.get("candidate_excluded_games"),
+        candidate_excluded_player_ids=stored.get("candidate_excluded_player_ids"),
+        game_ppd_pcts=stored.get("game_ppd_pcts"),
+        team_ownership_reductions=update.team_ownership_reductions,
+    )
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        _arc = _get_archive_dir()
+        if _arc is not None:
+            (_arc / "ownership_settings.json").write_text(
+                _json.dumps({
+                    "team_ownership_reductions": update.team_ownership_reductions,
+                    "saved_at": _dt.utcnow().isoformat(timespec="seconds"),
+                }, indent=2)
+            )
+    except Exception:
+        pass
+    return TeamOwnershipReductionsResponse(
+        slate_id=update.slate_id,
+        team_ownership_reductions=update.team_ownership_reductions,
     )
 
 
@@ -839,7 +877,7 @@ def projections_players():
         # Players in "both"-excluded games are zeroed out and not factored into
         # the ownership softmax at all — their projections are irrelevant to the slate.
         both_excl_pids: set = set()
-        _game_ownership_reductions: dict = {}
+        _team_ownership_reductions: dict = {}
         if "game" in slate_df.columns:
             try:
                 from .slate_exclusions import compute_slate_id
@@ -852,7 +890,7 @@ def projections_players():
                     both_excl_pids = set(
                         slate_df.loc[slate_df["game"].isin(_both_games), "player_id"].dropna().astype(int)
                     )
-                _game_ownership_reductions = _excl.get("game_ownership_reductions", {}) or {}
+                _team_ownership_reductions = _excl.get("team_ownership_reductions", {}) or {}
             except Exception:
                 pass
 
@@ -877,7 +915,7 @@ def projections_players():
                     non_excl["hr_prob"] = non_excl["name"].apply(lambda n: hr_odds.get(_norm_hr(str(n))))
                 ow_sub = compute_heuristic_ownership(
                     non_excl, team_totals,
-                    game_ownership_reductions=_game_ownership_reductions or None,
+                    team_ownership_reductions=_team_ownership_reductions or None,
                 )
                 ow_pct = [0.0] * len(merged)
                 sub_i = 0
@@ -903,9 +941,9 @@ def projections_players():
                 "ownership_pct":  ow_pct[i],
             })
 
-        # Archive ownership projections whenever game reductions are active so
+        # Archive ownership projections whenever team reductions are active so
         # post-contest evaluation can reconstruct what the model projected.
-        if _game_ownership_reductions:
+        if _team_ownership_reductions:
             try:
                 _arc = _get_archive_dir()
                 if _arc is not None:

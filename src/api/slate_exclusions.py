@@ -29,7 +29,7 @@ _EMPTY_ENTRY = {
     "candidate_excluded_games": [],
     "candidate_excluded_player_ids": [],
     "game_ppd_pcts": {},
-    "game_ownership_reductions": {},
+    "team_ownership_reductions": {},
 }
 
 
@@ -105,7 +105,7 @@ def write_exclusions(
     candidate_excluded_games: list[str] | None = None,
     candidate_excluded_player_ids: list[int] | None = None,
     game_ppd_pcts: dict[str, float] | None = None,
-    game_ownership_reductions: dict[str, float] | None = None,
+    team_ownership_reductions: dict[str, float] | None = None,
 ) -> None:
     """Persist exclusions for this slate/file combination."""
     EXCLUSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -119,7 +119,7 @@ def write_exclusions(
         "candidate_excluded_games": candidate_excluded_games or [],
         "candidate_excluded_player_ids": candidate_excluded_player_ids or [],
         "game_ppd_pcts": game_ppd_pcts or {},
-        "game_ownership_reductions": game_ownership_reductions or {},
+        "team_ownership_reductions": team_ownership_reductions or {},
     }
     with open(EXCLUSIONS_PATH, "w") as f:
         json.dump(all_data, f, indent=2)
@@ -246,7 +246,6 @@ def get_slate_games_with_status(
     candidate_excluded_games_set = set(candidate_excluded_games)
 
     game_ppd_pcts = stored.get("game_ppd_pcts", {})
-    game_ownership_reductions = stored.get("game_ownership_reductions", {})
 
     result = []
     for game in sorted(game_times, key=lambda g: (game_times[g] or "", g)):
@@ -263,7 +262,6 @@ def get_slate_games_with_status(
         home_scope = _effective_team_scope(home, game_scope, excluded_teams_set, candidate_excluded_teams_set)
 
         ppd_pct = game_ppd_pcts.get(game)
-        ownership_reduction = game_ownership_reductions.get(game)
         result.append(
             {
                 "game": game,
@@ -272,7 +270,6 @@ def get_slate_games_with_status(
                 "excluded": game_scope != "none",
                 "exclusion_scope": game_scope,
                 "ppd_pct": ppd_pct,
-                "ownership_reduction": ownership_reduction,
                 "game_start_time": game_times[game] or None,
                 "teams": [
                     {"team": away, "excluded": away_scope != "none", "exclusion_scope": away_scope},
