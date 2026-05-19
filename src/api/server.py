@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config_io import read_config, write_config
-from .models import AppConfig, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
+from .models import AppConfig, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
 from .twitter_lineups import (
     delete_twitter_lineup,
     get_twitter_overrides,
@@ -706,6 +706,47 @@ def post_team_ownership_reductions(update: TeamOwnershipReductionsUpdate) -> Tea
     )
 
 
+@app.get("/api/slate/projection-overrides")
+def get_player_projection_overrides() -> PlayerProjectionOverridesResponse:
+    """Return current per-player projection overrides for the active slate."""
+    from .slate_exclusions import compute_slate_id
+    game_times = _load_slate_games()
+    if not game_times:
+        return PlayerProjectionOverridesResponse(slate_id="", player_projection_overrides={})
+    fingerprint = compute_file_fingerprint(_get_slate_file_path())
+    slate_id = compute_slate_id(list(game_times.keys()))
+    stored = read_exclusions(slate_id, fingerprint)
+    raw = stored.get("player_projection_overrides", {}) or {}
+    return PlayerProjectionOverridesResponse(
+        slate_id=slate_id,
+        player_projection_overrides={int(k): v for k, v in raw.items()},
+    )
+
+
+@app.post("/api/slate/projection-overrides")
+def post_player_projection_overrides(update: PlayerProjectionOverridesUpdate) -> PlayerProjectionOverridesResponse:
+    """Update per-player projection overrides without touching any other exclusion state."""
+    fingerprint = compute_file_fingerprint(_get_slate_file_path())
+    stored = read_exclusions(update.slate_id, fingerprint)
+    write_exclusions(
+        slate_id=update.slate_id,
+        file_fingerprint=fingerprint,
+        excluded_teams=stored.get("excluded_teams", []),
+        excluded_games=stored.get("excluded_games", []),
+        excluded_player_ids=stored.get("excluded_player_ids"),
+        candidate_excluded_teams=stored.get("candidate_excluded_teams"),
+        candidate_excluded_games=stored.get("candidate_excluded_games"),
+        candidate_excluded_player_ids=stored.get("candidate_excluded_player_ids"),
+        game_ppd_pcts=stored.get("game_ppd_pcts"),
+        team_ownership_reductions=stored.get("team_ownership_reductions"),
+        player_projection_overrides=update.player_projection_overrides,
+    )
+    return PlayerProjectionOverridesResponse(
+        slate_id=update.slate_id,
+        player_projection_overrides=update.player_projection_overrides,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Projections endpoints
 # ---------------------------------------------------------------------------
@@ -878,6 +919,7 @@ def projections_players():
         # the ownership softmax at all — their projections are irrelevant to the slate.
         both_excl_pids: set = set()
         _team_ownership_reductions: dict = {}
+        _proj_overrides: dict = {}
         if "game" in slate_df.columns:
             try:
                 from .slate_exclusions import compute_slate_id
@@ -891,6 +933,12 @@ def projections_players():
                         slate_df.loc[slate_df["game"].isin(_both_games), "player_id"].dropna().astype(int)
                     )
                 _team_ownership_reductions = _excl.get("team_ownership_reductions", {}) or {}
+                _raw_overrides = _excl.get("player_projection_overrides", {}) or {}
+                _proj_overrides = {int(k): v for k, v in _raw_overrides.items()}
+                if _proj_overrides:
+                    merged = merged.copy()
+                    for _pid, _val in _proj_overrides.items():
+                        merged.loc[merged["player_id"] == _pid, "mean"] = _val
             except Exception:
                 pass
 
@@ -939,6 +987,7 @@ def projections_players():
                 "slot_confirmed": bool(row["slot_confirmed"]),
                 "mean":           float(row["mean"]),
                 "ownership_pct":  ow_pct[i],
+                "is_overridden":  int(row["player_id"]) in _proj_overrides,
             })
 
         # Archive ownership projections whenever team reductions are active so

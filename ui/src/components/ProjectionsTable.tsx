@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import type { ProjectionPlayerRow, PlatformType } from '../types'
-import { fetchTeamOwnershipReductions, saveTeamOwnershipReductions } from '../api'
+import { fetchTeamOwnershipReductions, saveTeamOwnershipReductions, fetchPlayerProjectionOverrides, savePlayerProjectionOverrides } from '../api'
 import TeamBadge from './TeamBadge'
 
 interface Props {
@@ -15,6 +15,11 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
   const [teamReductions, setTeamReductions] = useState<Record<string, string>>({})
   const [reductionSaving, setReductionSaving] = useState(false)
 
+  const [overrideSlateId, setOverrideSlateId] = useState<string>('')
+  const [projOverrides, setProjOverrides] = useState<Record<number, number>>({})
+  const [editingProj, setEditingProj] = useState<Record<number, string>>({})
+  const [overrideSaving, setOverrideSaving] = useState(false)
+
   useEffect(() => {
     fetchTeamOwnershipReductions().then(r => {
       setReductionSlateId(r.slate_id)
@@ -23,6 +28,15 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
         if (v > 0) s[t] = String(v)
       }
       setTeamReductions(s)
+    }).catch(() => {})
+
+    fetchPlayerProjectionOverrides().then(r => {
+      setOverrideSlateId(r.slate_id)
+      const overrides: Record<number, number> = {}
+      for (const [k, v] of Object.entries(r.player_projection_overrides)) {
+        overrides[Number(k)] = v
+      }
+      setProjOverrides(overrides)
     }).catch(() => {})
   }, [players])
 
@@ -41,6 +55,38 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
     } catch {}
     finally { setReductionSaving(false) }
   }, [reductionSlateId, teamReductions, reductionSaving, onOwnershipSettingsChanged])
+
+  const persistOverride = useCallback(async (playerId: number) => {
+    if (overrideSaving) return
+    const draft = editingProj[playerId]
+    if (draft === undefined) return
+    const val = parseFloat(draft)
+    setEditingProj(prev => { const n = { ...prev }; delete n[playerId]; return n })
+    if (isNaN(val) || val <= 0) return
+    setOverrideSaving(true)
+    try {
+      const next = { ...projOverrides, [playerId]: val }
+      const r = await savePlayerProjectionOverrides({ slate_id: overrideSlateId, player_projection_overrides: next })
+      setOverrideSlateId(r.slate_id)
+      setProjOverrides(r.player_projection_overrides as Record<number, number>)
+      onOwnershipSettingsChanged?.()
+    } catch {}
+    finally { setOverrideSaving(false) }
+  }, [overrideSlateId, projOverrides, editingProj, overrideSaving, onOwnershipSettingsChanged])
+
+  const resetOverride = useCallback(async (playerId: number) => {
+    if (overrideSaving) return
+    setOverrideSaving(true)
+    try {
+      const next = { ...projOverrides }
+      delete next[playerId]
+      const r = await savePlayerProjectionOverrides({ slate_id: overrideSlateId, player_projection_overrides: next })
+      setOverrideSlateId(r.slate_id)
+      setProjOverrides(r.player_projection_overrides as Record<number, number>)
+      onOwnershipSettingsChanged?.()
+    } catch {}
+    finally { setOverrideSaving(false) }
+  }, [overrideSlateId, projOverrides, overrideSaving, onOwnershipSettingsChanged])
 
   if (players.length === 0) {
     return (
@@ -102,6 +148,8 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
                 {[...pitchers, ...batters].map((p, i) => {
                   const isPitcher = p.position === 'P'
                   const slotNum = !isPitcher && p.slot != null && p.slot >= 1 && p.slot <= 9 ? p.slot : null
+                  const draftVal = editingProj[p.player_id]
+                  const displayVal = draftVal !== undefined ? draftVal : p.mean.toFixed(1)
                   return (
                     <div key={i} className="lineup-player">
                       <span className="lineup-player-pos">{p.position}</span>
@@ -115,7 +163,28 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
                       </span>
                       <TeamBadge team={p.team} className="lineup-player-team" />
                       <span className="lineup-player-sal">${(p.salary / 1000).toFixed(1)}k</span>
-                      <span className="lineup-player-proj">{p.mean.toFixed(1)}</span>
+                      <span className={`lineup-player-proj${p.is_overridden ? ' lineup-player-proj--overridden' : ''}`}>
+                        <input
+                          className="proj-override-input"
+                          type="number"
+                          step={0.1}
+                          value={displayVal}
+                          title={p.is_overridden ? 'Manually overridden — click ↺ to reset' : 'Click to override projection'}
+                          onChange={e => setEditingProj(prev => ({ ...prev, [p.player_id]: e.target.value }))}
+                          onFocus={() => setEditingProj(prev => ({ ...prev, [p.player_id]: p.mean.toFixed(1) }))}
+                          onBlur={() => persistOverride(p.player_id)}
+                          onKeyDown={e => { if (e.key === 'Enter') e.currentTarget.blur() }}
+                          disabled={overrideSaving}
+                        />
+                        {p.is_overridden && (
+                          <button
+                            className="proj-reset-btn"
+                            title="Reset to original projection"
+                            onClick={() => resetOverride(p.player_id)}
+                            disabled={overrideSaving}
+                          >↺</button>
+                        )}
+                      </span>
                       {p.ownership_pct != null && (
                         <span className="lineup-player-own" title="Projected ownership">{p.ownership_pct.toFixed(1)}%</span>
                       )}

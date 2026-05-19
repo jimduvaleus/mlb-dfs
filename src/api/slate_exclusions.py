@@ -30,6 +30,7 @@ _EMPTY_ENTRY = {
     "candidate_excluded_player_ids": [],
     "game_ppd_pcts": {},
     "team_ownership_reductions": {},
+    "player_projection_overrides": {},
 }
 
 
@@ -106,6 +107,7 @@ def write_exclusions(
     candidate_excluded_player_ids: list[int] | None = None,
     game_ppd_pcts: dict[str, float] | None = None,
     team_ownership_reductions: dict[str, float] | None = None,
+    player_projection_overrides: dict[int, float] | None = None,
 ) -> None:
     """Persist exclusions for this slate/file combination."""
     EXCLUSIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +122,7 @@ def write_exclusions(
         "candidate_excluded_player_ids": candidate_excluded_player_ids or [],
         "game_ppd_pcts": game_ppd_pcts or {},
         "team_ownership_reductions": team_ownership_reductions or {},
+        "player_projection_overrides": {str(k): v for k, v in (player_projection_overrides or {}).items()},
     }
     with open(EXCLUSIONS_PATH, "w") as f:
         json.dump(all_data, f, indent=2)

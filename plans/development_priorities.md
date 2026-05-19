@@ -1,2 +1,1 @@
 - BIG late swap?
-- Add manual projection override to projection panel

@@ -1,4 +1,4 @@
-import type { AppConfig, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -199,6 +199,25 @@ export async function saveTeamOwnershipReductions(update: TeamOwnershipReduction
   if (!res.ok) {
     const detail = await res.text()
     throw new Error(`Failed to save ownership reductions: ${detail}`)
+  }
+  return res.json()
+}
+
+export async function fetchPlayerProjectionOverrides(): Promise<PlayerProjectionOverridesResponse> {
+  const res = await fetch('/api/slate/projection-overrides')
+  if (!res.ok) return { slate_id: '', player_projection_overrides: {} }
+  return res.json()
+}
+
+export async function savePlayerProjectionOverrides(update: PlayerProjectionOverridesUpdate): Promise<PlayerProjectionOverridesResponse> {
+  const res = await fetch('/api/slate/projection-overrides', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(update),
+  })
+  if (!res.ok) {
+    const detail = await res.text()
+    throw new Error(`Failed to save projection overrides: ${detail}`)
   }
   return res.json()
 }

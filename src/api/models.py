@@ -151,6 +151,16 @@ class TeamOwnershipReductionsResponse(BaseModel):
     team_ownership_reductions: dict[str, float] = {}
 
 
+class PlayerProjectionOverridesUpdate(BaseModel):
+    slate_id: str
+    player_projection_overrides: dict[int, float] = {}
+
+
+class PlayerProjectionOverridesResponse(BaseModel):
+    slate_id: str
+    player_projection_overrides: dict[int, float] = {}
+
+
 class PlayerExclusionStatus(BaseModel):
     player_id: int
     name: str

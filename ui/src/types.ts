@@ -79,8 +79,9 @@ export interface ProjectionPlayerRow {
   salary: number
   slot: number | null      // 1–9 batters, 10 pitchers, null if missing
   slot_confirmed: boolean
-  mean: number             // final scaled projection value
+  mean: number             // final scaled projection value (override applied if set)
   ownership_pct: number | null  // heuristic projected ownership %
+  is_overridden: boolean
 }
 
 export interface LineupResult {
@@ -359,6 +360,16 @@ export interface TeamOwnershipReductionsUpdate {
 export interface TeamOwnershipReductionsResponse {
   slate_id: string
   team_ownership_reductions: Record<string, number>
+}
+
+export interface PlayerProjectionOverridesUpdate {
+  slate_id: string
+  player_projection_overrides: Record<number, number>
+}
+
+export interface PlayerProjectionOverridesResponse {
+  slate_id: string
+  player_projection_overrides: Record<number, number>
 }
 
 // Player-level exclusion types
