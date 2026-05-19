@@ -735,8 +735,6 @@ class PipelineRunner:
             if not hasattr(self, '_gpp_candidates') or not hasattr(self, '_gpp_robust_payout'):
                 raise RuntimeError("GPP artifacts unavailable — please re-run the portfolio")
 
-            from src.optimization.gpp_portfolio import _compute_marginal_ev as _gpp_marginal_ev
-
             # Build pid-set → candidate-index map.
             cand_pid_sets = [frozenset(lu.player_ids) for lu in self._gpp_candidates]
             pid_set_to_ci = {ps: ci for ci, ps in enumerate(cand_pid_sets)}
@@ -762,7 +760,11 @@ class PipelineRunner:
                     "No available candidates remain after excluding discarded lineups"
                 )
 
-            marginal_ev_vals = _gpp_marginal_ev(self._gpp_robust_payout, best_payout, avail)
+            # Marginal EV: mean incremental payout each candidate adds over the
+            # remaining portfolio's per-sim best payout — same criterion used by
+            # EVPortfolioSelector for rounds 1+.
+            avail_payout = self._gpp_robust_payout[avail]  # (n_avail, n_sims)
+            marginal_ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
             best_local = int(np.argmax(marginal_ev_vals))
             new_lineup = self._gpp_candidates[int(avail[best_local])]
             full_score = float(marginal_ev_vals[best_local])
