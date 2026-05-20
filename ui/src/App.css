@@ -563,6 +563,13 @@ button { cursor: pointer; }
   opacity: 0.8;
 }
 
+.merge-info-partial-proj {
+  color: #b794f4;
+  font-size: 0.85em;
+  opacity: 0.85;
+  cursor: help;
+}
+
 .merge-info-pitcher-icon {
   color: #f6ad55;
   cursor: help;
@@ -1294,8 +1301,8 @@ button { cursor: pointer; }
 }
 
 .lineup-card--own-red {
-  border-color: #553c9a;
-  background: #120d1e;
+  border-color: #b45309;
+  background: #1a1203;
 }
 
 .own-red-label {
@@ -1303,18 +1310,26 @@ button { cursor: pointer; }
   align-items: center;
   gap: 5px;
   font-size: 12px;
-  color: #b794f4;
+  color: #718096;
   white-space: nowrap;
   cursor: default;
 }
 
+.lineup-card--own-red .own-red-label {
+  color: #f59e0b;
+}
+
 .own-red-input {
-  border-color: #553c9a;
+  border-color: #4a5568;
+}
+
+.lineup-card--own-red .own-red-input {
+  border-color: #b45309;
 }
 
 .own-red-input:focus {
-  border-color: #805ad5;
-  box-shadow: 0 0 0 2px rgba(128, 90, 213, 0.25);
+  border-color: #f59e0b;
+  box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2);
 }
 
 .game-card--both {
