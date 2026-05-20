@@ -458,6 +458,7 @@ class PipelineRunner:
                 # Phase 2: score candidates against K simulated opponent fields
                 self._cb("gpp_score_start", {
                     "n_candidates": len(candidates),
+                    "n_field_lineups": n_field,
                     "n_field_samples": n_k,
                 })
                 team_totals_gpp = self._load_team_totals(slate_path)
@@ -489,6 +490,10 @@ class PipelineRunner:
                     progress_cb=lambda done, total: self._cb(
                         "gpp_score_progress",
                         {"batches_done": done, "batches_total": total},
+                    ),
+                    field_progress_cb=lambda n_done, n_total: self._cb(
+                        "gpp_field_progress",
+                        {"n_done": n_done, "n_total": n_total},
                     ),
                 )
                 self._cb("gpp_score_done", {})

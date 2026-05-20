@@ -5,7 +5,7 @@ probabilities, then computes per-lineup cash rate and EV stability metrics
 (ev_gap: sim-variance check; field_gap: field-sampling check).
 """
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
@@ -375,6 +375,8 @@ class ContestSimulator:
         rng_seed: Optional[int] = None,
         stack_probability: float = 0.75,
         max_attempts_per_lineup: int = 200,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        progress_chunk: int = 500,
     ) -> np.ndarray:
         """Generate n_lineups opponent lineups sampled by ownership.
 
@@ -429,6 +431,8 @@ class ContestSimulator:
                         ids = None
             if ids is not None:
                 field.append(ids)
+                if progress_cb is not None and len(field) % progress_chunk == 0:
+                    progress_cb(len(field), n_lineups)
 
         if len(field) < n_lineups:
             logger.warning(

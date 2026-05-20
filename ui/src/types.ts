@@ -133,6 +133,7 @@ export type SSEStage =
   | 'gpp_generate_progress'
   | 'gpp_generate_done'
   | 'gpp_score_start'
+  | 'gpp_field_progress'
   | 'gpp_score_progress'
   | 'gpp_score_done'
   | 'gpp_field_inject'
@@ -227,6 +228,12 @@ export interface ContestEvCompleteEvent extends SSEEvent {
 export interface GppGenerateProgressEvent extends SSEEvent {
   stage: 'gpp_generate_progress'
   n: number
+}
+
+export interface GppFieldProgressEvent extends SSEEvent {
+  stage: 'gpp_field_progress'
+  n_done: number
+  n_total: number
 }
 
 export interface GppScoreProgressEvent extends SSEEvent {

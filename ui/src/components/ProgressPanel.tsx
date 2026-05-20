@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -68,6 +68,7 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_generate_progress' ||
       last?.stage === 'gpp_generate_done' ||
       last?.stage === 'gpp_score_start' ||
+      last?.stage === 'gpp_field_progress' ||
       last?.stage === 'gpp_score_progress' ||
       last?.stage === 'gpp_score_done' ||
       last?.stage === 'gpp_select_progress'
@@ -116,6 +117,9 @@ export function ProgressPanel({ events, running }: Props) {
   const generateProgressEvents = events.filter(e => e.stage === 'gpp_generate_progress') as unknown as GppGenerateProgressEvent[]
   const latestGenerateProgress = generateProgressEvents[generateProgressEvents.length - 1]
   const generateDone = events.some(e => e.stage === 'gpp_generate_done')
+  const scoreStartEvent = events.find(e => e.stage === 'gpp_score_start') as unknown as { n_field_lineups: number; n_field_samples: number } | undefined
+  const fieldProgressEvents = events.filter(e => e.stage === 'gpp_field_progress') as unknown as GppFieldProgressEvent[]
+  const latestFieldProgress = fieldProgressEvents[fieldProgressEvents.length - 1]
   const scoreProgressEvents = events.filter(e => e.stage === 'gpp_score_progress') as unknown as GppScoreProgressEvent[]
   const latestScoreProgress = scoreProgressEvents[scoreProgressEvents.length - 1]
   const selectProgressEvents = events.filter(e => e.stage === 'gpp_select_progress') as unknown as GppSelectProgressEvent[]
@@ -131,6 +135,13 @@ export function ProgressPanel({ events, running }: Props) {
     } else if (latestScoreProgress) {
       gppPct = Math.round((latestScoreProgress.batches_done / latestScoreProgress.batches_total) * 100)
       gppLabel = `Scoring batch ${latestScoreProgress.batches_done} / ${latestScoreProgress.batches_total}`
+    } else if (latestFieldProgress && !scoreDone) {
+      gppPct = Math.round((latestFieldProgress.n_done / latestFieldProgress.n_total) * 100)
+      gppLabel = `Generating field: ${latestFieldProgress.n_done.toLocaleString()} / ${latestFieldProgress.n_total.toLocaleString()} lineups`
+    } else if (scoreStartEvent && fieldProgressEvents.length === 0) {
+      const nTotal = scoreStartEvent.n_field_lineups * scoreStartEvent.n_field_samples
+      gppPct = 0
+      gppLabel = `Generating field: 0 / ${nTotal.toLocaleString()} lineups`
     } else if (generateDone) {
       gppPct = 100
       gppLabel = 'Candidates generated'
@@ -153,6 +164,14 @@ export function ProgressPanel({ events, running }: Props) {
         const avgPerChunk = recentElapsed / (recent.length - 1)
         const remainingChunks = (generateStartEvent.n_candidates - latestGenerateProgress.n) / 500
         if (remainingChunks > 0) etaMs = avgPerChunk * remainingChunks
+      }
+    } else if (running && latestFieldProgress && !scoreDone && latestScoreProgress === undefined) {
+      const remaining = latestFieldProgress.n_total - latestFieldProgress.n_done
+      if (remaining > 0 && fieldProgressEvents.length >= 2) {
+        const recent = fieldProgressEvents.slice(-4)
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const recentLineups = recent[recent.length - 1].n_done - recent[0].n_done
+        if (recentLineups > 0) etaMs = (recentElapsed / recentLineups) * remaining
       }
     } else if (running && latestScoreProgress && !scoreDone) {
       const recent = scoreProgressEvents.slice(-4)
@@ -286,7 +305,7 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
 
   for (const e of events) {
     if (e.stage === 'optimize_lineup' || e.stage === 'upload_files') continue
-    if (GPP_PROGRESS_STAGES.has(e.stage)) continue
+    if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress') continue
     // Skip start event once done event is present (collapse into one row)
     if (e.stage === 'gpp_generate_start' && hasEvent('gpp_generate_done')) continue
     if (e.stage === 'gpp_score_start' && hasEvent('gpp_score_done')) continue

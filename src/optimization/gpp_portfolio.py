@@ -168,6 +168,7 @@ class ContestScorer:
         candidates: list[Lineup],
         progress_cb: Optional[Callable[[int, int], None]] = None,
         stop_check: Optional[Callable[[], bool]] = None,
+        field_progress_cb: Optional[Callable[[int, int], None]] = None,
     ) -> tuple[list[Lineup], np.ndarray]:
         """Compute robust_payout for all candidates.
 
@@ -175,6 +176,7 @@ class ContestScorer:
         ----------
         candidates : list of M Lineup objects
         progress_cb : optional callable(batches_done, total_batches)
+        field_progress_cb : optional callable(n_done, n_total) — total is K × N_field
 
         Returns
         -------
@@ -193,14 +195,22 @@ class ContestScorer:
             self._n_k, self._n_field,
         )
         field_sorted_list: list[np.ndarray] = []
+        n_total_field = self._n_k * self._n_field
         for k in range(self._n_k):
             seed = self._field_seed + k
+            offset = k * self._n_field
+            def _field_cb(n_done: int, _n: int, _offset: int = offset) -> None:
+                if field_progress_cb is not None:
+                    field_progress_cb(_offset + n_done, n_total_field)
             raw = self._cs.generate_field(
                 self._field_players_df, self._field_ownership_vec,
                 n_lineups=self._n_field, rng_seed=seed,
+                progress_cb=_field_cb if field_progress_cb is not None else None,
             )
             field_sorted_list.append(self._build_field_sorted(raw))
             logger.info("  Field %d/%d: %d lineups", k + 1, self._n_k, raw.shape[0])
+            if field_progress_cb is not None:
+                field_progress_cb(offset + len(raw), n_total_field)
 
         # Combine all K field samples into one sorted pool for coverage computation.
         # Beat rate = fraction of K×N field lineups beaten, consistent with how
