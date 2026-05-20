@@ -116,6 +116,15 @@ _STACK_VALUE_EXP = 0.17
 # Implied total threshold below which the stack-value signal does not fire.
 _STACK_THRESHOLD = 4.0
 
+# Per-player ownership caps applied after all softmax + calibration steps.
+# Any player exceeding their cap has the excess redistributed proportionally
+# to the other players in the same position group, preserving the slot-count sum.
+# _PITCHER_OWN_CAP: no SP is realistically in >85% of field lineups even as
+# dominant chalk.  _BATTER_OWN_CAP: batters almost never approach 100%; 1.0
+# acts as a pure safety valve against math overflow without distorting normal slates.
+_PITCHER_OWN_CAP = 0.85
+_BATTER_OWN_CAP  = 1.0
+
 # Maximum fractional boost for the earliest-bucket batter games on the slate.
 # Applied only to batters; pitchers are confirmed before the slate regardless.
 # Regression found 0.04: signal is real but weak — field builds regardless of
@@ -423,5 +432,27 @@ def compute_heuristic_ownership(
                     if current > 0:
                         pos_result[not_reduced] *= target / current
                 result[pmask] = pos_result
+
+    # --- Per-player ownership cap with redistribution ------------------------
+    # Iteratively clip any player above their position cap and spread the excess
+    # proportionally among uncapped players, preserving the slot-count sum.
+    for pos, n_slots in _SLOT_COUNTS.items():
+        cap = _PITCHER_OWN_CAP if pos == "P" else _BATTER_OWN_CAP
+        pmask = pos_vals == pos
+        if not pmask.any():
+            continue
+        vals = result[pmask].copy()
+        for _ in range(20):
+            over = vals > cap
+            if not over.any():
+                break
+            excess = (vals[over] - cap).sum()
+            vals[over] = cap
+            under = ~over
+            if under.any():
+                under_sum = vals[under].sum()
+                if under_sum > 0:
+                    vals[under] += excess * vals[under] / under_sum
+        result[pmask] = vals
 
     return result
