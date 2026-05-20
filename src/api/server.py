@@ -483,6 +483,11 @@ def _get_archive_dir() -> Path | None:
         mo, dy, yr = m.groups()
         d = PROJECT_ROOT / "archive" / f"{mo}{dy}{yr}"
         d.mkdir(parents=True, exist_ok=True)
+        # Ensure DKSalaries.csv is in the archive so evaluate_ownership dry-run works.
+        dk_archive = d / "DKSalaries.csv"
+        if not dk_archive.exists():
+            import shutil as _shutil
+            _shutil.copy2(str(slate_path), str(dk_archive))
         return d
     except Exception:
         return None
@@ -572,6 +577,7 @@ def post_slate_exclusions(update: ExclusionsUpdate) -> SlateGamesResponse:
         candidate_excluded_player_ids=existing_cand_pids,
         game_ppd_pcts=update.game_ppd_pcts,
         team_ownership_reductions=stored_reductions,
+        player_projection_overrides={int(k): v for k, v in stored.get("player_projection_overrides", {}).items()},
     )
     game_times = _load_slate_games()
     if not game_times:
@@ -643,6 +649,7 @@ def post_player_exclusions(update: PlayerExclusionsUpdate) -> SlatePlayersRespon
         candidate_excluded_games=cand_excluded_games,
         candidate_excluded_player_ids=cand_pids,
         game_ppd_pcts=game_ppd_pcts,
+        player_projection_overrides={int(k): v for k, v in stored.get("player_projection_overrides", {}).items()},
     )
 
     if df is None or df.empty:
@@ -686,6 +693,7 @@ def post_team_ownership_reductions(update: TeamOwnershipReductionsUpdate) -> Tea
         candidate_excluded_player_ids=stored.get("candidate_excluded_player_ids"),
         game_ppd_pcts=stored.get("game_ppd_pcts"),
         team_ownership_reductions=update.team_ownership_reductions,
+        player_projection_overrides={int(k): v for k, v in stored.get("player_projection_overrides", {}).items()},
     )
     try:
         import json as _json
@@ -1294,10 +1302,11 @@ async def projections_fetch(request: Request):
         dff_out    = proj_path.parent / "projections_dff.csv"
         rw_out     = proj_path.parent / "projections_rw.csv"
         mo_out     = proj_path.parent / "projections_mo.csv"
-        mo_sidecar           = proj_path.parent / "projections_mo_fallback.json"
-        mo_caps_path         = proj_path.parent / "projections_mo_caps.json"
-        mo_missing_opt_path  = proj_path.parent / "projections_mo_missing_opt.json"
-        mo_team_warn_path    = proj_path.parent / "projections_mo_team_warnings.json"
+        mo_sidecar               = proj_path.parent / "projections_mo_fallback.json"
+        mo_caps_path             = proj_path.parent / "projections_mo_caps.json"
+        mo_missing_opt_path      = proj_path.parent / "projections_mo_missing_opt.json"
+        mo_team_warn_path        = proj_path.parent / "projections_mo_team_warnings.json"
+        mo_pitcher_partial_path  = proj_path.parent / "projections_mo_pitcher_partial.json"
         # Persistent across partial fetches; overwritten only on a full fetch.
         merge_info_state_path = proj_path.parent / (proj_path.stem + "_merge_info.json")
 
@@ -1305,7 +1314,7 @@ async def projections_fetch(request: Request):
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
 
         # Clean up any stale temp files left by a prior incomplete fetch.
-        for _p in (dff_out, rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path, mo_team_warn_path):
+        for _p in (dff_out, rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path, mo_team_warn_path, mo_pitcher_partial_path):
             try:
                 _p.unlink(missing_ok=True)
             except Exception:
@@ -1325,6 +1334,15 @@ async def projections_fetch(request: Request):
                 return {}
             try:
                 raw = json.loads(mo_sidecar.read_text())
+                return {int(k): v for k, v in raw.items()}
+            except Exception:
+                return {}
+
+        def _read_mo_pitcher_partial() -> dict[int, dict]:
+            if not mo_pitcher_partial_path.exists():
+                return {}
+            try:
+                raw = json.loads(mo_pitcher_partial_path.read_text())
                 return {int(k): v for k, v in raw.items()}
             except Exception:
                 return {}
@@ -1678,7 +1696,8 @@ async def projections_fetch(request: Request):
                     else:
                         pool = rw_df.copy()
                         fallback_players: list[dict] = []
-                        mo_sidecar_reasons = _read_mo_sidecar()
+                        mo_sidecar_reasons  = _read_mo_sidecar()
+                        mo_pitcher_partials = _read_mo_pitcher_partial()
                         _itm = _ensure_id_to_team()
 
                         if not mo_df.empty and {"player_id", "mean", "std_dev"}.issubset(mo_df.columns):
@@ -1706,13 +1725,17 @@ async def projections_fetch(request: Request):
                                 for _, row in fallback_rows.iterrows():
                                     pid_val = int(row["player_id"]) if "player_id" in fallback_rows.columns else 0
                                     is_pitcher = bool(row.get("lineup_slot") == 10) if "lineup_slot" in fallback_rows.columns else False
-                                    fallback_players.append({
+                                    entry: dict = {
                                         "name": row["name"],
                                         "team": _itm.get(pid_val, ""),
                                         "reason": mo_sidecar_reasons.get(pid_val, ""),
                                         "player_id": pid_val,
                                         "is_pitcher": is_pitcher,
-                                    })
+                                    }
+                                    if is_pitcher and pid_val in mo_pitcher_partials:
+                                        entry["partial_mean"]    = mo_pitcher_partials[pid_val]["mean"]
+                                        entry["partial_std_dev"] = mo_pitcher_partials[pid_val]["std_dev"]
+                                    fallback_players.append(entry)
                         else:
                             result_event = _log(
                                 "Warning: Market odds unavailable; using RotoWire projections for all players."
@@ -1796,7 +1819,7 @@ async def projections_fetch(request: Request):
                 returncode = 1
                 result_event = _log(f"Warning: merge error — {exc}")
             finally:
-                for p in (rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path, mo_team_warn_path):
+                for p in (rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path, mo_team_warn_path, mo_pitcher_partial_path):
                     try:
                         p.unlink(missing_ok=True)
                     except Exception:
