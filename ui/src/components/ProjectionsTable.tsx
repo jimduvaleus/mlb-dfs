@@ -22,21 +22,31 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
 
   useEffect(() => {
     fetchTeamOwnershipReductions().then(r => {
-      setReductionSlateId(r.slate_id)
-      const s: Record<string, string> = {}
-      for (const [t, v] of Object.entries(r.team_ownership_reductions)) {
-        if (v > 0) s[t] = String(v)
-      }
-      setTeamReductions(s)
+      setReductionSlateId(prev => {
+        // Only overwrite local reductions when the slate genuinely changes.
+        // Frequent player refreshes within the same slate must not clobber state.
+        if (r.slate_id !== prev) {
+          const s: Record<string, string> = {}
+          for (const [t, v] of Object.entries(r.team_ownership_reductions)) {
+            if (v > 0) s[t] = String(v)
+          }
+          setTeamReductions(s)
+        }
+        return r.slate_id
+      })
     }).catch(() => {})
 
     fetchPlayerProjectionOverrides().then(r => {
-      setOverrideSlateId(r.slate_id)
-      const overrides: Record<number, number> = {}
-      for (const [k, v] of Object.entries(r.player_projection_overrides)) {
-        overrides[Number(k)] = v
-      }
-      setProjOverrides(overrides)
+      setOverrideSlateId(prev => {
+        if (r.slate_id !== prev) {
+          const overrides: Record<number, number> = {}
+          for (const [k, v] of Object.entries(r.player_projection_overrides)) {
+            overrides[Number(k)] = v
+          }
+          setProjOverrides(overrides)
+        }
+        return r.slate_id
+      })
     }).catch(() => {})
   }, [players])
 
