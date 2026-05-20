@@ -372,6 +372,9 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
                   <span key={p.name}>
                     {i > 0 && ', '}
                     {p.name}
+                    {p.partial_mean != null
+                      ? <span className="merge-info-partial-proj" title="Partial MO projection (win market unavailable)"> {p.partial_mean.toFixed(1)} pts w/o win</span>
+                      : null}
                     {p.reason
                       ? <span className="merge-info-reason" title={p.reason}> ⓘ</span>
                       : null}

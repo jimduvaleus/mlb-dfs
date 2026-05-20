@@ -276,6 +276,8 @@ export interface MergePlayer {
   reason?: string
   player_id?: number
   is_pitcher?: boolean
+  partial_mean?: number
+  partial_std_dev?: number
 }
 
 export interface CappedPlayer {

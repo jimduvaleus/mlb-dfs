@@ -1565,6 +1565,55 @@ def _compute_pitcher_projection(
     return mean, max(math.sqrt(var), 1.0)
 
 
+def _compute_pitcher_partial_no_win(
+    player_markets: dict[str, list[tuple[float, float]]],
+    platform: str = "draftkings",
+) -> tuple[float, float] | None:
+    """
+    Compute (mean, std_dev) for a pitcher when only 'Player Record A Win' is absent.
+    Returns None if any other required market is also missing.
+    Used exclusively to populate the UI fallback banner — the pitcher still falls
+    back to RotoWire for simulation; this number is for informational display only.
+    """
+    c = _FD_PITCHER if platform == "fanduel" else _DK_PITCHER
+
+    def get_lam(key: str) -> float:
+        lp = player_markets.get(key, [])
+        if not lp:
+            return 0.0
+        lam = _fit_lambda(lp)
+        return lam if lam is not None else 0.0
+
+    e_outs = get_lam(MK_OUTS)
+    e_k    = get_lam(MK_K)
+    e_ha   = get_lam(MK_HA)
+    e_bba  = get_lam(MK_BBA)
+    e_er   = get_lam(MK_ER)
+
+    if any(v == 0 for v in (e_outs, e_k, e_ha, e_bba, e_er)):
+        return None
+
+    e_ip  = e_outs / 3.0
+    e_hbp = e_ip * HBP_PER_INNING_PITCHER
+    p_qs  = _compute_qs_probability(e_outs, e_er) if platform == "fanduel" else 0.0
+
+    mean = (
+        e_outs * c["out"] + e_k * c["k"] + p_qs * c["qs"]
+        + e_er  * c["er"]
+        + e_ha  * c["h"] + e_bba * c["bb"] + e_hbp * c["hbp"]
+    )
+    var = (
+        e_outs * c["out"] ** 2
+        + e_k   * c["k"]   ** 2
+        + e_er  * c["er"]  ** 2
+        + e_ha  * c["h"]   ** 2
+        + e_bba * c["bb"]  ** 2
+        + e_hbp * c["hbp"] ** 2
+        + p_qs * (1.0 - p_qs) * c["qs"] ** 2
+    )
+    return mean, max(math.sqrt(var), 1.0)
+
+
 # ---------------------------------------------------------------------------
 # Playwright orchestration
 # ---------------------------------------------------------------------------
@@ -1995,6 +2044,8 @@ def build_projections_csv(
     unmatched: list[str] = []
     # player_id → reason string for batters that couldn't be projected from market data
     fallback_reasons: dict[int, str] = {}
+    # player_id → partial (no-win) projection when only the win market is missing
+    pitcher_partial_projections: dict[int, dict] = {}
     # player_id → list of market keys that hit the hard cap
     cap_warnings: dict[int, list[str]] = {}
     # player_id → list of soft-optional market keys that were absent (e.g. SB)
@@ -2017,6 +2068,12 @@ def build_projections_csv(
         if is_pitcher:
             result = _compute_pitcher_projection(player_markets, platform=platform)
             if result is None:
+                partial = _compute_pitcher_partial_no_win(player_markets, platform=platform)
+                if partial is not None:
+                    pitcher_partial_projections[pid] = {
+                        "mean": round(partial[0], 2),
+                        "std_dev": round(partial[1], 2),
+                    }
                 log.info(
                     "No projection for pitcher %s (pid=%d) — markets present: %s",
                     player_name, pid, list(player_markets.keys()) or "none",
@@ -2118,6 +2175,18 @@ def build_projections_csv(
         log.debug("Wrote fallback reasons for %d players → %s", len(fallback_reasons), sidecar_path)
     except Exception as e:
         log.warning("Could not write fallback sidecar: %s", e)
+
+    partial_path = _op.parent / (_op.stem + "_pitcher_partial.json")
+    try:
+        partial_path.write_text(
+            json.dumps({str(pid): proj for pid, proj in pitcher_partial_projections.items()}, indent=2)
+        )
+        log.debug(
+            "Wrote partial pitcher projections for %d player(s) → %s",
+            len(pitcher_partial_projections), partial_path,
+        )
+    except Exception as e:
+        log.warning("Could not write pitcher partial sidecar: %s", e)
 
     caps_path = _op.parent / (_op.stem + "_caps.json")
     try:
