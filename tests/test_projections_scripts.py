@@ -427,6 +427,60 @@ class TestDFFHelpers:
         assert _extract_date_from_fd_path(path) == "2026-04-12"
 
 
+def _make_link(slate_id: str, game_count: int, href: str | None = None) -> dict:
+    return {
+        "href": href or f"/mlb/projections/draftkings/2026-05-20?slate={slate_id}",
+        "text": f"{game_count} Games",
+        "date": "2026-05-20",
+        "slate_id": slate_id,
+        "game_count": game_count,
+    }
+
+
+class TestSelectSlateCandidates:
+    def test_prefers_superset_over_closer_subset(self):
+        from scripts.fetch_dff_projections import _select_slate_candidates
+        # DK=8; DFF has 7 (closer but smaller) and 10 (further but superset)
+        links = [_make_link("A", 7), _make_link("B", 10)]
+        result = _select_slate_candidates(links, game_count=8)
+        assert result[0]["slate_id"] == "B"
+
+    def test_exact_match_first(self):
+        from scripts.fetch_dff_projections import _select_slate_candidates
+        links = [_make_link("A", 6), _make_link("B", 10)]
+        result = _select_slate_candidates(links, game_count=6)
+        assert result[0]["slate_id"] == "A"
+
+    def test_smallest_superset_among_multiple(self):
+        from scripts.fetch_dff_projections import _select_slate_candidates
+        # DK=6; DFF has 8 and 12 — prefer 8 (smallest superset)
+        links = [_make_link("A", 8), _make_link("B", 12)]
+        result = _select_slate_candidates(links, game_count=6)
+        assert result[0]["slate_id"] == "A"
+
+    def test_falls_back_to_closest_when_no_superset(self):
+        from scripts.fetch_dff_projections import _select_slate_candidates
+        # DK=10; DFF only has 6 and 7 — fall back to closest (7)
+        links = [_make_link("A", 6), _make_link("B", 7)]
+        result = _select_slate_candidates(links, game_count=10)
+        assert result[0]["slate_id"] == "B"
+
+    def test_tiebreak_larger_when_same_diff(self):
+        from scripts.fetch_dff_projections import _select_slate_candidates
+        # DK=5; DFF has 3 and 7 — both diff=2, prefer 7 (more games)
+        links = [_make_link("A", 3), _make_link("B", 7)]
+        result = _select_slate_candidates(links, game_count=5)
+        assert result[0]["slate_id"] == "B"
+
+    def test_two_same_size_slates_both_returned(self):
+        from scripts.fetch_dff_projections import _select_slate_candidates
+        # Two 6-game slates (today's scenario) — both should appear in result
+        links = [_make_link("A", 6), _make_link("B", 6)]
+        result = _select_slate_candidates(links, game_count=6)
+        assert len(result) == 2
+        assert {r["slate_id"] for r in result} == {"A", "B"}
+
+
 class TestDFFBuildProjectionsCSV:
     def _player_rows(self):
         return [
@@ -495,6 +549,59 @@ class TestDFFBuildProjectionsCSV:
         df = pd.read_csv(output)
         for col in ("player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"):
             assert col in df.columns
+
+    def test_team_filter_discards_off_slate_players(self, tmp_path):
+        """Players from teams not in the DK slate must be filtered out."""
+        from scripts.fetch_dff_projections import build_projections_csv
+        # SAMPLE_DK_SPECS has PHI, ARI, NYY, TB, LAD, SF — BOS is not present
+        slate_df = _make_slate_df(SAMPLE_DK_SPECS)
+        output = str(tmp_path / "proj.csv")
+        rows = self._player_rows() + [{
+            "data-name": "Rafael Devers", "data-pos": "3B",
+            "data-salary": "6000", "data-ppg_proj": "14.0",
+            "data-depth_rank": "4", "data-starter_flag": "1",
+            "data-team": "BOS",
+        }]
+        with patch("scripts.fetch_dff_projections.fetch_player_and_team_rows", return_value=(rows, [])):
+            build_projections_csv(
+                slate_df=slate_df, target_date="2026-04-12", output_path=output
+            )
+        df = pd.read_csv(output)
+        assert "Rafael Devers" not in df["name"].values
+
+    def test_team_filter_keeps_slate_players(self, tmp_path):
+        """Players from slate teams must not be filtered out."""
+        from scripts.fetch_dff_projections import build_projections_csv
+        slate_df = _make_slate_df(SAMPLE_DK_SPECS)
+        output = str(tmp_path / "proj.csv")
+        rows = [
+            {
+                "data-name": "Zack Wheeler", "data-pos": "P",
+                "data-salary": "10000", "data-ppg_proj": "25.0",
+                "data-depth_rank": "0", "data-starter_flag": "0",
+                "data-team": "PHI",
+            },
+        ]
+        with patch("scripts.fetch_dff_projections.fetch_player_and_team_rows", return_value=(rows, [])):
+            result = build_projections_csv(
+                slate_df=slate_df, target_date="2026-04-12", output_path=output
+            )
+        assert len(result) == 1
+        assert result.iloc[0]["name"] == "Zack Wheeler"
+
+    def test_slate_teams_passed_to_fetch(self, tmp_path):
+        """build_projections_csv passes slate_teams to fetch_player_and_team_rows."""
+        from scripts.fetch_dff_projections import build_projections_csv
+        slate_df = _make_slate_df(SAMPLE_DK_SPECS)
+        output = str(tmp_path / "proj.csv")
+        with patch("scripts.fetch_dff_projections.fetch_player_and_team_rows") as mock_fetch:
+            mock_fetch.return_value = (self._player_rows(), [])
+            build_projections_csv(
+                slate_df=slate_df, target_date="2026-04-12", output_path=output
+            )
+        call_kwargs = mock_fetch.call_args[1]
+        assert "slate_teams" in call_kwargs
+        assert "PHI" in call_kwargs["slate_teams"]
 
 
 # ---------------------------------------------------------------------------

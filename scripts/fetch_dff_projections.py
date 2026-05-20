@@ -220,6 +220,8 @@ def _match_name(
             team_matches = [c for c in dk_lookup[fkey] if c[2].upper() == dff_team.upper()]
             if team_matches:
                 return _pick_from(team_matches)
+        # Fuzzy name match but no team confirmation — reject to avoid cross-slate false positives
+        return None
     return _pick_from(dk_lookup[matches[0]])
 
 
@@ -372,16 +374,41 @@ async def _get_trigger_links(page, url_segment: str = DK_URL_SEGMENT) -> list[di
     return results
 
 
+def _select_slate_candidates(
+    slate_links: list[dict],
+    game_count: int,
+) -> list[dict]:
+    """Return slate links sorted by preference (best first).
+
+    Prefers slates where game_count >= dk_game_count (potential superset of DK
+    games), picking the smallest such superset.  Falls back to closest available
+    when no superset exists.  Ties broken by most games.
+    """
+    supersets = [l for l in slate_links if (l["game_count"] or 0) >= game_count]
+    pool = supersets if supersets else slate_links
+    return sorted(pool, key=lambda l: (
+        abs((l["game_count"] or 0) - game_count),
+        -(l["game_count"] or 0),
+    ))
+
+
 async def _navigate_to_slate(
     page,
     target_date: str | None,
     game_count: int,
+    slate_teams: set[str] | None = None,
     url_segment: str = DK_URL_SEGMENT,
 ) -> None:
     """
     Use the projections-links-trigger UI to navigate to the best-matching slate
-    for *target_date*.  Clicks the date link first if slate links for *target_date*
-    are not yet visible, then picks by game_count closest to *game_count*.
+    for *target_date*.
+
+    Selection strategy:
+    1. Prefer slates whose game_count >= dk_game_count (potential superset).
+       Among those, pick the smallest.  Fall back to closest if none qualify.
+    2. When multiple slates tie on game_count and slate_teams is provided,
+       navigate to each in turn, score team overlap, and keep the best.
+       This handles days with two same-size slates (e.g. two 6-game slates).
     """
     links = await _get_trigger_links(page, url_segment=url_segment)
 
@@ -404,16 +431,51 @@ async def _navigate_to_slate(
         log.warning("No slate links found for %s after navigation.", target_date)
         return
 
-    # Pick slate with game_count closest to requested count; break ties by most games
-    best = min(
-        slate_links,
-        key=lambda l: (abs((l["game_count"] or 0) - game_count), -(l["game_count"] or 0)),
-    )
-    label = best["text"].split("\n")[0]
-    log.info("Selecting DFF slate: %s  (%s)", best["href"], label)
+    ordered = _select_slate_candidates(slate_links, game_count)
+    top_gc = ordered[0]["game_count"] or 0
+    tied = [c for c in ordered if (c["game_count"] or 0) == top_gc]
 
-    await page.goto(f"{BASE_URL}{best['href']}", wait_until="domcontentloaded")
-    await page.wait_for_selector("tr.projections-listing", timeout=20000)
+    if len(tied) == 1 or not slate_teams:
+        best = tied[0]
+        label = best["text"].split("\n")[0]
+        log.info("Selecting DFF slate: %s  (%s)", best["href"], label)
+        await page.goto(f"{BASE_URL}{best['href']}", wait_until="domcontentloaded")
+        await page.wait_for_selector("tr.projections-listing", timeout=20000)
+        return
+
+    # Multiple slates with the same game count — pick by team overlap with the DK slate.
+    best = tied[0]
+    best_overlap = -1
+    current_href: str | None = None
+
+    for candidate in tied:
+        if current_href != candidate["href"]:
+            await page.goto(f"{BASE_URL}{candidate['href']}", wait_until="domcontentloaded")
+            await page.wait_for_selector("tr.projections-listing", timeout=20000)
+            current_href = candidate["href"]
+
+        raw_teams: list[str] = await page.evaluate(
+            """() => Array.from(document.querySelectorAll('tr.projections-listing'))
+                        .map(tr => tr.getAttribute('data-team') || '')
+                        .filter(t => t !== '')"""
+        )
+        dff_teams_on_page = {_normalise_dff_team(t) for t in raw_teams}
+        overlap = len(dff_teams_on_page & slate_teams)
+        label = candidate["text"].split("\n")[0]
+        log.info(
+            "Slate candidate %s (%s): %d/%d DK teams found.",
+            candidate["href"], label, overlap, len(slate_teams),
+        )
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best = candidate
+
+    if current_href != best["href"]:
+        await page.goto(f"{BASE_URL}{best['href']}", wait_until="domcontentloaded")
+        await page.wait_for_selector("tr.projections-listing", timeout=20000)
+
+    label = best["text"].split("\n")[0]
+    log.info("Selected DFF slate: %s  (%s)  [team overlap %d/%d]", best["href"], label, best_overlap, len(slate_teams))
 
 
 async def _fetch_rows_playwright(
@@ -422,6 +484,7 @@ async def _fetch_rows_playwright(
     slate_override: str | None = None,
     url_segment: str = DK_URL_SEGMENT,
     debug: bool = False,
+    slate_teams: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """
     Launch headless Chromium, navigate to the correct DFF slate, and return
@@ -465,10 +528,10 @@ async def _fetch_rows_playwright(
                         "Default page shows %s; navigating to %s via UI.",
                         loaded_date, target_date,
                     )
-                    await _navigate_to_slate(page, target_date, game_count, url_segment)
+                    await _navigate_to_slate(page, target_date, game_count, slate_teams, url_segment)
                 else:
                     # Correct date already loaded — still pick the best sub-slate
-                    await _navigate_to_slate(page, target_date, game_count, url_segment)
+                    await _navigate_to_slate(page, target_date, game_count, slate_teams, url_segment)
 
         # Verify final loaded date
         final_date: str | None = await page.evaluate("() => window.url_start_date || null")
@@ -513,10 +576,11 @@ def fetch_player_rows(
     slate_override: str | None = None,
     url_segment: str = DK_URL_SEGMENT,
     debug: bool = False,
+    slate_teams: set[str] | None = None,
 ) -> list[dict]:
     """Synchronous entry point for Playwright-based player data fetch (player rows only)."""
     player_rows, _ = asyncio.run(
-        _fetch_rows_playwright(target_date, game_count, slate_override, url_segment, debug)
+        _fetch_rows_playwright(target_date, game_count, slate_override, url_segment, debug, slate_teams)
     )
     return player_rows
 
@@ -527,10 +591,11 @@ def fetch_player_and_team_rows(
     slate_override: str | None = None,
     url_segment: str = DK_URL_SEGMENT,
     debug: bool = False,
+    slate_teams: set[str] | None = None,
 ) -> tuple[list[dict], list[dict]]:
     """Synchronous entry point returning (player_rows, team_rows) from one browser session."""
     return asyncio.run(
-        _fetch_rows_playwright(target_date, game_count, slate_override, url_segment, debug)
+        _fetch_rows_playwright(target_date, game_count, slate_override, url_segment, debug, slate_teams)
     )
 
 
@@ -724,8 +789,9 @@ def build_projections_csv(
     if "position" in slate_df.columns:
         pos_map = {int(r["player_id"]): str(r["position"]) for _, r in slate_df.iterrows()}
 
-    # Estimate game count from unique teams / 2
-    game_count = len(_slate_df_teams(slate_df)) // 2
+    # Estimate game count from unique teams / 2; keep slate_teams for slate matching
+    slate_teams = _slate_df_teams(slate_df)
+    game_count = len(slate_teams) // 2
 
     # --- Fetch DFF player rows via Playwright --------------------------------
     raw_rows, team_rows = fetch_player_and_team_rows(
@@ -734,6 +800,7 @@ def build_projections_csv(
         slate_override=slate_override,
         url_segment=url_segment,
         debug=debug,
+        slate_teams=slate_teams,
     )
 
     proj_df = parse_players(raw_rows)
@@ -743,6 +810,22 @@ def build_projections_csv(
         sys.exit(1)
 
     log.info("Parsed %d player rows from DFF.", len(proj_df))
+
+    # Discard players whose team is not in the DK slate — guards against the DFF
+    # script landing on a wrong/larger slate (e.g. main vs turbo mismatch).
+    slate_teams = _slate_df_teams(slate_df)
+    if slate_teams:
+        before_team_filter = len(proj_df)
+        proj_df = proj_df[
+            proj_df["dff_team"].str.upper().isin(slate_teams) | (proj_df["dff_team"] == "")
+        ].copy()
+        discarded = before_team_filter - len(proj_df)
+        if discarded:
+            log.warning(
+                "Discarded %d DFF player row(s) from teams not in the DK slate — "
+                "possible slate mismatch. Run with --debug to investigate.",
+                discarded,
+            )
 
     if debug:
         print("\n--- Parsed projections (first 5) ---")
