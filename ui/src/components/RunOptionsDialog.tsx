@@ -3,13 +3,14 @@ import type { CacheStatus } from '../types'
 
 interface Props {
   cacheStatus: CacheStatus
-  onStart: (useCandidates: boolean, useField: boolean) => void
+  onStart: (useCandidates: boolean, useField: boolean, seedOptimal: boolean) => void
   onDismiss: () => void
 }
 
 export function RunOptionsDialog({ cacheStatus, onStart, onDismiss }: Props) {
   const [useCandidates, setUseCandidates] = useState(cacheStatus.candidates !== null)
   const [useField, setUseField] = useState(cacheStatus.field_k !== null)
+  const [seedOptimal, setSeedOptimal] = useState(false)
 
   const candAvailable = cacheStatus.candidates !== null
   const fieldAvailable = cacheStatus.field_k !== null
@@ -21,10 +22,13 @@ export function RunOptionsDialog({ cacheStatus, onStart, onDismiss }: Props) {
     ? `${cacheStatus.field_k} sample${cacheStatus.field_k !== 1 ? 's' : ''} cached`
     : 'none cached'
 
+  // Seed optimal is only meaningful when generating fresh candidates
+  const seedOptimalDisabled = useCandidates && candAvailable
+
   return (
     <div className="dialog-overlay" onClick={onDismiss}>
       <div className="dialog" onClick={e => e.stopPropagation()}>
-        <p className="dialog-title">Use cached lineups?</p>
+        <p className="dialog-title">Run options</p>
         <p className="dialog-message" style={{ marginBottom: 16 }}>
           Cached lineups reflect a previous run's ownership configuration.
           Ownership changes since then are not included.
@@ -57,9 +61,25 @@ export function RunOptionsDialog({ cacheStatus, onStart, onDismiss }: Props) {
               <strong>Field lineups</strong> — {fieldLabel}
             </span>
           </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: seedOptimalDisabled ? 'default' : 'pointer', opacity: seedOptimalDisabled ? 0.45 : 1 }}>
+            <input
+              type="checkbox"
+              checked={seedOptimal && !seedOptimalDisabled}
+              disabled={seedOptimalDisabled}
+              onChange={e => setSeedOptimal(e.target.checked)}
+            />
+            <span>
+              <strong>Seed with optimal lineups</strong> — prepend top 100 ILP-optimal candidates
+              {seedOptimalDisabled && (
+                <span style={{ color: 'var(--color-text-muted)', fontSize: '0.85em' }}>
+                  {' '}(unavailable when using cached candidates)
+                </span>
+              )}
+            </span>
+          </label>
         </div>
         <div className="dialog-actions">
-          <button className="btn-run" onClick={() => onStart(useCandidates && candAvailable, useField && fieldAvailable)}>
+          <button className="btn-run" onClick={() => onStart(useCandidates && candAvailable, useField && fieldAvailable, seedOptimal && !seedOptimalDisabled)}>
             Start Run
           </button>
           <button className="btn-secondary" onClick={onDismiss}>

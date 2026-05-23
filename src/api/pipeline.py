@@ -439,6 +439,7 @@ class PipelineRunner:
             )
 
             _gpp_stopped = self._stop_check is not None and self._stop_check
+            self._optimal_lineups: list = []  # populated only on fresh (non-cached) runs
 
             # Compute slate fingerprint for lineup cache (mtime_ns:size)
             from pathlib import Path as _Path
@@ -488,16 +489,47 @@ class PipelineRunner:
                     if _slate_fp and not (_gpp_stopped and self._stop_check()):
                         save_candidates(_slate_fp, candidates)
             else:
-                self._cb("gpp_generate_start", {"n_candidates": n_candidates})
-                candidates = gen.generate(
-                    n_candidates=n_candidates,
+                # Optionally seed the first N candidates with ILP-optimal lineups.
+                seed_optimal = gpp_cfg.get("seed_optimal_lineups", False)
+                _n_optimal_target = 100
+                _optimal_lineups: list = []
+
+                if seed_optimal and not (_gpp_stopped and self._stop_check()):
+                    from src.optimization.optimal_lineups import generate_optimal_lineups
+                    self._cb("gpp_optimal_start", {"n_optimal": _n_optimal_target})
+                    _opt_found: list[int] = []
+
+                    def _optimal_progress_cb(n_found: int) -> None:
+                        _opt_found.append(n_found)
+                        self._cb("gpp_optimal_progress", {
+                            "n": n_found, "total": _n_optimal_target,
+                        })
+
+                    _optimal_lineups = generate_optimal_lineups(
+                        cand_players_df,
+                        n=_n_optimal_target,
+                        min_uniques=3,
+                        salary_floor=salary_floor_gpp,
+                        progress_cb=_optimal_progress_cb,
+                    )
+                    self._cb("gpp_optimal_done", {"n_generated": len(_optimal_lineups)})
+
+                n_random = max(0, n_candidates - len(_optimal_lineups))
+                self._cb("gpp_generate_start", {
+                    "n_candidates": n_random + len(_optimal_lineups),
+                    **({"n_from_optimal": len(_optimal_lineups)} if _optimal_lineups else {}),
+                })
+                random_cands = gen.generate(
+                    n_candidates=n_random,
                     max_attempts_multiplier=max_attempts_mult,
                     stop_check=self._stop_check,
                     progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
                 )
+                candidates = _optimal_lineups + random_cands
                 self._cb("gpp_generate_done", {"n_generated": len(candidates)})
                 if _slate_fp and candidates and not (_gpp_stopped and self._stop_check()):
                     save_candidates(_slate_fp, candidates)
+                self._optimal_lineups = _optimal_lineups
 
             logger.info("Candidate pool: %d lineups.", len(candidates))
 
@@ -751,11 +783,37 @@ class PipelineRunner:
                 json.dump({str(k): v for k, v in entry_map.items()}, f)
 
         # --- Notify (after entry augmentation so SSE payload is complete) -
+        _optimal_result = (
+            self._serialize_portfolio(
+                [(lu, 0.0) for lu in self._optimal_lineups], players_df
+            )
+            if getattr(self, "_optimal_lineups", None)
+            else []
+        )
+
+        # --- Persist optimal lineups alongside portfolio (survives restart) -
+        if _optimal_result:
+            from pathlib import Path as _Path
+            from .slate_exclusions import compute_file_fingerprint as _cfp
+            _config_root = _Path(self._config_path).resolve().parent
+            _slate_abs = _config_root / slate_path if slate_path else None
+            _slate_fp = _cfp(_slate_abs)
+            _opt_json_path = os.path.join(output_dir, f"optimal_lineups_{platform.value}.json")
+            with open(_opt_json_path, "w") as _f:
+                json.dump({"lineups": _optimal_result, "slate_fingerprint": _slate_fp}, _f)
         if was_stopped:
             logger.info("Run stopped by user after %d lineups.", len(portfolio))
-            self._cb("stopped", {"portfolio": result, "n_lineups": len(result)})
+            self._cb("stopped", {
+                "portfolio": result,
+                "n_lineups": len(result),
+                "optimal_lineups": _optimal_result,
+            })
         else:
-            self._cb("complete", {"portfolio": result, "n_lineups": len(result)})
+            self._cb("complete", {
+                "portfolio": result,
+                "n_lineups": len(result),
+                "optimal_lineups": _optimal_result,
+            })
 
         return result
 

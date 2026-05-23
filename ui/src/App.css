@@ -695,6 +695,72 @@ button { cursor: pointer; }
   font-weight: 600;
 }
 
+.portfolio-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+}
+
+.portfolio-tab {
+  background: #1a1f2e;
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  color: #a0aec0;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 6px 14px;
+}
+.portfolio-tab:hover { background: #202636; color: #e2e8f0; }
+.portfolio-tab--active {
+  background: #2d3748;
+  border-color: #4a5568;
+  color: #e2e8f0;
+}
+
+.portfolio-optimal-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 14px;
+  padding: 6px 12px;
+  background: rgba(160, 174, 192, 0.1);
+  border: 1px solid rgba(160, 174, 192, 0.25);
+  border-radius: 6px;
+  color: #a0aec0;
+  font-size: 13px;
+  font-weight: 500;
+}
+.portfolio-optimal-banner--hit {
+  background: rgba(72, 187, 120, 0.12);
+  border-color: rgba(72, 187, 120, 0.4);
+  color: #68d391;
+}
+.portfolio-optimal-filter-toggle {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  opacity: 0.85;
+}
+.portfolio-optimal-filter-toggle:hover { opacity: 1; }
+
+.lineup-card--in-portfolio {
+  border-color: rgba(72, 187, 120, 0.5);
+  background: #131a1c;
+}
+.lineup-card--in-portfolio .lineup-card-header {
+  background: rgba(72, 187, 120, 0.08);
+  border-bottom-color: rgba(72, 187, 120, 0.25);
+}
+.lineup-card--in-portfolio .lineup-card-num {
+  color: #68d391;
+}
+
 .portfolio-unconfirmed-banner {
   margin: 0 0 16px;
   padding: 6px 12px;

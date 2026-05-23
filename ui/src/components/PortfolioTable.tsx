@@ -5,6 +5,7 @@ import TeamBadge from './TeamBadge'
 
 interface Props {
   lineups: LineupResult[]
+  optimalLineups?: LineupResult[]
   unconfirmedPlayerIds?: number[]
   onDeleteLineup?: (lineupIndex: number) => void
   replacingLineupIndex?: number | null
@@ -107,7 +108,9 @@ function sortAndAssignPositions(
   return result
 }
 
-export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
+export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
+  const [activeTab, setActiveTab] = useState<'portfolio' | 'optimal'>('portfolio')
+  const [showOnlyInPortfolio, setShowOnlyInPortfolio] = useState(false)
   const [filterPlayer, setFilterPlayer] = useState<PlayerRow | null>(null)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
@@ -161,8 +164,92 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
     ? ' — ' + sortedUnconfirmedPlayers.map(e => `${e.count} ${e.name}`).join(', ')
     : ''
 
+  // Map sorted player-id key → portfolio lineup_index for cross-referencing optimal lineups
+  const portfolioKeyMap = new Map<string, number>(
+    lineups.map(l => [
+      [...l.players.map(p => p.player_id)].sort((a, b) => a - b).join(','),
+      l.lineup_index,
+    ])
+  )
+
+  const optimalInPortfolioCount = optimalLineups.filter(ol => {
+    const key = [...ol.players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
+    return portfolioKeyMap.has(key)
+  }).length
+
+  const showOptimalTab = optimalLineups.length > 0
+
   return (
     <div className="portfolio-table-wrap">
+      {showOptimalTab && (
+        <div className="portfolio-tabs">
+          <button
+            className={`portfolio-tab${activeTab === 'portfolio' ? ' portfolio-tab--active' : ''}`}
+            onClick={() => setActiveTab('portfolio')}
+          >
+            Portfolio ({lineups.length})
+          </button>
+          <button
+            className={`portfolio-tab${activeTab === 'optimal' ? ' portfolio-tab--active' : ''}`}
+            onClick={() => setActiveTab('optimal')}
+          >
+            Optimal ({optimalLineups.length})
+          </button>
+        </div>
+      )}
+      {activeTab === 'optimal' ? (
+        <>
+        <div className={`portfolio-optimal-banner${optimalInPortfolioCount > 0 ? ' portfolio-optimal-banner--hit' : ''}`}>
+          <span>{optimalInPortfolioCount} / {optimalLineups.length} optimal lineup{optimalLineups.length !== 1 ? 's' : ''} selected in portfolio</span>
+          {optimalInPortfolioCount > 0 && (
+            <label className="portfolio-optimal-filter-toggle">
+              <input
+                type="checkbox"
+                checked={showOnlyInPortfolio}
+                onChange={e => setShowOnlyInPortfolio(e.target.checked)}
+              />
+              Show included only
+            </label>
+          )}
+        </div>
+        <div className="portfolio-cards">
+          {optimalLineups.filter(ol => {
+            if (!showOnlyInPortfolio) return true
+            const key = [...ol.players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
+            return portfolioKeyMap.has(key)
+          }).map(ol => {
+            const key = [...ol.players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
+            const portfolioIndex = portfolioKeyMap.get(key)
+            const sorted = sortAndAssignPositions(ol.players, platform)
+            const stack = getStackNotation(ol.players)
+            return (
+              <div key={ol.lineup_index} className={`lineup-card${portfolioIndex != null ? ' lineup-card--in-portfolio' : ''}`}>
+                <div className="lineup-card-header">
+                  <span className="lineup-card-num">
+                    {portfolioIndex != null ? `#${portfolioIndex} in portfolio` : `Optimal #${ol.lineup_index}`}
+                  </span>
+                  <span className="lineup-card-salary">${ol.lineup_salary.toLocaleString()}</span>
+                  <div className="lineup-card-header-right">
+                    {stack && <span className="lineup-card-stack">{stack}</span>}
+                  </div>
+                </div>
+                <div className="lineup-card-players">
+                  {sorted.map(({ player: p, displayPos }, i) => (
+                    <div key={i} className="lineup-player">
+                      <span className="lineup-player-pos">{displayPos}</span>
+                      <span className="lineup-player-name">{p.name}</span>
+                      <TeamBadge team={p.team} className="lineup-player-team" />
+                      <span className="lineup-player-sal">${(p.salary / 1000).toFixed(1)}k</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+        </>
+      ) : (
+      <>
       <h3>Portfolio — {filterPlayer ? `${visibleLineups.length} / ${lineups.length}` : lineups.length} Lineups</h3>
       <div className="portfolio-filter" ref={searchWrapRef}>
         {filterPlayer ? (
@@ -266,6 +353,8 @@ export function PortfolioTable({ lineups, unconfirmedPlayerIds, onDeleteLineup, 
           )
         })}
       </div>
+      </>
+      )}
     </div>
   )
 }

@@ -54,6 +54,7 @@ class GppConfig(BaseModel):
     holdout_fraction: float = 0.0
     candidate_batch_size: int = 500
     max_attempts_multiplier: int = 50
+    seed_optimal_lineups: bool = False
 
 
 class AppConfig(BaseModel):

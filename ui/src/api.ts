@@ -71,6 +71,14 @@ export async function fetchPortfolio(platform?: string): Promise<LineupResult[]>
   return data
 }
 
+export async function fetchOptimalLineups(platform?: string): Promise<LineupResult[]> {
+  const url = platform ? `/api/portfolio/optimal?platform=${encodeURIComponent(platform)}` : '/api/portfolio/optimal'
+  const res = await fetch(url)
+  if (res.status === 404) return []
+  if (!res.ok) throw new Error(`Failed to load optimal lineups: ${res.statusText}`)
+  return res.json()
+}
+
 export async function fetchRunStatus(): Promise<{ status: string; error: string | null }> {
   const res = await fetch('/api/run/status')
   if (!res.ok) throw new Error(`Failed to get run status`)

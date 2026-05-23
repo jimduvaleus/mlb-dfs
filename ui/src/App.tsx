@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import type { AppConfig, CacheStatus, LineupResult, MergeInfo, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
-import { dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
+import { dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchOptimalLineups, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -20,6 +20,7 @@ type Tab = 'config' | 'projections' | 'slate' | 'run' | 'portfolio' | 'metrics'
 interface State {
   config: AppConfig | null
   portfolio: LineupResult[]
+  optimalLineups: LineupResult[]
   runStatus: RunStatus
   activeTab: Tab
   unconfirmedPlayerIds: number[]
@@ -30,6 +31,7 @@ interface State {
 type Action =
   | { type: 'set_config'; config: AppConfig }
   | { type: 'set_portfolio'; portfolio: LineupResult[] }
+  | { type: 'set_optimal_lineups'; lineups: LineupResult[] }
   | { type: 'set_run_status'; status: RunStatus }
   | { type: 'set_tab'; tab: Tab }
   | { type: 'set_unconfirmed'; ids: number[] }
@@ -42,6 +44,8 @@ function reducer(state: State, action: Action): State {
       return { ...state, config: action.config }
     case 'set_portfolio':
       return { ...state, portfolio: action.portfolio }
+    case 'set_optimal_lineups':
+      return { ...state, optimalLineups: action.lineups }
     case 'set_run_status':
       return { ...state, runStatus: action.status }
     case 'set_tab':
@@ -58,6 +62,7 @@ function reducer(state: State, action: Action): State {
 const initial: State = {
   config: null,
   portfolio: [],
+  optimalLineups: [],
   runStatus: 'idle',
   activeTab: 'config',
   unconfirmedPlayerIds: [],
@@ -118,13 +123,16 @@ export default function App() {
     fetchConfig()
       .then(cfg => {
         dispatch({ type: 'set_config', config: cfg })
-        // Load the platform-specific portfolio for the current platform
-        return fetchPortfolio(cfg.platform)
+        // Load the platform-specific portfolio and optimal lineups for the current platform
+        return Promise.all([fetchPortfolio(cfg.platform), fetchOptimalLineups(cfg.platform)])
       })
-      .then(portfolio => {
+      .then(([portfolio, optimalLineups]) => {
         if (portfolio.length > 0) {
           dispatch({ type: 'set_portfolio', portfolio })
           dispatch({ type: 'set_run_status', status: 'complete' })
+        }
+        if (optimalLineups.length > 0) {
+          dispatch({ type: 'set_optimal_lineups', lineups: optimalLineups })
         }
       })
       .catch(e => setConfigError(String(e)))
@@ -152,6 +160,8 @@ export default function App() {
       setProjFetchExcluded([])
       setMergeInfo(null)
       setProjStatusTrigger(t => t + 1)
+      // Slate path changed — clear optimal lineups (server will also reject stale fingerprint)
+      dispatch({ type: 'set_optimal_lineups', lineups: [] })
     } else {
       setProjFetchExcluded(Array.isArray(all[platform]) ? all[platform] : [])
     }
@@ -192,11 +202,13 @@ export default function App() {
       if (event.stage === 'complete') {
         const ce = event as CompleteEvent
         dispatch({ type: 'set_portfolio', portfolio: ce.portfolio })
+        dispatch({ type: 'set_optimal_lineups', lineups: ce.optimal_lineups ?? [] })
         dispatch({ type: 'set_run_status', status: 'complete' })
         dispatch({ type: 'set_tab', tab: 'portfolio' })
       } else if (event.stage === 'stopped') {
         const se = event as StoppedEvent
         dispatch({ type: 'set_portfolio', portfolio: se.portfolio })
+        dispatch({ type: 'set_optimal_lineups', lineups: se.optimal_lineups ?? [] })
         dispatch({ type: 'set_run_status', status: 'stopped' })
         dispatch({ type: 'set_tab', tab: 'portfolio' })
         setStopPending(false)
@@ -210,17 +222,19 @@ export default function App() {
     }
   }, [events])
 
-  const _doStartRun = (useCandidates: boolean, useField: boolean) => {
+  const _doStartRun = (useCandidates: boolean, useField: boolean, seedOptimal: boolean = false) => {
     setShowRunOptionsDialog(false)
     setPendingCacheStatus(null)
     resetSSE()
     setShowUploadDialog(false)
     setStopPending(false)
     dispatch({ type: 'set_run_status', status: 'running' })
+    dispatch({ type: 'set_optimal_lineups', lineups: [] })
     dispatch({ type: 'set_tab', tab: 'run' })
     const params: Record<string, string> = {}
     if (useCandidates) params.use_candidates = 'true'
     if (useField) params.use_field = 'true'
+    if (seedOptimal) params.seed_optimal = 'true'
     startSSE(Object.keys(params).length ? params : undefined)
   }
 
@@ -383,14 +397,16 @@ export default function App() {
                   dispatch({ type: 'set_config', config: cfg })
                   if (cfg.platform !== prevPlatform) {
                     refreshProjectionPlayers()
-                    // Platform changed — load the portfolio for the new platform (may be empty)
-                    fetchPortfolio(cfg.platform)
-                      .then(portfolio => {
+                    // Platform changed — load the portfolio and optimal lineups for the new platform
+                    Promise.all([fetchPortfolio(cfg.platform), fetchOptimalLineups(cfg.platform)])
+                      .then(([portfolio, optimalLineups]) => {
                         dispatch({ type: 'set_portfolio', portfolio })
                         dispatch({ type: 'set_run_status', status: portfolio.length > 0 ? 'complete' : 'idle' })
+                        dispatch({ type: 'set_optimal_lineups', lineups: optimalLineups })
                       })
                       .catch(() => {
                         dispatch({ type: 'set_portfolio', portfolio: [] })
+                        dispatch({ type: 'set_optimal_lineups', lineups: [] })
                         dispatch({ type: 'set_run_status', status: 'idle' })
                       })
                   }
@@ -434,6 +450,7 @@ export default function App() {
         {state.activeTab === 'portfolio' && (
           <PortfolioTable
             lineups={state.portfolio}
+            optimalLineups={state.optimalLineups}
             unconfirmedPlayerIds={state.unconfirmedPlayerIds}
             onDeleteLineup={state.runStatus === 'complete' ? handleDeleteLineup : undefined}
             replacingLineupIndex={replacingIndex}
@@ -473,7 +490,7 @@ export default function App() {
       {showRunOptionsDialog && pendingCacheStatus && (
         <RunOptionsDialog
           cacheStatus={pendingCacheStatus}
-          onStart={(useCandidates, useField) => _doStartRun(useCandidates, useField)}
+          onStart={(useCandidates, useField, seedOptimal) => _doStartRun(useCandidates, useField, seedOptimal)}
           onDismiss={() => { setShowRunOptionsDialog(false); setPendingCacheStatus(null) }}
         />
       )}

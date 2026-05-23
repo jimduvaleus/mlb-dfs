@@ -59,6 +59,7 @@ app = FastAPI(title="MLB DFS Optimizer")
 _state: dict = {
     "status": "idle",      # idle | running | complete | stopped | error
     "portfolio": None,     # PortfolioResult dict or None
+    "optimal_lineups": None,  # list[LineupResult] or None
     "error": None,
     "_runner_last": None,  # Last PipelineRunner instance (for upload file writing)
 }
@@ -222,6 +223,34 @@ def _load_portfolio_from_csv(platform_val: str) -> list[dict] | None:
         return None  # corrupt or missing CSV — return nothing
 
 
+def _optimal_lineups_path(platform_val: str | None = None) -> Path:
+    cfg = read_config()
+    if platform_val is None:
+        platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+    output_dir = cfg.paths.output_dir or "outputs"
+    base = PROJECT_ROOT / output_dir if not Path(output_dir).is_absolute() else Path(output_dir)
+    return base / f"optimal_lineups_{platform_val}.json"
+
+
+def _load_optimal_lineups_from_json(platform_val: str) -> list[dict] | None:
+    """Load persisted optimal lineups, returning None if missing or slate fingerprint is stale."""
+    try:
+        path = _optimal_lineups_path(platform_val)
+        if not path.exists():
+            return None
+        with open(path) as f:
+            data = json.load(f)
+        stored_fp = data.get("slate_fingerprint", "")
+        if stored_fp:
+            current_fp = compute_file_fingerprint(_get_slate_file_path())
+            if current_fp != stored_fp:
+                return None  # slate changed — discard
+        lineups = data.get("lineups")
+        return lineups if lineups else None
+    except Exception:
+        return None
+
+
 @app.on_event("startup")
 def _load_persisted_portfolio() -> None:
     """Restore the last portfolio from the current-platform CSV so the UI shows it after restart."""
@@ -234,6 +263,19 @@ def _load_persisted_portfolio() -> None:
             _state["status"] = "complete"
     except Exception:
         pass  # corrupt or missing config/CSV — start fresh
+
+
+@app.on_event("startup")
+def _load_persisted_optimal_lineups() -> None:
+    """Restore the last optimal lineups from JSON (if slate fingerprint still matches)."""
+    try:
+        cfg = read_config()
+        platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+        lineups = _load_optimal_lineups_from_json(platform_val)
+        if lineups:
+            _state["optimal_lineups"] = lineups
+    except Exception:
+        pass
 
 
 @app.on_event("startup")
@@ -2060,6 +2102,7 @@ async def run_stream(
     request: Request,
     use_candidates: bool = False,
     use_field: bool = False,
+    seed_optimal: bool = False,
 ):
     if _state["status"] in ("running", "replacing"):
         raise HTTPException(409, "A run is already in progress")
@@ -2079,8 +2122,22 @@ async def run_stream(
     def run_pipeline() -> None:
         try:
             from .pipeline import PipelineRunner
+            import yaml as _yaml
+            _cfg_path = str(PROJECT_ROOT / "config.yaml")
+            if seed_optimal:
+                with open(_cfg_path) as _f:
+                    _cfg = _yaml.safe_load(_f) or {}
+                _cfg.setdefault("gpp", {})["seed_optimal_lineups"] = True
+                import tempfile, os as _os
+                _tmp = tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".yaml", delete=False,
+                    dir=str(PROJECT_ROOT),
+                )
+                _yaml.dump(_cfg, _tmp)
+                _tmp.close()
+                _cfg_path = _tmp.name
             runner = PipelineRunner(
-                str(PROJECT_ROOT / "config.yaml"),
+                _cfg_path,
                 progress_cb,
                 stop_check=_stop_event.is_set,
                 use_cached_candidates=use_candidates,
@@ -2096,6 +2153,12 @@ async def run_stream(
             err_payload = {"stage": "error", "message": str(exc), "timestamp": int(time.time() * 1000)}
             asyncio.run_coroutine_threadsafe(queue.put(err_payload), loop)
         finally:
+            if seed_optimal and _cfg_path != str(PROJECT_ROOT / "config.yaml"):
+                import os as _os
+                try:
+                    _os.unlink(_cfg_path)
+                except OSError:
+                    pass
             asyncio.run_coroutine_threadsafe(queue.put(None), loop)  # sentinel
 
     async def _sse_generator():
@@ -2146,6 +2209,41 @@ def get_portfolio(platform: str | None = None):
     if _state["portfolio"] is None:
         raise HTTPException(404, "No portfolio available")
     return _state["portfolio"]
+
+
+@app.get("/api/portfolio/optimal")
+def get_optimal_lineups(platform: str | None = None):
+    """Return persisted optimal lineups if they match the current slate fingerprint."""
+    try:
+        cfg = read_config()
+        platform_val = platform or (cfg.platform.value if hasattr(cfg, "platform") else "draftkings")
+    except Exception:
+        platform_val = platform or "draftkings"
+
+    # If a run just completed (in-memory), check in-memory first.
+    if _state["optimal_lineups"] is not None:
+        # Validate against current slate fingerprint before serving in-memory copy.
+        current_fp = compute_file_fingerprint(_get_slate_file_path())
+        path = _optimal_lineups_path(platform_val)
+        if path.exists():
+            try:
+                with open(path) as f:
+                    stored_fp = json.load(f).get("slate_fingerprint", "")
+                if stored_fp and stored_fp != current_fp:
+                    _state["optimal_lineups"] = None
+                    raise HTTPException(404, "Optimal lineups invalidated by slate change")
+            except HTTPException:
+                raise
+            except Exception:
+                pass
+        return _state["optimal_lineups"]
+
+    # Fall through to disk.
+    lineups = _load_optimal_lineups_from_json(platform_val)
+    if lineups is None:
+        raise HTTPException(404, "No optimal lineups available")
+    _state["optimal_lineups"] = lineups
+    return lineups
 
 
 # ---------------------------------------------------------------------------

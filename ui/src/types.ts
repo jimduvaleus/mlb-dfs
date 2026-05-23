@@ -48,6 +48,7 @@ export interface GppConfig {
   holdout_fraction: number
   candidate_batch_size: number
   max_attempts_multiplier: number
+  seed_optimal_lineups: boolean
 }
 
 export interface AppConfig {
@@ -129,6 +130,9 @@ export type SSEStage =
   | 'contest_ev_start'
   | 'contest_ev_complete'
   | 'upload_files'
+  | 'gpp_optimal_start'
+  | 'gpp_optimal_progress'
+  | 'gpp_optimal_done'
   | 'gpp_generate_start'
   | 'gpp_generate_progress'
   | 'gpp_generate_done'
@@ -225,6 +229,12 @@ export interface ContestEvCompleteEvent extends SSEEvent {
   ev_results: ContestEvResult[]
 }
 
+export interface GppOptimalProgressEvent extends SSEEvent {
+  stage: 'gpp_optimal_progress'
+  n: number
+  total: number
+}
+
 export interface GppGenerateProgressEvent extends SSEEvent {
   stage: 'gpp_generate_progress'
   n: number
@@ -255,12 +265,14 @@ export interface CompleteEvent extends SSEEvent {
   stage: 'complete'
   portfolio: LineupResult[]
   n_lineups: number
+  optimal_lineups?: LineupResult[]
 }
 
 export interface StoppedEvent extends SSEEvent {
   stage: 'stopped'
   portfolio: LineupResult[]
   n_lineups: number
+  optimal_lineups?: LineupResult[]
 }
 
 export interface ErrorEvent extends SSEEvent {

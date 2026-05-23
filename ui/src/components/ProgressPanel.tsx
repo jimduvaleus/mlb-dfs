@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -28,6 +28,8 @@ const STAGE_LABELS: Record<string, string> = {
   compute_target: 'Compute target',
   calibrate_beta: 'Calibrate beta',
   optimize_lineup: 'Optimize lineups',
+  gpp_optimal_start: 'Optimal seeding',
+  gpp_optimal_done: 'Optimal seeding',
   gpp_generate_start: 'Generate candidates',
   gpp_generate_done: 'Generate candidates',
   gpp_score_start: 'Score candidates',
@@ -40,7 +42,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
-const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress', 'gpp_optimal_progress'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
@@ -65,6 +67,9 @@ export function ProgressPanel({ events, running }: Props) {
     const last = events[events.length - 1]
     const isLiveProgressEvent =
       last?.stage === 'optimize_lineup' ||
+      last?.stage === 'gpp_optimal_start' ||
+      last?.stage === 'gpp_optimal_progress' ||
+      last?.stage === 'gpp_optimal_done' ||
       last?.stage === 'gpp_generate_start' ||
       last?.stage === 'gpp_generate_progress' ||
       last?.stage === 'gpp_generate_done' ||
@@ -102,10 +107,17 @@ export function ProgressPanel({ events, running }: Props) {
   const elapsed = first && last ? last.timestamp - first.timestamp : null
 
   const isGpp = events.some(e =>
+    e.stage === 'gpp_optimal_start' || e.stage === 'gpp_optimal_done' ||
     e.stage === 'gpp_generate_start' || e.stage === 'gpp_generate_done' ||
     e.stage === 'gpp_score_start' || e.stage === 'gpp_field_inject' ||
     e.stage === 'gpp_select_progress'
   )
+
+  // --- Optimal lineup seeding progress ---
+  const optimalStartEvent = events.find(e => e.stage === 'gpp_optimal_start') as unknown as { n_optimal: number } | undefined
+  const optimalProgressEvents = events.filter(e => e.stage === 'gpp_optimal_progress') as unknown as GppOptimalProgressEvent[]
+  const latestOptimalProgress = optimalProgressEvents[optimalProgressEvents.length - 1]
+  const optimalDone = events.some(e => e.stage === 'gpp_optimal_done')
 
   // --- Non-GPP lineup progress ---
   const latestLineup = [...events]
@@ -161,13 +173,30 @@ export function ProgressPanel({ events, running }: Props) {
     } else if (generateStartEvent) {
       gppPct = 0
       gppLabel = 'Generating candidates…'
+    } else if (optimalDone) {
+      gppPct = 100
+      gppLabel = 'Optimal seeding complete'
+    } else if (latestOptimalProgress && optimalStartEvent) {
+      gppPct = Math.round((latestOptimalProgress.n / latestOptimalProgress.total) * 100)
+      gppLabel = `Seeding optimal: ${latestOptimalProgress.n} / ${latestOptimalProgress.total}`
+    } else if (optimalStartEvent) {
+      gppPct = 0
+      gppLabel = `Seeding optimal: 0 / ${optimalStartEvent.n_optimal}`
     }
   }
 
   // --- ETA ---
   let etaMs: number | null = null
   if (isGpp) {
-    if (running && latestGenerateProgress && !generateDone && generateStartEvent) {
+    if (running && latestOptimalProgress && !optimalDone) {
+      const recent = optimalProgressEvents.slice(-4)
+      if (recent.length >= 2) {
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const avgPerLineup = recentElapsed / (recent.length - 1)
+        const remaining = latestOptimalProgress.total - latestOptimalProgress.n
+        if (remaining > 0) etaMs = avgPerLineup * remaining
+      }
+    } else if (running && latestGenerateProgress && !generateDone && generateStartEvent) {
       const recent = generateProgressEvents.slice(-4)
       if (recent.length >= 2) {
         const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
@@ -317,6 +346,7 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
     if (e.stage === 'optimize_lineup' || e.stage === 'upload_files') continue
     if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress') continue
     // Skip start event once done event is present (collapse into one row)
+    if (e.stage === 'gpp_optimal_start' && hasEvent('gpp_optimal_done')) continue
     if (e.stage === 'gpp_generate_start' && hasEvent('gpp_generate_done')) continue
     if (e.stage === 'gpp_score_start' && hasEvent('gpp_score_done')) continue
     // field_inject is a one-shot cache notification; skip once score is done
@@ -383,10 +413,21 @@ function renderDetail(e: SSEEvent): string {
       const ptLabel = ev.target_percentile != null ? `p${ev.target_percentile}` : 'target'
       return `p90: ${pctFmt(ev.pct_above_p90)} · ${ptLabel}: ${pctFmt(ev.pct_above_target)} · p99: ${pctFmt(ev.pct_above_p99)}`
     }
+    case 'gpp_optimal_start': {
+      const ev = e as unknown as { n_optimal: number }
+      return `Generating ${ev.n_optimal} optimal candidates…`
+    }
+    case 'gpp_optimal_done': {
+      const ev = e as unknown as { n_generated: number }
+      return `${ev.n_generated} optimal candidates seeded`
+    }
     case 'gpp_generate_start': {
-      const ev = e as unknown as { n_candidates: number; n_from_cache?: number }
+      const ev = e as unknown as { n_candidates: number; n_from_cache?: number; n_from_optimal?: number }
       if (ev.n_from_cache != null && ev.n_from_cache > 0) {
         return `Generating ${ev.n_candidates.toLocaleString()} + ${ev.n_from_cache.toLocaleString()} from cache…`
+      }
+      if (ev.n_from_optimal != null && ev.n_from_optimal > 0) {
+        return `Generating ${(ev.n_candidates - ev.n_from_optimal).toLocaleString()} random + ${ev.n_from_optimal} optimal candidates…`
       }
       return `Generating ${ev.n_candidates.toLocaleString()} candidates…`
     }
