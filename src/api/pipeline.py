@@ -491,26 +491,46 @@ class PipelineRunner:
             else:
                 # Optionally seed the first N candidates with ILP-optimal lineups.
                 seed_optimal = gpp_cfg.get("seed_optimal_lineups", False)
-                _n_optimal_target = 100
+                _n_per_batch = 100
+                _n_optimal_target = _n_per_batch * 2  # 100 × stack-4 + 100 × stack-5
                 _optimal_lineups: list = []
 
                 if seed_optimal and not (_gpp_stopped and self._stop_check()):
                     from src.optimization.optimal_lineups import generate_optimal_lineups
                     self._cb("gpp_optimal_start", {"n_optimal": _n_optimal_target})
-                    _opt_found: list[int] = []
 
-                    def _optimal_progress_cb(n_found: int) -> None:
-                        _opt_found.append(n_found)
-                        self._cb("gpp_optimal_progress", {
-                            "n": n_found, "total": _n_optimal_target,
-                        })
+                    def _make_progress_cb(offset: int):
+                        def _cb(n_found: int) -> None:
+                            self._cb("gpp_optimal_progress", {
+                                "n": offset + n_found, "total": _n_optimal_target,
+                            })
+                        return _cb
 
-                    _optimal_lineups = generate_optimal_lineups(
+                    _stack4 = generate_optimal_lineups(
                         cand_players_df,
-                        n=_n_optimal_target,
+                        n=_n_per_batch,
                         min_uniques=3,
+                        min_stack=4,
                         salary_floor=salary_floor_gpp,
-                        progress_cb=_optimal_progress_cb,
+                        progress_cb=_make_progress_cb(0),
+                    )
+                    _stack5 = generate_optimal_lineups(
+                        cand_players_df,
+                        n=_n_per_batch,
+                        min_uniques=3,
+                        min_stack=5,
+                        salary_floor=salary_floor_gpp,
+                        progress_cb=_make_progress_cb(len(_stack4)),
+                    )
+                    # Merge and sort by projected score descending
+                    _mean_map = dict(zip(
+                        cand_players_df["player_id"].astype(int),
+                        cand_players_df["mean"].astype(float),
+                    ))
+                    _optimal_lineups = sorted(
+                        _stack4 + _stack5,
+                        key=lambda lu: sum(_mean_map.get(pid, 0.0) for pid in lu.player_ids),
+                        reverse=True,
                     )
                     self._cb("gpp_optimal_done", {"n_generated": len(_optimal_lineups)})
 

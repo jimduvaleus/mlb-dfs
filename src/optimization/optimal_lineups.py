@@ -13,13 +13,13 @@ from src.optimization.lineup import Lineup
 POS_REQUIREMENTS: dict[str, int] = {
     "P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3,
 }
-MIN_STACK: int = 4
 
 
 def generate_optimal_lineups(
     df: pd.DataFrame,
     n: int = 100,
     min_uniques: int = 3,
+    min_stack: int = 4,
     salary_floor: Optional[float] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
 ) -> list[Lineup]:
@@ -39,6 +39,8 @@ def generate_optimal_lineups(
         Number of lineups to return.
     min_uniques:
         Minimum players that must differ from any single prior lineup.
+    min_stack:
+        Minimum batters from one team required (stack constraint).
     salary_floor:
         Minimum total salary (optional).
     progress_cb:
@@ -174,12 +176,12 @@ def generate_optimal_lineups(
     for t in range(T):
         c.SetCoefficient(z[t], 1)
 
-    # C8: sum(batter_xp[team_t]) - MIN_STACK * z[t] >= 0 (stack linkage)
+    # C8: sum(batter_xp[team_t]) - min_stack * z[t] >= 0 (stack linkage)
     for t, tm in enumerate(batter_teams):
         c = solver.Constraint(0, solver.infinity())
         for j in team_batter_js[tm]:
             c.SetCoefficient(xp[j], 1)
-        c.SetCoefficient(z[t], -float(MIN_STACK))
+        c.SetCoefficient(z[t], -float(min_stack))
 
     # C9: <= 9 players per game (ensures >= 2 games)
     for _g, js in game_js.items():

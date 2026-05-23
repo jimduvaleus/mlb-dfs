@@ -69,7 +69,7 @@ export function RunOptionsDialog({ cacheStatus, onStart, onDismiss }: Props) {
               onChange={e => setSeedOptimal(e.target.checked)}
             />
             <span>
-              <strong>Seed with optimal lineups</strong> — prepend top 100 ILP-optimal candidates
+              <strong>Seed with optimal lineups</strong> — prepend 200 ILP-optimal candidates (100 × 4-stack, 100 × 5-stack)
               {seedOptimalDisabled && (
                 <span style={{ color: 'var(--color-text-muted)', fontSize: '0.85em' }}>
                   {' '}(unavailable when using cached candidates)
