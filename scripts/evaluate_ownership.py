@@ -432,22 +432,14 @@ def compute_models(
         except Exception as exc:
             print(f"  [{_label} skipped: {exc}]")
 
-    # J: sweep _PITCHER_MATCHUP_EXP around current production value (0.75).
-    _MATCHUP_EXPS = [0.30, 0.50]
+    # J: sweep _PITCHER_MATCHUP_EXP around current production value
+    _MATCHUP_EXPS = [0.30]
     for _exp in _MATCHUP_EXPS:
         _label = f"J_mexp_{int(_exp * 100):03d}"
         try:
             models[_label] = _compute_model_j(pool_df, team_totals, _exp)
         except Exception as exc:
             print(f"  [{_label} skipped: {exc}]")
-
-    # L: salary-calibrated ownership — tilts E_production toward expensive
-    # players until implied lineup salary hits the historical field mean from
-    # contest_stats.json.  Silently skipped if the stats file is absent.
-    try:
-        models["L_sal_calibrated"] = _compute_model_l(pool_df, team_totals)
-    except Exception as exc:
-        print(f"  [L_sal_calibrated skipped: {exc}]")
 
     # U: post-hoc power-law calibration sweep to address chalk under-prediction.
     # Applies ownership^b per position group (renormalised), including pitchers.
@@ -462,7 +454,7 @@ def compute_models(
 
     # R: batter scoring-participation composite (runs + RBIs over-0.5 props).
     # Also sweep boost-only variant (no fade for below-average scoring batters).
-    _SCORING_EXPS = [0.10, 0.20]
+    _SCORING_EXPS = [0.15]
     for _exp in _SCORING_EXPS:
         _label = f"R_scoring_{int(_exp * 100):03d}"
         try:
@@ -612,55 +604,6 @@ def _compute_model_k(
     finally:
         for name, old_val in old_vals.items():
             setattr(_own_mod, name, old_val)
-
-
-def _compute_model_l(
-    pool_df: pd.DataFrame,
-    team_totals: dict[str, float] | None,
-) -> np.ndarray:
-    """
-    L_sal_calibrated — E_production with a post-hoc salary tilt to hit the
-    historical field mean lineup salary from contest_stats.json.
-
-    After computing base ownership from compute_heuristic_ownership, applies:
-
-        o'_j = o_j × (s_j / mean_s)^α × C
-
-    where C normalises to preserve Σ o'_j = 10 (total slots unchanged), and
-    α is found by bisection so that Σ(o'_j × s_j) = target_mean_sal.
-
-    α = 0 → identical to E_production.  α > 0 → expensive players gain share;
-    α < 0 → cheap players gain share.  The bisection converges in 50 iterations
-    (~1e-14 precision) over a search range of [−5, 5].
-
-    Skipped (exception raised) if data/processed/contest_stats.json is absent —
-    call analyze_contest_lineups.py first to generate it.
-    """
-    import json as _json
-
-    stats_path = PROJECT_ROOT / "data" / "processed" / "contest_stats.json"
-    with open(stats_path) as _f:
-        target_mean_sal = float(_json.load(_f)["aggregate"]["salary_mean"])
-
-    from src.optimization.ownership import compute_heuristic_ownership
-    base     = compute_heuristic_ownership(pool_df, team_totals)
-    salaries = pool_df["salary"].values.astype(float)
-    mean_s   = salaries.mean()
-    total    = base.sum()  # sum of all ownership values = total roster slots = 10
-
-    def _tilt(alpha: float) -> np.ndarray:
-        w = base * (salaries / mean_s) ** alpha
-        return w * total / w.sum()
-
-    lo, hi = -5.0, 5.0
-    for _ in range(50):
-        mid = (lo + hi) / 2.0
-        if float(np.sum(_tilt(mid) * salaries)) < target_mean_sal:
-            lo = mid
-        else:
-            hi = mid
-
-    return _tilt((lo + hi) / 2.0)
 
 
 
