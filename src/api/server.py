@@ -2038,8 +2038,31 @@ def write_upload():
     return {"paths": paths}
 
 
+@app.get("/api/run/cache_status")
+def run_cache_status():
+    """Return lineup cache availability for the current slate."""
+    from .lineup_cache import get_cache_status
+    cfg = read_config(PROJECT_ROOT / "config.yaml")
+    paths = cfg.get("paths", {})
+    slate_path = paths.get("dk_slate", "")
+    abs_slate = (PROJECT_ROOT / slate_path) if slate_path else None
+    is_gpp = cfg.get("optimizer", {}).get("objective") == "leverage_surplus"
+    gpp_cfg = cfg.get("gpp", {})
+    status = get_cache_status(abs_slate or "")
+    return {
+        **status,
+        "is_gpp": is_gpp,
+        "n_configured_candidates": int(gpp_cfg.get("n_candidates", 10_000)),
+        "n_configured_field_k": int(gpp_cfg.get("n_field_samples", 3)),
+    }
+
+
 @app.get("/api/run/stream")
-async def run_stream(request: Request):
+async def run_stream(
+    request: Request,
+    use_candidates: bool = False,
+    use_field: bool = False,
+):
     if _state["status"] in ("running", "replacing"):
         raise HTTPException(409, "A run is already in progress")
 
@@ -2062,6 +2085,8 @@ async def run_stream(request: Request):
                 str(PROJECT_ROOT / "config.yaml"),
                 progress_cb,
                 stop_check=_stop_event.is_set,
+                use_cached_candidates=use_candidates,
+                use_cached_field=use_field,
             )
             portfolio = runner.run()
             _state["portfolio"] = portfolio

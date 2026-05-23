@@ -64,10 +64,14 @@ class PipelineRunner:
         config_path: str,
         progress_cb: Optional[Callable[[str, dict], None]] = None,
         stop_check: Optional[Callable[[], bool]] = None,
+        use_cached_candidates: bool = False,
+        use_cached_field: bool = False,
     ):
         self._config_path = config_path
         self._cb = progress_cb or (lambda stage, data: None)
         self._stop_check = stop_check
+        self._use_cached_candidates = use_cached_candidates
+        self._use_cached_field = use_cached_field
 
     # ------------------------------------------------------------------
     # Public API
@@ -436,21 +440,66 @@ class PipelineRunner:
 
             _gpp_stopped = self._stop_check is not None and self._stop_check
 
-            # Phase 1: generate stacked candidate pool
-            self._cb("gpp_generate_start", {"n_candidates": n_candidates})
+            # Compute slate fingerprint for lineup cache (mtime_ns:size)
+            from pathlib import Path as _Path
+            from src.api.slate_exclusions import compute_file_fingerprint
+            from src.api.lineup_cache import (
+                load_candidates, save_candidates,
+                load_field, save_field,
+            )
+            _config_root = _Path(self._config_path).resolve().parent
+            _slate_fp = compute_file_fingerprint(_config_root / slate_path)
+
+            # Phase 1: generate stacked candidate pool (with optional cache)
             gen = CandidateGenerator(
                 cand_players_df, ownership_vector,
                 rng_seed=opt_cfg.get("rng_seed"),
                 salary_floor=salary_floor_gpp,
             )
-            candidates = gen.generate(
-                n_candidates=n_candidates,
-                max_attempts_multiplier=max_attempts_mult,
-                stop_check=self._stop_check,
-                progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
+
+            _preloaded_cands = (
+                load_candidates(_slate_fp) if (self._use_cached_candidates and _slate_fp) else None
             )
-            self._cb("gpp_generate_done", {"n_generated": len(candidates)})
-            logger.info("Generated %d candidate lineups.", len(candidates))
+            if _preloaded_cands is not None:
+                n_cached = len(_preloaded_cands)
+                if n_cached >= n_candidates:
+                    candidates = _preloaded_cands[:n_candidates]
+                    logger.info("Using %d candidates from cache.", len(candidates))
+                    self._cb("gpp_generate_done", {
+                        "n_generated": len(candidates), "from_cache": True,
+                    })
+                else:
+                    need = n_candidates - n_cached
+                    logger.info(
+                        "Partial cache: %d candidates cached, generating %d more.",
+                        n_cached, need,
+                    )
+                    self._cb("gpp_generate_start", {
+                        "n_candidates": need, "n_from_cache": n_cached,
+                    })
+                    new_cands = gen.generate(
+                        n_candidates=need,
+                        max_attempts_multiplier=max_attempts_mult,
+                        stop_check=self._stop_check,
+                        progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
+                    )
+                    candidates = _preloaded_cands + new_cands
+                    self._cb("gpp_generate_done", {"n_generated": len(candidates)})
+                    if _slate_fp and not (_gpp_stopped and self._stop_check()):
+                        save_candidates(_slate_fp, candidates)
+            else:
+                self._cb("gpp_generate_start", {"n_candidates": n_candidates})
+                candidates = gen.generate(
+                    n_candidates=n_candidates,
+                    max_attempts_multiplier=max_attempts_mult,
+                    stop_check=self._stop_check,
+                    progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
+                )
+                self._cb("gpp_generate_done", {"n_generated": len(candidates)})
+                if _slate_fp and candidates and not (_gpp_stopped and self._stop_check()):
+                    save_candidates(_slate_fp, candidates)
+
+            logger.info("Candidate pool: %d lineups.", len(candidates))
 
             if not candidates or (_gpp_stopped and self._stop_check()):
                 portfolio = []
@@ -470,6 +519,14 @@ class PipelineRunner:
                     set(sim_players_df["player_id"].tolist())
                     - set(cand_players_df["player_id"].tolist())
                 )
+
+                _cached_field = (
+                    load_field(_slate_fp) if (self._use_cached_field and _slate_fp) else None
+                )
+                if _cached_field is not None:
+                    logger.info("Using %d field samples from cache.", len(_cached_field))
+                    self._cb("gpp_field_inject", {"n_field": n_field, "n_k": len(_cached_field)})
+
                 scorer = ContestScorer(
                     sim_results=sim_results,
                     players_df=cand_players_df,
@@ -483,6 +540,7 @@ class PipelineRunner:
                     candidate_batch_size=cand_batch,
                     portfolio_size=portfolio_size,
                     cand_excluded_player_ids=_cand_excluded_pids,
+                    preloaded_field=_cached_field,
                 )
                 candidates, robust_payout = scorer.score_candidates(
                     candidates,
@@ -496,6 +554,8 @@ class PipelineRunner:
                         {"n_done": n_done, "n_total": n_total},
                     ),
                 )
+                if _cached_field is None and scorer.last_raw_field_list and _slate_fp:
+                    save_field(_slate_fp, scorer.last_raw_field_list)
                 self._cb("gpp_score_done", {})
 
                 if _gpp_stopped and self._stop_check():

@@ -117,6 +117,7 @@ class ContestScorer:
         candidate_batch_size: int = 500,
         portfolio_size: int = 0,
         cand_excluded_player_ids: Optional[set] = None,
+        preloaded_field: Optional[list[np.ndarray]] = None,
     ) -> None:
         self._sim_results = sim_results
         self._players_df = players_df
@@ -128,9 +129,11 @@ class ContestScorer:
         self._cand_excluded_pids: set[int] = (
             {int(p) for p in cand_excluded_player_ids} if cand_excluded_player_ids else set()
         )
+        self._preloaded_field = preloaded_field
         # Populated after score_candidates() for use by the coverage selector.
         self.last_field_sorted: Optional[np.ndarray] = None
         self.last_col_lineups: Optional[np.ndarray] = None
+        self.last_raw_field_list: Optional[list[np.ndarray]] = None
 
         if payout_arr is None:
             from src.optimization.payout import load_payout_structure, payout_table_to_array
@@ -189,28 +192,40 @@ class ContestScorer:
         """
         n_sims = self._sim_matrix.shape[0]
 
-        # --- Generate all K field samples (sorted scoring arrays) ---
-        logger.info(
-            "Generating %d field samples (N=%d each)...",
-            self._n_k, self._n_field,
-        )
+        # --- Generate (or inject cached) field samples ---
         field_sorted_list: list[np.ndarray] = []
-        n_total_field = self._n_k * self._n_field
-        for k in range(self._n_k):
-            seed = self._field_seed + k
-            offset = k * self._n_field
-            def _field_cb(n_done: int, _n: int, _offset: int = offset) -> None:
-                if field_progress_cb is not None:
-                    field_progress_cb(_offset + n_done, n_total_field)
-            raw = self._cs.generate_field(
-                self._field_players_df, self._field_ownership_vec,
-                n_lineups=self._n_field, rng_seed=seed,
-                progress_cb=_field_cb if field_progress_cb is not None else None,
+        if self._preloaded_field is not None:
+            logger.info(
+                "Using %d preloaded field samples from cache.", len(self._preloaded_field)
             )
-            field_sorted_list.append(self._build_field_sorted(raw))
-            logger.info("  Field %d/%d: %d lineups", k + 1, self._n_k, raw.shape[0])
-            if field_progress_cb is not None:
-                field_progress_cb(offset + len(raw), n_total_field)
+            for raw in self._preloaded_field:
+                field_sorted_list.append(self._build_field_sorted(raw))
+            self._n_k = len(self._preloaded_field)
+            self._n_field = self._preloaded_field[0].shape[0] if self._preloaded_field else self._n_field
+        else:
+            logger.info(
+                "Generating %d field samples (N=%d each)...",
+                self._n_k, self._n_field,
+            )
+            raw_list: list[np.ndarray] = []
+            n_total_field = self._n_k * self._n_field
+            for k in range(self._n_k):
+                seed = self._field_seed + k
+                offset = k * self._n_field
+                def _field_cb(n_done: int, _n: int, _offset: int = offset) -> None:
+                    if field_progress_cb is not None:
+                        field_progress_cb(_offset + n_done, n_total_field)
+                raw = self._cs.generate_field(
+                    self._field_players_df, self._field_ownership_vec,
+                    n_lineups=self._n_field, rng_seed=seed,
+                    progress_cb=_field_cb if field_progress_cb is not None else None,
+                )
+                raw_list.append(raw)
+                field_sorted_list.append(self._build_field_sorted(raw))
+                logger.info("  Field %d/%d: %d lineups", k + 1, self._n_k, raw.shape[0])
+                if field_progress_cb is not None:
+                    field_progress_cb(offset + len(raw), n_total_field)
+            self.last_raw_field_list = raw_list
 
         # Combine all K field samples into one sorted pool for coverage computation.
         # Beat rate = fraction of K×N field lineups beaten, consistent with how
