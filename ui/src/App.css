@@ -597,7 +597,7 @@ button { cursor: pointer; }
 /* ── Progress panel ── */
 
 .progress-panel {
-  max-width: 1200px;
+  max-width: 1500px;
 }
 
 .progress-panel h3 {

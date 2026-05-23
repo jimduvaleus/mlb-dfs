@@ -2042,18 +2042,16 @@ def write_upload():
 def run_cache_status():
     """Return lineup cache availability for the current slate."""
     from .lineup_cache import get_cache_status
-    cfg = read_config(PROJECT_ROOT / "config.yaml")
-    paths = cfg.get("paths", {})
-    slate_path = paths.get("dk_slate", "")
+    cfg = read_config()
+    slate_path = cfg.paths.dk_slate or ""
     abs_slate = (PROJECT_ROOT / slate_path) if slate_path else None
-    is_gpp = cfg.get("optimizer", {}).get("objective") == "leverage_surplus"
-    gpp_cfg = cfg.get("gpp", {})
+    is_gpp = cfg.optimizer.objective == "leverage_surplus"
     status = get_cache_status(abs_slate or "")
     return {
         **status,
         "is_gpp": is_gpp,
-        "n_configured_candidates": int(gpp_cfg.get("n_candidates", 10_000)),
-        "n_configured_field_k": int(gpp_cfg.get("n_field_samples", 3)),
+        "n_configured_candidates": cfg.gpp.n_candidates,
+        "n_configured_field_k": cfg.gpp.n_field_samples,
     }
 
 
