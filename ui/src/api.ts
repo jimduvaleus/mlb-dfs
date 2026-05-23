@@ -1,4 +1,4 @@
-import type { AppConfig, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, CacheStatus, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -220,4 +220,14 @@ export async function savePlayerProjectionOverrides(update: PlayerProjectionOver
     throw new Error(`Failed to save projection overrides: ${detail}`)
   }
   return res.json()
+}
+
+export async function fetchCacheStatus(): Promise<CacheStatus> {
+  try {
+    const res = await fetch('/api/run/cache_status')
+    if (!res.ok) throw new Error('not ok')
+    return res.json()
+  } catch {
+    return { is_gpp: false, fingerprint: '', candidates: null, field_k: null, n_configured_candidates: 0, n_configured_field_k: 0 }
+  }
 }

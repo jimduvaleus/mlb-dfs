@@ -268,6 +268,21 @@ export interface ErrorEvent extends SSEEvent {
   message: string
 }
 
+export interface GppFieldInjectEvent extends SSEEvent {
+  stage: 'gpp_field_inject'
+  n_field: number
+  n_k: number
+}
+
+export interface CacheStatus {
+  fingerprint: string
+  candidates: number | null   // null = no cache
+  field_k: number | null      // null = no cache
+  n_configured_candidates: number
+  n_configured_field_k: number
+  is_gpp: boolean
+}
+
 export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 'replacing'
 
 export interface MergePlayer {

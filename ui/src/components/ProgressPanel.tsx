@@ -32,6 +32,7 @@ const STAGE_LABELS: Record<string, string> = {
   gpp_generate_done: 'Generate candidates',
   gpp_score_start: 'Score candidates',
   gpp_score_done: 'Score candidates',
+  gpp_field_inject: 'Field lineups',
   gpp_holdout: 'Holdout evaluation',
   complete: 'Complete',
   stopped: 'Stopped',
@@ -71,6 +72,7 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_field_progress' ||
       last?.stage === 'gpp_score_progress' ||
       last?.stage === 'gpp_score_done' ||
+      last?.stage === 'gpp_field_inject' ||
       last?.stage === 'gpp_select_progress'
     if (!isLiveProgressEvent) return
 
@@ -99,7 +101,11 @@ export function ProgressPanel({ events, running }: Props) {
   const last = events[events.length - 1]
   const elapsed = first && last ? last.timestamp - first.timestamp : null
 
-  const isGpp = events.some(e => e.stage === 'gpp_generate_start' || e.stage === 'gpp_score_start' || e.stage === 'gpp_select_progress')
+  const isGpp = events.some(e =>
+    e.stage === 'gpp_generate_start' || e.stage === 'gpp_generate_done' ||
+    e.stage === 'gpp_score_start' || e.stage === 'gpp_field_inject' ||
+    e.stage === 'gpp_select_progress'
+  )
 
   // --- Non-GPP lineup progress ---
   const latestLineup = [...events]
@@ -124,6 +130,7 @@ export function ProgressPanel({ events, running }: Props) {
   const latestScoreProgress = scoreProgressEvents[scoreProgressEvents.length - 1]
   const selectProgressEvents = events.filter(e => e.stage === 'gpp_select_progress') as unknown as GppSelectProgressEvent[]
   const scoreDone = events.some(e => e.stage === 'gpp_score_done')
+  const fieldInjectEvent = events.find(e => e.stage === 'gpp_field_inject') as unknown as { n_field: number; n_k: number } | undefined
 
   let gppPct = 0
   let gppLabel = ''
@@ -135,6 +142,9 @@ export function ProgressPanel({ events, running }: Props) {
     } else if (latestScoreProgress) {
       gppPct = Math.round((latestScoreProgress.batches_done / latestScoreProgress.batches_total) * 100)
       gppLabel = `Scoring batch ${latestScoreProgress.batches_done} / ${latestScoreProgress.batches_total}`
+    } else if (fieldInjectEvent) {
+      gppPct = 100
+      gppLabel = `Field lineups loaded from cache`
     } else if (latestFieldProgress && !scoreDone) {
       gppPct = Math.round((latestFieldProgress.n_done / latestFieldProgress.n_total) * 100)
       gppLabel = `Generating field: ${latestFieldProgress.n_done.toLocaleString()} / ${latestFieldProgress.n_total.toLocaleString()} lineups`
@@ -309,6 +319,8 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
     // Skip start event once done event is present (collapse into one row)
     if (e.stage === 'gpp_generate_start' && hasEvent('gpp_generate_done')) continue
     if (e.stage === 'gpp_score_start' && hasEvent('gpp_score_done')) continue
+    // field_inject is a one-shot cache notification; skip once score is done
+    if (e.stage === 'gpp_field_inject' && hasEvent('gpp_score_done')) continue
     if (CONFIG_STAGES.has(e.stage)) {
       if (!configInserted) {
         result.push({ stage: 'config', label: 'Configuration', detail: buildConfigDetail(events) })
@@ -372,12 +384,20 @@ function renderDetail(e: SSEEvent): string {
       return `p90: ${pctFmt(ev.pct_above_p90)} · ${ptLabel}: ${pctFmt(ev.pct_above_target)} · p99: ${pctFmt(ev.pct_above_p99)}`
     }
     case 'gpp_generate_start': {
-      const ev = e as unknown as { n_candidates: number }
+      const ev = e as unknown as { n_candidates: number; n_from_cache?: number }
+      if (ev.n_from_cache != null && ev.n_from_cache > 0) {
+        return `Generating ${ev.n_candidates.toLocaleString()} + ${ev.n_from_cache.toLocaleString()} from cache…`
+      }
       return `Generating ${ev.n_candidates.toLocaleString()} candidates…`
     }
     case 'gpp_generate_done': {
-      const ev = e as unknown as { n_generated: number }
-      return `${ev.n_generated.toLocaleString()} candidates generated`
+      const ev = e as unknown as { n_generated: number; from_cache?: boolean }
+      const suffix = ev.from_cache ? ' (from cache)' : ''
+      return `${ev.n_generated.toLocaleString()} candidates${suffix}`
+    }
+    case 'gpp_field_inject': {
+      const ev = e as unknown as { n_field: number; n_k: number }
+      return `${(ev.n_field * ev.n_k).toLocaleString()} lineups loaded from cache`
     }
     case 'gpp_score_start': {
       const ev = e as unknown as { n_candidates: number; n_field_samples: number }

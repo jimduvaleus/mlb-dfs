@@ -6,7 +6,7 @@ export type SSEHookStatus = 'idle' | 'connecting' | 'streaming' | 'done' | 'erro
 interface UseSSEResult {
   events: SSEEvent[]
   status: SSEHookStatus
-  start: () => void
+  start: (params?: Record<string, string>) => void
   reset: () => void
 }
 
@@ -15,14 +15,17 @@ export function useSSE(url: string): UseSSEResult {
   const [status, setStatus] = useState<SSEHookStatus>('idle')
   const esRef = useRef<EventSource | null>(null)
 
-  const start = () => {
+  const start = (params?: Record<string, string>) => {
     if (esRef.current) {
       esRef.current.close()
     }
     setEvents([])
     setStatus('connecting')
 
-    const es = new EventSource(url)
+    const qs = params && Object.keys(params).length
+      ? '?' + new URLSearchParams(params).toString()
+      : ''
+    const es = new EventSource(url + qs)
     esRef.current = es
 
     es.onopen = () => setStatus('streaming')

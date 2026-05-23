@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
-import type { AppConfig, LineupResult, MergeInfo, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
-import { dismissNotification, dismissTwitterLineup, fetchConfig, fetchNotifications, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
+import type { AppConfig, CacheStatus, LineupResult, MergeInfo, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import { dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -10,6 +10,7 @@ import { ProjectionsTable } from './components/ProjectionsTable'
 import { MetricsPanel } from './components/MetricsPanel'
 import { SlatePanel } from './components/SlatePanel'
 import { StopUploadDialog } from './components/StopUploadDialog'
+import { RunOptionsDialog } from './components/RunOptionsDialog'
 import { DeleteConfirmModal } from './components/DeleteConfirmModal'
 import { LineupParserDialog } from './components/LineupParserDialog'
 import './App.css'
@@ -79,6 +80,8 @@ export default function App() {
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
   const [stopPending, setStopPending] = useState(false)
+  const [showRunOptionsDialog, setShowRunOptionsDialog] = useState(false)
+  const [pendingCacheStatus, setPendingCacheStatus] = useState<CacheStatus | null>(null)
   const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null)
   const [replacingIndex, setReplacingIndex] = useState<number | null>(null)
   const [projStatusTrigger, setProjStatusTrigger] = useState(0)
@@ -207,14 +210,35 @@ export default function App() {
     }
   }, [events])
 
-  const handleRun = () => {
-    if (running) return
+  const _doStartRun = (useCandidates: boolean, useField: boolean) => {
+    setShowRunOptionsDialog(false)
+    setPendingCacheStatus(null)
     resetSSE()
     setShowUploadDialog(false)
     setStopPending(false)
     dispatch({ type: 'set_run_status', status: 'running' })
     dispatch({ type: 'set_tab', tab: 'run' })
-    startSSE()
+    const params: Record<string, string> = {}
+    if (useCandidates) params.use_candidates = 'true'
+    if (useField) params.use_field = 'true'
+    startSSE(Object.keys(params).length ? params : undefined)
+  }
+
+  const handleRun = async () => {
+    if (running) return
+    if (state.config?.optimizer?.objective === 'leverage_surplus') {
+      try {
+        const status = await fetchCacheStatus()
+        if (status.is_gpp && (status.candidates !== null || status.field_k !== null)) {
+          setPendingCacheStatus(status)
+          setShowRunOptionsDialog(true)
+          return
+        }
+      } catch {
+        // fall through to immediate start
+      }
+    }
+    _doStartRun(false, false)
   }
 
   const handleStop = () => {
@@ -443,6 +467,14 @@ export default function App() {
           lineupCount={stoppedLineupCount}
           onConfirm={handleWriteUpload}
           onDismiss={() => setShowUploadDialog(false)}
+        />
+      )}
+
+      {showRunOptionsDialog && pendingCacheStatus && (
+        <RunOptionsDialog
+          cacheStatus={pendingCacheStatus}
+          onStart={(useCandidates, useField) => _doStartRun(useCandidates, useField)}
+          onDismiss={() => { setShowRunOptionsDialog(false); setPendingCacheStatus(null) }}
         />
       )}
     </div>

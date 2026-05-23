@@ -1,0 +1,72 @@
+import { useState } from 'react'
+import type { CacheStatus } from '../types'
+
+interface Props {
+  cacheStatus: CacheStatus
+  onStart: (useCandidates: boolean, useField: boolean) => void
+  onDismiss: () => void
+}
+
+export function RunOptionsDialog({ cacheStatus, onStart, onDismiss }: Props) {
+  const [useCandidates, setUseCandidates] = useState(cacheStatus.candidates !== null)
+  const [useField, setUseField] = useState(cacheStatus.field_k !== null)
+
+  const candAvailable = cacheStatus.candidates !== null
+  const fieldAvailable = cacheStatus.field_k !== null
+
+  const candLabel = candAvailable
+    ? `${cacheStatus.candidates!.toLocaleString()} cached`
+    : 'none cached'
+  const fieldLabel = fieldAvailable
+    ? `${cacheStatus.field_k} sample${cacheStatus.field_k !== 1 ? 's' : ''} cached`
+    : 'none cached'
+
+  return (
+    <div className="dialog-overlay" onClick={onDismiss}>
+      <div className="dialog" onClick={e => e.stopPropagation()}>
+        <p className="dialog-title">Use cached lineups?</p>
+        <p className="dialog-message" style={{ marginBottom: 16 }}>
+          Cached lineups reflect a previous run's ownership configuration.
+          Ownership changes since then are not included.
+        </p>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10, marginBottom: 20 }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: candAvailable ? 'pointer' : 'default', opacity: candAvailable ? 1 : 0.45 }}>
+            <input
+              type="checkbox"
+              checked={useCandidates && candAvailable}
+              disabled={!candAvailable}
+              onChange={e => setUseCandidates(e.target.checked)}
+            />
+            <span>
+              <strong>Candidates</strong> — {candLabel}
+              {candAvailable && cacheStatus.candidates! < cacheStatus.n_configured_candidates && (
+                <span style={{ color: 'var(--color-text-muted)', fontSize: '0.85em' }}>
+                  {' '}(will generate {(cacheStatus.n_configured_candidates - cacheStatus.candidates!).toLocaleString()} more)
+                </span>
+              )}
+            </span>
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: fieldAvailable ? 'pointer' : 'default', opacity: fieldAvailable ? 1 : 0.45 }}>
+            <input
+              type="checkbox"
+              checked={useField && fieldAvailable}
+              disabled={!fieldAvailable}
+              onChange={e => setUseField(e.target.checked)}
+            />
+            <span>
+              <strong>Field lineups</strong> — {fieldLabel}
+            </span>
+          </label>
+        </div>
+        <div className="dialog-actions">
+          <button className="btn-run" onClick={() => onStart(useCandidates && candAvailable, useField && fieldAvailable)}>
+            Start Run
+          </button>
+          <button className="btn-secondary" onClick={onDismiss}>
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
