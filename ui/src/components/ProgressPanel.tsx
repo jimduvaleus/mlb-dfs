@@ -189,12 +189,11 @@ export function ProgressPanel({ events, running }: Props) {
   let etaMs: number | null = null
   if (isGpp) {
     if (running && latestOptimalProgress && !optimalDone) {
-      const recent = optimalProgressEvents.slice(-4)
-      if (recent.length >= 2) {
-        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
-        const avgPerLineup = recentElapsed / (recent.length - 1)
-        const remaining = latestOptimalProgress.total - latestOptimalProgress.n
-        if (remaining > 0) etaMs = avgPerLineup * remaining
+      const elapsed = latestOptimalProgress.timestamp - optimalProgressEvents[0].timestamp
+      const n = latestOptimalProgress.n
+      const remaining = latestOptimalProgress.total - n
+      if (n > 0 && remaining > 0 && elapsed > 0) {
+        etaMs = (elapsed / n) * remaining
       }
     } else if (running && latestGenerateProgress && !generateDone && generateStartEvent) {
       const recent = generateProgressEvents.slice(-4)

@@ -214,66 +214,74 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
 
   const showOptimalTab = optimalLineups.length > 0
 
+  const tabLabel = activeTab === 'optimal'
+    ? `Optimal — ${filterOptimalPlayer ? `${visibleOptimalLineups.length} / ${optimalInPortfolio.length}` : optimalInPortfolio.length} Lineup${optimalInPortfolio.length !== 1 ? 's' : ''}`
+    : `Portfolio — ${filterPlayer ? `${visibleLineups.length} / ${lineups.length}` : lineups.length} Lineup${lineups.length !== 1 ? 's' : ''}`
+
   return (
     <div className="portfolio-table-wrap">
-      {showOptimalTab && (
-        <div className="portfolio-tabs">
-          <button
-            className={`portfolio-tab${activeTab === 'portfolio' ? ' portfolio-tab--active' : ''}`}
-            onClick={() => setActiveTab('portfolio')}
-          >
-            Portfolio ({lineups.length})
-          </button>
-          <button
-            className={`portfolio-tab${activeTab === 'optimal' ? ' portfolio-tab--active' : ''}`}
-            onClick={() => setActiveTab('optimal')}
-          >
-            Optimal ({optimalInPortfolio.length})
-          </button>
-        </div>
-      )}
+      <div className="portfolio-tabs">
+        {showOptimalTab && (
+          <>
+            <button
+              className={`portfolio-tab${activeTab === 'portfolio' ? ' portfolio-tab--active' : ''}`}
+              onClick={() => setActiveTab('portfolio')}
+            >
+              Portfolio ({lineups.length})
+            </button>
+            <button
+              className={`portfolio-tab${activeTab === 'optimal' ? ' portfolio-tab--active' : ''}`}
+              onClick={() => setActiveTab('optimal')}
+            >
+              Optimal ({optimalInPortfolio.length})
+            </button>
+          </>
+        )}
+        <span className="portfolio-tab-label">{tabLabel}</span>
+      </div>
       {activeTab === 'optimal' ? (
         <>
-        <h3>Optimal — {filterOptimalPlayer ? `${visibleOptimalLineups.length} / ${optimalInPortfolio.length}` : optimalInPortfolio.length} Lineups</h3>
-        <div className="portfolio-filter" ref={searchOptimalWrapRef}>
-          {filterOptimalPlayer ? (
-            <span className="portfolio-filter-chip">
-              {filterOptimalPlayer.name}
-              <button onClick={() => { setFilterOptimalPlayer(null); setSearchOptimal('') }}>×</button>
-            </span>
-          ) : (
-            <>
-              <input
-                className="portfolio-filter-input"
-                placeholder="Filter by player…"
-                value={searchOptimal}
-                onChange={e => { setSearchOptimal(e.target.value); setSearchOptimalOpen(true) }}
-                onFocus={() => setSearchOptimalOpen(true)}
-              />
-              {searchOptimalOpen && optimalSearchResults.length > 0 && (
-                <div className="portfolio-filter-results">
-                  {optimalSearchResults.map(p => (
-                    <button
-                      key={p.player_id}
-                      className="portfolio-filter-result-btn"
-                      onMouseDown={e => {
-                        e.preventDefault()
-                        setFilterOptimalPlayer(p)
-                        setSearchOptimal('')
-                        setSearchOptimalOpen(false)
-                      }}
-                    >
-                      <span>{p.name}</span>
-                      <span className="portfolio-filter-result-meta">{p.position} · {p.team}</span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </>
-          )}
-        </div>
-        <div className={`portfolio-optimal-banner${optimalInPortfolio.length > 0 ? ' portfolio-optimal-banner--hit' : ''}`}>
-          <span>{optimalInPortfolio.length} / {optimalLineups.length} optimal lineup{optimalLineups.length !== 1 ? 's' : ''} selected in portfolio</span>
+        <div className="portfolio-filter-row">
+          <div className="portfolio-filter" ref={searchOptimalWrapRef}>
+            {filterOptimalPlayer ? (
+              <span className="portfolio-filter-chip">
+                {filterOptimalPlayer.name}
+                <button onClick={() => { setFilterOptimalPlayer(null); setSearchOptimal('') }}>×</button>
+              </span>
+            ) : (
+              <>
+                <input
+                  className="portfolio-filter-input"
+                  placeholder="Filter by player…"
+                  value={searchOptimal}
+                  onChange={e => { setSearchOptimal(e.target.value); setSearchOptimalOpen(true) }}
+                  onFocus={() => setSearchOptimalOpen(true)}
+                />
+                {searchOptimalOpen && optimalSearchResults.length > 0 && (
+                  <div className="portfolio-filter-results">
+                    {optimalSearchResults.map(p => (
+                      <button
+                        key={p.player_id}
+                        className="portfolio-filter-result-btn"
+                        onMouseDown={e => {
+                          e.preventDefault()
+                          setFilterOptimalPlayer(p)
+                          setSearchOptimal('')
+                          setSearchOptimalOpen(false)
+                        }}
+                      >
+                        <span>{p.name}</span>
+                        <span className="portfolio-filter-result-meta">{p.position} · {p.team}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+          <div className={`portfolio-optimal-banner${optimalInPortfolio.length > 0 ? ' portfolio-optimal-banner--hit' : ''}`}>
+            <span>{optimalInPortfolio.length} / {optimalLineups.length} optimal lineup{optimalLineups.length !== 1 ? 's' : ''} selected in portfolio</span>
+          </div>
         </div>
         <div className="portfolio-cards">
           {visibleOptimalLineups.map(ol => {
@@ -313,48 +321,49 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
         </>
       ) : (
       <>
-      <h3>Portfolio — {filterPlayer ? `${visibleLineups.length} / ${lineups.length}` : lineups.length} Lineups</h3>
-      <div className="portfolio-filter" ref={searchWrapRef}>
-        {filterPlayer ? (
-          <span className="portfolio-filter-chip">
-            {filterPlayer.name}
-            <button onClick={() => { setFilterPlayer(null); setSearch('') }}>×</button>
-          </span>
-        ) : (
-          <>
-            <input
-              className="portfolio-filter-input"
-              placeholder="Filter by player…"
-              value={search}
-              onChange={e => { setSearch(e.target.value); setSearchOpen(true) }}
-              onFocus={() => setSearchOpen(true)}
-            />
-            {searchOpen && searchResults.length > 0 && (
-              <div className="portfolio-filter-results">
-                {searchResults.map(p => (
-                  <button
-                    key={p.player_id}
-                    className="portfolio-filter-result-btn"
-                    onMouseDown={e => {
-                      e.preventDefault()
-                      setFilterPlayer(p)
-                      setSearch('')
-                      setSearchOpen(false)
-                    }}
-                  >
-                    <span>{p.name}</span>
-                    <span className="portfolio-filter-result-meta">{p.position} · {p.team}</span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </>
-        )}
-      </div>
-      <div className={`portfolio-unconfirmed-banner ${totalUnconfirmed === 0 ? 'portfolio-unconfirmed-banner--clear' : ''}`}>
-        {totalUnconfirmed === 0
-          ? '✓ All lineup slots confirmed'
-          : `✕ ${totalUnconfirmed} unconfirmed lineup slot${totalUnconfirmed !== 1 ? 's' : ''} across portfolio${breakdown}`}
+      <div className="portfolio-filter-row">
+        <div className="portfolio-filter" ref={searchWrapRef}>
+          {filterPlayer ? (
+            <span className="portfolio-filter-chip">
+              {filterPlayer.name}
+              <button onClick={() => { setFilterPlayer(null); setSearch('') }}>×</button>
+            </span>
+          ) : (
+            <>
+              <input
+                className="portfolio-filter-input"
+                placeholder="Filter by player…"
+                value={search}
+                onChange={e => { setSearch(e.target.value); setSearchOpen(true) }}
+                onFocus={() => setSearchOpen(true)}
+              />
+              {searchOpen && searchResults.length > 0 && (
+                <div className="portfolio-filter-results">
+                  {searchResults.map(p => (
+                    <button
+                      key={p.player_id}
+                      className="portfolio-filter-result-btn"
+                      onMouseDown={e => {
+                        e.preventDefault()
+                        setFilterPlayer(p)
+                        setSearch('')
+                        setSearchOpen(false)
+                      }}
+                    >
+                      <span>{p.name}</span>
+                      <span className="portfolio-filter-result-meta">{p.position} · {p.team}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+        <div className={`portfolio-unconfirmed-banner ${totalUnconfirmed === 0 ? 'portfolio-unconfirmed-banner--clear' : ''}`}>
+          {totalUnconfirmed === 0
+            ? '✓ All lineup slots confirmed'
+            : `✕ ${totalUnconfirmed} unconfirmed lineup slot${totalUnconfirmed !== 1 ? 's' : ''} across portfolio${breakdown}`}
+        </div>
       </div>
       <div className="portfolio-cards">
         {visibleLineups.map(lineup => {

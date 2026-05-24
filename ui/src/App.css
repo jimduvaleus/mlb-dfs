@@ -689,16 +689,26 @@ button { cursor: pointer; }
 
 /* ── Portfolio cards ── */
 
-.portfolio-table-wrap h3 {
-  margin: 0 0 10px;
-  font-size: 16px;
-  font-weight: 600;
-}
 
 .portfolio-tabs {
   display: flex;
+  align-items: center;
   gap: 4px;
   margin-bottom: 14px;
+  position: sticky;
+  top: 89px;
+  z-index: 5;
+  background: #0f1117;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  margin-top: -6px;
+}
+
+.portfolio-tab-label {
+  margin-left: 12px;
+  font-size: 15px;
+  font-weight: 600;
+  color: #e2e8f0;
 }
 
 .portfolio-tab {
@@ -723,7 +733,7 @@ button { cursor: pointer; }
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin: 0 0 14px;
+  margin: 0;
   padding: 6px 12px;
   background: rgba(160, 174, 192, 0.1);
   border: 1px solid rgba(160, 174, 192, 0.25);
@@ -760,7 +770,7 @@ button { cursor: pointer; }
 }
 
 .portfolio-unconfirmed-banner {
-  margin: 0 0 16px;
+  margin: 0;
   padding: 6px 12px;
   background: rgba(246, 173, 85, 0.15);
   border: 1px solid rgba(246, 173, 85, 0.4);
@@ -793,10 +803,17 @@ button { cursor: pointer; }
   color: #48bb78;
 }
 
+.portfolio-filter-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
 .portfolio-filter {
   position: relative;
-  margin-bottom: 12px;
-  max-width: 320px;
+  flex-shrink: 0;
+  width: 220px;
 }
 
 .portfolio-filter-input {
