@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -458,6 +459,7 @@ class PipelineRunner:
                 salary_floor=salary_floor_gpp,
             )
 
+            _t_gpp_start = time.perf_counter()
             _preloaded_cands = (
                 load_candidates(_slate_fp) if (self._use_cached_candidates and _slate_fp) else None
             )
@@ -488,6 +490,24 @@ class PipelineRunner:
                     self._cb("gpp_generate_done", {"n_generated": len(candidates)})
                     if _slate_fp and not (_gpp_stopped and self._stop_check()):
                         save_candidates(_slate_fp, candidates)
+
+                # Restore optimal lineups from persisted JSON if fingerprints match.
+                try:
+                    _opt_json = os.path.join(output_dir, f"optimal_lineups_{platform.value}.json")
+                    if os.path.exists(_opt_json):
+                        with open(_opt_json) as _f:
+                            _opt_data = json.load(_f)
+                        if _opt_data.get("slate_fingerprint") == _slate_fp and _opt_data.get("lineups"):
+                            from src.optimization.lineup import Lineup as _Lineup
+                            self._optimal_lineups = [
+                                _Lineup(player_ids=[p["player_id"] for p in lr["players"]])
+                                for lr in _opt_data["lineups"]
+                            ]
+                            logger.info(
+                                "Restored %d optimal lineups from cache.", len(self._optimal_lineups)
+                            )
+                except Exception:
+                    pass
             else:
                 # Optionally seed the first N candidates with ILP-optimal lineups.
                 seed_optimal = gpp_cfg.get("seed_optimal_lineups", False)
@@ -563,6 +583,11 @@ class PipelineRunner:
                 self._optimal_lineups = _optimal_lineups
 
             logger.info("Candidate pool: %d lineups.", len(candidates))
+            logger.info(
+                "[TIMING] Candidate phase (load+generate): %.3fs  from_cache=%s",
+                time.perf_counter() - _t_gpp_start,
+                _preloaded_cands is not None,
+            )
 
             if not candidates or (_gpp_stopped and self._stop_check()):
                 portfolio = []
@@ -605,6 +630,7 @@ class PipelineRunner:
                     cand_excluded_player_ids=_cand_excluded_pids,
                     preloaded_field=_cached_field,
                 )
+                _t_score = time.perf_counter()
                 candidates, robust_payout = scorer.score_candidates(
                     candidates,
                     stop_check=self._stop_check,
@@ -616,6 +642,13 @@ class PipelineRunner:
                         "gpp_field_progress",
                         {"n_done": n_done, "n_total": n_total},
                     ),
+                )
+                logger.info(
+                    "[TIMING] score_candidates wall time: %.3fs  "
+                    "robust_payout shape=%s (%.1f MB)  field_from_cache=%s",
+                    time.perf_counter() - _t_score,
+                    robust_payout.shape, robust_payout.nbytes / 1e6,
+                    _cached_field is not None,
                 )
                 if _cached_field is None and scorer.last_raw_field_list and _slate_fp:
                     save_field(_slate_fp, scorer.last_raw_field_list)
@@ -630,8 +663,21 @@ class PipelineRunner:
                     _sim_mat = scorer._sim_matrix                # (n_sims, n_players) float32
                     _n_field = _field_sorted.shape[1]
                     _BATCH = 1000
+                    logger.info(
+                        "[TIMING] EV phase setup — field_sorted %s (%.1f MB), "
+                        "col_lineups %s, sim_mat %s (%.1f MB), n_field=%d",
+                        _field_sorted.shape, _field_sorted.nbytes / 1e6,
+                        _col_lineups.shape,
+                        _sim_mat.shape, _sim_mat.nbytes / 1e6,
+                        _n_field,
+                    )
+
+                    _beat_rate_call_count = 0
+                    _beat_rate_total_time = 0.0
 
                     def _beat_rate_fn(candidate_idx: int) -> np.ndarray:
+                        nonlocal _beat_rate_call_count, _beat_rate_total_time
+                        _t_br = time.perf_counter()
                         cols = _col_lineups[candidate_idx]
                         scores = _sim_mat[:, cols].sum(axis=1)
                         n_s = scores.shape[0]
@@ -641,7 +687,17 @@ class PipelineRunner:
                             beat_counts[_s:_e] = (
                                 _field_sorted[_s:_e] < scores[_s:_e, np.newaxis]
                             ).sum(axis=1)
-                        return beat_counts / _n_field
+                        result = beat_counts / _n_field
+                        _dt = time.perf_counter() - _t_br
+                        _beat_rate_call_count += 1
+                        _beat_rate_total_time += _dt
+                        logger.info(
+                            "[TIMING] _beat_rate_fn call #%d (idx=%d): %.3fs  "
+                            "field_sorted[%d cols] vs %d sims",
+                            _beat_rate_call_count, candidate_idx, _dt,
+                            _n_field, n_s,
+                        )
+                        return result
 
                     _coverage_pct = (
                         int(port_cfg.get("target_percentile", 97)) / 100.0
@@ -654,6 +710,7 @@ class PipelineRunner:
                         holdout_fraction=holdout_frac,
                         rng_seed=opt_cfg.get("rng_seed"),
                     )
+                    _t_select = time.perf_counter()
                     gpp_result = selector.select(
                         stop_check=self._stop_check,
                         beat_rate_fn=_beat_rate_fn,
@@ -668,6 +725,12 @@ class PipelineRunner:
                                 "pct_covered": round(pct_cov, 2),
                             },
                         ),
+                    )
+                    logger.info(
+                        "[TIMING] selector.select() wall time: %.3fs  "
+                        "beat_rate_fn calls=%d total=%.3fs",
+                        time.perf_counter() - _t_select,
+                        _beat_rate_call_count, _beat_rate_total_time,
                     )
                     if selector.holdout_score() is not None:
                         self._cb("gpp_holdout", {
@@ -924,6 +987,7 @@ class PipelineRunner:
             # when at least one remaining lineup beats >= coverage_percentile of
             # the field there. The stored threshold is the per-sim score needed
             # to achieve that beat rate, so we just compare scores directly.
+            avail_payout = self._gpp_robust_payout[avail]
             if hasattr(self, '_gpp_coverage_threshold'):
                 covered_mask = np.zeros(n_sims_gpp, dtype=bool)
                 pid_to_col = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
@@ -934,15 +998,25 @@ class PipelineRunner:
                     covered_mask |= (lu_scores >= self._gpp_coverage_threshold)
                 active_mask = ~covered_mask
                 n_active = int(active_mask.sum())
-                avail_payout = self._gpp_robust_payout[avail]
-                ev_vals = (
-                    avail_payout[:, active_mask].mean(axis=1)
-                    if n_active > 0
-                    else avail_payout.mean(axis=1)
+                logger.info(
+                    "replace_lineup: n_active=%d / %d sims uncovered, avail_candidates=%d",
+                    n_active, n_sims_gpp, len(avail),
                 )
+                if n_active > 0:
+                    ev_vals = avail_payout[:, active_mask].mean(axis=1)
+                else:
+                    # All sims are already covered by the remaining lineup — pick
+                    # the candidate that adds the most marginal payout above what
+                    # the remaining portfolio already achieves rather than the
+                    # globally highest-EV lineup (which would be nearly identical
+                    # to what was just deleted).
+                    ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
             else:
                 # Portfolio built before threshold was stored — fall back to marginal EV.
-                avail_payout = self._gpp_robust_payout[avail]
+                logger.info(
+                    "replace_lineup: no coverage threshold, using marginal EV, avail_candidates=%d",
+                    len(avail),
+                )
                 ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
 
             best_local = int(np.argmax(ev_vals))

@@ -39,7 +39,7 @@ echo "Starting MLB DFS Optimizer UI on http://localhost:$PORT"
 uvicorn src.api.server:app \
     --host 127.0.0.1 \
     --port "$PORT" \
-    --log-level warning >> "$LOG_FILE" 2>&1 &
+    --log-level info >> "$LOG_FILE" 2>&1 &
 SERVER_PID=$!
 echo "$SERVER_PID" > "$PID_FILE"
 

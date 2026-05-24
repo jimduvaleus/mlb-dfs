@@ -50,6 +50,12 @@ from .slate_exclusions import compute_file_fingerprint, get_slate_games_with_sta
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 UI_DIST = PROJECT_ROOT / "ui" / "dist"
 
+import logging as _logging
+_logging.basicConfig(
+    level=_logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 app = FastAPI(title="MLB DFS Optimizer")
 
 # ---------------------------------------------------------------------------
@@ -2147,6 +2153,25 @@ async def run_stream(
 
     def run_pipeline() -> None:
         try:
+            # Release large arrays from the previous run before allocating new
+            # ones.  The old runner's robust_payout (~400 MB), field_sorted
+            # (~600 MB), and sim_results can otherwise co-exist in memory with
+            # the new run's equivalents, causing significant memory pressure.
+            _old = _state.get("_runner_last")
+            if _old is not None:
+                for _attr in (
+                    "_gpp_robust_payout",
+                    "_gpp_candidates",
+                    "_gpp_coverage_threshold",
+                    "_sim_results",
+                    "_raw_portfolio",
+                ):
+                    try:
+                        setattr(_old, _attr, None)
+                    except Exception:
+                        pass
+            del _old
+
             from .pipeline import PipelineRunner
             import yaml as _yaml
             _cfg_path = str(PROJECT_ROOT / "config.yaml")
@@ -2205,10 +2230,16 @@ async def replace_lineup_endpoint(lineup_index: int):
     if _state["status"] in ("running", "replacing"):
         raise HTTPException(409, "Cannot replace lineup while a run is in progress")
     runner = _state.get("_runner_last")
-    if runner is None or not hasattr(runner, "_raw_portfolio"):
-        raise HTTPException(400, "No portfolio available")
-    if not hasattr(runner, "_sim_results"):
-        raise HTTPException(400, "Simulation results not available — please re-run the portfolio")
+    if runner is None or getattr(runner, "_raw_portfolio", None) is None:
+        raise HTTPException(
+            400,
+            "Simulation data unavailable — please re-run the portfolio to enable lineup replacement.",
+        )
+    if getattr(runner, "_sim_results", None) is None:
+        raise HTTPException(
+            400,
+            "Simulation results unavailable — please re-run the portfolio to enable lineup replacement.",
+        )
     if lineup_index < 1 or lineup_index > len(runner._raw_portfolio):
         raise HTTPException(400, f"Invalid lineup index: {lineup_index}")
     _state["status"] = "replacing"
