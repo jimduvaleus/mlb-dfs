@@ -244,7 +244,7 @@ export default function App() {
     if (state.config?.optimizer?.objective === 'leverage_surplus') {
       try {
         const status = await fetchCacheStatus()
-        if (status.is_gpp && (status.candidates !== null || status.field_k !== null)) {
+        if (status.is_gpp) {
           setPendingCacheStatus(status)
           setShowRunOptionsDialog(true)
           return

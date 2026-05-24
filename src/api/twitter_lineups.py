@@ -35,7 +35,7 @@ TEAM_NAME_MAP: dict[str, str] = {
     "cardinals": "STL", "st. louis cardinals": "STL",
     "pirates": "PIT", "pittsburgh pirates": "PIT",
     "rockies": "COL", "colorado rockies": "COL",
-    "diamondbacks": "ARI", "arizona diamondbacks": "ARI",
+    "diamondbacks": "ARI", "arizona diamondbacks": "ARI", "d-backs": "ARI", "dbacks": "ARI",
     "marlins": "MIA", "miami marlins": "MIA",
     "nationals": "WSH", "washington nationals": "WSH",
 }
