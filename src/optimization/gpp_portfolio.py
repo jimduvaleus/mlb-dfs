@@ -20,6 +20,7 @@ The Numba kernel _compute_payout_from_sorted_field is a module-level
 optimizer.py. Compiled artifacts land in __pycache__; first-run JIT adds ~5–15 s.
 """
 import logging
+import time
 from typing import Callable, Optional
 
 import numpy as np
@@ -191,6 +192,7 @@ class ContestScorer:
         and self.last_col_lineups (M × 10 int32) for use by EVPortfolioSelector.
         """
         n_sims = self._sim_matrix.shape[0]
+        _t_phase = time.perf_counter()
 
         # --- Generate (or inject cached) field samples ---
         field_sorted_list: list[np.ndarray] = []
@@ -198,8 +200,13 @@ class ContestScorer:
             logger.info(
                 "Using %d preloaded field samples from cache.", len(self._preloaded_field)
             )
-            for raw in self._preloaded_field:
+            for _ki, raw in enumerate(self._preloaded_field):
+                _t_fs = time.perf_counter()
                 field_sorted_list.append(self._build_field_sorted(raw))
+                logger.info(
+                    "  [TIMING] _build_field_sorted sample %d/%d (cached): %.3fs",
+                    _ki + 1, len(self._preloaded_field), time.perf_counter() - _t_fs,
+                )
             self._n_k = len(self._preloaded_field)
             self._n_field = self._preloaded_field[0].shape[0] if self._preloaded_field else self._n_field
         else:
@@ -215,28 +222,46 @@ class ContestScorer:
                 def _field_cb(n_done: int, _n: int, _offset: int = offset) -> None:
                     if field_progress_cb is not None:
                         field_progress_cb(_offset + n_done, n_total_field)
+                _t_gen = time.perf_counter()
                 raw = self._cs.generate_field(
                     self._field_players_df, self._field_ownership_vec,
                     n_lineups=self._n_field, rng_seed=seed,
                     progress_cb=_field_cb if field_progress_cb is not None else None,
                 )
+                logger.info(
+                    "  [TIMING] generate_field %d/%d: %.3fs (%d lineups)",
+                    k + 1, self._n_k, time.perf_counter() - _t_gen, raw.shape[0],
+                )
                 raw_list.append(raw)
+                _t_fs = time.perf_counter()
                 field_sorted_list.append(self._build_field_sorted(raw))
-                logger.info("  Field %d/%d: %d lineups", k + 1, self._n_k, raw.shape[0])
+                logger.info(
+                    "  [TIMING] _build_field_sorted %d/%d (fresh): %.3fs",
+                    k + 1, self._n_k, time.perf_counter() - _t_fs,
+                )
                 if field_progress_cb is not None:
                     field_progress_cb(offset + len(raw), n_total_field)
             self.last_raw_field_list = raw_list
 
+        logger.info("[TIMING] Total field phase: %.3fs", time.perf_counter() - _t_phase)
+
         # Combine all K field samples into one sorted pool for coverage computation.
         # Beat rate = fraction of K×N field lineups beaten, consistent with how
         # robust_payout averages payout across the same K samples.
+        _t_concat = time.perf_counter()
         self.last_field_sorted = np.sort(
             np.concatenate(field_sorted_list, axis=1), axis=1
         )  # (n_sims, K * N_field)
+        logger.info(
+            "[TIMING] concat+sort field_sorted %s: %.3fs",
+            self.last_field_sorted.shape, time.perf_counter() - _t_concat,
+        )
 
+        _t_col = time.perf_counter()
         M = len(candidates)
         col_lineups = self._build_col_lineups(candidates)  # (M, 10) int32
         self.last_col_lineups = col_lineups
+        logger.info("[TIMING] _build_col_lineups M=%d: %.3fs", M, time.perf_counter() - _t_col)
 
         # --- Score the (possibly enriched) candidate pool against all K fields ---
         robust_payout = np.zeros((M, n_sims), dtype=np.float32)
@@ -246,6 +271,7 @@ class ContestScorer:
             M, n_batches, self._batch_size,
         )
 
+        _t_scoring = time.perf_counter()
         for batch_idx, start in enumerate(range(0, M, self._batch_size)):
             end = min(start + self._batch_size, M)
             batch_cols = col_lineups[start:end]  # (batch, 10)
@@ -271,6 +297,13 @@ class ContestScorer:
                 logger.info("ContestScorer: stop requested after batch %d/%d.", batch_idx + 1, n_batches)
                 break
 
+        logger.info("[TIMING] Numba scoring loop total: %.3fs", time.perf_counter() - _t_scoring)
+        logger.info(
+            "[TIMING] score_candidates total: %.3fs (field=%.3fs, scoring=%.3fs)",
+            time.perf_counter() - _t_phase,
+            time.perf_counter() - _t_phase - (time.perf_counter() - _t_scoring),
+            time.perf_counter() - _t_scoring,
+        )
         return candidates, robust_payout
 
     # ------------------------------------------------------------------
@@ -387,8 +420,19 @@ class EVPortfolioSelector:
         list of (Lineup, lineup_ev) tuples in selection order, where lineup_ev
         is the mean robust_payout on uncovered sims at the time of selection.
         """
-        train_payout = self._robust_payout[:, self._train_idx]  # (M, n_train)
+        # Avoid a redundant copy of robust_payout when there is no holdout split.
+        # Fancy indexing with np.arange(n) always materialises a full copy; skip it
+        # when train_idx covers the whole matrix.
+        n_sims_total = self._robust_payout.shape[1]
+        if len(self._train_idx) == n_sims_total:
+            train_payout = self._robust_payout          # view — no copy
+        else:
+            train_payout = self._robust_payout[:, self._train_idx]  # (M, n_train)
         n_train = train_payout.shape[1]
+        logger.info(
+            "[TIMING] EVPortfolioSelector.select() start — train_payout shape %s (%.1f MB)",
+            train_payout.shape, train_payout.nbytes / 1e6,
+        )
 
         selected: list[tuple[Lineup, float]] = []
         selected_pid_sets: list[frozenset] = []
@@ -398,18 +442,33 @@ class EVPortfolioSelector:
         active_mask = np.ones(n_train, dtype=bool)
         n_covered = 0
 
+        # Incremental EV: precompute the per-candidate sum over all train sims once,
+        # then subtract covered-sim contributions as coverage accrues.  Each round
+        # becomes O(M) instead of O(M × n_active), avoiding repeated 1800 MB copies.
+        _t_setup = time.perf_counter()
+        _ev_sum_all = train_payout.sum(axis=1).astype(np.float64)  # (M,) immutable baseline
+        _ev_sum = _ev_sum_all.copy()                                # (M,) mutable running sum
+        _n_active = float(n_train)
+        logger.info("[TIMING] ev_sum precompute: %.3fs", time.perf_counter() - _t_setup)
+
+        _t_select_start = time.perf_counter()
+        _t_ev_total = 0.0
+        _t_beat_total = 0.0
+
         for k in range(self._portfolio_size):
             if len(remaining) == 0:
                 break
 
-            # Compute EV once per round, then scan best-first to skip any
-            # exact duplicate lineups (same player set, different candidate idx).
-            if k == 0 or not active_mask.any():
-                # Round 0: use all sims. Also fall back to all sims if everything
-                # is already covered (edge case with very few sims).
-                ev = train_payout[remaining, :].mean(axis=1)
+            # EV per round: O(M) — just index the running sum vector.
+            _t_ev = time.perf_counter()
+            n_active = int(_n_active)
+            if _n_active > 0:
+                ev = (_ev_sum[remaining] / _n_active).astype(np.float32)
             else:
-                ev = train_payout[remaining][:, active_mask].mean(axis=1)
+                # All sims covered: fall back to global mean as tiebreaker.
+                ev = (_ev_sum_all[remaining] / float(n_train)).astype(np.float32)
+            _dt_ev = time.perf_counter() - _t_ev
+            _t_ev_total += _dt_ev
 
             # Walk candidates in descending EV order, skipping duplicates.
             order = np.argsort(ev)[::-1]
@@ -445,19 +504,30 @@ class EVPortfolioSelector:
             self._selected_indices.append(best_global)
             remaining = np.delete(remaining, best_local)
 
-            # Mark sims covered by this lineup.
+            # Mark sims covered by this lineup and update running EV sum.
+            _t_beat = time.perf_counter()
             if beat_rate_fn is not None:
                 beat_rates = beat_rate_fn(best_global)  # (n_sims,) float32
                 # beat_rates is over the full sim set; index into train split.
                 beat_rates_train = beat_rates[self._train_idx]
                 newly_covered = active_mask & (beat_rates_train >= coverage_percentile)
-                active_mask[newly_covered] = False
+                if newly_covered.any():
+                    # Subtract newly covered sims from running sum: O(M × n_newly_covered)
+                    # rather than recomputing the full O(M × n_active) slice next round.
+                    covered_idx = np.where(newly_covered)[0]
+                    _ev_sum -= train_payout[:, covered_idx].sum(axis=1).astype(np.float64)
+                    active_mask[newly_covered] = False
+                    _n_active = float(int(active_mask.sum()))
                 n_covered = int((~active_mask).sum())
+            _dt_beat = time.perf_counter() - _t_beat
+            _t_beat_total += _dt_beat
 
             pct_covered = n_covered / n_train * 100
             logger.info(
-                "  Round %d: lineup_ev=%.4f, covered=%d/%d (%.1f%%)",
+                "  Round %d: lineup_ev=%.4f, covered=%d/%d (%.1f%%) | "
+                "ev_compute=%.3fs (n_active=%d), beat_rate=%.3fs",
                 k, lineup_ev, n_covered, n_train, pct_covered,
+                _dt_ev, n_active, _dt_beat,
             )
 
             if progress_cb is not None:
@@ -465,6 +535,14 @@ class EVPortfolioSelector:
             if stop_check is not None and stop_check():
                 logger.info("EVPortfolioSelector: stop requested after round %d.", k)
                 break
+
+        _t_select_total = time.perf_counter() - _t_select_start
+        logger.info(
+            "[TIMING] EVPortfolioSelector.select() done — total=%.3fs, "
+            "ev_compute_total=%.3fs, beat_rate_total=%.3fs, other=%.3fs",
+            _t_select_total, _t_ev_total, _t_beat_total,
+            _t_select_total - _t_ev_total - _t_beat_total,
+        )
 
         self._best_payout_train = np.zeros(n_train, dtype=np.float32)
         return selected
