@@ -89,6 +89,7 @@ export default function App() {
   const [pendingCacheStatus, setPendingCacheStatus] = useState<CacheStatus | null>(null)
   const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null)
   const [replacingIndex, setReplacingIndex] = useState<number | null>(null)
+  const [replaceError, setReplaceError] = useState<string | null>(null)
   const [projStatusTrigger, setProjStatusTrigger] = useState(0)
   const [parsingNotification, setParsingNotification] = useState<TwitterNotification | null>(null)
   const [parseResult, setParseResult] = useState<TwitterLineupParseResponse | null>(null)
@@ -314,10 +315,9 @@ export default function App() {
     try {
       const updated = await replaceLineup(idx)
       dispatch({ type: 'set_portfolio', portfolio: updated })
-    } catch {
-      fetchPortfolio()
-        .then(p => { if (p.length > 0) dispatch({ type: 'set_portfolio', portfolio: p }) })
-        .catch(() => {})
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Failed to replace lineup'
+      setReplaceError(msg)
     } finally {
       setReplacingIndex(null)
       dispatch({ type: 'set_run_status', status: 'complete' })
@@ -456,6 +456,9 @@ export default function App() {
             replacingLineupIndex={replacingIndex}
             platform={state.config?.platform}
           />
+        )}
+        {replaceError && state.activeTab === 'portfolio' && (
+          <div className="parse-error-toast" onClick={() => setReplaceError(null)}>{replaceError}</div>
         )}
 
         {state.activeTab === 'metrics' && (

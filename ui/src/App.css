@@ -749,16 +749,14 @@ button { cursor: pointer; }
 }
 .portfolio-optimal-filter-toggle:hover { opacity: 1; }
 
-.lineup-card--in-portfolio {
-  border-color: rgba(72, 187, 120, 0.5);
-  background: #131a1c;
-}
 .lineup-card--in-portfolio .lineup-card-header {
-  background: rgba(72, 187, 120, 0.08);
-  border-bottom-color: rgba(72, 187, 120, 0.25);
+  font-size: 16px;
 }
 .lineup-card--in-portfolio .lineup-card-num {
-  color: #68d391;
+  font-size: 16px;
+}
+.lineup-card--in-portfolio .lineup-card-opt-ref {
+  font-size: 16px;
 }
 
 .portfolio-unconfirmed-banner {
@@ -892,13 +890,13 @@ button { cursor: pointer; }
   padding: 11px 17px;
   background: #1a1f2e;
   border-bottom: 1px solid #2d3748;
-  font-size: 17px;
+  font-size: 16px;
 }
 
 .lineup-card-num {
   font-weight: 700;
   color: #a0aec0;
-  font-size: 18px;
+  font-size: 16px;
 }
 
 .lineup-card-salary {
@@ -907,9 +905,9 @@ button { cursor: pointer; }
 }
 
 .lineup-card-opt-ref {
-  font-size: 12px;
+  font-size: 16px;
   font-weight: 500;
-  color: #68d391;
+  color: #a0aec0;
   opacity: 0.8;
   align-self: center;
 }

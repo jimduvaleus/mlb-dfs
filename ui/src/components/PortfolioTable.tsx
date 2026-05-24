@@ -125,11 +125,18 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const searchWrapRef = useRef<HTMLDivElement>(null)
+  const [filterOptimalPlayer, setFilterOptimalPlayer] = useState<PlayerRow | null>(null)
+  const [searchOptimal, setSearchOptimal] = useState('')
+  const [searchOptimalOpen, setSearchOptimalOpen] = useState(false)
+  const searchOptimalWrapRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
       if (searchWrapRef.current && !searchWrapRef.current.contains(e.target as Node)) {
         setSearchOpen(false)
+      }
+      if (searchOptimalWrapRef.current && !searchOptimalWrapRef.current.contains(e.target as Node)) {
+        setSearchOptimalOpen(false)
       }
     }
     document.addEventListener('mousedown', handleClick)
@@ -192,6 +199,19 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
   // Only show optimal lineups that are included in the portfolio
   const optimalInPortfolio = optimalLineups.filter(ol => portfolioKeyMap.has(playerKey(ol.players)))
 
+  const optimalAllPlayers = Array.from(
+    new Map(optimalInPortfolio.flatMap(l => l.players).map(p => [p.player_id, p])).values()
+  ).sort((a, b) => a.name.localeCompare(b.name))
+
+  const searchOptimalLower = searchOptimal.toLowerCase()
+  const optimalSearchResults = optimalAllPlayers
+    .filter(p => p.name.toLowerCase().includes(searchOptimalLower))
+    .slice(0, 10)
+
+  const visibleOptimalLineups = filterOptimalPlayer
+    ? optimalInPortfolio.filter(l => l.players.some(p => p.player_id === filterOptimalPlayer.player_id))
+    : optimalInPortfolio
+
   const showOptimalTab = optimalLineups.length > 0
 
   return (
@@ -214,11 +234,49 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
       )}
       {activeTab === 'optimal' ? (
         <>
+        <h3>Optimal — {filterOptimalPlayer ? `${visibleOptimalLineups.length} / ${optimalInPortfolio.length}` : optimalInPortfolio.length} Lineups</h3>
+        <div className="portfolio-filter" ref={searchOptimalWrapRef}>
+          {filterOptimalPlayer ? (
+            <span className="portfolio-filter-chip">
+              {filterOptimalPlayer.name}
+              <button onClick={() => { setFilterOptimalPlayer(null); setSearchOptimal('') }}>×</button>
+            </span>
+          ) : (
+            <>
+              <input
+                className="portfolio-filter-input"
+                placeholder="Filter by player…"
+                value={searchOptimal}
+                onChange={e => { setSearchOptimal(e.target.value); setSearchOptimalOpen(true) }}
+                onFocus={() => setSearchOptimalOpen(true)}
+              />
+              {searchOptimalOpen && optimalSearchResults.length > 0 && (
+                <div className="portfolio-filter-results">
+                  {optimalSearchResults.map(p => (
+                    <button
+                      key={p.player_id}
+                      className="portfolio-filter-result-btn"
+                      onMouseDown={e => {
+                        e.preventDefault()
+                        setFilterOptimalPlayer(p)
+                        setSearchOptimal('')
+                        setSearchOptimalOpen(false)
+                      }}
+                    >
+                      <span>{p.name}</span>
+                      <span className="portfolio-filter-result-meta">{p.position} · {p.team}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </>
+          )}
+        </div>
         <div className={`portfolio-optimal-banner${optimalInPortfolio.length > 0 ? ' portfolio-optimal-banner--hit' : ''}`}>
           <span>{optimalInPortfolio.length} / {optimalLineups.length} optimal lineup{optimalLineups.length !== 1 ? 's' : ''} selected in portfolio</span>
         </div>
         <div className="portfolio-cards">
-          {optimalInPortfolio.map(ol => {
+          {visibleOptimalLineups.map(ol => {
             const key = playerKey(ol.players)
             const portfolioIndex = portfolioKeyMap.get(key)!
             const portLineup = portfolioLineupByIndex.get(portfolioIndex)
@@ -228,9 +286,9 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
             return (
               <div key={ol.lineup_index} className="lineup-card lineup-card--in-portfolio">
                 <div className="lineup-card-header">
-                  <span className="lineup-card-num">Opt #{ol.lineup_index}</span>
-                  <span className="lineup-card-opt-ref">Portfolio #{portfolioIndex}</span>
+                  <span className="lineup-card-num">#{ol.lineup_index}</span>
                   <span className="lineup-card-salary">${ol.lineup_salary.toLocaleString()}</span>
+                  <span className="lineup-card-opt-ref">Portfolio #{portfolioIndex}</span>
                   <div className="lineup-card-header-right">
                     {stack && <span className="lineup-card-stack">{stack}</span>}
                   </div>
@@ -308,10 +366,10 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
             <div key={lineup.lineup_index} className="lineup-card">
               <div className="lineup-card-header">
                 <span className="lineup-card-num">#{lineup.lineup_index}</span>
+                <span className="lineup-card-salary">${lineup.lineup_salary.toLocaleString()}</span>
                 {optIdx != null && (
                   <span className="lineup-card-opt-ref">Opt #{optIdx}</span>
                 )}
-                <span className="lineup-card-salary">${lineup.lineup_salary.toLocaleString()}</span>
                 <div className="lineup-card-header-right">
                   {isReplacing ? (
                     <span className="lineup-card-generating">Generating…</span>
