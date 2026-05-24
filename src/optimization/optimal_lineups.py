@@ -18,12 +18,14 @@ POS_REQUIREMENTS: dict[str, int] = {
 def generate_optimal_lineups(
     df: pd.DataFrame,
     n: int = 100,
-    min_uniques: int = 3,
+    min_uniques: int = 4,
     min_stack: int = 4,
+    stack_team: Optional[str] = None,
     salary_floor: Optional[float] = None,
+    seen: Optional[set] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
 ) -> list[Lineup]:
-    """Return the top-N optimal lineups by projected mean score.
+    """Return up to N optimal lineups by projected mean score.
 
     Uses iterative ILP (OR-Tools CBC) with no-good cuts to enumerate
     distinct lineups. Each new lineup must differ from every previously
@@ -41,8 +43,14 @@ def generate_optimal_lineups(
         Minimum players that must differ from any single prior lineup.
     min_stack:
         Minimum batters from one team required (stack constraint).
+    stack_team:
+        If provided, forces this team to be the stack team (z[t]=1).
     salary_floor:
         Minimum total salary (optional).
+    seen:
+        set of frozenset[int] of player_ids already generated in other
+        batches. Duplicate lineups are skipped (but their no-good cut is
+        still added), so the solver won't revisit them.
     progress_cb:
         Called with the count of lineups found so far after each lineup.
     """
@@ -189,24 +197,41 @@ def generate_optimal_lineups(
         for j in js:
             c.SetCoefficient(xp[j], 1)
 
+    # C9b: force a specific team to be the stack team (optional)
+    if stack_team is not None and stack_team in team_idx:
+        t_forced = team_idx[stack_team]
+        c = solver.Constraint(1, 1)
+        c.SetCoefficient(z[t_forced], 1)
+
     # --- Iterative solve with no-good cuts ---
     lineups: list[Lineup] = []
+    # Budget extra attempts to account for cross-batch duplicates skipped via `seen`
+    max_attempts = n * 3 if seen is not None else n
 
-    for _ in range(n):
+    for _ in range(max_attempts):
+        if len(lineups) >= n:
+            break
         status = solver.Solve()
         if status != pywraplp.Solver.OPTIMAL:
             break
 
         pids = [xp_list[j][0] for j in range(n_xp) if xp[j].solution_value() > 0.5]
-        lineups.append(Lineup(player_ids=pids))
 
-        if progress_cb is not None:
-            progress_cb(len(lineups))
-
-        # No-good cut: sum(xp[j] for j in lineup vars) <= 10 - min_uniques
+        # No-good cut always runs so this lineup is never revisited
         cut_js = sorted({j for pid in pids for j in player_to_js[pid]})
         c = solver.Constraint(0, float(10 - min_uniques))
         for j in cut_js:
             c.SetCoefficient(xp[j], 1)
+
+        # Skip if already generated in a prior batch
+        key = frozenset(pids)
+        if seen is not None and key in seen:
+            continue
+
+        lineups.append(Lineup(player_ids=pids))
+        if seen is not None:
+            seen.add(key)
+        if progress_cb is not None:
+            progress_cb(len(lineups))
 
     return lineups

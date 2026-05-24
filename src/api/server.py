@@ -2089,11 +2089,37 @@ def run_cache_status():
     abs_slate = (PROJECT_ROOT / slate_path) if slate_path else None
     is_gpp = cfg.optimizer.objective == "leverage_surplus"
     status = get_cache_status(abs_slate or "")
+
+    n_batter_teams = 0
+    try:
+        slate_df = _load_slate_df()
+        if slate_df is not None:
+            all_batter_teams = set(slate_df[slate_df["position"] != "P"]["team"])
+            game_times = _load_slate_games()
+            if game_times and abs_slate:
+                from .slate_exclusions import compute_file_fingerprint, compute_slate_id, read_exclusions as _re
+                fp = compute_file_fingerprint(abs_slate)
+                sid = compute_slate_id(list(game_times.keys()))
+                stored = _re(sid, fp)
+                excluded_games = set(stored.get("excluded_games", []))
+                if excluded_games:
+                    excl_teams = set(
+                        slate_df[
+                            slate_df["game"].isin(excluded_games) &
+                            (slate_df["position"] != "P")
+                        ]["team"]
+                    )
+                    all_batter_teams -= excl_teams
+            n_batter_teams = len(all_batter_teams)
+    except Exception:
+        pass
+
     return {
         **status,
         "is_gpp": is_gpp,
         "n_configured_candidates": cfg.gpp.n_candidates,
         "n_configured_field_k": cfg.gpp.n_field_samples,
+        "n_batter_teams": n_batter_teams,
     }
 
 

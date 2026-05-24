@@ -293,6 +293,7 @@ export interface CacheStatus {
   n_configured_candidates: number
   n_configured_field_k: number
   is_gpp: boolean
+  n_batter_teams: number
 }
 
 export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 'replacing'

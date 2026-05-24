@@ -906,6 +906,14 @@ button { cursor: pointer; }
   color: #f6ad55;
 }
 
+.lineup-card-opt-ref {
+  font-size: 12px;
+  font-weight: 500;
+  color: #68d391;
+  opacity: 0.8;
+  align-self: center;
+}
+
 .lineup-card-entry-info {
   font-size: 14px;
   font-weight: 600;

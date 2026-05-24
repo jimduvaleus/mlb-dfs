@@ -23,6 +23,13 @@ function formatFdEntryInfo(entryFee?: string | null, contestName?: string | null
   return [fee, name].filter(Boolean).join(' ')
 }
 
+function entryInfoText(lineup: LineupResult, platform?: PlatformType): string | null {
+  if (!lineup.upload_tag) return null
+  return platform === 'fanduel'
+    ? formatFdEntryInfo(lineup.entry_fee, lineup.contest_name)
+    : `${lineup.upload_tag}${lineup.entry_fee ? ` ${lineup.entry_fee}` : ''}${lineup.contest_name ? ` ${lineup.contest_name}` : ''}`
+}
+
 // Maps each slot label to the set of player positions that may fill it.
 // DK slots are exact-match; FD adds compound labels (C/1B, UTIL).
 const SLOT_ELIGIBILITY: Record<string, ReadonlySet<string>> = {
@@ -108,9 +115,12 @@ function sortAndAssignPositions(
   return result
 }
 
+function playerKey(players: PlayerRow[]): string {
+  return [...players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
+}
+
 export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
   const [activeTab, setActiveTab] = useState<'portfolio' | 'optimal'>('portfolio')
-  const [showOnlyInPortfolio, setShowOnlyInPortfolio] = useState(false)
   const [filterPlayer, setFilterPlayer] = useState<PlayerRow | null>(null)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
@@ -164,18 +174,23 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
     ? ' — ' + sortedUnconfirmedPlayers.map(e => `${e.count} ${e.name}`).join(', ')
     : ''
 
-  // Map sorted player-id key → portfolio lineup_index for cross-referencing optimal lineups
+  // portfolio key → lineup_index
   const portfolioKeyMap = new Map<string, number>(
-    lineups.map(l => [
-      [...l.players.map(p => p.player_id)].sort((a, b) => a - b).join(','),
-      l.lineup_index,
-    ])
+    lineups.map(l => [playerKey(l.players), l.lineup_index])
   )
 
-  const optimalInPortfolioCount = optimalLineups.filter(ol => {
-    const key = [...ol.players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
-    return portfolioKeyMap.has(key)
-  }).length
+  // portfolio lineup_index → LineupResult (for looking up entry info on optimal cards)
+  const portfolioLineupByIndex = new Map<number, LineupResult>(
+    lineups.map(l => [l.lineup_index, l])
+  )
+
+  // optimal key → lineup_index (for showing Opt# on portfolio cards)
+  const optimalIndexMap = new Map<string, number>(
+    optimalLineups.map(ol => [playerKey(ol.players), ol.lineup_index])
+  )
+
+  // Only show optimal lineups that are included in the portfolio
+  const optimalInPortfolio = optimalLineups.filter(ol => portfolioKeyMap.has(playerKey(ol.players)))
 
   const showOptimalTab = optimalLineups.length > 0
 
@@ -193,46 +208,36 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
             className={`portfolio-tab${activeTab === 'optimal' ? ' portfolio-tab--active' : ''}`}
             onClick={() => setActiveTab('optimal')}
           >
-            Optimal ({optimalLineups.length})
+            Optimal ({optimalInPortfolio.length})
           </button>
         </div>
       )}
       {activeTab === 'optimal' ? (
         <>
-        <div className={`portfolio-optimal-banner${optimalInPortfolioCount > 0 ? ' portfolio-optimal-banner--hit' : ''}`}>
-          <span>{optimalInPortfolioCount} / {optimalLineups.length} optimal lineup{optimalLineups.length !== 1 ? 's' : ''} selected in portfolio</span>
-          {optimalInPortfolioCount > 0 && (
-            <label className="portfolio-optimal-filter-toggle">
-              <input
-                type="checkbox"
-                checked={showOnlyInPortfolio}
-                onChange={e => setShowOnlyInPortfolio(e.target.checked)}
-              />
-              Show included only
-            </label>
-          )}
+        <div className={`portfolio-optimal-banner${optimalInPortfolio.length > 0 ? ' portfolio-optimal-banner--hit' : ''}`}>
+          <span>{optimalInPortfolio.length} / {optimalLineups.length} optimal lineup{optimalLineups.length !== 1 ? 's' : ''} selected in portfolio</span>
         </div>
         <div className="portfolio-cards">
-          {optimalLineups.filter(ol => {
-            if (!showOnlyInPortfolio) return true
-            const key = [...ol.players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
-            return portfolioKeyMap.has(key)
-          }).map(ol => {
-            const key = [...ol.players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
-            const portfolioIndex = portfolioKeyMap.get(key)
+          {optimalInPortfolio.map(ol => {
+            const key = playerKey(ol.players)
+            const portfolioIndex = portfolioKeyMap.get(key)!
+            const portLineup = portfolioLineupByIndex.get(portfolioIndex)
             const sorted = sortAndAssignPositions(ol.players, platform)
             const stack = getStackNotation(ol.players)
+            const entryText = portLineup ? entryInfoText(portLineup, platform) : null
             return (
-              <div key={ol.lineup_index} className={`lineup-card${portfolioIndex != null ? ' lineup-card--in-portfolio' : ''}`}>
+              <div key={ol.lineup_index} className="lineup-card lineup-card--in-portfolio">
                 <div className="lineup-card-header">
-                  <span className="lineup-card-num">
-                    {portfolioIndex != null ? `#${portfolioIndex} in portfolio` : `Optimal #${ol.lineup_index}`}
-                  </span>
+                  <span className="lineup-card-num">Opt #{ol.lineup_index}</span>
+                  <span className="lineup-card-opt-ref">Portfolio #{portfolioIndex}</span>
                   <span className="lineup-card-salary">${ol.lineup_salary.toLocaleString()}</span>
                   <div className="lineup-card-header-right">
                     {stack && <span className="lineup-card-stack">{stack}</span>}
                   </div>
                 </div>
+                {entryText && (
+                  <div className="lineup-card-entry-info">{entryText}</div>
+                )}
                 <div className="lineup-card-players">
                   {sorted.map(({ player: p, displayPos }, i) => (
                     <div key={i} className="lineup-player">
@@ -298,10 +303,14 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
           const sorted = sortAndAssignPositions(lineup.players, platform)
           const stack = getStackNotation(lineup.players)
           const isReplacing = replacingLineupIndex === lineup.lineup_index
+          const optIdx = optimalIndexMap.get(playerKey(lineup.players))
           return (
             <div key={lineup.lineup_index} className="lineup-card">
               <div className="lineup-card-header">
                 <span className="lineup-card-num">#{lineup.lineup_index}</span>
+                {optIdx != null && (
+                  <span className="lineup-card-opt-ref">Opt #{optIdx}</span>
+                )}
                 <span className="lineup-card-salary">${lineup.lineup_salary.toLocaleString()}</span>
                 <div className="lineup-card-header-right">
                   {isReplacing ? (
@@ -325,9 +334,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
               </div>
               {lineup.upload_tag && (
                 <div className="lineup-card-entry-info">
-                  {platform === 'fanduel'
-                    ? formatFdEntryInfo(lineup.entry_fee, lineup.contest_name)
-                    : `${lineup.upload_tag}${lineup.entry_fee ? ` ${lineup.entry_fee}` : ''}${lineup.contest_name ? ` ${lineup.contest_name}` : ''}`}
+                  {entryInfoText(lineup, platform)}
                 </div>
               )}
               <div className="lineup-card-players">

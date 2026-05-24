@@ -236,6 +236,6 @@ export async function fetchCacheStatus(): Promise<CacheStatus> {
     if (!res.ok) throw new Error('not ok')
     return res.json()
   } catch {
-    return { is_gpp: false, fingerprint: '', candidates: null, field_k: null, n_configured_candidates: 0, n_configured_field_k: 0 }
+    return { is_gpp: false, fingerprint: '', candidates: null, field_k: null, n_configured_candidates: 0, n_configured_field_k: 0, n_batter_teams: 0 }
   }
 }
