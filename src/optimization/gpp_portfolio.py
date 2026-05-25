@@ -298,6 +298,20 @@ class ContestScorer:
                 break
 
         logger.info("[TIMING] Numba scoring loop total: %.3fs", time.perf_counter() - _t_scoring)
+
+        # Zero out robust_payout for any candidate whose col_lineups contains -1
+        # (a player absent from sim_results). Without this, numpy's -1 index wraps
+        # to the last column and inflates the candidate's score, potentially
+        # causing it to be selected into the portfolio.
+        invalid_mask = (col_lineups == -1).any(axis=1)
+        if invalid_mask.any():
+            robust_payout[invalid_mask] = 0.0
+            logger.warning(
+                "%d candidate(s) contain player_ids not in sim_results "
+                "(loaded from cache for a different player pool?); zeroed out.",
+                int(invalid_mask.sum()),
+            )
+
         logger.info(
             "[TIMING] score_candidates total: %.3fs (field=%.3fs, scoring=%.3fs)",
             time.perf_counter() - _t_phase,

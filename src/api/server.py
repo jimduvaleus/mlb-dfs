@@ -512,11 +512,13 @@ def _get_slate_file_path() -> Path | None:
     return p if p.exists() else None
 
 
-def _get_archive_dir() -> Path | None:
+def _get_archive_dir(create: bool = False) -> Path | None:
     """Return archive/MMDDYYYY path derived from the slate CSV Game Info date.
 
-    Creates the directory if it does not yet exist.  Returns None when the
-    slate is missing, the date cannot be parsed, or any other error occurs.
+    When create=True, creates the directory and copies DKSalaries.csv into it
+    (needed by evaluate_ownership dry-run).  When create=False (default), just
+    returns the path without touching the filesystem.  Returns None when the
+    slate is missing or the date cannot be parsed.
     """
     import re as _re
     import pandas as _pd
@@ -530,12 +532,12 @@ def _get_archive_dir() -> Path | None:
             return None
         mo, dy, yr = m.groups()
         d = PROJECT_ROOT / "archive" / f"{mo}{dy}{yr}"
-        d.mkdir(parents=True, exist_ok=True)
-        # Ensure DKSalaries.csv is in the archive so evaluate_ownership dry-run works.
-        dk_archive = d / "DKSalaries.csv"
-        if not dk_archive.exists():
-            import shutil as _shutil
-            _shutil.copy2(str(slate_path), str(dk_archive))
+        if create:
+            d.mkdir(parents=True, exist_ok=True)
+            dk_archive = d / "DKSalaries.csv"
+            if not dk_archive.exists():
+                import shutil as _shutil
+                _shutil.copy2(str(slate_path), str(dk_archive))
         return d
     except Exception:
         return None
@@ -746,7 +748,7 @@ def post_team_ownership_reductions(update: TeamOwnershipReductionsUpdate) -> Tea
     try:
         import json as _json
         from datetime import datetime as _dt
-        _arc = _get_archive_dir()
+        _arc = _get_archive_dir(create=True)
         if _arc is not None:
             (_arc / "ownership_settings.json").write_text(
                 _json.dumps({
@@ -1050,7 +1052,7 @@ def projections_players():
         # post-contest evaluation can reconstruct what the model projected.
         if _team_ownership_reductions:
             try:
-                _arc = _get_archive_dir()
+                _arc = _get_archive_dir(create=True)
                 if _arc is not None:
                     _proj_rows = [
                         {
@@ -2248,6 +2250,8 @@ async def replace_lineup_endpoint(lineup_index: int):
         result = await loop.run_in_executor(None, runner.replace_lineup, lineup_index)
         _state["portfolio"] = result
         return result
+    except KeyError as exc:
+        raise HTTPException(500, f"Lineup replacement failed: player {exc} not found in simulation data — try re-running the portfolio")
     except Exception as exc:
         raise HTTPException(500, str(exc))
     finally:

@@ -464,6 +464,27 @@ class PipelineRunner:
                 load_candidates(_slate_fp) if (self._use_cached_candidates and _slate_fp) else None
             )
             if _preloaded_cands is not None:
+                # Validate cached candidates against the current eligible player pool.
+                # If a player's value has shifted across the cutoff, or exclusions have
+                # changed, cached lineups referencing now-ineligible players must be
+                # dropped before entering the scoring pipeline.
+                _eligible_pids = set(int(p) for p in cand_players_df["player_id"])
+                _n_raw = len(_preloaded_cands)
+                _preloaded_cands = [
+                    lu for lu in _preloaded_cands
+                    if all(int(pid) in _eligible_pids for pid in lu.player_ids)
+                ]
+                _n_dropped = _n_raw - len(_preloaded_cands)
+                if _n_dropped:
+                    logger.warning(
+                        "Dropped %d cached candidate(s) referencing players not in "
+                        "current eligible pool (value cutoff or exclusion change?).",
+                        _n_dropped,
+                    )
+                    self._cb("gpp_cache_filtered", {
+                        "n_dropped": _n_dropped, "n_remaining": len(_preloaded_cands),
+                    })
+
                 n_cached = len(_preloaded_cands)
                 if n_cached >= n_candidates:
                     candidates = _preloaded_cands[:n_candidates]
@@ -993,7 +1014,10 @@ class PipelineRunner:
                 pid_to_col = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
                 sim_mat_f32 = self._sim_results.results_matrix.astype(np.float32)
                 for lu, _ in remaining:
-                    cols = np.array([pid_to_col[pid] for pid in lu.player_ids], dtype=np.int32)
+                    cols = [pid_to_col.get(pid) for pid in lu.player_ids]
+                    cols = np.array([c for c in cols if c is not None], dtype=np.int32)
+                    if len(cols) == 0:
+                        continue
                     lu_scores = sim_mat_f32[:, cols].sum(axis=1)
                     covered_mask |= (lu_scores >= self._gpp_coverage_threshold)
                 active_mask = ~covered_mask

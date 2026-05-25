@@ -410,3 +410,88 @@ def test_selector_zero_payout_edge_case():
     selector = EVPortfolioSelector(robust_payout, stubs, portfolio_size=5)
     result = selector.select()
     assert len(result) == 5
+
+
+# ------------------------------------------------------------------ #
+#  Unmapped player_id / stale-cache bug regression tests             #
+# ------------------------------------------------------------------ #
+
+def test_scorer_invalid_candidate_zeroed_out(players_df, ownership_vec, test_payout_arr):
+    """Candidates with player_ids absent from sim_results must have robust_payout zeroed.
+
+    Replicates the stale-cache scenario: candidates were generated for an old slate
+    that included player 9999 (e.g. Bryce Harper with a new DK ID), but sim_results
+    was built from the current slate which does NOT include player 9999. Without the
+    invalid_mask fix, numpy's -1 index wraps to the last column and inflates that
+    candidate's score, potentially selecting it into the portfolio.
+    """
+    rng = np.random.default_rng(42)
+    pids = players_df["player_id"].tolist()
+    sim_matrix = rng.uniform(0, 40, size=(200, len(pids))).astype(np.float32)
+    sim_results_obj = SimulationResults(player_ids=pids, results_matrix=sim_matrix)
+
+    # Build two valid candidates from the current player pool.
+    valid_lu_a = Lineup(player_ids=[1, 20, 5, 7, 9, 11, 13, 15, 19, 16])  # P, P, C, 1B, 2B, 3B, SS, OF, OF, OF
+    valid_lu_b = Lineup(player_ids=[2, 3, 6, 8, 10, 12, 14, 17, 22, 18])
+
+    # Build one "stale cache" candidate that references player 9999 (not in sim_results).
+    ghost_lu = Lineup(player_ids=[9999, 20, 5, 7, 9, 11, 13, 15, 19, 16])
+
+    candidates_mixed = [valid_lu_a, valid_lu_b, ghost_lu]
+
+    scorer = ContestScorer(
+        sim_results_obj, players_df,
+        n_field_lineups=30, n_field_samples=1,
+        payout_arr=test_payout_arr,
+        ownership_vec=ownership_vec,
+        candidate_batch_size=10,
+    )
+    _, robust_payout = scorer.score_candidates(candidates_mixed)
+
+    # The ghost candidate (index 2) must have been zeroed out entirely.
+    assert np.all(robust_payout[2] == 0.0), (
+        "robust_payout for stale-cache candidate with unmapped player_id must be all zeros"
+    )
+    # Valid candidates must have non-zero payout (they can score in the contest).
+    assert robust_payout[0].max() > 0.0, "Valid candidate A should have non-zero payout"
+    assert robust_payout[1].max() > 0.0, "Valid candidate B should have non-zero payout"
+
+
+def test_scorer_invalid_candidate_not_selected(players_df, ownership_vec, test_payout_arr):
+    """EVPortfolioSelector must never select a stale-cache candidate into the portfolio.
+
+    Even if the ghost candidate's raw column values (before zeroing) would have scored
+    high — because numpy's -1 wraps to the last-column player — the invalid_mask fix
+    must prevent selection.
+    """
+    rng = np.random.default_rng(7)
+    pids = players_df["player_id"].tolist()
+    sim_matrix = rng.uniform(0, 40, size=(200, len(pids))).astype(np.float32)
+
+    # Make the last column (index -1, i.e. index len(pids)-1) very high so the ghost
+    # candidate would dominate if -1 wraps were not corrected.
+    sim_matrix[:, -1] = 999.0
+
+    sim_results_obj = SimulationResults(player_ids=pids, results_matrix=sim_matrix)
+
+    valid_lu = Lineup(player_ids=[1, 20, 5, 7, 9, 11, 13, 15, 19, 16])
+    ghost_lu = Lineup(player_ids=[9999, 3, 6, 8, 10, 12, 14, 17, 22, 18])
+
+    candidates_mixed = [ghost_lu, valid_lu]  # ghost first so it would win without the fix
+
+    scorer = ContestScorer(
+        sim_results_obj, players_df,
+        n_field_lineups=30, n_field_samples=1,
+        payout_arr=test_payout_arr,
+        ownership_vec=ownership_vec,
+        candidate_batch_size=10,
+    )
+    _, robust_payout = scorer.score_candidates(candidates_mixed)
+
+    selector = EVPortfolioSelector(robust_payout, candidates_mixed, portfolio_size=1)
+    result = selector.select()
+
+    selected_lineup = result[0][0]
+    assert selected_lineup is valid_lu, (
+        "EVPortfolioSelector must select the valid lineup, not the stale-cache ghost candidate"
+    )

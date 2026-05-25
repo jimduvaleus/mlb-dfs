@@ -105,7 +105,9 @@ export async function writeUploadFiles(): Promise<{ paths: string[] }> {
 export async function replaceLineup(lineupIndex: number): Promise<LineupResult[]> {
   const res = await fetch(`/api/portfolio/replace/${lineupIndex}`, { method: 'POST' })
   if (!res.ok) {
-    const detail = await res.text()
+    const text = await res.text()
+    let detail = text
+    try { const body = JSON.parse(text); if (typeof body?.detail === 'string') detail = body.detail } catch {}
     throw new Error(`Failed to replace lineup: ${detail}`)
   }
   return res.json()
