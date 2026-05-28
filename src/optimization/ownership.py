@@ -122,8 +122,13 @@ _STACK_THRESHOLD = 4.0
 # _PITCHER_OWN_CAP: no SP is realistically in >85% of field lineups even as
 # dominant chalk.  _BATTER_OWN_CAP: batters almost never approach 100%; 1.0
 # acts as a pure safety valve against math overflow without distorting normal slates.
+# _PITCHER_OWN_CAP_LARGE_SLATE: tighter cap for slates with ≥5 games. On larger
+# slates ownership is distributed across more pitcher options, so exceeding 65% is
+# rare and the lower cap prevents outlier softmax spikes from distorting the model.
 _PITCHER_OWN_CAP = 0.85
+_PITCHER_OWN_CAP_LARGE_SLATE = 0.65
 _BATTER_OWN_CAP  = 1.0
+_LARGE_SLATE_GAME_THRESHOLD = 5
 
 # Maximum fractional boost for the earliest-bucket batter games on the slate.
 # Applied only to batters; pitchers are confirmed before the slate regardless.
@@ -436,8 +441,14 @@ def compute_heuristic_ownership(
     # --- Per-player ownership cap with redistribution ------------------------
     # Iteratively clip any player above their position cap and spread the excess
     # proportionally among uncapped players, preserving the slot-count sum.
+    n_games = df["game"].nunique() if "game" in df.columns else 0
+    pitcher_cap = (
+        _PITCHER_OWN_CAP_LARGE_SLATE
+        if n_games >= _LARGE_SLATE_GAME_THRESHOLD
+        else _PITCHER_OWN_CAP
+    )
     for pos, n_slots in _SLOT_COUNTS.items():
-        cap = _PITCHER_OWN_CAP if pos == "P" else _BATTER_OWN_CAP
+        cap = pitcher_cap if pos == "P" else _BATTER_OWN_CAP
         pmask = pos_vals == pos
         if not pmask.any():
             continue

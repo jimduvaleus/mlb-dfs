@@ -540,40 +540,69 @@ class PipelineRunner:
                     batter_teams = sorted(
                         cand_players_df[cand_players_df["position"] != "P"]["team"].unique().tolist()
                     )
-                    _n_per_batch = 25
-                    _stack_sizes = [4, 5]
-                    _n_optimal_target = len(batter_teams) * len(_stack_sizes) * _n_per_batch
+                    _batches_per_stack = {5: 35, 4: 25}
+                    _stack_sizes = [5, 4]
+                    _n_optimal_target = len(batter_teams) * sum(_batches_per_stack.values())
 
                     self._cb("gpp_optimal_start", {"n_optimal": _n_optimal_target})
 
-                    _all_optimal: list = []
-                    _seen: set = set()
-                    _total_found = 0
+                    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
-                    for _stack_size in _stack_sizes:
-                        for _team in batter_teams:
+                    _batch_tasks = [(ss, tm) for ss in _stack_sizes for tm in batter_teams]
+                    _all_batches: dict[tuple, list] = {}
+
+                    with ThreadPoolExecutor() as _executor:
+                        _futures = {
+                            _executor.submit(
+                                generate_optimal_lineups,
+                                cand_players_df,
+                                n=_batches_per_stack[ss],
+                                min_uniques=3,
+                                min_stack=ss,
+                                stack_team=tm,
+                                salary_floor=salary_floor_gpp,
+                            ): (ss, tm)
+                            for ss, tm in _batch_tasks
+                        }
+                        _running_count = 0
+                        for _fut in _as_completed(_futures):
+                            _ss, _tm = _futures[_fut]
+                            _all_batches[(_ss, _tm)] = _fut.result()
+                            _running_count += len(_all_batches[(_ss, _tm)])
+                            self._cb("gpp_optimal_progress", {"n": _running_count, "total": _n_optimal_target})
                             if self._stop_check():
+                                for _f in _futures:
+                                    _f.cancel()
                                 break
 
-                            def _make_cb(off: int):
-                                def _cb(n: int) -> None:
-                                    self._cb("gpp_optimal_progress", {
-                                        "n": off + n, "total": _n_optimal_target,
-                                    })
-                                return _cb
+                    # Post-hoc collision detection (only 4-stack batches can collide).
+                    _seen_keys: dict = {}
+                    _collisions: list = []
+                    for (_ss, _tm), _lineups in _all_batches.items():
+                        for _lu in _lineups:
+                            _key = frozenset(_lu.player_ids)
+                            if _key in _seen_keys:
+                                _collisions.append((_key, _seen_keys[_key], (_ss, _tm)))
+                            else:
+                                _seen_keys[_key] = (_ss, _tm)
 
-                            _batch = generate_optimal_lineups(
-                                cand_players_df,
-                                n=_n_per_batch,
-                                min_uniques=4,
-                                min_stack=_stack_size,
-                                stack_team=_team,
-                                salary_floor=salary_floor_gpp,
-                                seen=_seen,
-                                progress_cb=_make_cb(_total_found),
-                            )
-                            _all_optimal.extend(_batch)
-                            _total_found += len(_batch)
+                    # Re-solve to replace colliding lineups in the second owner's batch.
+                    for _key, _first, (_ss2, _tm2) in _collisions:
+                        _replacements = generate_optimal_lineups(
+                            cand_players_df,
+                            n=1,
+                            min_uniques=3,
+                            min_stack=_ss2,
+                            stack_team=_tm2,
+                            salary_floor=salary_floor_gpp,
+                            seen={_key},
+                        )
+                        _all_batches[(_ss2, _tm2)] = [
+                            _lu for _lu in _all_batches[(_ss2, _tm2)]
+                            if frozenset(_lu.player_ids) != _key
+                        ] + _replacements
+
+                    _all_optimal: list = [_lu for _lus in _all_batches.values() for _lu in _lus]
 
                     _mean_map = dict(zip(
                         cand_players_df["player_id"].astype(int),

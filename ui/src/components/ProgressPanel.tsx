@@ -168,8 +168,9 @@ export function ProgressPanel({ events, running }: Props) {
       gppPct = 100
       gppLabel = 'Candidates generated'
     } else if (latestGenerateProgress && generateStartEvent) {
-      gppPct = Math.round((latestGenerateProgress.n / generateStartEvent.n_candidates) * 100)
-      gppLabel = `Generating candidates: ${latestGenerateProgress.n.toLocaleString()} / ${generateStartEvent.n_candidates.toLocaleString()}`
+      const nToGenerate = generateStartEvent.n_candidates - (generateStartEvent.n_from_optimal ?? 0)
+      gppPct = Math.round((latestGenerateProgress.n / nToGenerate) * 100)
+      gppLabel = `Generating candidates: ${latestGenerateProgress.n.toLocaleString()} / ${nToGenerate.toLocaleString()}`
     } else if (generateStartEvent) {
       gppPct = 0
       gppLabel = 'Generating candidates…'
@@ -200,7 +201,8 @@ export function ProgressPanel({ events, running }: Props) {
       if (recent.length >= 2) {
         const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
         const avgPerChunk = recentElapsed / (recent.length - 1)
-        const remainingChunks = (generateStartEvent.n_candidates - latestGenerateProgress.n) / 500
+        const nToGenerate = generateStartEvent.n_candidates - (generateStartEvent.n_from_optimal ?? 0)
+        const remainingChunks = (nToGenerate - latestGenerateProgress.n) / 500
         if (remainingChunks > 0) etaMs = avgPerChunk * remainingChunks
       }
     } else if (running && latestFieldProgress && !scoreDone && latestScoreProgress === undefined) {
