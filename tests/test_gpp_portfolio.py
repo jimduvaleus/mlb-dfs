@@ -7,6 +7,7 @@ from src.optimization.gpp_portfolio import (
     ContestScorer,
     EVPortfolioSelector,
     MeanVariancePortfolioSelector,
+    _build_payout_lookup,
     _compute_payout_from_sorted_field,
 )
 from src.optimization.lineup import Lineup
@@ -100,33 +101,31 @@ def _make_test_payout_arr(n_entries=100, first_place=100.0, pay_positions=30, mi
     return arr
 
 
-def _python_payout_dollar_ref(cand_scores, field_sorted, payout_arr):
-    """Pure-Python reference for dollar payout computation."""
+def _python_payout_dollar_ref(cand_scores, field_sorted, payout_lookup):
+    """Pure-Python reference for dollar payout computation (direct lookup)."""
     BATCH, n_sims = cand_scores.shape
     N = field_sorted.shape[1]
-    T = len(payout_arr)
     out = np.zeros((BATCH, n_sims), dtype=np.float32)
     for b in range(BATCH):
         for s in range(n_sims):
             score = float(cand_scores[b, s])
             lo = int(np.searchsorted(field_sorted[s], score, side="right"))
-            real_rank = (N - lo) * T // N + 1
-            if real_rank <= T:
-                out[b, s] = payout_arr[real_rank - 1]
+            out[b, s] = payout_lookup[lo]
     return out
 
 
 def test_payout_kernel_matches_reference():
     rng = np.random.default_rng(0)
     BATCH, n_sims, N = 10, 200, 50
-    payout_arr = _make_test_payout_arr()
+    gross_arr = _make_test_payout_arr()
+    payout_lookup = _build_payout_lookup(gross_arr, N=N, entry_fee=0.0)
     cand = rng.uniform(0, 50, (BATCH, n_sims)).astype(np.float32)
     field = np.sort(rng.uniform(0, 50, (n_sims, N)).astype(np.float32), axis=1)
     cand_c = np.ascontiguousarray(cand)
     field_c = np.ascontiguousarray(field)
 
-    result = _compute_payout_from_sorted_field(cand_c, field_c, payout_arr)
-    expected = _python_payout_dollar_ref(cand, field, payout_arr)
+    result = _compute_payout_from_sorted_field(cand_c, field_c, payout_lookup)
+    expected = _python_payout_dollar_ref(cand, field, payout_lookup)
 
     np.testing.assert_allclose(result, expected, atol=1e-5)
 
@@ -134,25 +133,28 @@ def test_payout_kernel_matches_reference():
 def test_payout_kernel_all_above_field():
     """Candidate that beats entire field in every sim → rank 1 → first-place payout."""
     n_sims, N = 100, 50
-    payout_arr = _make_test_payout_arr(first_place=5000.0)
+    gross_arr = _make_test_payout_arr(first_place=5000.0)
+    lookup = _build_payout_lookup(gross_arr, N=N, entry_fee=0.0)
     cand = np.full((1, n_sims), 999.0, dtype=np.float32)
     field = np.sort(np.random.uniform(0, 50, (n_sims, N)).astype(np.float32), axis=1)
     result = _compute_payout_from_sorted_field(
-        np.ascontiguousarray(cand), np.ascontiguousarray(field), payout_arr
+        np.ascontiguousarray(cand), np.ascontiguousarray(field), lookup
     )
-    np.testing.assert_allclose(result, 5000.0, atol=1e-3)
+    # Beat all N → lookup[N]; bin-averaging of top ranks should be close to first-place prize
+    np.testing.assert_allclose(result, lookup[N], atol=1e-3)
 
 
 def test_payout_kernel_all_below_field():
-    """Candidate always below entire field → rank beyond payout table → $0."""
+    """Candidate always below entire field → beat none → lookup[0]."""
     n_sims, N = 100, 50
-    payout_arr = _make_test_payout_arr()
+    gross_arr = _make_test_payout_arr()
+    lookup = _build_payout_lookup(gross_arr, N=N, entry_fee=0.0)
     cand = np.full((1, n_sims), -999.0, dtype=np.float32)
     field = np.sort(np.random.uniform(0, 50, (n_sims, N)).astype(np.float32), axis=1)
     result = _compute_payout_from_sorted_field(
-        np.ascontiguousarray(cand), np.ascontiguousarray(field), payout_arr
+        np.ascontiguousarray(cand), np.ascontiguousarray(field), lookup
     )
-    np.testing.assert_array_equal(result, 0.0)
+    np.testing.assert_allclose(result, lookup[0], atol=1e-5)
 
 
 def test_payout_kernel_output_shape():
@@ -190,7 +192,9 @@ def test_scorer_output_shape(sim_results, players_df, candidates, ownership_vec,
     assert result.dtype == np.float32
 
 
-def test_scorer_values_nonnegative(sim_results, players_df, candidates, ownership_vec, test_payout_arr):
+def test_scorer_values_floor(sim_results, players_df, candidates, ownership_vec, test_payout_arr):
+    """Net payout floor is -entry_fee (losing entries pay the entry fee)."""
+    entry_fee = 4.0
     scorer = ContestScorer(
         sim_results, players_df,
         n_field_lineups=30, n_field_samples=2,
@@ -199,7 +203,9 @@ def test_scorer_values_nonnegative(sim_results, players_df, candidates, ownershi
         candidate_batch_size=20,
     )
     _, result = scorer.score_candidates(candidates[:10])
-    assert np.all(result >= 0.0), "Payout values must be non-negative"
+    assert np.all(result >= -entry_fee - 1e-3), (
+        f"Net payout below floor (-${entry_fee}): min observed ${result.min():.2f}"
+    )
 
 
 def test_scorer_values_bounded(sim_results, players_df, candidates, ownership_vec, test_payout_arr):

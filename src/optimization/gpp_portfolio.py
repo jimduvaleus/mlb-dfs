@@ -40,23 +40,74 @@ logger = logging.getLogger(__name__)
 #  Numba kernels (module-level, compiled once per process)            #
 # ------------------------------------------------------------------ #
 
+def _build_payout_lookup(gross_payout_arr: np.ndarray, N: int, entry_fee: float = 4.0) -> np.ndarray:
+    """Precompute a net payout lookup of size N+1 from the real gross payout array.
+
+    Each entry lookup[lo] is the average GROSS payout over the fractionally-weighted
+    band of real ranks corresponding to beating lo of N simulated field lineups,
+    minus the entry fee.
+
+    The prize pool scales naturally with the simulated field size: a 5,001-entry
+    simulated contest drawn from a 14,863-entry real structure gets a prize pool of
+    $50,000 × (5001/14863) ≈ $16,820 — the same economics as if DK ran that
+    smaller contest with the same payout shape.
+
+    Example (N=5_000, T=5_001, prize_pool=$16_800, entry_fee=$4):
+      - Each bin covers exactly 1 real rank (T == N+1)
+      - lookup[5000] (beat all)  = $2,000 - $4 = +$1,996 net
+      - lookup[4100] (min cash)  = $8    - $4 = +$4.00 net
+      - lookup[4099] (no cash)   = $0    - $4 = -$4.00 net
+      - lookup[0]    (beat none) = $0    - $4 = -$4.00 net
+
+    Parameters
+    ----------
+    gross_payout_arr : (T,) array — GROSS prize per rank (entry fee NOT subtracted)
+    N : number of simulated field lineups; lookup will have N+1 entries (lo=0..N)
+    entry_fee : $4 for a standard DK GPP; subtracted from each slot after scaling
+    """
+    T = len(gross_payout_arr)
+    ga = gross_payout_arr.astype(np.float64)
+    cum = np.empty(T + 1, dtype=np.float64)
+    cum[0] = 0.0
+    np.cumsum(ga, out=cum[1:])
+
+    band = T / (N + 1)
+    gross_lookup = np.empty(N + 1, dtype=np.float64)
+
+    for lo in range(N + 1):
+        k = N - lo             # 0-indexed rank: k=0=best, k=N=worst
+        r_lo = k * band
+        r_hi = (k + 1) * band
+
+        i0 = int(r_lo);  f0 = r_lo - i0
+        i1 = int(r_hi);  f1 = r_hi - i1
+        if i0 >= T: i0, f0 = T - 1, 0.0
+        if i1 >= T: i1, f1 = T - 1, 0.0
+
+        gross_lookup[lo] = (cum[i1] + f1 * ga[i1] - cum[i0] - f0 * ga[i0]) / band
+
+    return (gross_lookup - entry_fee).astype(np.float32)
+
+
 @njit(parallel=True, cache=True)
 def _compute_payout_from_sorted_field(
     cand_scores_batch: np.ndarray,  # (BATCH, n_sims) float32, C-contiguous
     field_sorted: np.ndarray,       # (n_sims, N) float32, sorted along axis=1
-    payout_arr: np.ndarray,         # (total_entries,) float32 — payout_arr[rank-1] = $ for that rank
+    payout_lookup: np.ndarray,      # (N+1,) float32 — precomputed by _build_payout_lookup
 ) -> np.ndarray:                    # (BATCH, n_sims) float32
-    """Compute dollar payout for each (candidate, sim) pair.
+    """Compute dollar payout for each (candidate, sim) pair via precomputed lookup.
 
     For each candidate b and simulation s:
-      lo          = number of simulated field lineups beaten (binary search)
-      real_rank   = (N - lo) * total_entries // N + 1   (scales sim field → real contest)
-      payout      = payout_arr[real_rank - 1]  (0 for ranks beyond the payout table)
+      lo      = number of simulated field lineups beaten (binary search, O(log N))
+      payout  = payout_lookup[lo]   (O(1) table lookup)
+
+    The lookup is indexed directly by lo so there is no floating-point arithmetic
+    in the inner loop.  Aggregate preservation and edge cases are handled entirely
+    in _build_payout_lookup at construction time.
     """
     BATCH = cand_scores_batch.shape[0]
     n_sims = cand_scores_batch.shape[1]
     N = field_sorted.shape[1]
-    T = len(payout_arr)
     out = np.zeros((BATCH, n_sims), dtype=np.float32)
     for b in prange(BATCH):
         for s in range(n_sims):
@@ -69,11 +120,7 @@ def _compute_payout_from_sorted_field(
                     lo = mid + 1
                 else:
                     hi = mid
-            # Map simulated percentile to real contest rank (1-indexed).
-            # rank=1 when lo=N (beat entire field); rank=T+1 when lo=0 (beat nobody).
-            real_rank = (N - lo) * T // N + 1
-            if real_rank <= T:
-                out[b, s] = payout_arr[real_rank - 1]
+            out[b, s] = payout_lookup[lo]
     return out
 
 
@@ -139,9 +186,17 @@ class ContestScorer:
 
         if payout_arr is None:
             from src.optimization.payout import load_payout_structure, payout_table_to_array
-            structure = load_payout_structure("dk_classic_gpp")
+            structure = load_payout_structure("dk_classic_gpp_5001")
             payout_arr = payout_table_to_array(structure).astype(np.float32)
+            self._entry_fee: float = float(structure.get("entry_fee", 4.0))
+        else:
+            # Caller is responsible for passing the GROSS payout array and setting
+            # entry_fee via the ContestScorer.entry_fee attribute if needed.
+            self._entry_fee = 4.0  # default for DK Classic GPP
         self._payout_arr = np.ascontiguousarray(payout_arr.astype(np.float32))
+        self._payout_lookup = _build_payout_lookup(
+            self._payout_arr, N=n_field_lineups, entry_fee=self._entry_fee
+        )
 
         self._sim_matrix = sim_results.results_matrix.astype(np.float32)
         self._col_map: dict[int, int] = {
@@ -286,7 +341,7 @@ class ContestScorer:
             batch_payout = np.zeros((end - start, n_sims), dtype=np.float32)
             for field_sorted in field_sorted_list:
                 payout_k = _compute_payout_from_sorted_field(
-                    cand_scores_batch, field_sorted, self._payout_arr,
+                    cand_scores_batch, field_sorted, self._payout_lookup,
                 )
                 batch_payout += payout_k
 
@@ -585,17 +640,17 @@ class EVPortfolioSelector:
 class MeanVariancePortfolioSelector:
     """Mean-variance portfolio selection via simulated annealing.
 
-    Finds K lineups from M candidates maximising:
-        f(S) = mean_s[max_{k∈S} payout_k(s)] - alpha * std_s[max_{k∈S} payout_k(s)]
+    Finds K lineups from M candidates maximising the Markowitz objective:
+        f(S) = mean_s[sum_{k∈S} payout_k(s)] - alpha * std_s[sum_{k∈S} payout_k(s)]
     where alpha = (10 - risk) / 10.
 
     risk=0  → alpha=1.0 → maximum diversity (Shaidy's default)
     risk=10 → alpha=0.0 → pure mean-EV maximisation
 
-    The search uses simulated annealing with single-swap proposals. A top-2
-    data structure (best1/best2/bidx1/bidx2 per sim) enables O(n_sims) swap
-    evaluation. Every 500 iterations the top-2 is rebuilt from scratch to
-    correct for a known staleness edge case in the incremental update path.
+    Under sum, mean[sum_k] = sum_k mean[k] and the benefit of diversification
+    flows through std[sum], which decreases as pairwise lineup correlations fall.
+    A single-swap proposal reduces to new_pp = portfolio_payout - old + new, so
+    there is no top-2 tracking and no periodic rebuild.
 
     Parameters
     ----------
@@ -694,12 +749,10 @@ class MeanVariancePortfolioSelector:
         ]
 
     def holdout_score(self) -> Optional[float]:
-        """Mean of max_k payout_k on holdout sims. None if no holdout split."""
+        """Mean of sum_k payout_k on holdout sims. None if no holdout split."""
         if len(self._holdout_idx) == 0 or not self._selected_indices:
             return None
-        hp = self._robust_payout[self._selected_indices[0], self._holdout_idx]
-        for idx in self._selected_indices[1:]:
-            hp = np.maximum(hp, self._robust_payout[idx, self._holdout_idx])
+        hp = self._robust_payout[self._selected_indices, :][:, self._holdout_idx].sum(axis=0)
         return float(hp.mean())
 
     def find_replacement(
@@ -730,7 +783,7 @@ class MeanVariancePortfolioSelector:
             means = self._robust_payout.mean(axis=1)
             return int(np.argmax(means))
 
-        current_max = self._robust_payout[remaining].max(axis=0)  # (n_sims,)
+        current_sum = self._robust_payout[remaining].sum(axis=0)  # (n_sims,)
 
         excluded_set: set[int] = set(current_portfolio_indices) | {exclude_index}
         if additional_excluded:
@@ -742,11 +795,9 @@ class MeanVariancePortfolioSelector:
             return int(np.argmax(self._robust_payout.mean(axis=1)))
 
         # (n_avail, n_sims): portfolio payout after adding each candidate
-        candidate_max = np.maximum(
-            current_max[np.newaxis, :], self._robust_payout[avail]
-        )
-        means = candidate_max.mean(axis=1)
-        stds = candidate_max.std(axis=1)
+        candidate_sum = current_sum[np.newaxis, :] + self._robust_payout[avail]
+        means = candidate_sum.mean(axis=1)
+        stds = candidate_sum.std(axis=1)
         f_vals = means - self._alpha * stds
         return int(avail[int(np.argmax(f_vals))])
 
@@ -754,103 +805,15 @@ class MeanVariancePortfolioSelector:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _build_top2(
-        self, selected: list[int]
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Rebuild best1/best2/bidx1/bidx2 from scratch. O(K × n_train)."""
-        n_train = self._train_payout.shape[1]
-        payout_sel = self._train_payout[selected]          # (K, n_train)
-
-        order = np.argsort(-payout_sel, axis=0)            # (K, n_train) descending ranks
-        best1 = payout_sel[order[0], np.arange(n_train)]
-        bidx1 = np.array(selected, dtype=np.int32)[order[0]]
-        if len(selected) >= 2:
-            best2 = payout_sel[order[1], np.arange(n_train)]
-            bidx2 = np.array(selected, dtype=np.int32)[order[1]]
-        else:
-            best2 = np.zeros(n_train, dtype=np.float32)
-            bidx2 = np.full(n_train, -1, dtype=np.int32)
-        return best1, best2, bidx1, bidx2
-
     def _compute_f(self, portfolio_payout: np.ndarray) -> float:
         m = float(portfolio_payout.mean())
         s = float(portfolio_payout.std())
         return m - self._alpha * s
 
-    def _eval_swap(
-        self,
-        old_global: int,
-        new_global: int,
-        best1: np.ndarray,
-        best2: np.ndarray,
-        bidx1: np.ndarray,
-        current_f: float,
-    ) -> tuple[float, np.ndarray]:
-        """Compute delta_f and new portfolio_payout for swap(old→new). O(n_train)."""
-        new_payout = self._train_payout[new_global]
-        was_best = bidx1 == old_global
-        new_max = np.where(was_best, np.maximum(best2, new_payout), np.maximum(best1, new_payout))
-        new_f = self._compute_f(new_max)
-        return new_f - current_f, new_max
-
-    def _update_top2_incremental(
-        self,
-        old_global: int,
-        new_global: int,
-        new_portfolio_payout: np.ndarray,
-        best1: np.ndarray,
-        best2: np.ndarray,
-        bidx1: np.ndarray,
-        bidx2: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """O(n_train) incremental top-2 update after accepting swap(old→new)."""
-        new_payout = self._train_payout[new_global]
-        old_payout = self._train_payout[old_global]
-
-        nb1 = best1.copy()
-        nb2 = best2.copy()
-        ni1 = bidx1.copy()
-        ni2 = bidx2.copy()
-
-        # --- Case A: old was best1 ---
-        A = bidx1 == old_global
-        new_gt_b2 = A & (new_payout >= best2)
-        # new beats best2 → new becomes best1, best2 stays
-        nb1 = np.where(new_gt_b2, new_payout, nb1)
-        ni1 = np.where(new_gt_b2, new_global, ni1)
-        # new doesn't beat best2 → best2 becomes best1, new becomes best2
-        A_fall = A & ~new_gt_b2
-        nb1 = np.where(A_fall, best2, nb1)
-        ni1 = np.where(A_fall, bidx2, ni1)
-        nb2 = np.where(A_fall, new_payout, nb2)
-        ni2 = np.where(A_fall, new_global, ni2)
-
-        # --- Case B: old was best2 (but not best1) ---
-        # We don't know the true 3rd-best; set best2 = new_payout.
-        # Periodic full rebuilds correct any resulting error.
-        B = (bidx2 == old_global) & ~A
-        nb2 = np.where(B, new_payout, nb2)
-        ni2 = np.where(B, new_global, ni2)
-
-        # --- Case C: old was neither best1 nor best2 ---
-        C = ~A & ~B
-        c_beats_b1 = C & (new_payout > nb1)
-        nb2 = np.where(c_beats_b1, nb1, nb2)
-        ni2 = np.where(c_beats_b1, ni1, ni2)
-        nb1 = np.where(c_beats_b1, new_payout, nb1)
-        ni1 = np.where(c_beats_b1, new_global, ni1)
-        c_beats_b2 = C & ~c_beats_b1 & (new_payout > nb2)
-        nb2 = np.where(c_beats_b2, new_payout, nb2)
-        ni2 = np.where(c_beats_b2, new_global, ni2)
-
-        return nb1, nb2, ni1, ni2
-
     def _calibrate_temperature(
         self,
         selected: list[int],
-        best1: np.ndarray,
-        best2: np.ndarray,
-        bidx1: np.ndarray,
+        portfolio_payout: np.ndarray,
         rng: np.random.Generator,
         n_probes: int = 50,
     ) -> float:
@@ -858,28 +821,58 @@ class MeanVariancePortfolioSelector:
         remaining = list(set(range(self._M)) - set(selected))
         if not remaining:
             return 1.0
-        current_pp = best1.copy()
-        current_f = self._compute_f(current_pp)
+        current_f = self._compute_f(portfolio_payout)
         deltas = []
         for _ in range(n_probes):
             old_local = int(rng.integers(0, self._K))
+            old_global = selected[old_local]
             new_global = remaining[int(rng.integers(0, len(remaining)))]
-            delta, _ = self._eval_swap(
-                selected[old_local], new_global, best1, best2, bidx1, current_f
-            )
-            deltas.append(abs(delta))
+            new_pp = portfolio_payout - self._train_payout[old_global] + self._train_payout[new_global]
+            deltas.append(abs(self._compute_f(new_pp) - current_f))
         median_delta = float(np.median(deltas)) if deltas else 1.0
         return median_delta / np.log(2) if median_delta > 1e-12 else 1.0
 
     def _greedy_init(self, rng: np.random.Generator) -> list[int]:
-        """Top-K candidates by individual mean payout on train split."""
-        means = self._train_payout.mean(axis=1)
-        return list(np.argsort(means)[::-1][: self._K])
+        """Incremental greedy: repeatedly add the lineup maximising f(current_sum + payout_new).
+
+        Each step is O(M × n_train) vectorised in batches of 500 to cap peak memory.
+        Accounts for correlation: a lineup redundant with those already selected won't
+        be picked even if its individual EV is high.
+        """
+        selected: list[int] = []
+        remaining = list(range(self._M))
+        n_train = self._train_payout.shape[1]
+        portfolio_sum = np.zeros(n_train, dtype=np.float32)
+        batch_size = 500
+
+        for _ in range(self._K):
+            if not remaining:
+                break
+            avail = np.array(remaining, dtype=np.int32)
+            f_vals = np.empty(len(avail), dtype=np.float32)
+            for b_start in range(0, len(avail), batch_size):
+                batch = avail[b_start: b_start + batch_size]
+                csum = portfolio_sum + self._train_payout[batch]   # (batch, n_train)
+                f_vals[b_start: b_start + len(batch)] = (
+                    csum.mean(axis=1) - self._alpha * csum.std(axis=1)
+                )
+            best_local = int(np.argmax(f_vals))
+            best_global = int(avail[best_local])
+            selected.append(best_global)
+            portfolio_sum = portfolio_sum + self._train_payout[best_global]
+            remaining.pop(best_local)
+
+        return selected
 
     def _random_init(self, rng: np.random.Generator) -> list[int]:
-        """Soft-weighted random init proportional to individual mean payout."""
+        """Soft-weighted random init proportional to individual mean payout.
+
+        Weights are shifted by the minimum so the best candidates still get
+        more weight even when all individual means are negative (typical after
+        entry-fee subtraction in a GPP with a high contest rake).
+        """
         means = self._train_payout.mean(axis=1)
-        weights = np.maximum(means, 0.0) + 1e-9
+        weights = means - means.min() + 1e-9   # always positive, relative ordering preserved
         weights /= weights.sum()
         return list(rng.choice(self._M, size=self._K, replace=False, p=weights))
 
@@ -896,8 +889,8 @@ class MeanVariancePortfolioSelector:
         selected = list(init_selected)
         remaining = list(set(range(self._M)) - set(selected))
 
-        best1, best2, bidx1, bidx2 = self._build_top2(selected)
-        portfolio_payout = best1.copy()
+        # Portfolio sum payout vector: sum_k payout_k across all train sims.
+        portfolio_payout = self._train_payout[selected].sum(axis=0).copy()
         current_f = self._compute_f(portfolio_payout)
         best_f = current_f
         best_selected = selected[:]
@@ -905,7 +898,7 @@ class MeanVariancePortfolioSelector:
         if not remaining:
             return best_selected, best_f
 
-        T_start = self._calibrate_temperature(selected, best1, best2, bidx1, rng)
+        T_start = self._calibrate_temperature(selected, portfolio_payout, rng)
 
         acceptance_window: list[int] = []
         iter_offset = restart_idx * self._n_iter
@@ -914,10 +907,6 @@ class MeanVariancePortfolioSelector:
             if stop_check is not None and stop_check():
                 break
 
-            # Periodic full rebuild to correct Case B top-2 staleness
-            if iteration > 0 and iteration % 500 == 0:
-                best1, best2, bidx1, bidx2 = self._build_top2(selected)
-
             T = T_start * (1.0 - iteration / self._n_iter)
 
             old_local = int(rng.integers(0, self._K))
@@ -925,9 +914,9 @@ class MeanVariancePortfolioSelector:
             new_local = int(rng.integers(0, len(remaining)))
             new_global = remaining[new_local]
 
-            delta_f, new_pp = self._eval_swap(
-                old_global, new_global, best1, best2, bidx1, current_f
-            )
+            new_pp = portfolio_payout - self._train_payout[old_global] + self._train_payout[new_global]
+            new_f = self._compute_f(new_pp)
+            delta_f = new_f - current_f
 
             accepted = delta_f > 0
             if not accepted and T > 1e-12:
@@ -938,11 +927,8 @@ class MeanVariancePortfolioSelector:
                 acceptance_window.pop(0)
 
             if accepted:
-                best1, best2, bidx1, bidx2 = self._update_top2_incremental(
-                    old_global, new_global, new_pp, best1, best2, bidx1, bidx2
-                )
                 portfolio_payout = new_pp
-                current_f = current_f + delta_f
+                current_f = new_f
                 selected[old_local] = new_global
                 remaining[new_local] = old_global
 

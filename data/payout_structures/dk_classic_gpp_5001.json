@@ -1,0 +1,18 @@
+{
+  "name": "DK Classic GPP (5,001 entries)",
+  "entry_fee": 4.0,
+  "total_entries": 5001,
+  "payouts": [
+    {"start": 1,   "end": 1,   "amount": 2000.0},
+    {"start": 2,   "end": 2,   "amount": 1000.0},
+    {"start": 3,   "end": 3,   "amount":  500.0},
+    {"start": 4,   "end": 5,   "amount":  300.0},
+    {"start": 6,   "end": 10,  "amount":  200.0},
+    {"start": 11,  "end": 20,  "amount":  100.0},
+    {"start": 21,  "end": 50,  "amount":   50.0},
+    {"start": 51,  "end": 100, "amount":   25.0},
+    {"start": 101, "end": 250, "amount":   15.0},
+    {"start": 251, "end": 500, "amount":   10.0},
+    {"start": 501, "end": 900, "amount":    8.0}
+  ]
+}
