@@ -2309,6 +2309,97 @@ def get_optimal_lineups(platform: str | None = None):
 
 
 # ---------------------------------------------------------------------------
+# Portfolio reselect (SA-only re-run against cached payout matrix)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/portfolio/reselect")
+async def portfolio_reselect(
+    request: Request,
+    risk: float = 5.0,
+    n_iter: int = 10000,
+    n_restarts: int = 6,
+    save_config: bool = True,
+):
+    """Re-run SA portfolio selection with new settings, skipping all upstream stages.
+
+    Requires a prior leverage_surplus run whose cached payout matrix is still
+    in memory on _runner_last.
+    """
+    if _state["status"] in ("running", "replacing", "reselecting"):
+        raise HTTPException(409, "A run is already in progress")
+
+    runner = _state.get("_runner_last")
+    if runner is None or not hasattr(runner, "_gpp_robust_payout") or runner._gpp_robust_payout is None:
+        raise HTTPException(
+            400,
+            "No cached GPP data — please run the full pipeline first.",
+        )
+    if getattr(runner, "_gpp_candidates", None) is None:
+        raise HTTPException(
+            400,
+            "No cached candidates — please run the full pipeline first.",
+        )
+    if getattr(runner, "_sim_results", None) is None:
+        raise HTTPException(
+            400,
+            "Simulation results unavailable — please run the full pipeline first.",
+        )
+
+    _state["status"] = "reselecting"
+    _state["error"] = None
+    _stop_event.clear()
+
+    loop = asyncio.get_event_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def progress_cb(stage: str, data: dict) -> None:
+        payload = {"stage": stage, "timestamp": int(time.time() * 1000), **data}
+        asyncio.run_coroutine_threadsafe(queue.put(payload), loop)
+
+    def run_reselect() -> None:
+        try:
+            if save_config:
+                cfg = read_config()
+                cfg.gpp.risk = risk
+                cfg.gpp.portfolio_n_iter = n_iter
+                cfg.gpp.portfolio_n_restarts = n_restarts
+                write_config(cfg)
+
+            result = runner.reselect_portfolio(
+                risk=risk,
+                n_iter=n_iter,
+                n_restarts=n_restarts,
+                progress_cb=progress_cb,
+                stop_check=_stop_event.is_set,
+            )
+            _state["portfolio"] = result
+            _state["status"] = "complete"
+            progress_cb("complete", {
+                "portfolio": result,
+                "n_lineups": len(result),
+                "optimal_lineups": _state.get("optimal_lineups") or [],
+            })
+        except Exception as exc:
+            _state["status"] = "error"
+            _state["error"] = str(exc)
+            progress_cb("error", {"message": str(exc)})
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop)
+
+    async def _sse_generator():
+        asyncio.get_event_loop().run_in_executor(None, run_reselect)
+        while True:
+            if await request.is_disconnected():
+                break
+            event = await queue.get()
+            if event is None:
+                break
+            yield f"data: {json.dumps(event)}\n\n"
+
+    return StreamingResponse(_sse_generator(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
 # Static files (React SPA)
 # ---------------------------------------------------------------------------
 

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useMemo, useState, useEffect } from 'react'
 import type { AppConfig, GppConfig, PlatformType } from '../types'
 import { saveConfig } from '../api'
 
@@ -31,6 +31,12 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
 
   const configJson = useMemo(() => JSON.stringify(config), [config])
   const isDirty = JSON.stringify(draft) !== configJson
+
+  // Sync draft when the external config changes (e.g. after a reselect save).
+  // Only resets if the user has no unsaved edits.
+  useEffect(() => {
+    if (!isDirty) setDraft(config)
+  }, [configJson])
 
   const setGpp = (key: keyof GppConfig, value: unknown) => {
     setDraft(d => ({ ...d, gpp: { ...d.gpp, [key]: value } }))

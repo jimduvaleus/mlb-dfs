@@ -322,7 +322,7 @@ export interface CacheStatus {
   n_batter_teams: number
 }
 
-export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 'replacing'
+export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 'replacing' | 'reselecting'
 
 export interface MergePlayer {
   name: string

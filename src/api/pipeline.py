@@ -707,9 +707,8 @@ class PipelineRunner:
                 })
                 team_totals_gpp = self._load_team_totals(slate_path)
                 from src.optimization.payout import load_payout_structure, payout_table_to_array
-                _gpp_payout_arr = payout_table_to_array(
-                    load_payout_structure("dk_classic_gpp")
-                ).astype(np.float32)
+                _gpp_structure = load_payout_structure("dk_classic_gpp_5001")
+                _gpp_payout_arr = payout_table_to_array(_gpp_structure).astype(np.float32)
                 _cand_excluded_pids = (
                     set(sim_players_df["player_id"].tolist())
                     - set(cand_players_df["player_id"].tolist())
@@ -760,6 +759,22 @@ class PipelineRunner:
                 if _cached_field is None and scorer.last_raw_field_list and _slate_fp:
                     save_field(_slate_fp, scorer.last_raw_field_list)
                 self._cb("gpp_score_done", {})
+
+                # Diagnostic: log candidate EV distribution so we can tell if the
+                # simulation is producing any +EV lineups at all.
+                _ev_means = robust_payout.mean(axis=1)
+                _pct_pos = float((_ev_means > 0).mean() * 100)
+                logger.info(
+                    "Candidate EV distribution (net, post-fee): "
+                    "min=$%.3f  p10=$%.3f  p50=$%.3f  p90=$%.3f  max=$%.3f  "
+                    "+EV candidates: %.1f%%",
+                    float(_ev_means.min()),
+                    float(np.percentile(_ev_means, 10)),
+                    float(np.percentile(_ev_means, 50)),
+                    float(np.percentile(_ev_means, 90)),
+                    float(_ev_means.max()),
+                    _pct_pos,
+                )
 
                 if _gpp_stopped and self._stop_check():
                     portfolio = []
@@ -1165,6 +1180,169 @@ class PipelineRunner:
             self.write_upload_files()
 
             entry_map = self._build_lineup_entry_map(self._all_file_entries, self._raw_portfolio)
+            for lr in result:
+                info = entry_map.get(lr["lineup_index"])
+                if info:
+                    lr.update(info)
+            meta_path = os.path.join(self._output_dir, f"portfolio_entries_{platform_val}.json")
+            with open(meta_path, "w") as f:
+                json.dump({str(k): v for k, v in entry_map.items()}, f)
+
+        return result
+
+    def reselect_portfolio(
+        self,
+        risk: float,
+        n_iter: int,
+        n_restarts: int,
+        progress_cb,
+        stop_check=None,
+    ) -> list[dict]:
+        """Re-run SA portfolio selection with new settings using the cached payout matrix.
+
+        Skips all upstream stages (candidate generation, field simulation, EV
+        scoring). Requires that a full leverage_surplus run has already
+        completed and populated _gpp_robust_payout / _gpp_candidates /
+        _sim_results on this runner.
+
+        Returns the same serialized list[dict] as run().
+        """
+        if stop_check is None:
+            stop_check = lambda: False
+
+        if not hasattr(self, "_gpp_robust_payout") or self._gpp_robust_payout is None:
+            raise RuntimeError(
+                "No cached GPP payout matrix — run the full pipeline first."
+            )
+        if not hasattr(self, "_gpp_candidates") or self._gpp_candidates is None:
+            raise RuntimeError(
+                "No cached candidates — run the full pipeline first."
+            )
+        if not hasattr(self, "_sim_results") or self._sim_results is None:
+            raise RuntimeError(
+                "Simulation results unavailable — run the full pipeline first."
+            )
+
+        from src.optimization.gpp_portfolio import MeanVariancePortfolioSelector
+        from pathlib import Path as _Path
+
+        # _config_path may be a now-deleted temp file (seed_optimal run); fall
+        # back to config.yaml in the same directory.
+        _cfg_file = _Path(self._config_path)
+        if not _cfg_file.exists():
+            _cfg_file = _cfg_file.parent / "config.yaml"
+        with open(_cfg_file) as _f:
+            cfg = yaml.safe_load(_f) or {}
+        gpp_cfg = cfg.get("gpp", {})
+        opt_cfg = cfg.get("optimizer", {})
+        port_cfg = cfg.get("portfolio", {})
+
+        holdout_frac = float(gpp_cfg.get("holdout_fraction", 0.0))
+        config_size = int(port_cfg.get("size", 20))
+        all_file_entries = getattr(self, "_all_file_entries", None) or []
+        total_entries = sum(len(recs) for _, recs in all_file_entries) if all_file_entries else 0
+        portfolio_size = max(config_size, total_entries) if total_entries > 0 else config_size
+        rng_seed = opt_cfg.get("rng_seed")
+
+        selector = MeanVariancePortfolioSelector(
+            robust_payout=self._gpp_robust_payout,
+            candidates=self._gpp_candidates,
+            portfolio_size=portfolio_size,
+            risk=risk,
+            n_iter=n_iter,
+            n_restarts=n_restarts,
+            holdout_fraction=holdout_frac,
+            rng_seed=rng_seed,
+        )
+
+        portfolio = selector.select(
+            stop_check=stop_check,
+            progress_cb=lambda itr, tot, T, f, acc, mean, std, restart: progress_cb(
+                "gpp_mv_select_progress",
+                {
+                    "iteration": itr,
+                    "total_iterations": tot,
+                    "temperature": round(float(T), 6),
+                    "current_f": round(float(f), 6),
+                    "acceptance_rate": round(float(acc), 4),
+                    "portfolio_mean": round(float(mean), 4),
+                    "portfolio_std": round(float(std), 4),
+                    "restart": restart,
+                },
+            ),
+        )
+
+        if selector.holdout_score() is not None:
+            progress_cb("gpp_holdout", {
+                "holdout_mean_payout": round(selector.holdout_score(), 6),
+            })
+
+        self._gpp_selector = selector
+
+        # Compute best_scores for portfolio_stats.
+        col_map = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
+        sim_mat = self._sim_results.results_matrix.astype(np.float32)
+        best_scores = np.zeros(self._sim_results.n_sims, dtype=np.float64)
+        for lu, _ in portfolio:
+            cols = [col_map[pid] for pid in lu.player_ids if pid in col_map]
+            if len(cols) == 10:
+                lu_scores = sim_mat[:, cols].sum(axis=1).astype(np.float64)
+                np.maximum(best_scores, lu_scores, out=best_scores)
+
+        target = self._target
+        n_sims_ps = len(best_scores)
+        covered_mask = best_scores >= target
+        covered = best_scores[covered_mask]
+        score_min = float(best_scores.min())
+        score_max = float(best_scores.max())
+        n_buckets = 40
+        bucket_size = (score_max - score_min) / n_buckets if score_max > score_min else 1.0
+        histogram = []
+        for k in range(n_buckets):
+            lo = score_min + k * bucket_size
+            hi = lo + bucket_size
+            histogram.append({
+                "lo": round(lo, 1),
+                "hi": round(hi, 1),
+                "mid": round((lo + hi) / 2, 1),
+                "count": int(((best_scores >= lo) & (best_scores < hi)).sum()),
+            })
+
+        def _pct(arr: np.ndarray, q: float) -> Optional[float]:
+            return round(float(np.percentile(arr, q)), 1) if len(arr) > 0 else None
+
+        progress_cb("portfolio_stats", {
+            "target": round(target, 1),
+            "great_threshold": round(target + 15.0, 1),
+            "n_sims": n_sims_ps,
+            "covered_count": int(covered_mask.sum()),
+            "covered_mean": round(float(covered.mean()), 1) if len(covered) > 0 else None,
+            "covered_p50": _pct(covered, 50),
+            "covered_p90": _pct(covered, 90),
+            "covered_p95": _pct(covered, 95),
+            "covered_p99": _pct(covered, 99),
+            "overall_p90": round(float(np.percentile(best_scores, 90)), 1),
+            "overall_p95": round(float(np.percentile(best_scores, 95)), 1),
+            "overall_p99": round(float(np.percentile(best_scores, 99)), 1),
+            "histogram": histogram,
+        })
+
+        _fees = PipelineRunner._extract_sorted_fees(all_file_entries)
+        portfolio = PipelineRunner._reorder_by_diversity(portfolio, _fees)
+        self._raw_portfolio = portfolio
+
+        result = self._serialize_portfolio(portfolio, self._players_df, mean_ev_from_score=True)
+
+        os.makedirs(self._output_dir, exist_ok=True)
+        portfolio_df = self._format_portfolio_df(portfolio, self._players_df, mean_ev_from_score=True)
+        platform_val = self._platform.value if hasattr(self, "_platform") else "draftkings"
+        output_path = os.path.join(self._output_dir, f"portfolio_{platform_val}.csv")
+        portfolio_df.to_csv(output_path, index=False)
+        logger.info("Reselect complete; portfolio saved to %s", output_path)
+
+        if all_file_entries:
+            self.write_upload_files()
+            entry_map = self._build_lineup_entry_map(all_file_entries, portfolio)
             for lr in result:
                 info = entry_map.get(lr["lineup_index"])
                 if info:

@@ -215,6 +215,124 @@ button { cursor: pointer; }
   justify-content: flex-end;
 }
 
+/* ── Refine SA button ── */
+
+.btn-refine {
+  padding: 8px 20px;
+  background: transparent;
+  color: #63b3ed;
+  border: 1px solid #3182ce;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 600;
+  transition: background 0.15s, color 0.15s;
+  cursor: pointer;
+}
+.btn-refine:hover:not(:disabled) { background: #1a365d; color: #90cdf4; }
+.btn-refine:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* ── Reselect dialog ── */
+
+.reselect-dialog {
+  max-width: 480px;
+}
+
+.reselect-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  margin-bottom: 20px;
+}
+
+.reselect-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  cursor: pointer;
+}
+
+.reselect-field--inline {
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+
+.reselect-field-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.reselect-field-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: #a0aec0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.reselect-field-value {
+  font-size: 15px;
+  font-weight: 700;
+  color: #e2e8f0;
+}
+
+.reselect-slider {
+  width: 100%;
+  accent-color: #3182ce;
+}
+
+.reselect-slider-labels {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: #718096;
+}
+
+.reselect-number {
+  width: 100px;
+  padding: 6px 10px;
+  background: #2d3748;
+  border: 1px solid #4a5568;
+  border-radius: 6px;
+  color: #e2e8f0;
+  font-size: 14px;
+}
+.reselect-number:disabled { opacity: 0.5; }
+
+.reselect-progress {
+  margin-bottom: 16px;
+}
+
+.reselect-progress-bar-track {
+  height: 6px;
+  background: #2d3748;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.reselect-progress-bar-fill {
+  height: 100%;
+  background: #3182ce;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+
+.reselect-progress-label {
+  font-size: 12px;
+  color: #718096;
+  margin-top: 6px;
+}
+
+.reselect-error {
+  color: #fc8181;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+/* ── status-reselecting badge ── */
+.status-reselecting { background: #2c4a6e; color: #63b3ed; }
+
 /* ── Utility ── */
 
 .muted { color: #718096; }

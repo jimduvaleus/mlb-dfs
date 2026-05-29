@@ -13,6 +13,7 @@ import { StopUploadDialog } from './components/StopUploadDialog'
 import { RunOptionsDialog } from './components/RunOptionsDialog'
 import { DeleteConfirmModal } from './components/DeleteConfirmModal'
 import { LineupParserDialog } from './components/LineupParserDialog'
+import { ReselectDialog } from './components/ReselectDialog'
 import './App.css'
 
 type Tab = 'config' | 'projections' | 'slate' | 'run' | 'portfolio' | 'metrics'
@@ -86,6 +87,7 @@ export default function App() {
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
   const [stopPending, setStopPending] = useState(false)
   const [showRunOptionsDialog, setShowRunOptionsDialog] = useState(false)
+  const [showReselectDialog, setShowReselectDialog] = useState(false)
   const [pendingCacheStatus, setPendingCacheStatus] = useState<CacheStatus | null>(null)
   const [pendingDeleteIndex, setPendingDeleteIndex] = useState<number | null>(null)
   const [replacingIndex, setReplacingIndex] = useState<number | null>(null)
@@ -351,10 +353,20 @@ export default function App() {
               Stop
             </button>
           )}
+          {state.runStatus === 'complete' && state.config?.optimizer.objective === 'leverage_surplus' && (
+            <button
+              className="btn-refine"
+              onClick={() => setShowReselectDialog(true)}
+              disabled={running}
+              title="Re-run SA selection with different settings — no simulation re-run needed"
+            >
+              Refine SA
+            </button>
+          )}
           <button
             className="btn-run"
             onClick={handleRun}
-            disabled={running || state.runStatus === 'replacing' || state.config === null}
+            disabled={running || state.runStatus === 'replacing' || state.runStatus === 'reselecting' || state.config === null}
           >
             {running ? 'Running…' : 'Run Portfolio'}
           </button>
@@ -495,6 +507,21 @@ export default function App() {
           cacheStatus={pendingCacheStatus}
           onStart={(useCandidates, useField, seedOptimal) => _doStartRun(useCandidates, useField, seedOptimal)}
           onDismiss={() => { setShowRunOptionsDialog(false); setPendingCacheStatus(null) }}
+        />
+      )}
+      {showReselectDialog && (
+        <ReselectDialog
+          isOpen={showReselectDialog}
+          initialRisk={state.config?.gpp.risk ?? 5.0}
+          initialNIter={state.config?.gpp.portfolio_n_iter ?? 10000}
+          initialNRestarts={state.config?.gpp.portfolio_n_restarts ?? 6}
+          onClose={() => setShowReselectDialog(false)}
+          onComplete={portfolio => {
+            dispatch({ type: 'set_portfolio', portfolio })
+            dispatch({ type: 'set_tab', tab: 'portfolio' })
+            setShowReselectDialog(false)
+            fetchConfig().then(cfg => dispatch({ type: 'set_config', config: cfg })).catch(() => {})
+          }}
         />
       )}
     </div>
