@@ -1,4 +1,4 @@
-"""Tests for ContestScorer (Phase 2) and EVPortfolioSelector (Phase 3)."""
+"""Tests for ContestScorer, EVPortfolioSelector, and MeanVariancePortfolioSelector."""
 import numpy as np
 import pandas as pd
 import pytest
@@ -6,6 +6,7 @@ import pytest
 from src.optimization.gpp_portfolio import (
     ContestScorer,
     EVPortfolioSelector,
+    MeanVariancePortfolioSelector,
     _compute_payout_from_sorted_field,
 )
 from src.optimization.lineup import Lineup
@@ -495,3 +496,169 @@ def test_scorer_invalid_candidate_not_selected(players_df, ownership_vec, test_p
     assert selected_lineup is valid_lu, (
         "EVPortfolioSelector must select the valid lineup, not the stale-cache ghost candidate"
     )
+
+
+# ------------------------------------------------------------------ #
+#  MeanVariancePortfolioSelector tests                                #
+# ------------------------------------------------------------------ #
+
+def _mv_stubs(M: int):
+    """M distinct Lineup stubs with non-overlapping player_ids."""
+    return [Lineup(player_ids=list(range(i * 10, i * 10 + 10))) for i in range(M)]
+
+
+class TestMeanVariancePortfolioSelector:
+
+    def test_mv_output_count(self):
+        rng = np.random.default_rng(0)
+        M, n_sims = 30, 500
+        payout = rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32)
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=5,
+                                            n_iter=200, n_restarts=1, rng_seed=0)
+        result = sel.select()
+        assert len(result) == 5
+
+    def test_mv_all_distinct(self):
+        rng = np.random.default_rng(1)
+        M, n_sims = 30, 500
+        payout = rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32)
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=8,
+                                            n_iter=200, n_restarts=1, rng_seed=1)
+        result = sel.select()
+        pid_sets = [frozenset(lu.player_ids) for lu, _ in result]
+        assert len(set(pid_sets)) == len(pid_sets), "All selected lineups must be distinct"
+
+    def test_mv_risk0_diversifies(self):
+        """risk=0 should select from both disjoint-coverage groups."""
+        n_sims = 1000
+        M = 20
+        payout = np.zeros((M, n_sims), dtype=np.float32)
+        for i in range(10):
+            payout[i, :500] = 0.1      # Group A: pays on first 500 sims
+        for i in range(10, 20):
+            payout[i, 500:] = 0.1      # Group B: pays on second 500 sims
+
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=4,
+                                            risk=0.0, n_iter=3000, n_restarts=2,
+                                            rng_seed=42)
+        result = sel.select()
+        stubs = _mv_stubs(M)
+        indices = [stubs.index(lu) for lu, _ in result]
+        n_a = sum(1 for i in indices if i < 10)
+        n_b = sum(1 for i in indices if i >= 10)
+        assert n_a >= 1 and n_b >= 1, (
+            f"risk=0 must select from both coverage groups; got A={n_a} B={n_b}"
+        )
+
+    def test_mv_risk10_concentrates(self):
+        """risk=10 (alpha=0) should select the top-5 highest-EV candidates."""
+        n_sims = 500
+        M = 20
+        payout = np.zeros((M, n_sims), dtype=np.float32)
+        for i in range(5):
+            payout[i] = 0.1   # only first 5 have non-zero EV
+
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=5,
+                                            risk=10.0, n_iter=1000, n_restarts=1,
+                                            rng_seed=0)
+        result = sel.select()
+        stubs = _mv_stubs(M)
+        selected_indices = set(stubs.index(lu) for lu, _ in result)
+        assert selected_indices == {0, 1, 2, 3, 4}, (
+            f"risk=10 must select the 5 highest-EV candidates; got {selected_indices}"
+        )
+
+    def test_mv_holdout_returns_float(self):
+        rng = np.random.default_rng(2)
+        M, n_sims = 20, 500
+        payout = rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32)
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=5,
+                                            holdout_fraction=0.2, rng_seed=42,
+                                            n_iter=200, n_restarts=1)
+        sel.select()
+        score = sel.holdout_score()
+        assert score is not None
+        assert score >= 0.0
+
+    def test_mv_no_holdout_returns_none(self):
+        rng = np.random.default_rng(3)
+        M, n_sims = 20, 500
+        payout = rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32)
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=5,
+                                            n_iter=200, n_restarts=1)
+        sel.select()
+        assert sel.holdout_score() is None
+
+    def test_mv_find_replacement_not_in_portfolio(self):
+        rng = np.random.default_rng(4)
+        M, n_sims = 30, 500
+        payout = rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32)
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=5,
+                                            n_iter=200, n_restarts=1, rng_seed=0)
+        sel.select()
+        current = [0, 1, 2, 3, 4]
+        replacement = sel.find_replacement(current_portfolio_indices=current, exclude_index=0)
+        assert replacement not in current
+        assert 0 <= replacement < M
+
+    def test_mv_find_replacement_with_additional_excluded(self):
+        rng = np.random.default_rng(5)
+        M, n_sims = 30, 500
+        payout = rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32)
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=5,
+                                            n_iter=200, n_restarts=1, rng_seed=0)
+        sel.select()
+        current = [0, 1, 2, 3, 4]
+        extra_excluded = {5, 6, 7, 8, 9}
+        replacement = sel.find_replacement(current, exclude_index=0,
+                                           additional_excluded=extra_excluded)
+        assert replacement not in current
+        assert replacement not in extra_excluded
+
+    def test_mv_multiple_restarts_at_least_as_good_as_one(self):
+        rng = np.random.default_rng(6)
+        M, n_sims = 50, 300
+        payout = rng.uniform(0, 0.5, (M, n_sims)).astype(np.float32)
+        stubs = _mv_stubs(M)
+
+        def _final_f(sel):
+            idx = sel._selected_indices
+            pp = sel._train_payout[idx].max(axis=0)
+            return float(pp.mean()) - sel._alpha * float(pp.std())
+
+        sel1 = MeanVariancePortfolioSelector(payout, stubs, portfolio_size=5,
+                                             n_iter=500, n_restarts=1, rng_seed=99)
+        sel1.select()
+
+        sel3 = MeanVariancePortfolioSelector(payout, stubs, portfolio_size=5,
+                                             n_iter=500, n_restarts=3, rng_seed=99)
+        sel3.select()
+
+        assert _final_f(sel3) >= _final_f(sel1) - 1e-6
+
+    def test_mv_progress_callback_called(self):
+        rng = np.random.default_rng(7)
+        M, n_sims = 20, 200
+        payout = rng.uniform(0, 0.1, (M, n_sims)).astype(np.float32)
+        calls = []
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=3,
+                                            n_iter=500, n_restarts=1, rng_seed=0)
+        sel.select(progress_cb=lambda itr, tot, T, f, acc, mean, std, restart: calls.append(itr))
+        assert len(calls) > 0
+
+    def test_mv_zero_payout_no_crash(self):
+        M, n_sims = 20, 100
+        payout = np.zeros((M, n_sims), dtype=np.float32)
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=5,
+                                            n_iter=200, n_restarts=1, rng_seed=0)
+        result = sel.select()
+        assert len(result) == 5
+
+    def test_mv_portfolio_size_larger_than_candidates(self):
+        """portfolio_size > M should be silently capped to M."""
+        M, n_sims = 5, 100
+        payout = np.ones((M, n_sims), dtype=np.float32)
+        sel = MeanVariancePortfolioSelector(payout, _mv_stubs(M), portfolio_size=20,
+                                            n_iter=100, n_restarts=1, rng_seed=0)
+        result = sel.select()
+        assert len(result) == M

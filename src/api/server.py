@@ -212,6 +212,7 @@ def _load_portfolio_from_csv(platform_val: str) -> list[dict] | None:
                 "lineup_index": int(lineup_idx),
                 "p_hit_target": float(first["p_hit_target"]),
                 "lineup_salary": int(first["lineup_salary"]),
+                "mean_ev": float(first["mean_ev"]) if "mean_ev" in first and pd.notna(first["mean_ev"]) else None,
                 "players": players,
             })
         if not portfolio:

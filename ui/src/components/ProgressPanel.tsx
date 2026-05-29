@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppMvSelectProgressEvent, GppOptimalProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -42,7 +42,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
-const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress', 'gpp_optimal_progress'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress', 'gpp_mv_select_progress', 'gpp_optimal_progress'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
@@ -78,7 +78,8 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_score_progress' ||
       last?.stage === 'gpp_score_done' ||
       last?.stage === 'gpp_field_inject' ||
-      last?.stage === 'gpp_select_progress'
+      last?.stage === 'gpp_select_progress' ||
+      last?.stage === 'gpp_mv_select_progress'
     if (!isLiveProgressEvent) return
 
     const ts = Date.now()
@@ -110,7 +111,7 @@ export function ProgressPanel({ events, running }: Props) {
     e.stage === 'gpp_optimal_start' || e.stage === 'gpp_optimal_done' ||
     e.stage === 'gpp_generate_start' || e.stage === 'gpp_generate_done' ||
     e.stage === 'gpp_score_start' || e.stage === 'gpp_field_inject' ||
-    e.stage === 'gpp_select_progress'
+    e.stage === 'gpp_select_progress' || e.stage === 'gpp_mv_select_progress'
   )
 
   // --- Optimal lineup seeding progress ---
@@ -131,7 +132,7 @@ export function ProgressPanel({ events, running }: Props) {
   const lineupEvents = events.filter(e => e.stage === 'optimize_lineup') as OptimizeLineupEvent[]
 
   // --- GPP progress ---
-  const generateStartEvent = events.find(e => e.stage === 'gpp_generate_start') as unknown as { n_candidates: number } | undefined
+  const generateStartEvent = events.find(e => e.stage === 'gpp_generate_start') as unknown as { n_candidates: number; n_from_optimal?: number } | undefined
   const generateProgressEvents = events.filter(e => e.stage === 'gpp_generate_progress') as unknown as GppGenerateProgressEvent[]
   const latestGenerateProgress = generateProgressEvents[generateProgressEvents.length - 1]
   const generateDone = events.some(e => e.stage === 'gpp_generate_done')
@@ -141,13 +142,23 @@ export function ProgressPanel({ events, running }: Props) {
   const scoreProgressEvents = events.filter(e => e.stage === 'gpp_score_progress') as unknown as GppScoreProgressEvent[]
   const latestScoreProgress = scoreProgressEvents[scoreProgressEvents.length - 1]
   const selectProgressEvents = events.filter(e => e.stage === 'gpp_select_progress') as unknown as GppSelectProgressEvent[]
+  const mvSelectProgressEvents = events.filter(e => e.stage === 'gpp_mv_select_progress') as unknown as GppMvSelectProgressEvent[]
   const scoreDone = events.some(e => e.stage === 'gpp_score_done')
   const fieldInjectEvent = events.find(e => e.stage === 'gpp_field_inject') as unknown as { n_field: number; n_k: number } | undefined
 
   let gppPct = 0
   let gppLabel = ''
   if (isGpp) {
-    if (selectProgressEvents.length > 0) {
+    if (mvSelectProgressEvents.length > 0) {
+      const lastMv = mvSelectProgressEvents[mvSelectProgressEvents.length - 1]
+      gppPct = lastMv.total_iterations > 0
+        ? Math.round((lastMv.iteration / lastMv.total_iterations) * 100)
+        : 100
+      const bestF = Math.max(...mvSelectProgressEvents.map(ev => ev.current_f))
+      const fStr = (f: number) => (f >= 0 ? `+${f.toFixed(2)}` : f.toFixed(2))
+      const isCurrent = lastMv.current_f >= bestF
+      gppLabel = `Portfolio (SA): restart ${lastMv.restart + 1} · score ${fStr(lastMv.current_f)}${isCurrent ? ' ★ best' : ` (best ${fStr(bestF)})`} · ${gppPct}% done`
+    } else if (selectProgressEvents.length > 0) {
       const lastSel = selectProgressEvents[selectProgressEvents.length - 1]
       gppPct = 100
       gppLabel = `Portfolio selection: round ${lastSel.round + 1} — ${lastSel.pct_covered.toFixed(1)}% covered`
@@ -220,6 +231,15 @@ export function ProgressPanel({ events, running }: Props) {
         const avgPerBatch = recentElapsed / (recent.length - 1)
         const remaining = latestScoreProgress.batches_total - latestScoreProgress.batches_done
         if (remaining > 0) etaMs = avgPerBatch * remaining
+      }
+    } else if (running && mvSelectProgressEvents.length >= 2) {
+      const lastMv = mvSelectProgressEvents[mvSelectProgressEvents.length - 1]
+      const recent = mvSelectProgressEvents.slice(-4)
+      const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+      const recentIter = recent[recent.length - 1].iteration - recent[0].iteration
+      if (recentIter > 0) {
+        const remaining = lastMv.total_iterations - lastMv.iteration
+        etaMs = (recentElapsed / recentIter) * remaining
       }
     }
   } else {
@@ -303,7 +323,7 @@ export function ProgressPanel({ events, running }: Props) {
         </div>
       )}
 
-      {/* GPP selection grid */}
+      {/* GPP selection grid (legacy EVPortfolioSelector) */}
       {selectProgressEvents.length > 0 && (
         <div className="event-list event-list-four-col">
           {selectProgressEvents.map((ev, i) => (
@@ -316,6 +336,50 @@ export function ProgressPanel({ events, running }: Props) {
           ))}
         </div>
       )}
+
+      {/* GPP MV SA selection rows */}
+      {mvSelectProgressEvents.length > 0 && (() => {
+        const fStr = (f: number) => (f >= 0 ? `+${f.toFixed(2)}` : f.toFixed(2))
+        // Derive n_iter from the global iteration offset of the first restart-1 event.
+        // Each event is emitted every 250 iterations; sample ~4 rows per restart.
+        const firstRestart1 = mvSelectProgressEvents.find(ev => ev.restart >= 1)
+        const nIter = firstRestart1
+          ? firstRestart1.iteration
+          : mvSelectProgressEvents[0].total_iterations
+        const eventsPerRestart = Math.max(1, Math.round(nIter / 250))
+        const sampleEvery = Math.max(1, Math.round(eventsPerRestart / 4))
+        let runningBestF = -Infinity
+        const sampled = mvSelectProgressEvents
+          .filter((_, i) => i % sampleEvery === 0 || i === mvSelectProgressEvents.length - 1)
+          .map(ev => {
+            const isNewBest = ev.current_f > runningBestF
+            if (isNewBest) runningBestF = ev.current_f
+            return { ev, isNewBest }
+          })
+        return (
+          <div className="event-list">
+            {sampled.map(({ ev, isNewBest }, i, arr) => {
+              const isFirstOfRestart = i > 0 && arr[i - 1].ev.restart !== ev.restart
+              return (
+                <div key={i}>
+                  {isFirstOfRestart && (
+                    <div className="event-row">
+                      <span className="event-stage muted">Restart {ev.restart + 1}</span>
+                      <span className="event-detail muted">exploring new combinations</span>
+                    </div>
+                  )}
+                  <div className="event-row event-gpp_mv_select_progress">
+                    <span className="event-stage event-stage-lineup">R{ev.restart + 1} · {ev.iteration.toLocaleString()}</span>
+                    <span className="event-detail">
+                      {isNewBest ? '★ ' : ''}score {fStr(ev.current_f)} · avg ${ev.portfolio_mean.toFixed(2)} · spread ±${ev.portfolio_std.toFixed(2)} · {(ev.acceptance_rate * 100).toFixed(0)}% accepting
+                    </span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )
+      })()}
     </div>
   )
 }

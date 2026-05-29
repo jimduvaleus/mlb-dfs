@@ -420,7 +420,27 @@ class PipelineRunner:
             # marginal-EV greedy selection.
             # ----------------------------------------------------------------
             from src.optimization.candidate_generator import CandidateGenerator
-            from src.optimization.gpp_portfolio import ContestScorer, EVPortfolioSelector
+            from src.optimization.gpp_portfolio import ContestScorer, EVPortfolioSelector, MeanVariancePortfolioSelector
+
+            def _candidate_team_distribution(cands, players_df):
+                """Return {team: count} of unambiguous 4/5-hitter primary stacks."""
+                pid_team = dict(zip(players_df["player_id"].astype(int), players_df["team"]))
+                pid_pos = dict(zip(players_df["player_id"].astype(int), players_df["position"]))
+                dist: dict[str, int] = {}
+                for lu in cands:
+                    th: dict[str, int] = {}
+                    for pid in lu.player_ids:
+                        if pid_pos.get(int(pid), "") != "P":
+                            t = pid_team.get(int(pid), "")
+                            if t:
+                                th[t] = th.get(t, 0) + 1
+                    if not th:
+                        continue
+                    top = max(th.values())
+                    top_teams = [t for t, c in th.items() if c == top]
+                    if top >= 4 and len(top_teams) == 1:
+                        dist[top_teams[0]] = dist.get(top_teams[0], 0) + 1
+                return dist
 
             gpp_cfg = cfg.get("gpp", {})
             n_candidates = int(gpp_cfg.get("n_candidates", 10_000))
@@ -429,6 +449,10 @@ class PipelineRunner:
             holdout_frac = float(gpp_cfg.get("holdout_fraction", 0.0))
             cand_batch = int(gpp_cfg.get("candidate_batch_size", 500))
             max_attempts_mult = int(gpp_cfg.get("max_attempts_multiplier", 50))
+            candidate_floor_relief = int(gpp_cfg.get("candidate_floor_relief", 2500))
+            mv_risk = float(gpp_cfg.get("risk", 0.0))
+            mv_n_iter = int(gpp_cfg.get("portfolio_n_iter", 10_000))
+            mv_n_restarts = int(gpp_cfg.get("portfolio_n_restarts", 3))
             salary_floor_gpp = (
                 float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None
             )
@@ -491,6 +515,7 @@ class PipelineRunner:
                     logger.info("Using %d candidates from cache.", len(candidates))
                     self._cb("gpp_generate_done", {
                         "n_generated": len(candidates), "from_cache": True,
+                        "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
                     })
                 else:
                     need = n_candidates - n_cached
@@ -504,11 +529,15 @@ class PipelineRunner:
                     new_cands = gen.generate(
                         n_candidates=need,
                         max_attempts_multiplier=max_attempts_mult,
+                        floor_relief=candidate_floor_relief,
                         stop_check=self._stop_check,
                         progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
                     )
                     candidates = _preloaded_cands + new_cands
-                    self._cb("gpp_generate_done", {"n_generated": len(candidates)})
+                    self._cb("gpp_generate_done", {
+                        "n_generated": len(candidates),
+                        "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
+                    })
                     if _slate_fp and not (_gpp_stopped and self._stop_check()):
                         save_candidates(_slate_fp, candidates)
 
@@ -623,11 +652,15 @@ class PipelineRunner:
                 random_cands = gen.generate(
                     n_candidates=n_random,
                     max_attempts_multiplier=max_attempts_mult,
+                    floor_relief=candidate_floor_relief,
                     stop_check=self._stop_check,
                     progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
                 )
                 candidates = _optimal_lineups + random_cands
-                self._cb("gpp_generate_done", {"n_generated": len(candidates)})
+                self._cb("gpp_generate_done", {
+                    "n_generated": len(candidates),
+                    "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
+                })
                 if _slate_fp and candidates and not (_gpp_stopped and self._stop_check()):
                     save_candidates(_slate_fp, candidates)
                 self._optimal_lineups = _optimal_lineups
@@ -638,6 +671,30 @@ class PipelineRunner:
                 time.perf_counter() - _t_gpp_start,
                 _preloaded_cands is not None,
             )
+
+            if gpp_cfg.get("dump_candidate_pool", False) and candidates:
+                _dump_path = os.path.join(output_dir, "candidate_pool_debug.csv")
+                _pid_meta = {
+                    int(r["player_id"]): r
+                    for r in cand_players_df.to_dict("records")
+                }
+                import csv as _csv
+                with open(_dump_path, "w", newline="") as _f:
+                    _w = _csv.writer(_f)
+                    _w.writerow(["lineup_index", "player_id", "name", "position", "team", "salary", "mean"])
+                    for _li, _lu in enumerate(candidates):
+                        for _pid in _lu.player_ids:
+                            _m = _pid_meta.get(int(_pid), {})
+                            _w.writerow([
+                                _li,
+                                int(_pid),
+                                _m.get("name", ""),
+                                _m.get("position", ""),
+                                _m.get("team", ""),
+                                _m.get("salary", ""),
+                                round(float(_m.get("mean", 0)), 3),
+                            ])
+                logger.info("Candidate pool written to %s", _dump_path)
 
             if not candidates or (_gpp_stopped and self._stop_check()):
                 portfolio = []
@@ -722,65 +779,36 @@ class PipelineRunner:
                         _n_field,
                     )
 
-                    _beat_rate_call_count = 0
-                    _beat_rate_total_time = 0.0
-
-                    def _beat_rate_fn(candidate_idx: int) -> np.ndarray:
-                        nonlocal _beat_rate_call_count, _beat_rate_total_time
-                        _t_br = time.perf_counter()
-                        cols = _col_lineups[candidate_idx]
-                        scores = _sim_mat[:, cols].sum(axis=1)
-                        n_s = scores.shape[0]
-                        beat_counts = np.empty(n_s, dtype=np.float32)
-                        for _s in range(0, n_s, _BATCH):
-                            _e = min(_s + _BATCH, n_s)
-                            beat_counts[_s:_e] = (
-                                _field_sorted[_s:_e] < scores[_s:_e, np.newaxis]
-                            ).sum(axis=1)
-                        result = beat_counts / _n_field
-                        _dt = time.perf_counter() - _t_br
-                        _beat_rate_call_count += 1
-                        _beat_rate_total_time += _dt
-                        logger.info(
-                            "[TIMING] _beat_rate_fn call #%d (idx=%d): %.3fs  "
-                            "field_sorted[%d cols] vs %d sims",
-                            _beat_rate_call_count, candidate_idx, _dt,
-                            _n_field, n_s,
-                        )
-                        return result
-
-                    _coverage_pct = (
-                        int(port_cfg.get("target_percentile", 97)) / 100.0
-                    )
-
-                    selector = EVPortfolioSelector(
+                    selector = MeanVariancePortfolioSelector(
                         robust_payout=robust_payout,
                         candidates=candidates,
                         portfolio_size=portfolio_size,
+                        risk=mv_risk,
+                        n_iter=mv_n_iter,
+                        n_restarts=mv_n_restarts,
                         holdout_fraction=holdout_frac,
                         rng_seed=opt_cfg.get("rng_seed"),
                     )
                     _t_select = time.perf_counter()
                     gpp_result = selector.select(
                         stop_check=self._stop_check,
-                        beat_rate_fn=_beat_rate_fn,
-                        coverage_percentile=_coverage_pct,
-                        progress_cb=lambda k, idx, ev, n_cov, pct_cov: self._cb(
-                            "gpp_select_progress",
+                        progress_cb=lambda itr, tot, T, f, acc, mean, std, restart: self._cb(
+                            "gpp_mv_select_progress",
                             {
-                                "round": k,
-                                "lineup_index": idx,
-                                "lineup_ev": round(ev, 6),
-                                "n_covered": n_cov,
-                                "pct_covered": round(pct_cov, 2),
+                                "iteration": itr,
+                                "total_iterations": tot,
+                                "temperature": round(float(T), 6),
+                                "current_f": round(float(f), 6),
+                                "acceptance_rate": round(float(acc), 4),
+                                "portfolio_mean": round(float(mean), 4),
+                                "portfolio_std": round(float(std), 4),
+                                "restart": restart,
                             },
                         ),
                     )
                     logger.info(
-                        "[TIMING] selector.select() wall time: %.3fs  "
-                        "beat_rate_fn calls=%d total=%.3fs",
+                        "[TIMING] MeanVariancePortfolioSelector.select() wall time: %.3fs",
                         time.perf_counter() - _t_select,
-                        _beat_rate_call_count, _beat_rate_total_time,
                     )
                     if selector.holdout_score() is not None:
                         self._cb("gpp_holdout", {
@@ -801,15 +829,10 @@ class PipelineRunner:
                     if not (_gpp_stopped and self._stop_check()):
                         _on_portfolio_complete(best_scores_gpp)
 
-                    # Cache GPP artifacts for potential future use.
+                    # Cache GPP artifacts for replace_lineup.
                     self._gpp_robust_payout = robust_payout
                     self._gpp_candidates = candidates
-                    # Per-sim score threshold that corresponds to beating
-                    # coverage_percentile of the field — used by replace_lineup
-                    # to faithfully reproduce the EVPortfolioSelector coverage mask.
-                    self._gpp_coverage_threshold = np.percentile(
-                        scorer.last_field_sorted, _coverage_pct * 100, axis=1
-                    ).astype(np.float32)
+                    self._gpp_selector = selector
 
         else:
             # ----------------------------------------------------------------
@@ -888,8 +911,16 @@ class PipelineRunner:
 
         logger.info("Portfolio complete: %d lineups.", len(portfolio))
 
+        # Sort portfolio descending by score. For leverage_surplus the score is
+        # robust_payout[k].mean() (mean dollar EV); for other objectives it is
+        # p_hit_target. Either way descending score is the natural display order.
+        _fees = PipelineRunner._extract_sorted_fees(all_file_entries)
+        portfolio = PipelineRunner._reorder_by_diversity(portfolio, _fees)
+        _portfolio_has_dollar_ev = objective == "leverage_surplus"
+
         # Store raw artifacts for on-demand upload file writing.
         self._raw_portfolio = portfolio
+        self._portfolio_has_dollar_ev = _portfolio_has_dollar_ev
         self._discarded_lineups: set[frozenset] = set()
         self._all_file_entries = all_file_entries
         self._entry_handlers = entry_handlers
@@ -898,13 +929,13 @@ class PipelineRunner:
         self._platform = platform
 
         # --- Serialize --------------------------------------------------
-        result = self._serialize_portfolio(portfolio, players_df)
+        result = self._serialize_portfolio(portfolio, players_df, mean_ev_from_score=_portfolio_has_dollar_ev)
 
         was_stopped = self._stop_check is not None and self._stop_check()
 
         # --- Save CSV ---------------------------------------------------
         os.makedirs(output_dir, exist_ok=True)
-        portfolio_df = self._format_portfolio_df(portfolio, players_df)
+        portfolio_df = self._format_portfolio_df(portfolio, players_df, mean_ev_from_score=_portfolio_has_dollar_ev)
         output_path = os.path.join(output_dir, f"portfolio_{platform.value}.csv")
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Portfolio saved to %s", output_path)
@@ -1024,57 +1055,46 @@ class PipelineRunner:
                 if ci is not None:
                     np.maximum(best_payout, self._gpp_robust_payout[ci], out=best_payout)
 
-            avail = np.array(
-                [ci for ci, ps in enumerate(cand_pid_sets) if ps not in excluded],
-                dtype=np.int32,
-            )
-            if len(avail) == 0:
-                raise RuntimeError(
-                    "No available candidates remain after excluding discarded lineups"
-                )
+            remaining_ci = [
+                pid_set_to_ci[ps]
+                for ps in [frozenset(lu.player_ids) for lu, _ in remaining]
+                if ps in pid_set_to_ci
+            ]
+            deleted_ci = pid_set_to_ci.get(frozenset(deleted_lineup.player_ids))
+            discarded_ci = {
+                pid_set_to_ci[ps]
+                for ps in self._discarded_lineups
+                if ps in pid_set_to_ci
+            }
 
-            # Reproduce the EVPortfolioSelector coverage mask: a sim is covered
-            # when at least one remaining lineup beats >= coverage_percentile of
-            # the field there. The stored threshold is the per-sim score needed
-            # to achieve that beat rate, so we just compare scores directly.
-            avail_payout = self._gpp_robust_payout[avail]
-            if hasattr(self, '_gpp_coverage_threshold'):
-                covered_mask = np.zeros(n_sims_gpp, dtype=bool)
-                pid_to_col = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
-                sim_mat_f32 = self._sim_results.results_matrix.astype(np.float32)
-                for lu, _ in remaining:
-                    cols = [pid_to_col.get(pid) for pid in lu.player_ids]
-                    cols = np.array([c for c in cols if c is not None], dtype=np.int32)
-                    if len(cols) == 0:
-                        continue
-                    lu_scores = sim_mat_f32[:, cols].sum(axis=1)
-                    covered_mask |= (lu_scores >= self._gpp_coverage_threshold)
-                active_mask = ~covered_mask
-                n_active = int(active_mask.sum())
-                logger.info(
-                    "replace_lineup: n_active=%d / %d sims uncovered, avail_candidates=%d",
-                    n_active, n_sims_gpp, len(avail),
+            if hasattr(self, '_gpp_selector'):
+                new_ci = self._gpp_selector.find_replacement(
+                    current_portfolio_indices=remaining_ci,
+                    exclude_index=deleted_ci,
+                    additional_excluded=discarded_ci,
                 )
-                if n_active > 0:
-                    ev_vals = avail_payout[:, active_mask].mean(axis=1)
-                else:
-                    # All sims are already covered by the remaining lineup — pick
-                    # the candidate that adds the most marginal payout above what
-                    # the remaining portfolio already achieves rather than the
-                    # globally highest-EV lineup (which would be nearly identical
-                    # to what was just deleted).
-                    ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
+                logger.info("replace_lineup: MV find_replacement → candidate %d", new_ci)
             else:
-                # Portfolio built before threshold was stored — fall back to marginal EV.
-                logger.info(
-                    "replace_lineup: no coverage threshold, using marginal EV, avail_candidates=%d",
-                    len(avail),
-                )
+                # Backward compat: old artifacts without _gpp_selector — marginal EV fallback.
+                avail_payout = self._gpp_robust_payout[
+                    np.array(
+                        [ci for ci, ps in enumerate(cand_pid_sets) if ps not in excluded],
+                        dtype=np.int32,
+                    )
+                ]
                 ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
+                avail_list = [ci for ci, ps in enumerate(cand_pid_sets) if ps not in excluded]
+                new_ci = avail_list[int(np.argmax(ev_vals))]
+                logger.info(
+                    "replace_lineup: no _gpp_selector, using marginal EV fallback → candidate %d",
+                    new_ci,
+                )
 
-            best_local = int(np.argmax(ev_vals))
-            new_lineup = self._gpp_candidates[int(avail[best_local])]
-            full_score = float(ev_vals[best_local])
+            if new_ci is None or new_ci < 0:
+                raise RuntimeError("No available candidates remain after excluding discarded lineups")
+
+            new_lineup = self._gpp_candidates[new_ci]
+            full_score = float(self._gpp_robust_payout[new_ci].mean())
 
         elif self._objective == "marginal_payout":
             best_scores = np.zeros(self._sim_results.n_sims, dtype=np.float64)
@@ -1129,11 +1149,13 @@ class PipelineRunner:
             cols = [col_map[pid] for pid in new_lineup.player_ids]
             full_score = float((full_matrix[:, cols].sum(axis=1) >= self._target).mean())
 
-        self._raw_portfolio = remaining + [(new_lineup, full_score)]
-        result = self._serialize_portfolio(self._raw_portfolio, self._players_df)
+        _has_ev = getattr(self, "_portfolio_has_dollar_ev", False)
+        _fees_re = PipelineRunner._extract_sorted_fees(self._all_file_entries)
+        self._raw_portfolio = PipelineRunner._reorder_by_diversity(remaining + [(new_lineup, full_score)], _fees_re)
+        result = self._serialize_portfolio(self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev)
 
         os.makedirs(self._output_dir, exist_ok=True)
-        portfolio_df = self._format_portfolio_df(self._raw_portfolio, self._players_df)
+        portfolio_df = self._format_portfolio_df(self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev)
         platform_val = self._platform.value if hasattr(self, "_platform") else "draftkings"
         output_path = os.path.join(self._output_dir, f"portfolio_{platform_val}.csv")
         portfolio_df.to_csv(output_path, index=False)
@@ -1619,9 +1641,68 @@ class PipelineRunner:
             return {pid: player_meta.get(pid, {}).get('position', '') for pid in lineup.player_ids}
 
     @staticmethod
+    def _extract_sorted_fees(all_file_entries: list) -> list[int]:
+        fees = []
+        for _, records in all_file_entries:
+            for rec in records:
+                fees.append(rec.entry_fee_cents)
+        fees.sort(reverse=True)
+        return fees
+
+    @staticmethod
+    def _reorder_by_diversity(portfolio: list, fees: list[int] | None = None) -> list:
+        """Greedy diversity reorder with fee-weighted running exposure.
+
+        At each step k, selects the lineup whose players are most underrepresented
+        relative to their full-portfolio frequency, weighted by entry fees so that
+        higher-fee positions discount their players more when computing residual exposure.
+        """
+        if len(portfolio) <= 1:
+            return portfolio
+        N = len(portfolio)
+
+        if fees:
+            padded = (fees + [0] * N)[:N]
+            total_fees = sum(padded)
+        else:
+            padded, total_fees = [], 0
+        if total_fees == 0:
+            padded = [1] * N
+            total_fees = N
+
+        full_freq: dict[int, float] = {}
+        for lineup, _ in portfolio:
+            for pid in lineup.player_ids:
+                full_freq[pid] = full_freq.get(pid, 0) + 1
+        for pid in full_freq:
+            full_freq[pid] /= N
+
+        remaining = list(range(N))
+        selected: list[int] = []
+        running_weight: dict[int, float] = {}
+
+        while remaining:
+            k = len(selected)
+            best_i, best_score = remaining[0], float('-inf')
+            for i in remaining:
+                lineup, _ = portfolio[i]
+                s = sum(full_freq.get(pid, 0) - running_weight.get(pid, 0.0)
+                        for pid in lineup.player_ids)
+                if s > best_score:
+                    best_score, best_i = s, i
+            selected.append(best_i)
+            remaining.remove(best_i)
+            fee_weight = padded[k] / total_fees
+            for pid in portfolio[best_i][0].player_ids:
+                running_weight[pid] = running_weight.get(pid, 0.0) + fee_weight
+
+        return [portfolio[i] for i in selected]
+
+    @staticmethod
     def _serialize_portfolio(
         portfolio: list,
         players_df: pd.DataFrame,
+        mean_ev_from_score: bool = False,
     ) -> list[dict]:
         from src.optimization.optimizer import _build_player_meta
         id_to_name = dict(zip(players_df["player_id"], players_df.get("name", players_df["player_id"])))
@@ -1657,10 +1738,12 @@ class PipelineRunner:
                 }
                 for pid in lineup.player_ids
             ]
+            mean_ev: Optional[float] = round(float(score), 4) if mean_ev_from_score else None
             result.append({
                 "lineup_index": i,
                 "p_hit_target": round(score, 4),
                 "lineup_salary": total_salary,
+                "mean_ev": mean_ev,
                 "players": players,
             })
         return result
@@ -1694,6 +1777,7 @@ class PipelineRunner:
     def _format_portfolio_df(
         portfolio: list,
         players_df: pd.DataFrame,
+        mean_ev_from_score: bool = False,
     ) -> pd.DataFrame:
         from src.optimization.optimizer import _build_player_meta
         id_to_name = dict(zip(players_df["player_id"], players_df.get("name", players_df["player_id"])))
@@ -1713,6 +1797,7 @@ class PipelineRunner:
         for i, (lineup, score) in enumerate(portfolio, start=1):
             pid_to_assigned = PipelineRunner._assigned_positions(lineup, player_meta)
             total_salary = sum(id_to_salary.get(pid, 0) for pid in lineup.player_ids)
+            mean_ev: Optional[float] = round(float(score), 4) if mean_ev_from_score else None
             for pid in lineup.player_ids:
                 rows.append({
                     "lineup": i,
@@ -1725,6 +1810,7 @@ class PipelineRunner:
                     "salary": id_to_salary.get(pid, 0),
                     "mean": float(id_to_mean[pid]) if pid in id_to_mean else None,
                     "lineup_salary": total_salary,
+                    "mean_ev": mean_ev,
                     "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
                     "slot_confirmed": bool(id_to_confirmed[pid]) if pid in id_to_confirmed else False,
                 })

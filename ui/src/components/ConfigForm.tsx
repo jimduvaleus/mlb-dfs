@@ -242,6 +242,26 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <input type="number" step={0.05} min={0} max={0.5} value={draft.gpp.holdout_fraction}
                   onChange={e => setGpp('holdout_fraction', Number(e.target.value))} disabled={disabled} />
               </FieldRow>
+              <FieldRow label="Risk (0 = diverse · 10 = concentrated)">
+                <input type="number" step={1} min={0} max={10} value={draft.gpp.risk}
+                  onChange={e => setGpp('risk', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="SA iterations">
+                <input type="number" step={1000} min={1000} value={draft.gpp.portfolio_n_iter}
+                  onChange={e => setGpp('portfolio_n_iter', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="SA restarts">
+                <input type="number" step={1} min={1} max={10} value={draft.gpp.portfolio_n_restarts}
+                  onChange={e => setGpp('portfolio_n_restarts', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="Candidate floor relief ($)">
+                <input type="number" step={500} min={0} max={10000} value={draft.gpp.candidate_floor_relief}
+                  onChange={e => setGpp('candidate_floor_relief', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="Dump candidate pool">
+                <input type="checkbox" checked={!!draft.gpp.dump_candidate_pool}
+                  onChange={e => setGpp('dump_candidate_pool', e.target.checked)} disabled={disabled} />
+              </FieldRow>
             </section>
           )}
         </div>

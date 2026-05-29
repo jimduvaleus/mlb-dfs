@@ -55,6 +55,11 @@ class GppConfig(BaseModel):
     candidate_batch_size: int = 500
     max_attempts_multiplier: int = 50
     seed_optimal_lineups: bool = False
+    risk: float = 0.0
+    portfolio_n_iter: int = 10_000
+    portfolio_n_restarts: int = 3
+    dump_candidate_pool: bool = False
+    candidate_floor_relief: int = 2500
 
 
 class AppConfig(BaseModel):
@@ -79,6 +84,7 @@ class LineupResult(BaseModel):
     lineup_index: int
     p_hit_target: float
     lineup_salary: int
+    mean_ev: Optional[float] = None
     players: list[PlayerRow]
     upload_tag: Optional[str] = None
     entry_fee: Optional[str] = None

@@ -6,12 +6,13 @@ Two-stage pipeline for the `leverage_surplus` objective:
                     returning a robust_payout matrix (M × n_sims) that averages
                     over field compositions to reduce overfitting.
 
-  EVPortfolioSelector — assembles a portfolio by simulation-coverage selection:
-                         lineup #1 is the highest-EV candidate across all sims;
-                         each subsequent lineup is the highest-EV candidate on
-                         the subset of sims not yet "covered" by prior lineups.
-                         A sim is covered when the selected lineup beats ≥
-                         coverage_percentile fraction of the field in that sim.
+  MeanVariancePortfolioSelector — assembles a portfolio via simulated annealing
+                                   on the (M × n_sims) robust_payout matrix.
+                                   Objective: mean(max_k payout_k) - alpha * std(max_k payout_k)
+                                   where alpha = (10 - risk) / 10. Risk=0 (Shaidy default)
+                                   maximises diversity; risk=10 maximises concentration.
+
+  EVPortfolioSelector — legacy greedy coverage-based selector (preserved for reference).
 
 Performance notes
 -----------------
@@ -575,3 +576,391 @@ class EVPortfolioSelector:
                 self._robust_payout[idx, self._holdout_idx],
             )
         return float(holdout_payout.mean())
+
+
+# ------------------------------------------------------------------ #
+#  MeanVariancePortfolioSelector                                       #
+# ------------------------------------------------------------------ #
+
+class MeanVariancePortfolioSelector:
+    """Mean-variance portfolio selection via simulated annealing.
+
+    Finds K lineups from M candidates maximising:
+        f(S) = mean_s[max_{k∈S} payout_k(s)] - alpha * std_s[max_{k∈S} payout_k(s)]
+    where alpha = (10 - risk) / 10.
+
+    risk=0  → alpha=1.0 → maximum diversity (Shaidy's default)
+    risk=10 → alpha=0.0 → pure mean-EV maximisation
+
+    The search uses simulated annealing with single-swap proposals. A top-2
+    data structure (best1/best2/bidx1/bidx2 per sim) enables O(n_sims) swap
+    evaluation. Every 500 iterations the top-2 is rebuilt from scratch to
+    correct for a known staleness edge case in the incremental update path.
+
+    Parameters
+    ----------
+    robust_payout : (M, n_sims) float32 from ContestScorer.score_candidates()
+    candidates : list of M Lineup objects (same order as robust_payout rows)
+    portfolio_size : number of lineups to select
+    risk : float 0–10; 0 = max diversity, 10 = max concentration
+    n_iter : SA iterations per restart
+    n_restarts : number of independent SA chains; best result returned
+    holdout_fraction : fraction of sims held out for OOS evaluation
+    rng_seed : base seed; restart r uses seed + r
+    """
+
+    def __init__(
+        self,
+        robust_payout: np.ndarray,
+        candidates: list,
+        portfolio_size: int = 10,
+        risk: float = 0.0,
+        n_iter: int = 10_000,
+        n_restarts: int = 3,
+        holdout_fraction: float = 0.0,
+        rng_seed: Optional[int] = None,
+    ) -> None:
+        self._M = len(candidates)
+        self._K = min(portfolio_size, self._M)
+        self._candidates = candidates
+        self._alpha = (10.0 - float(risk)) / 10.0
+        self._n_iter = n_iter
+        self._n_restarts = n_restarts
+        self._rng_seed = rng_seed
+        self._robust_payout = np.ascontiguousarray(robust_payout.astype(np.float32))
+
+        n_sims = robust_payout.shape[1]
+        if holdout_fraction > 0.0:
+            rng = np.random.default_rng(rng_seed)
+            perm = rng.permutation(n_sims)
+            n_holdout = max(1, int(n_sims * holdout_fraction))
+            self._train_idx = np.sort(perm[n_holdout:]).astype(np.int64)
+            self._holdout_idx = np.sort(perm[:n_holdout]).astype(np.int64)
+        else:
+            self._train_idx = np.arange(n_sims, dtype=np.int64)
+            self._holdout_idx = np.array([], dtype=np.int64)
+
+        n_train = len(self._train_idx)
+        n_total = self._robust_payout.shape[1]
+        if n_train == n_total:
+            self._train_payout = self._robust_payout          # view, no copy
+        else:
+            self._train_payout = self._robust_payout[:, self._train_idx]
+
+        self._selected_indices: list[int] = []
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def select(
+        self,
+        progress_cb: Optional[Callable] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> list:
+        """Run SA portfolio selection.
+
+        Parameters
+        ----------
+        progress_cb : callable(iteration, total_iterations, temperature, current_f, acceptance_rate)
+        stop_check : callable() -> bool
+
+        Returns
+        -------
+        list of (Lineup, mean_payout) tuples in selection order
+        """
+        best_selected: list[int] = []
+        best_f = -np.inf
+        total_iter = self._n_restarts * self._n_iter
+
+        for restart_idx in range(self._n_restarts):
+            if stop_check is not None and stop_check():
+                break
+            seed = (self._rng_seed + restart_idx) if self._rng_seed is not None else None
+            rng = np.random.default_rng(seed)
+
+            init = self._greedy_init(rng) if restart_idx == 0 else self._random_init(rng)
+            selected, f = self._run_annealing(
+                init, rng, progress_cb, stop_check, restart_idx, total_iter
+            )
+            if f > best_f:
+                best_f = f
+                best_selected = selected[:]
+
+        self._selected_indices = best_selected
+        return [
+            (self._candidates[i], float(self._robust_payout[i].mean()))
+            for i in best_selected
+        ]
+
+    def holdout_score(self) -> Optional[float]:
+        """Mean of max_k payout_k on holdout sims. None if no holdout split."""
+        if len(self._holdout_idx) == 0 or not self._selected_indices:
+            return None
+        hp = self._robust_payout[self._selected_indices[0], self._holdout_idx]
+        for idx in self._selected_indices[1:]:
+            hp = np.maximum(hp, self._robust_payout[idx, self._holdout_idx])
+        return float(hp.mean())
+
+    def find_replacement(
+        self,
+        current_portfolio_indices: list[int],
+        exclude_index: int,
+        additional_excluded: Optional[set] = None,
+    ) -> int:
+        """Find the best replacement for a removed lineup.
+
+        Uses the full robust_payout matrix (not the train split) so replacement
+        quality is evaluated on all sims consistently with external reporting.
+
+        Parameters
+        ----------
+        current_portfolio_indices : candidate indices of the remaining portfolio
+            (should NOT include exclude_index)
+        exclude_index : candidate index being removed
+        additional_excluded : extra indices to skip (previously discarded lineups)
+
+        Returns
+        -------
+        int : candidate index of the best replacement
+        """
+        remaining = [i for i in current_portfolio_indices if i != exclude_index]
+
+        if len(remaining) == 0:
+            means = self._robust_payout.mean(axis=1)
+            return int(np.argmax(means))
+
+        current_max = self._robust_payout[remaining].max(axis=0)  # (n_sims,)
+
+        excluded_set: set[int] = set(current_portfolio_indices) | {exclude_index}
+        if additional_excluded:
+            excluded_set |= additional_excluded
+        avail = np.array(
+            [i for i in range(self._M) if i not in excluded_set], dtype=np.int32
+        )
+        if len(avail) == 0:
+            return int(np.argmax(self._robust_payout.mean(axis=1)))
+
+        # (n_avail, n_sims): portfolio payout after adding each candidate
+        candidate_max = np.maximum(
+            current_max[np.newaxis, :], self._robust_payout[avail]
+        )
+        means = candidate_max.mean(axis=1)
+        stds = candidate_max.std(axis=1)
+        f_vals = means - self._alpha * stds
+        return int(avail[int(np.argmax(f_vals))])
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_top2(
+        self, selected: list[int]
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Rebuild best1/best2/bidx1/bidx2 from scratch. O(K × n_train)."""
+        n_train = self._train_payout.shape[1]
+        payout_sel = self._train_payout[selected]          # (K, n_train)
+
+        order = np.argsort(-payout_sel, axis=0)            # (K, n_train) descending ranks
+        best1 = payout_sel[order[0], np.arange(n_train)]
+        bidx1 = np.array(selected, dtype=np.int32)[order[0]]
+        if len(selected) >= 2:
+            best2 = payout_sel[order[1], np.arange(n_train)]
+            bidx2 = np.array(selected, dtype=np.int32)[order[1]]
+        else:
+            best2 = np.zeros(n_train, dtype=np.float32)
+            bidx2 = np.full(n_train, -1, dtype=np.int32)
+        return best1, best2, bidx1, bidx2
+
+    def _compute_f(self, portfolio_payout: np.ndarray) -> float:
+        m = float(portfolio_payout.mean())
+        s = float(portfolio_payout.std())
+        return m - self._alpha * s
+
+    def _eval_swap(
+        self,
+        old_global: int,
+        new_global: int,
+        best1: np.ndarray,
+        best2: np.ndarray,
+        bidx1: np.ndarray,
+        current_f: float,
+    ) -> tuple[float, np.ndarray]:
+        """Compute delta_f and new portfolio_payout for swap(old→new). O(n_train)."""
+        new_payout = self._train_payout[new_global]
+        was_best = bidx1 == old_global
+        new_max = np.where(was_best, np.maximum(best2, new_payout), np.maximum(best1, new_payout))
+        new_f = self._compute_f(new_max)
+        return new_f - current_f, new_max
+
+    def _update_top2_incremental(
+        self,
+        old_global: int,
+        new_global: int,
+        new_portfolio_payout: np.ndarray,
+        best1: np.ndarray,
+        best2: np.ndarray,
+        bidx1: np.ndarray,
+        bidx2: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """O(n_train) incremental top-2 update after accepting swap(old→new)."""
+        new_payout = self._train_payout[new_global]
+        old_payout = self._train_payout[old_global]
+
+        nb1 = best1.copy()
+        nb2 = best2.copy()
+        ni1 = bidx1.copy()
+        ni2 = bidx2.copy()
+
+        # --- Case A: old was best1 ---
+        A = bidx1 == old_global
+        new_gt_b2 = A & (new_payout >= best2)
+        # new beats best2 → new becomes best1, best2 stays
+        nb1 = np.where(new_gt_b2, new_payout, nb1)
+        ni1 = np.where(new_gt_b2, new_global, ni1)
+        # new doesn't beat best2 → best2 becomes best1, new becomes best2
+        A_fall = A & ~new_gt_b2
+        nb1 = np.where(A_fall, best2, nb1)
+        ni1 = np.where(A_fall, bidx2, ni1)
+        nb2 = np.where(A_fall, new_payout, nb2)
+        ni2 = np.where(A_fall, new_global, ni2)
+
+        # --- Case B: old was best2 (but not best1) ---
+        # We don't know the true 3rd-best; set best2 = new_payout.
+        # Periodic full rebuilds correct any resulting error.
+        B = (bidx2 == old_global) & ~A
+        nb2 = np.where(B, new_payout, nb2)
+        ni2 = np.where(B, new_global, ni2)
+
+        # --- Case C: old was neither best1 nor best2 ---
+        C = ~A & ~B
+        c_beats_b1 = C & (new_payout > nb1)
+        nb2 = np.where(c_beats_b1, nb1, nb2)
+        ni2 = np.where(c_beats_b1, ni1, ni2)
+        nb1 = np.where(c_beats_b1, new_payout, nb1)
+        ni1 = np.where(c_beats_b1, new_global, ni1)
+        c_beats_b2 = C & ~c_beats_b1 & (new_payout > nb2)
+        nb2 = np.where(c_beats_b2, new_payout, nb2)
+        ni2 = np.where(c_beats_b2, new_global, ni2)
+
+        return nb1, nb2, ni1, ni2
+
+    def _calibrate_temperature(
+        self,
+        selected: list[int],
+        best1: np.ndarray,
+        best2: np.ndarray,
+        bidx1: np.ndarray,
+        rng: np.random.Generator,
+        n_probes: int = 50,
+    ) -> float:
+        """Estimate T_start via random walk so initial acceptance rate ≈ 50%."""
+        remaining = list(set(range(self._M)) - set(selected))
+        if not remaining:
+            return 1.0
+        current_pp = best1.copy()
+        current_f = self._compute_f(current_pp)
+        deltas = []
+        for _ in range(n_probes):
+            old_local = int(rng.integers(0, self._K))
+            new_global = remaining[int(rng.integers(0, len(remaining)))]
+            delta, _ = self._eval_swap(
+                selected[old_local], new_global, best1, best2, bidx1, current_f
+            )
+            deltas.append(abs(delta))
+        median_delta = float(np.median(deltas)) if deltas else 1.0
+        return median_delta / np.log(2) if median_delta > 1e-12 else 1.0
+
+    def _greedy_init(self, rng: np.random.Generator) -> list[int]:
+        """Top-K candidates by individual mean payout on train split."""
+        means = self._train_payout.mean(axis=1)
+        return list(np.argsort(means)[::-1][: self._K])
+
+    def _random_init(self, rng: np.random.Generator) -> list[int]:
+        """Soft-weighted random init proportional to individual mean payout."""
+        means = self._train_payout.mean(axis=1)
+        weights = np.maximum(means, 0.0) + 1e-9
+        weights /= weights.sum()
+        return list(rng.choice(self._M, size=self._K, replace=False, p=weights))
+
+    def _run_annealing(
+        self,
+        init_selected: list[int],
+        rng: np.random.Generator,
+        progress_cb: Optional[Callable],
+        stop_check: Optional[Callable[[], bool]],
+        restart_idx: int,
+        total_iter: int,
+    ) -> tuple[list[int], float]:
+        """One SA restart. Returns (best_selected, best_f)."""
+        selected = list(init_selected)
+        remaining = list(set(range(self._M)) - set(selected))
+
+        best1, best2, bidx1, bidx2 = self._build_top2(selected)
+        portfolio_payout = best1.copy()
+        current_f = self._compute_f(portfolio_payout)
+        best_f = current_f
+        best_selected = selected[:]
+
+        if not remaining:
+            return best_selected, best_f
+
+        T_start = self._calibrate_temperature(selected, best1, best2, bidx1, rng)
+
+        acceptance_window: list[int] = []
+        iter_offset = restart_idx * self._n_iter
+
+        for iteration in range(self._n_iter):
+            if stop_check is not None and stop_check():
+                break
+
+            # Periodic full rebuild to correct Case B top-2 staleness
+            if iteration > 0 and iteration % 500 == 0:
+                best1, best2, bidx1, bidx2 = self._build_top2(selected)
+
+            T = T_start * (1.0 - iteration / self._n_iter)
+
+            old_local = int(rng.integers(0, self._K))
+            old_global = selected[old_local]
+            new_local = int(rng.integers(0, len(remaining)))
+            new_global = remaining[new_local]
+
+            delta_f, new_pp = self._eval_swap(
+                old_global, new_global, best1, best2, bidx1, current_f
+            )
+
+            accepted = delta_f > 0
+            if not accepted and T > 1e-12:
+                accepted = rng.random() < np.exp(delta_f / T)
+
+            acceptance_window.append(1 if accepted else 0)
+            if len(acceptance_window) > 200:
+                acceptance_window.pop(0)
+
+            if accepted:
+                best1, best2, bidx1, bidx2 = self._update_top2_incremental(
+                    old_global, new_global, new_pp, best1, best2, bidx1, bidx2
+                )
+                portfolio_payout = new_pp
+                current_f = current_f + delta_f
+                selected[old_local] = new_global
+                remaining[new_local] = old_global
+
+                if current_f > best_f:
+                    best_f = current_f
+                    best_selected = selected[:]
+
+            if progress_cb is not None and iteration % 250 == 0:
+                acc_rate = sum(acceptance_window) / len(acceptance_window) if acceptance_window else 0.0
+                progress_cb(
+                    iter_offset + iteration,
+                    total_iter,
+                    float(T),
+                    float(current_f),
+                    acc_rate,
+                    float(portfolio_payout.mean()),
+                    float(portfolio_payout.std()),
+                    restart_idx,
+                )
+
+        return best_selected, best_f

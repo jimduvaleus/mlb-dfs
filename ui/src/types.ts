@@ -49,6 +49,11 @@ export interface GppConfig {
   candidate_batch_size: number
   max_attempts_multiplier: number
   seed_optimal_lineups: boolean
+  risk: number
+  portfolio_n_iter: number
+  portfolio_n_restarts: number
+  dump_candidate_pool: boolean
+  candidate_floor_relief: number
 }
 
 export interface AppConfig {
@@ -89,6 +94,7 @@ export interface LineupResult {
   lineup_index: number
   p_hit_target: number
   lineup_salary: number
+  mean_ev?: number | null
   players: PlayerRow[]
   upload_tag?: string | null
   entry_fee?: string | null
@@ -142,6 +148,7 @@ export type SSEStage =
   | 'gpp_score_done'
   | 'gpp_field_inject'
   | 'gpp_select_progress'
+  | 'gpp_mv_select_progress'
   | 'gpp_holdout'
   | 'complete'
   | 'stopped'
@@ -240,6 +247,13 @@ export interface GppGenerateProgressEvent extends SSEEvent {
   n: number
 }
 
+export interface GppGenerateDoneEvent extends SSEEvent {
+  stage: 'gpp_generate_done'
+  n_generated: number
+  from_cache?: boolean
+  team_distribution?: Record<string, number>
+}
+
 export interface GppFieldProgressEvent extends SSEEvent {
   stage: 'gpp_field_progress'
   n_done: number
@@ -259,6 +273,18 @@ export interface GppSelectProgressEvent extends SSEEvent {
   lineup_ev: number
   n_covered: number
   pct_covered: number
+}
+
+export interface GppMvSelectProgressEvent extends SSEEvent {
+  stage: 'gpp_mv_select_progress'
+  iteration: number
+  total_iterations: number
+  temperature: number
+  current_f: number
+  acceptance_rate: number
+  portfolio_mean: number
+  portfolio_std: number
+  restart: number
 }
 
 export interface CompleteEvent extends SSEEvent {

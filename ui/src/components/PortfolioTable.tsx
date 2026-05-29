@@ -376,6 +376,9 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
               <div className="lineup-card-header">
                 <span className="lineup-card-num">#{lineup.lineup_index}</span>
                 <span className="lineup-card-salary">${lineup.lineup_salary.toLocaleString()}</span>
+                {lineup.mean_ev != null && (
+                  <span className="lineup-card-ev">${lineup.mean_ev.toFixed(1)}</span>
+                )}
                 {optIdx != null && (
                   <span className="lineup-card-opt-ref">Opt #{optIdx}</span>
                 )}

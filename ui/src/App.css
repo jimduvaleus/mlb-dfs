@@ -921,6 +921,11 @@ button { cursor: pointer; }
   color: #f6ad55;
 }
 
+.lineup-card-ev {
+  font-weight: 600;
+  color: #68d391;
+}
+
 .lineup-card-opt-ref {
   font-size: 16px;
   font-weight: 500;

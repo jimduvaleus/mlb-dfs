@@ -1,4 +1,4 @@
-import type { LineupResult, SSEEvent, OptimizeLineupEvent } from '../types'
+import type { LineupResult, SSEEvent, OptimizeLineupEvent, GppGenerateDoneEvent } from '../types'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from 'recharts'
@@ -97,6 +97,18 @@ export function MetricsPanel({ lineups, events }: Props) {
   }
   const stackList = Object.entries(stackCounts).sort((a, b) => b[1] - a[1])
 
+  // --- Candidate pool team distribution ---
+  const generateDoneEvent = [...events].reverse().find(e => e.stage === 'gpp_generate_done') as GppGenerateDoneEvent | undefined
+  const teamDist = generateDoneEvent?.team_distribution
+  const teamDistList = teamDist
+    ? Object.entries(teamDist).sort((a, b) => b[1] - a[1])
+    : null
+  const teamDistTotal = teamDistList ? teamDistList.reduce((s, [, c]) => s + c, 0) : 0
+  const teamDistExpected = teamDistList && teamDistList.length > 0
+    ? teamDistTotal / teamDistList.length
+    : 0
+  const teamDistMax = teamDistList ? Math.max(...teamDistList.map(([, c]) => c)) : 1
+
   return (
     <div className="metrics-panel">
       <h3>Portfolio Metrics</h3>
@@ -134,6 +146,51 @@ export function MetricsPanel({ lineups, events }: Props) {
           ))}
         </div>
       </div>
+
+      {/* Candidate pool team distribution */}
+      {teamDistList && teamDistList.length > 0 && (
+        <div className="metrics-section">
+          <h4>Candidate Pool — Primary Stack Distribution</h4>
+          <div className="metrics-row" style={{ marginBottom: 6 }}>
+            <span className="metric-chip">
+              {teamDistList.length} teams · {teamDistTotal.toLocaleString()} main-stack lineups · expected {Math.round(teamDistExpected)}/team
+            </span>
+          </div>
+          <div className="stack-list">
+            {teamDistList.map(([team, count]) => {
+              const pct = (count / teamDistMax) * 100
+              const expectedPct = (teamDistExpected / teamDistMax) * 100
+              const deviation = teamDistExpected > 0
+                ? (count - teamDistExpected) / teamDistExpected
+                : 0
+              const outside = Math.abs(deviation) > 0.33
+              const barColor = outside ? (deviation < 0 ? '#e07b54' : '#4fb36c') : '#4f9de8'
+              const deviationLabel = `${deviation >= 0 ? '+' : ''}${(deviation * 100).toFixed(0)}%`
+              return (
+                <div key={team} className="stack-row">
+                  <span style={{ width: 28, display: 'inline-flex', alignItems: 'center' }}>
+                    <TeamBadge team={team} className="exposure-team" />
+                  </span>
+                  <span style={{ position: 'relative', flex: 1, height: 14, margin: '0 6px' }}>
+                    <span
+                      className="stack-bar"
+                      style={{ width: `${pct}%`, background: barColor, position: 'absolute', top: 0, left: 0, height: '100%' }}
+                    />
+                    {/* tick mark at uniform expected */}
+                    <span style={{
+                      position: 'absolute', top: 0, left: `${expectedPct}%`,
+                      width: 2, height: '100%', background: 'rgba(255,255,255,0.45)',
+                      transform: 'translateX(-50%)',
+                    }} />
+                  </span>
+                  <span className="stack-count" style={{ minWidth: 38, textAlign: 'right' }}>{count.toLocaleString()}</span>
+                  <span className="muted" style={{ minWidth: 38, textAlign: 'right', fontSize: '0.82em' }}>{deviationLabel}</span>
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Salary distribution */}
       <div className="metrics-section">
