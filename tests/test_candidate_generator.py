@@ -1,4 +1,6 @@
 """Tests for Phase 1: CandidateGenerator."""
+import math
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -246,7 +248,7 @@ def test_max_five_hitters_per_team(generator, players_df):
 
 
 # ------------------------------------------------------------------ #
-#  Salary floor test                                                  #
+#  Salary floor tests                                                 #
 # ------------------------------------------------------------------ #
 
 def test_salary_floor_enforced(players_df, ownership_vec):
@@ -258,6 +260,78 @@ def test_salary_floor_enforced(players_df, ownership_vec):
     for lu in results:
         total = sum(df_dict[pid]["salary"] for pid in lu.player_ids)
         assert total >= 44_000.0, f"Salary {total} below floor"
+
+
+def test_salary_floor_enforced_when_full_stack_leaves_no_fill():
+    """Regression: a (5+3) stack where both teams together cover all 8 batter
+    positions produces fill_slots=[] so the salary-window fill loop never runs.
+    The explicit floor guard at the end of _sample_one must catch this case.
+
+    Fixture: team A has cheap C/1B/2B/3B/SS ($2500 each, high projection) and
+    team B has cheap OFs ($2500 each, high projection).  A(5)+B(3) covers every
+    batter slot, total batter salary=$20 000.  With the cheapest eligible pitchers
+    (~$5000 each) total is ≈$30 000, far below the $44 000 floor used here.
+    The generator must reject all such lineups.
+    """
+    rows = [
+        # Team A — cheap infield, high projection → drawn frequently as primary
+        _make_player(1,  "C",  2500, "A", "A@B", mean=28.0),
+        _make_player(2,  "1B", 2500, "A", "A@B", mean=28.0),
+        _make_player(3,  "2B", 2500, "A", "A@B", mean=28.0),
+        _make_player(4,  "3B", 2500, "A", "A@B", mean=28.0),
+        _make_player(5,  "SS", 2500, "A", "A@B", mean=28.0),
+        # Team B — cheap outfield, high projection → drawn frequently as secondary
+        _make_player(6,  "OF", 2500, "B", "A@B", mean=28.0),
+        _make_player(7,  "OF", 2500, "B", "A@B", mean=28.0),
+        _make_player(8,  "OF", 2500, "B", "A@B", mean=28.0),
+        # A@B pitchers (cheap; can only be used when stacking C or D batters)
+        _make_player(9,  "P",  5000, "A", "A@B", mean=18.0),
+        _make_player(10, "P",  5000, "B", "A@B", mean=18.0),
+        # Team C — expensive batters covering all positions
+        _make_player(11, "C",  4800, "C", "C@D", mean=18.0),
+        _make_player(12, "1B", 4800, "C", "C@D", mean=18.0),
+        _make_player(13, "2B", 4800, "C", "C@D", mean=18.0),
+        _make_player(14, "3B", 4800, "C", "C@D", mean=18.0),
+        _make_player(15, "SS", 4800, "C", "C@D", mean=18.0),
+        _make_player(16, "OF", 4800, "C", "C@D", mean=18.0),
+        _make_player(17, "OF", 4800, "C", "C@D", mean=18.0),
+        _make_player(18, "OF", 4800, "C", "C@D", mean=18.0),
+        # Team D — expensive batters covering all positions
+        _make_player(19, "C",  4800, "D", "C@D", mean=18.0),
+        _make_player(20, "1B", 4800, "D", "C@D", mean=18.0),
+        _make_player(21, "2B", 4800, "D", "C@D", mean=18.0),
+        _make_player(22, "3B", 4800, "D", "C@D", mean=18.0),
+        _make_player(23, "SS", 4800, "D", "C@D", mean=18.0),
+        _make_player(24, "OF", 4800, "D", "C@D", mean=18.0),
+        _make_player(25, "OF", 4800, "D", "C@D", mean=18.0),
+        _make_player(26, "OF", 4800, "D", "C@D", mean=18.0),
+        # C@D pitchers (expensive; eligible when stacking A or B)
+        _make_player(27, "P",  8000, "C", "C@D", mean=22.0),
+        _make_player(28, "P",  8000, "D", "C@D", mean=22.0),
+    ]
+    df = pd.DataFrame(rows)
+    df["opponent"] = df.apply(
+        lambda row: (
+            row["game"].split("@")[1] if row["team"] == row["game"].split("@")[0]
+            else row["game"].split("@")[0]
+        ),
+        axis=1,
+    )
+    ow = compute_heuristic_ownership(df)
+    pid_to_salary = dict(zip(df["player_id"], df["salary"]))
+
+    salary_floor = 44_000.0
+    gen = CandidateGenerator(df, ow, rng_seed=0, salary_floor=salary_floor,
+                              team_weight_power=0.5, fill_weight_power=0.0)
+    results = gen.generate(n_candidates=40, max_attempts_multiplier=500)
+
+    assert len(results) > 0, "Generator produced no lineups — check fixture salaries"
+    for lu in results:
+        total = sum(pid_to_salary[pid] for pid in lu.player_ids)
+        assert total >= salary_floor, (
+            f"Lineup below salary floor: total={total}, floor={salary_floor}, "
+            f"player_ids={lu.player_ids}"
+        )
 
 
 # ------------------------------------------------------------------ #
@@ -280,3 +354,87 @@ def test_progress_callback_called(players_df, ownership_vec):
     # Should have been called at least once (every 500 lineups)
     assert len(calls) >= 1
     assert calls[0] == 500
+
+
+# ------------------------------------------------------------------ #
+#  Stack group distribution                                           #
+# ------------------------------------------------------------------ #
+
+def test_stack_group_distribution(players_df, ownership_vec):
+    """5-group ~50%, 4-group ~40%, 3-group ~10% across a large enough sample."""
+    gen = CandidateGenerator(players_df, ownership_vec, rng_seed=77)
+    df_dict = {row["player_id"]: row for row in players_df.to_dict("records")}
+    results = gen.generate(n_candidates=300, max_attempts_multiplier=50)
+
+    group5 = group4 = group3 = 0
+    for lu in results:
+        team_counts: dict[str, int] = {}
+        for pid in lu.player_ids:
+            if df_dict[pid]["position"] != "P":
+                t = df_dict[pid]["team"]
+                team_counts[t] = team_counts.get(t, 0) + 1
+        top = max(team_counts.values())
+        if top >= 5:
+            group5 += 1
+        elif top >= 4:
+            group4 += 1
+        else:
+            group3 += 1
+
+    n = len(results)
+    assert n > 0
+    # Tolerant bounds: ±20pp for 5-group; 4-group lower bound is loose because the
+    # small fixture has several teams with only 3 batters, making (4,4) patterns
+    # structurally infeasible for those teams.
+    assert 0.30 <= group5 / n <= 0.70, f"5-group fraction {group5/n:.2f} out of [0.30, 0.70]"
+    assert 0.05 <= group4 / n <= 0.60, f"4-group fraction {group4/n:.2f} out of [0.05, 0.60]"
+    assert 0.00 <= group3 / n <= 0.30, f"3-group fraction {group3/n:.2f} out of [0.00, 0.30]"
+
+
+# ------------------------------------------------------------------ #
+#  Team distribution                                                  #
+# ------------------------------------------------------------------ #
+
+def test_team_primary_cap_respected(players_df, ownership_vec):
+    """No primary team should exceed ceil(n * 1.33 / n_teams) lineups."""
+    gen = CandidateGenerator(players_df, ownership_vec, rng_seed=42)
+    df_dict = {row["player_id"]: row for row in players_df.to_dict("records")}
+
+    n_candidates = 90
+    # 6 batter teams in the 3-game fixture (A, B, C, D, E, F)
+    n_batter_teams = len({
+        row["team"] for row in players_df.to_dict("records")
+        if row["position"] != "P"
+    })
+    # Use 1.7× (vs the production hard_cap of 1.33×) to account for fill batters that
+    # can raise a team's apparent hitter count beyond the generator's intended stack size
+    # in this small fixture. In real slates (18 teams, 8-9 batters) the fill effect is
+    # negligible and the actual distribution stays within ±33% of uniform.
+    cap = math.ceil(n_candidates * 1.7 / n_batter_teams)
+
+    results = gen.generate(n_candidates=n_candidates, max_attempts_multiplier=200)
+
+    # Count unambiguous primary team for 4-group and 5-group lineups.
+    # Lineups with two teams tied at the top (i.e. 4-4 stacks) are excluded
+    # since neither team is unambiguously the "primary".
+    primary_counts: dict[str, int] = {}
+    for lu in results:
+        team_hitters: dict[str, int] = {}
+        for pid in lu.player_ids:
+            if df_dict[pid]["position"] != "P":
+                t = df_dict[pid]["team"]
+                team_hitters[t] = team_hitters.get(t, 0) + 1
+        top = max(team_hitters.values())
+        if top < 4:
+            continue  # 3-group: excluded from distribution math
+        top_teams = [t for t, c in team_hitters.items() if c == top]
+        if len(top_teams) > 1:
+            continue  # 4-4 tie: skip, both teams share credit
+        primary = top_teams[0]
+        primary_counts[primary] = primary_counts.get(primary, 0) + 1
+
+    for team, count in primary_counts.items():
+        assert count <= cap, (
+            f"Team {team} has {count} unambiguous primary lineups, exceeds cap {cap} "
+            f"(n={n_candidates}, n_teams={n_batter_teams})"
+        )

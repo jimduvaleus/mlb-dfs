@@ -59,6 +59,16 @@ _SECONDARY_SIZE_2_PROB: float = float(_CAL.get("secondary_size_2_prob", 0.525))
 _FIELD_SALARY_FLOOR: float = float(_CAL.get("salary_floor_field", 49_000))
 
 
+def _gumbel_choice(rng: np.random.Generator, n: int, size: int, weights: np.ndarray) -> np.ndarray:
+    """Weighted sampling without replacement via Efraimidis-Spirakis (O(n)).
+
+    Avoids the numpy.unique / Fisher-Yates path inside rng.choice(replace=False).
+    """
+    log_u = np.log(rng.random(n))
+    keys = np.where(weights > 0, log_u / weights, -np.inf)
+    return np.argpartition(keys, -size)[-size:]
+
+
 def compute_emergent_ownership(
     players_df: pd.DataFrame,
     team_totals: dict[str, float] | None = None,
@@ -81,19 +91,28 @@ def compute_emergent_ownership(
     pos_pools = _build_pos_pools(df, proj_w)
     pmeta = _player_meta_from_df(df)
 
+    pid_team: dict[int, str] = {pid: meta["team"] for pid, meta in pmeta.items()}
+    pid_salary: dict[int, int] = {pid: int(meta["salary"]) for pid, meta in pmeta.items()}
+    pid_opponent: dict[int, str] = {pid: meta.get("opponent", "") for pid, meta in pmeta.items()}
+
     team_batters: dict[str, list[int]] = {}
     team_stack_w: dict[str, float] = {}
+    pid_to_ow: dict[int, float] = {}
     for pos_name in ("C", "1B", "2B", "3B", "SS", "OF"):
-        p_ids, _ = pos_pools.get(pos_name, ([], np.array([])))
-        for pid in p_ids:
-            t = pmeta[pid]["team"]
+        p_ids, p_w = pos_pools.get(pos_name, ([], np.array([])))
+        for pid, w in zip(p_ids, p_w):
+            t = pid_team[pid]
             team_batters.setdefault(t, []).append(pid)
+            pid_to_ow[pid] = float(w)
     for team in team_batters:
         team_stack_w[team] = float((team_totals or {}).get(team, 4.5))
 
-    p_sals = sorted([v["salary"] for v in pmeta.values() if v["position"] == "P"], reverse=True)
-    b_sals = sorted([v["salary"] for v in pmeta.values() if v["position"] != "P"], reverse=True)
-    effective_floor = (
+    batter_salaries = [pid_salary[pid] for pid in pid_to_ow]
+    min_batter_salary = float(min(batter_salaries)) if batter_salaries else 0.0
+
+    p_sals = sorted([pid_salary[pid] for pid, meta in pmeta.items() if meta["position"] == "P"], reverse=True)
+    b_sals = sorted(batter_salaries, reverse=True)
+    effective_floor = float(
         _FIELD_SALARY_FLOOR if (sum(p_sals[:2]) + sum(b_sals[:8])) >= _FIELD_SALARY_FLOOR else 0.0
     )
 
@@ -107,15 +126,17 @@ def compute_emergent_ownership(
         attempts += 1
         try:
             ids = (
-                _sample_stacked_lineup(rng, pos_pools, pmeta, team_batters, team_stack_w)
+                _sample_stacked_lineup(
+                    rng, pos_pools, pmeta, team_batters, team_stack_w,
+                    pid_to_ow, pid_team, pid_salary, pid_opponent,
+                    min_batter_salary=min_batter_salary,
+                    salary_floor=effective_floor,
+                )
                 if rng.random() < sp
                 else _sample_random_lineup(rng, pos_pools, pmeta)
             )
         except Exception:
             ids = None
-        if ids is not None and effective_floor > 0:
-            if sum(pmeta[pid]["salary"] for pid in ids) < effective_floor:
-                ids = None
         if ids is not None:
             for pid in ids:
                 if (idx := pid_to_idx.get(int(pid))) is not None:
@@ -216,14 +237,25 @@ def _sample_stacked_lineup(
     pmeta: dict,
     team_batters: dict[str, list[int]],
     team_weights: dict[str, float],
+    pid_to_ow: dict[int, float],
+    pid_team: dict[int, str],
+    pid_salary: dict[int, int],
+    pid_opponent: dict[int, str],
+    min_batter_salary: float = 0.0,
+    salary_floor: float = 0.0,
 ) -> Optional[list[int]]:
-    """Try to build one stacked lineup (4-5 batters from a primary team)."""
-    # Weight teams by sum of their batter ownership
+    """Try to build one stacked lineup (4-5 batters from a primary team).
+
+    Pre-built lookup dicts (pid_to_ow, pid_team, pid_salary, pid_opponent) must
+    be provided by the caller to avoid O(all_players) construction per call.
+    """
     teams = list(team_weights.keys())
-    tw = np.array([team_weights[t] for t in teams])
-    tw = tw / tw.sum()
-    primary_team = teams[int(rng.choice(len(teams), p=tw))]
-    primary_pool = team_batters.get(primary_team, [])
+    tw = np.array([team_weights[t] for t in teams], dtype=np.float64)
+    tw /= tw.sum()
+    # cumsum sampling: avoids rng.choice dispatch overhead for size=1
+    primary_team = teams[int(np.searchsorted(np.cumsum(tw), rng.random()))]
+
+    primary_pool = [pid for pid in team_batters.get(primary_team, []) if pid in pid_to_ow]
     if len(primary_pool) < 4:
         return None
 
@@ -231,49 +263,37 @@ def _sample_stacked_lineup(
     if len(primary_pool) < stack_size:
         stack_size = len(primary_pool)
 
-    # Ownership weights within primary stack
-    all_pids = pos_pools.get("C", ([], []))[0] + pos_pools.get("1B", ([], []))[0] + \
-               pos_pools.get("2B", ([], []))[0] + pos_pools.get("3B", ([], []))[0] + \
-               pos_pools.get("SS", ([], []))[0] + pos_pools.get("OF", ([], []))[0]
-    pid_to_ow: dict[int, float] = {}
-    for pos_name in ("C", "1B", "2B", "3B", "SS", "OF"):
-        p_ids, p_w = pos_pools.get(pos_name, ([], np.array([])))
-        for pid, w in zip(p_ids, p_w):
-            pid_to_ow[pid] = w
+    sw = np.array([pid_to_ow[pid] for pid in primary_pool], dtype=np.float64)
+    sw /= sw.sum()
+    chosen_idx = _gumbel_choice(rng, len(primary_pool), stack_size, sw)
+    stack_ids = {int(primary_pool[i]) for i in chosen_idx}
+    current_salary: int = sum(pid_salary[pid] for pid in stack_ids)
 
-    stack_pool = [pid for pid in primary_pool if pid in pid_to_ow]
-    if len(stack_pool) < stack_size:
-        return None
-    sw = np.array([pid_to_ow[pid] for pid in stack_pool])
-    sw = sw / sw.sum()
-    chosen_idx = rng.choice(len(stack_pool), size=stack_size, replace=False, p=sw)
-    stack_ids = set(int(stack_pool[i]) for i in chosen_idx)
-
-    # Fill 2 pitchers (not from primary team's opponent)
+    # 2 pitchers (not opposing any stacked batter)
+    excluded_opps = {pid_opponent.get(pid, "") for pid in stack_ids}
     p_ids, p_w = pos_pools.get("P", ([], np.array([])))
-    excluded_pitcher_opps = {pmeta[pid]["opponent"] for pid in stack_ids}
-    pitcher_pool = [pid for pid in p_ids if pmeta[pid]["team"] not in excluded_pitcher_opps]
+    pitcher_pool = [pid for pid in p_ids if pid_team[pid] not in excluded_opps]
     if len(pitcher_pool) < 2:
         return None
-    pitcher_w_raw = np.array([pid_to_ow.get(pid, 1.0 / len(p_ids)) for pid in pitcher_pool])
-    # Use the pitcher ownership from pos_pools
     p_w_dict = dict(zip(p_ids, p_w))
-    pitcher_w = np.array([p_w_dict.get(pid, 1.0 / len(pitcher_pool)) for pid in pitcher_pool])
-    pitcher_w = pitcher_w / pitcher_w.sum()
-    pit_idx = rng.choice(len(pitcher_pool), size=2, replace=False, p=pitcher_w)
+    pit_w = np.array([p_w_dict.get(pid, 1.0 / len(pitcher_pool)) for pid in pitcher_pool], dtype=np.float64)
+    pit_w /= pit_w.sum()
+    pit_idx = _gumbel_choice(rng, len(pitcher_pool), 2, pit_w)
     pitcher_ids = [int(pitcher_pool[i]) for i in pit_idx]
 
     used = set(pitcher_ids) | stack_ids
+    current_salary += pid_salary[pitcher_ids[0]] + pid_salary[pitcher_ids[1]]
 
-    # Secondary stack: fill 2-3 batter slots from a second team before the
-    # generic remaining-positions pass.
+    pitcher_opp_teams = {pid_opponent.get(pid, "") for pid in pitcher_ids if pid_opponent.get(pid)}
+
+    # Secondary stack: ownership-weighted fill from a second team
     secondary_ids: list[int] = []
     if rng.random() < _SECONDARY_STACK_PROB and len(teams) > 1:
         sec_teams = [t for t in teams if t != primary_team]
         if sec_teams:
-            sec_tw = np.array([team_weights[t] for t in sec_teams])
-            sec_tw = sec_tw / sec_tw.sum()
-            secondary_team = sec_teams[int(rng.choice(len(sec_teams), p=sec_tw))]
+            sec_tw = np.array([team_weights[t] for t in sec_teams], dtype=np.float64)
+            sec_tw /= sec_tw.sum()
+            secondary_team = sec_teams[int(np.searchsorted(np.cumsum(sec_tw), rng.random()))]
             secondary_target = 2 if rng.random() < _SECONDARY_SIZE_2_PROB else 3
 
             for pos_name in ("C", "1B", "2B", "3B", "SS", "OF"):
@@ -289,45 +309,78 @@ def _sample_stacked_lineup(
                     continue
                 sec_cands = [
                     pid for pid in p_ids_pos
-                    if pmeta[pid]["team"] == secondary_team and pid not in used
+                    if pid_team[pid] == secondary_team and pid not in used
                 ]
                 if not sec_cands:
                     continue
                 cw_dict = dict(zip(p_ids_pos, p_w_pos))
-                cw = np.array([cw_dict.get(pid, 1.0 / len(sec_cands)) for pid in sec_cands])
-                cw = cw / cw.sum()
+                cw = np.array([cw_dict.get(pid, 1.0 / len(sec_cands)) for pid in sec_cands], dtype=np.float64)
+                cw /= cw.sum()
                 n_pick = min(need, secondary_target - len(secondary_ids), len(sec_cands))
-                chosen = [
-                    int(sec_cands[i])
-                    for i in rng.choice(len(sec_cands), size=n_pick, replace=False, p=cw)
-                ]
+                picked = list(_gumbel_choice(rng, len(sec_cands), n_pick, cw))
+                chosen = [int(sec_cands[i]) for i in picked]
                 secondary_ids.extend(chosen)
                 used.update(chosen)
+                current_salary += sum(pid_salary[pid] for pid in chosen)
 
     all_stacked = stack_ids | set(secondary_ids)
-    remaining: list[int] = []
+
+    # Build ordered fill slots and fill them one at a time with salary-window filtering.
+    fill_slots: list[str] = []
     for pos_name in ("C", "1B", "2B", "3B", "SS", "OF"):
+        already = sum(1 for pid in all_stacked if pmeta[pid]["position"] == pos_name)
+        need = ROSTER_REQUIREMENTS.get(pos_name, 0) - already
+        if need > 0:
+            fill_slots.extend([pos_name] * need)
+
+    hitter_team_count: dict[str, int] = {}
+    for pid in all_stacked:
+        if pmeta[pid]["position"] != "P":
+            t = pid_team[pid]
+            hitter_team_count[t] = hitter_team_count.get(t, 0) + 1
+
+    remaining_fill = len(fill_slots)
+    remaining: list[int] = []
+
+    for pos_name in fill_slots:
         p_ids_pos, p_w_pos = pos_pools.get(pos_name, ([], np.array([])))
-        already_covered = sum(
-            1 for pid in all_stacked
-            if pmeta[pid]["position"] == pos_name
+
+        min_sal = max(
+            0.0,
+            (salary_floor - current_salary) - min_batter_salary * (remaining_fill - 1),
         )
-        need = ROSTER_REQUIREMENTS.get(pos_name, 0) - already_covered
-        if need <= 0:
-            continue
-        cands = [pid for pid in p_ids_pos if pid not in used]
-        if len(cands) < need:
+        max_sal = (SALARY_CAP - current_salary) - min_batter_salary * (remaining_fill - 1)
+
+        cands = [
+            pid for pid in p_ids_pos
+            if pid not in used
+            and hitter_team_count.get(pid_team[pid], 0) < _MAX_HITTERS_PER_TEAM
+            and pid_team[pid] not in pitcher_opp_teams
+            and pid_salary[pid] >= min_sal
+            and pid_salary[pid] <= max_sal
+        ]
+        if not cands:
             return None
-        cw_raw = p_w_pos
-        cw_dict = dict(zip(p_ids_pos, cw_raw))
-        cw = np.array([cw_dict.get(pid, 1.0 / len(cands)) for pid in cands])
-        cw = cw / cw.sum()
-        chosen = [int(cands[i]) for i in rng.choice(len(cands), size=need, replace=False, p=cw)]
-        remaining.extend(chosen)
-        used.update(chosen)
+
+        # Ownership-weighted selection preserving projected ownership distribution.
+        cw_dict = dict(zip(p_ids_pos, p_w_pos))
+        cw = np.array([cw_dict.get(pid, 1.0 / len(cands)) for pid in cands], dtype=np.float64)
+        cw /= cw.sum()
+        chosen_pid = int(cands[int(np.searchsorted(np.cumsum(cw), rng.random()))])
+
+        hitter_team_count[pid_team[chosen_pid]] = hitter_team_count.get(pid_team[chosen_pid], 0) + 1
+        current_salary += pid_salary[chosen_pid]
+        remaining_fill -= 1
+        used.add(chosen_pid)
+        remaining.append(chosen_pid)
 
     all_ids = pitcher_ids + list(stack_ids) + secondary_ids + remaining
     if len(set(all_ids)) != 10 or len(all_ids) != 10:
+        return None
+    # Floor check: salary-window fill is skipped when fill_slots is empty (full-stack
+    # patterns where both teams cover all 8 batter positions). current_salary tracks
+    # the running tally so no extra iteration is needed here.
+    if salary_floor > 0 and current_salary < salary_floor:
         return None
     if not _is_valid_field_lineup(all_ids, pmeta):
         return None
@@ -354,9 +407,10 @@ def _sample_random_lineup(
                     weights.append(float(w))
         if not cands:
             return None
-        w_arr = np.array(weights)
-        w_arr = w_arr / w_arr.sum()
-        chosen = int(cands[rng.choice(len(cands), p=w_arr)])
+        w_arr = np.array(weights, dtype=np.float64)
+        w_arr /= w_arr.sum()
+        # cumsum sampling avoids rng.choice dispatch overhead for size=1
+        chosen = int(cands[int(np.searchsorted(np.cumsum(w_arr), rng.random()))])
         ids.append(chosen)
         used.add(chosen)
     if not _is_valid_field_lineup(ids, pmeta):
@@ -388,27 +442,33 @@ class ContestSimulator:
         pmeta = _player_meta_from_df(players_df)
         pos_pools = _build_pos_pools(players_df, ownership_vec)
 
-        # Build team batter groups and team stack weights
+        # Pre-build flat per-player lookups — avoids nested pmeta[pid]["x"] in hot loop.
+        pid_team: dict[int, str] = {pid: meta["team"] for pid, meta in pmeta.items()}
+        pid_salary: dict[int, int] = {pid: int(meta["salary"]) for pid, meta in pmeta.items()}
+        pid_opponent: dict[int, str] = {pid: meta.get("opponent", "") for pid, meta in pmeta.items()}
+
+        # Build team batter groups, stack weights, and per-batter ownership lookup once.
         team_batters: dict[str, list[int]] = {}
         team_stack_w: dict[str, float] = {}
+        pid_to_ow: dict[int, float] = {}
         for pos_name in ("C", "1B", "2B", "3B", "SS", "OF"):
             p_ids, p_w = pos_pools.get(pos_name, ([], np.array([])))
             for pid, w in zip(p_ids, p_w):
-                t = pmeta[pid]["team"]
+                t = pid_team[pid]
                 team_batters.setdefault(t, []).append(pid)
                 team_stack_w[t] = team_stack_w.get(t, 0.0) + float(w)
+                pid_to_ow[pid] = float(w)
+
+        batter_salaries = [pid_salary[pid] for pid in pid_to_ow]
+        min_batter_salary = float(min(batter_salaries)) if batter_salaries else 0.0
 
         # Empirical salary floor: only apply when the player pool can achieve it.
-        # If the best-case lineup salary (top-2 pitchers + top-8 batters) falls below
-        # _FIELD_SALARY_FLOOR, the pool is a toy/test fixture and we skip the floor.
         pitcher_sals = sorted(
-            [v["salary"] for v in pmeta.values() if v["position"] == "P"], reverse=True
+            [pid_salary[pid] for pid, meta in pmeta.items() if meta["position"] == "P"], reverse=True
         )
-        batter_sals = sorted(
-            [v["salary"] for v in pmeta.values() if v["position"] != "P"], reverse=True
-        )
+        batter_sals = sorted(batter_salaries, reverse=True)
         max_feasible_sal = sum(pitcher_sals[:2]) + sum(batter_sals[:8])
-        effective_floor = _FIELD_SALARY_FLOOR if max_feasible_sal >= _FIELD_SALARY_FLOOR else 0.0
+        effective_floor = float(_FIELD_SALARY_FLOOR) if max_feasible_sal >= _FIELD_SALARY_FLOOR else 0.0
 
         field: list[list[int]] = []
         total_attempts = 0
@@ -418,17 +478,21 @@ class ContestSimulator:
             total_attempts += 1
             try:
                 if rng.random() < stack_probability:
-                    ids = _sample_stacked_lineup(rng, pos_pools, pmeta, team_batters, team_stack_w)
+                    ids = _sample_stacked_lineup(
+                        rng, pos_pools, pmeta, team_batters, team_stack_w,
+                        pid_to_ow, pid_team, pid_salary, pid_opponent,
+                        min_batter_salary=min_batter_salary,
+                        salary_floor=effective_floor,
+                    )
                 else:
                     ids = _sample_random_lineup(rng, pos_pools, pmeta)
             except Exception:
                 ids = None
 
             if ids is not None:
-                if effective_floor > 0:
-                    total_sal = sum(pmeta[pid]["salary"] for pid in ids)
-                    if total_sal < effective_floor:
-                        ids = None
+                # Random lineups have no internal salary-floor logic; check here.
+                if effective_floor > 0 and sum(pid_salary[pid] for pid in ids) < effective_floor:
+                    ids = None
             if ids is not None:
                 field.append(ids)
                 if progress_cb is not None and len(field) % progress_chunk == 0:
