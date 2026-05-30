@@ -8,7 +8,7 @@ Two-stage pipeline for the `leverage_surplus` objective:
 
   MeanVariancePortfolioSelector — assembles a portfolio via simulated annealing
                                    on the (M × n_sims) robust_payout matrix.
-                                   Objective: mean(max_k payout_k) - alpha * std(max_k payout_k)
+                                   Objective: mean(sum_k payout_k) - alpha * std(sum_k payout_k)
                                    where alpha = (10 - risk) / 10. Risk=0 (Shaidy default)
                                    maximises diversity; risk=10 maximises concentration.
 
@@ -833,36 +833,9 @@ class MeanVariancePortfolioSelector:
         return median_delta / np.log(2) if median_delta > 1e-12 else 1.0
 
     def _greedy_init(self, rng: np.random.Generator) -> list[int]:
-        """Incremental greedy: repeatedly add the lineup maximising f(current_sum + payout_new).
-
-        Each step is O(M × n_train) vectorised in batches of 500 to cap peak memory.
-        Accounts for correlation: a lineup redundant with those already selected won't
-        be picked even if its individual EV is high.
-        """
-        selected: list[int] = []
-        remaining = list(range(self._M))
-        n_train = self._train_payout.shape[1]
-        portfolio_sum = np.zeros(n_train, dtype=np.float32)
-        batch_size = 500
-
-        for _ in range(self._K):
-            if not remaining:
-                break
-            avail = np.array(remaining, dtype=np.int32)
-            f_vals = np.empty(len(avail), dtype=np.float32)
-            for b_start in range(0, len(avail), batch_size):
-                batch = avail[b_start: b_start + batch_size]
-                csum = portfolio_sum + self._train_payout[batch]   # (batch, n_train)
-                f_vals[b_start: b_start + len(batch)] = (
-                    csum.mean(axis=1) - self._alpha * csum.std(axis=1)
-                )
-            best_local = int(np.argmax(f_vals))
-            best_global = int(avail[best_local])
-            selected.append(best_global)
-            portfolio_sum = portfolio_sum + self._train_payout[best_global]
-            remaining.pop(best_local)
-
-        return selected
+        """Top-K candidates by individual mean payout on train split."""
+        means = self._train_payout.mean(axis=1)
+        return list(np.argsort(means)[::-1][: self._K])
 
     def _random_init(self, rng: np.random.Generator) -> list[int]:
         """Soft-weighted random init proportional to individual mean payout.
