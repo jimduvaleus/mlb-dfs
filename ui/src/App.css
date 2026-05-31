@@ -411,6 +411,7 @@ button { cursor: pointer; }
   align-items: center;
   gap: 12px;
   margin-top: 12px;
+  margin-bottom: 16px;
 }
 
 .config-form button[type="submit"] {

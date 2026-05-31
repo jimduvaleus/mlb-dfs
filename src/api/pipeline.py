@@ -779,56 +779,100 @@ class PipelineRunner:
                 if _gpp_stopped and self._stop_check():
                     portfolio = []
                 else:
-                    # Phase 3: simulation-coverage portfolio selection
-                    _field_sorted = scorer.last_field_sorted    # (n_sims, N_field) float32
-                    _col_lineups = scorer.last_col_lineups       # (M, 10) int32
-                    _sim_mat = scorer._sim_matrix                # (n_sims, n_players) float32
-                    _n_field = _field_sorted.shape[1]
-                    _BATCH = 1000
-                    logger.info(
-                        "[TIMING] EV phase setup — field_sorted %s (%.1f MB), "
-                        "col_lineups %s, sim_mat %s (%.1f MB), n_field=%d",
-                        _field_sorted.shape, _field_sorted.nbytes / 1e6,
-                        _col_lineups.shape,
-                        _sim_mat.shape, _sim_mat.nbytes / 1e6,
-                        _n_field,
-                    )
-
-                    selector = MeanVariancePortfolioSelector(
-                        robust_payout=robust_payout,
-                        candidates=candidates,
-                        portfolio_size=portfolio_size,
-                        risk=mv_risk,
-                        n_iter=mv_n_iter,
-                        n_restarts=mv_n_restarts,
-                        holdout_fraction=holdout_frac,
-                        rng_seed=opt_cfg.get("rng_seed"),
-                    )
+                    # Phase 3: portfolio selection — dispatch on portfolio_method
+                    portfolio_method = gpp_cfg.get("portfolio_method", "mean_variance")
                     _t_select = time.perf_counter()
-                    gpp_result = selector.select(
-                        stop_check=self._stop_check,
-                        progress_cb=lambda itr, tot, T, f, acc, mean, std, restart: self._cb(
-                            "gpp_mv_select_progress",
-                            {
-                                "iteration": itr,
-                                "total_iterations": tot,
-                                "temperature": round(float(T), 6),
-                                "current_f": round(float(f), 6),
-                                "acceptance_rate": round(float(acc), 4),
-                                "portfolio_mean": round(float(mean), 4),
-                                "portfolio_std": round(float(std), 4),
-                                "restart": restart,
-                            },
-                        ),
-                    )
-                    logger.info(
-                        "[TIMING] MeanVariancePortfolioSelector.select() wall time: %.3fs",
-                        time.perf_counter() - _t_select,
-                    )
-                    if selector.holdout_score() is not None:
-                        self._cb("gpp_holdout", {
-                            "holdout_mean_payout": round(selector.holdout_score(), 6),
-                        })
+
+                    if portfolio_method == "hybrid_field":
+                        from src.optimization.hybrid_field_portfolio import HybridFieldPortfolioSelector
+                        hybrid_n_sims = int(gpp_cfg.get("hybrid_n_sims", 10_000))
+                        _entry_fee = float(_gpp_structure.get("entry_fee", 4.0))
+                        logger.info(
+                            "HybridField selector — portfolio_size=%d, n_field=%d, "
+                            "n_hybrid_sims=%d",
+                            portfolio_size, n_field, hybrid_n_sims,
+                        )
+                        hf_selector = HybridFieldPortfolioSelector(
+                            candidates=candidates,
+                            robust_payout=robust_payout,
+                            sim_engine=engine,
+                            players_df=cand_players_df,
+                            payout_arr=_gpp_payout_arr,
+                            portfolio_size=portfolio_size,
+                            n_field_lineups=n_field,
+                            n_hybrid_sims=hybrid_n_sims,
+                            field_players_df=sim_players_df,
+                            ownership_vec=ownership_vector,
+                            team_totals=team_totals_gpp,
+                            entry_fee=_entry_fee,
+                            rng_seed=opt_cfg.get("rng_seed"),
+                        )
+                        gpp_result = hf_selector.select(
+                            stop_check=self._stop_check,
+                            progress_cb=lambda data: self._cb(
+                                "gpp_hybrid_select_progress", data
+                            ),
+                        )
+                        logger.info(
+                            "[TIMING] HybridFieldPortfolioSelector.select() wall time: %.3fs",
+                            time.perf_counter() - _t_select,
+                        )
+                        # Cache artifacts (no selector object for replace_lineup).
+                        self._gpp_robust_payout = robust_payout
+                        self._gpp_candidates = candidates
+
+                    else:
+                        # Default: mean-variance simulated-annealing selector.
+                        _field_sorted = scorer.last_field_sorted    # (n_sims, N_field)
+                        _col_lineups = scorer.last_col_lineups       # (M, 10)
+                        _sim_mat = scorer._sim_matrix                # (n_sims, n_players)
+                        _n_field = _field_sorted.shape[1]
+                        logger.info(
+                            "[TIMING] EV phase setup — field_sorted %s (%.1f MB), "
+                            "col_lineups %s, sim_mat %s (%.1f MB), n_field=%d",
+                            _field_sorted.shape, _field_sorted.nbytes / 1e6,
+                            _col_lineups.shape,
+                            _sim_mat.shape, _sim_mat.nbytes / 1e6,
+                            _n_field,
+                        )
+                        selector = MeanVariancePortfolioSelector(
+                            robust_payout=robust_payout,
+                            candidates=candidates,
+                            portfolio_size=portfolio_size,
+                            risk=mv_risk,
+                            n_iter=mv_n_iter,
+                            n_restarts=mv_n_restarts,
+                            holdout_fraction=holdout_frac,
+                            rng_seed=opt_cfg.get("rng_seed"),
+                        )
+                        gpp_result = selector.select(
+                            stop_check=self._stop_check,
+                            progress_cb=lambda itr, tot, T, f, acc, mean, std, restart: self._cb(
+                                "gpp_mv_select_progress",
+                                {
+                                    "iteration": itr,
+                                    "total_iterations": tot,
+                                    "temperature": round(float(T), 6),
+                                    "current_f": round(float(f), 6),
+                                    "acceptance_rate": round(float(acc), 4),
+                                    "portfolio_mean": round(float(mean), 4),
+                                    "portfolio_std": round(float(std), 4),
+                                    "restart": restart,
+                                },
+                            ),
+                        )
+                        logger.info(
+                            "[TIMING] MeanVariancePortfolioSelector.select() wall time: %.3fs",
+                            time.perf_counter() - _t_select,
+                        )
+                        if selector.holdout_score() is not None:
+                            self._cb("gpp_holdout", {
+                                "holdout_mean_payout": round(selector.holdout_score(), 6),
+                            })
+                        # Cache GPP artifacts for replace_lineup.
+                        self._gpp_robust_payout = robust_payout
+                        self._gpp_candidates = candidates
+                        self._gpp_selector = selector
 
                     portfolio = gpp_result
 
@@ -843,11 +887,6 @@ class PipelineRunner:
                             np.maximum(best_scores_gpp, lu_scores, out=best_scores_gpp)
                     if not (_gpp_stopped and self._stop_check()):
                         _on_portfolio_complete(best_scores_gpp)
-
-                    # Cache GPP artifacts for replace_lineup.
-                    self._gpp_robust_payout = robust_payout
-                    self._gpp_candidates = candidates
-                    self._gpp_selector = selector
 
         else:
             # ----------------------------------------------------------------
@@ -930,7 +969,7 @@ class PipelineRunner:
         # robust_payout[k].mean() (mean dollar EV); for other objectives it is
         # p_hit_target. Either way descending score is the natural display order.
         _fees = PipelineRunner._extract_sorted_fees(all_file_entries)
-        portfolio = PipelineRunner._reorder_by_diversity(portfolio, _fees)
+        # portfolio = PipelineRunner._reorder_by_diversity(portfolio, _fees)
         _portfolio_has_dollar_ev = objective == "leverage_surplus"
 
         # Store raw artifacts for on-demand upload file writing.
@@ -1328,7 +1367,7 @@ class PipelineRunner:
         })
 
         _fees = PipelineRunner._extract_sorted_fees(all_file_entries)
-        portfolio = PipelineRunner._reorder_by_diversity(portfolio, _fees)
+        # portfolio = PipelineRunner._reorder_by_diversity(portfolio, _fees)
         self._raw_portfolio = portfolio
 
         result = self._serialize_portfolio(portfolio, self._players_df, mean_ev_from_score=True)

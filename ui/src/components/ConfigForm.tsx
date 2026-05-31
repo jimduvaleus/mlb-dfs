@@ -93,6 +93,17 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
 
   return (
     <form className="config-form" onSubmit={handleSubmit}>
+      <div className="config-form-footer">
+        <button
+          type="submit"
+          className={isDirty ? 'btn-dirty' : 'btn-clean'}
+          disabled={disabled || saving || (!isDirty && !saving)}
+        >
+          {saving ? 'Saving…' : 'Save Config'}
+        </button>
+        {error && <span className="error">{error}</span>}
+        {saved && !isDirty && <span className="success">Saved.</span>}
+      </div>
       <div className="config-form-grid">
         <div>
           <section>
@@ -275,22 +286,24 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <input type="checkbox" checked={!!draft.gpp.dump_candidate_pool}
                   onChange={e => setGpp('dump_candidate_pool', e.target.checked)} disabled={disabled} />
               </FieldRow>
+              <FieldRow label="Portfolio method">
+                <select value={draft.gpp.portfolio_method ?? 'hybrid_field'}
+                  onChange={e => setGpp('portfolio_method', e.target.value)} disabled={disabled}>
+                  <option value="hybrid_field">Hybrid Field</option>
+                  <option value="mean_variance">Mean-Variance (SA)</option>
+                </select>
+              </FieldRow>
+              {(draft.gpp.portfolio_method ?? 'hybrid_field') === 'hybrid_field' && (
+                <FieldRow label="Hybrid sims per cycle">
+                  <input type="number" step={1000} min={1000} value={draft.gpp.hybrid_n_sims ?? 10000}
+                    onChange={e => setGpp('hybrid_n_sims', Number(e.target.value))} disabled={disabled} />
+                </FieldRow>
+              )}
             </section>
           )}
         </div>
       </div>
 
-      <div className="config-form-footer">
-        <button
-          type="submit"
-          className={isDirty ? 'btn-dirty' : 'btn-clean'}
-          disabled={disabled || saving || (!isDirty && !saving)}
-        >
-          {saving ? 'Saving…' : 'Save Config'}
-        </button>
-        {error && <span className="error">{error}</span>}
-        {saved && !isDirty && <span className="success">Saved.</span>}
-      </div>
     </form>
   )
 }

@@ -60,6 +60,8 @@ class GppConfig(BaseModel):
     portfolio_n_restarts: int = 3
     dump_candidate_pool: bool = False
     candidate_floor_relief: int = 2500
+    portfolio_method: str = "hybrid_field"
+    hybrid_n_sims: int = 10_000
 
 
 class AppConfig(BaseModel):

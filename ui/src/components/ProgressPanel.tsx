@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppMvSelectProgressEvent, GppOptimalProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppMvSelectProgressEvent, GppOptimalProgressEvent, GppHybridSelectProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -42,7 +42,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
-const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress', 'gpp_mv_select_progress', 'gpp_optimal_progress'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress', 'gpp_mv_select_progress', 'gpp_optimal_progress', 'gpp_hybrid_select_progress'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
@@ -79,7 +79,8 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_score_done' ||
       last?.stage === 'gpp_field_inject' ||
       last?.stage === 'gpp_select_progress' ||
-      last?.stage === 'gpp_mv_select_progress'
+      last?.stage === 'gpp_mv_select_progress' ||
+      last?.stage === 'gpp_hybrid_select_progress'
     if (!isLiveProgressEvent) return
 
     const ts = Date.now()
@@ -111,7 +112,8 @@ export function ProgressPanel({ events, running }: Props) {
     e.stage === 'gpp_optimal_start' || e.stage === 'gpp_optimal_done' ||
     e.stage === 'gpp_generate_start' || e.stage === 'gpp_generate_done' ||
     e.stage === 'gpp_score_start' || e.stage === 'gpp_field_inject' ||
-    e.stage === 'gpp_select_progress' || e.stage === 'gpp_mv_select_progress'
+    e.stage === 'gpp_select_progress' || e.stage === 'gpp_mv_select_progress' ||
+    e.stage === 'gpp_hybrid_select_progress'
   )
 
   // --- Optimal lineup seeding progress ---
@@ -143,13 +145,23 @@ export function ProgressPanel({ events, running }: Props) {
   const latestScoreProgress = scoreProgressEvents[scoreProgressEvents.length - 1]
   const selectProgressEvents = events.filter(e => e.stage === 'gpp_select_progress') as unknown as GppSelectProgressEvent[]
   const mvSelectProgressEvents = events.filter(e => e.stage === 'gpp_mv_select_progress') as unknown as GppMvSelectProgressEvent[]
+  const hybridProgressEvents = events.filter(e => e.stage === 'gpp_hybrid_select_progress') as unknown as GppHybridSelectProgressEvent[]
   const scoreDone = events.some(e => e.stage === 'gpp_score_done')
   const fieldInjectEvent = events.find(e => e.stage === 'gpp_field_inject') as unknown as { n_field: number; n_k: number } | undefined
 
   let gppPct = 0
   let gppLabel = ''
   if (isGpp) {
-    if (mvSelectProgressEvents.length > 0) {
+    if (hybridProgressEvents.length > 0) {
+      const lastH = hybridProgressEvents[hybridProgressEvents.length - 1]
+      gppPct = lastH.portfolio_total > 0
+        ? Math.round((lastH.portfolio_current / lastH.portfolio_total) * 100)
+        : 100
+      const cycleStr = lastH.cycle === 0
+        ? 'Phase 2 fast-track'
+        : `Cycle ${lastH.cycle}`
+      gppLabel = `Portfolio (Hybrid): ${lastH.portfolio_current} / ${lastH.portfolio_total} lineups · ${cycleStr} · ${lastH.n_remaining} remaining`
+    } else if (mvSelectProgressEvents.length > 0) {
       const lastMv = mvSelectProgressEvents[mvSelectProgressEvents.length - 1]
       gppPct = lastMv.total_iterations > 0
         ? Math.round((lastMv.iteration / lastMv.total_iterations) * 100)
@@ -240,6 +252,19 @@ export function ProgressPanel({ events, running }: Props) {
       if (recentIter > 0) {
         const remaining = lastMv.total_iterations - lastMv.iteration
         etaMs = (recentElapsed / recentIter) * remaining
+      }
+    } else if (running && hybridProgressEvents.length >= 2) {
+      // Use average wall time of the last few cycles (skip cycle=0 which is free).
+      const cycleEvents = hybridProgressEvents.filter(e => e.cycle > 0)
+      if (cycleEvents.length >= 1) {
+        const recentCycles = cycleEvents.slice(-4)
+        const avgWallMs = recentCycles.reduce((s, e) => s + e.cycle_wall_s * 1000, 0) / recentCycles.length
+        const avgAdded = recentCycles.reduce((s, e) => s + e.n_added, 0) / recentCycles.length
+        const lastH = hybridProgressEvents[hybridProgressEvents.length - 1]
+        const remaining = lastH.portfolio_total - lastH.portfolio_current
+        if (avgAdded > 0 && remaining > 0) {
+          etaMs = (remaining / avgAdded) * avgWallMs
+        }
       }
     }
   } else {
@@ -334,6 +359,27 @@ export function ProgressPanel({ events, running }: Props) {
               </span>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Hybrid field selection cycle rows */}
+      {hybridProgressEvents.length > 0 && (
+        <div className="event-list">
+          {hybridProgressEvents.map((ev, i) => {
+            const isPhase2 = ev.cycle === 0
+            return (
+              <div key={i} className="event-row event-gpp_hybrid_select_progress">
+                <span className="event-stage event-stage-lineup">
+                  {isPhase2 ? 'P2' : `C${ev.cycle}`}
+                </span>
+                <span className="event-detail">
+                  {isPhase2
+                    ? `+${ev.n_added} lineups (fast-track) · ${ev.n_ev_survivors} +EV candidates · ${ev.n_remaining} in pool`
+                    : `+${ev.n_added} lineups · ${ev.n_ev_survivors} survived · ${ev.n_remaining} in pool · ${ev.cycle_wall_s.toFixed(1)}s`}
+                </span>
+              </div>
+            )
+          })}
         </div>
       )}
 

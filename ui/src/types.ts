@@ -54,6 +54,8 @@ export interface GppConfig {
   portfolio_n_restarts: number
   dump_candidate_pool: boolean
   candidate_floor_relief: number
+  portfolio_method: string
+  hybrid_n_sims: number
 }
 
 export interface AppConfig {
@@ -149,6 +151,7 @@ export type SSEStage =
   | 'gpp_field_inject'
   | 'gpp_select_progress'
   | 'gpp_mv_select_progress'
+  | 'gpp_hybrid_select_progress'
   | 'gpp_holdout'
   | 'complete'
   | 'stopped'
@@ -285,6 +288,17 @@ export interface GppMvSelectProgressEvent extends SSEEvent {
   portfolio_mean: number
   portfolio_std: number
   restart: number
+}
+
+export interface GppHybridSelectProgressEvent extends SSEEvent {
+  stage: 'gpp_hybrid_select_progress'
+  portfolio_current: number
+  portfolio_total: number
+  cycle: number          // 0 = Phase 2 fast-track; 1+ = hybrid field cycles
+  n_added: number        // lineups added this cycle (including zero-overlap fast-tracks)
+  n_remaining: number    // candidates still in pool after this cycle
+  n_ev_survivors: number // candidates that passed +EV filter (Phase 1 total for cycle=0)
+  cycle_wall_s: number   // wall-clock seconds for this cycle (0 for cycle=0)
 }
 
 export interface CompleteEvent extends SSEEvent {
