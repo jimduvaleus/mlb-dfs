@@ -864,6 +864,15 @@ class PipelineRunner:
                             )
                             _portfolio_sweep_raw.append((_sweep_risk, _det_result))
 
+                        # Reorder all sweep portfolios by entry-fee-weighted diversity now,
+                        # so the ordering is final from the outset and never needs to be
+                        # repeated when a risk level is activated or the sweep is displayed.
+                        _sweep_fees = PipelineRunner._extract_sorted_fees(all_file_entries)
+                        _portfolio_sweep_raw = [
+                            (r, PipelineRunner._reorder_by_diversity(p, _sweep_fees))
+                            for r, p in _portfolio_sweep_raw
+                        ]
+
                         # Default active = risk=1 (first entry).
                         gpp_result = _portfolio_sweep_raw[0][1] if _portfolio_sweep_raw else []
                         self._sweep_portfolios_raw = {r: p for r, p in _portfolio_sweep_raw}
@@ -1083,11 +1092,6 @@ class PipelineRunner:
 
         logger.info("Portfolio complete: %d lineups.", len(portfolio))
 
-        # Sort portfolio descending by score. For leverage_surplus the score is
-        # robust_payout[k].mean() (mean dollar EV); for other objectives it is
-        # p_hit_target. Either way descending score is the natural display order.
-        _fees = PipelineRunner._extract_sorted_fees(all_file_entries)
-        # portfolio = PipelineRunner._reorder_by_diversity(portfolio, _fees)
         _portfolio_has_dollar_ev = objective == "leverage_surplus"
 
         # Store raw artifacts for on-demand upload file writing.
@@ -1113,6 +1117,7 @@ class PipelineRunner:
         logger.info("Portfolio saved to %s", output_path)
 
         # --- Generate upload files (skipped when stopped) ----------------
+        entry_map: dict = {}
         if not was_stopped and all_file_entries:
             assignments = entry_handlers["assign"](all_file_entries, portfolio)
             paths_written = entry_handlers["write"](
@@ -1163,6 +1168,28 @@ class PipelineRunner:
                 }
                 for r, p in _portfolio_sweep_raw
             ] if _portfolio_sweep_raw else []
+            # Apply entry meta to all sweep entries (assignment is positional: lineup i → entry i)
+            # and update the persisted sweep JSON so entry info survives a server restart.
+            if _sweep_payload and entry_map:
+                for _se in _sweep_payload:
+                    for lr in _se["lineups"]:
+                        info = entry_map.get(lr["lineup_index"])
+                        if info:
+                            lr.update(info)
+                _sweep_cache_path = os.path.join(output_dir, f"portfolio_sweep_{platform.value}.json")
+                if os.path.exists(_sweep_cache_path):
+                    try:
+                        with open(_sweep_cache_path) as _scf:
+                            _scd = json.load(_scf)
+                        for _se in _scd.get("sweep", []):
+                            for lr in _se.get("lineups", []):
+                                info = entry_map.get(lr["lineup_index"])
+                                if info:
+                                    lr.update(info)
+                        with open(_sweep_cache_path, "w") as _scf:
+                            json.dump(_scd, _scf)
+                    except Exception as _sce:
+                        logger.warning("Failed to update sweep cache with entry meta: %s", _sce)
             self._cb("complete", {
                 "portfolio": result,
                 "n_lineups": len(result),
@@ -1186,6 +1213,7 @@ class PipelineRunner:
         # Exact match or closest risk in sweep.
         if risk not in sweep:
             risk = min(sweep.keys(), key=lambda r: abs(r - risk))
+        # Portfolios were already diversity-reordered at sweep-build time; use as-is.
         portfolio = sweep[risk]
 
         self._raw_portfolio = portfolio
