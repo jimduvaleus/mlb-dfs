@@ -341,8 +341,14 @@ button { cursor: pointer; }
 
 /* ── Config form ── */
 
+.config-layout {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 32px;
+  align-items: start;
+}
+
 .config-form {
-  max-width: 820px;
 }
 
 .config-form-grid {
@@ -447,8 +453,6 @@ button { cursor: pointer; }
   border: 1px solid #2d3748;
   border-radius: 8px;
   padding: 16px 20px;
-  margin-bottom: 24px;
-  max-width: 680px;
 }
 
 .projections-panel h3 {

@@ -657,6 +657,15 @@ def build_projections_csv(
 
     out_df = pd.DataFrame(matched)
 
+    # Sidecar: all RW-matched player IDs before the slot filter.  The server uses
+    # this to block the DFF fallback from re-introducing players RW knows about
+    # (e.g. a scratched batter who lost their lineup slot).
+    try:
+        _seen_path = Path(output_path).with_name(Path(output_path).stem + "_seen_ids.json")
+        _seen_path.write_text(json.dumps(out_df["player_id"].astype(int).tolist()))
+    except Exception:
+        pass
+
     # --- Filter to projected starters only ----------------------------------
     # Only keep batters with a lineup slot (1-9) and starting pitchers (slot 10).
     # Bench players and relief pitchers have lineup_slot=None and must not enter

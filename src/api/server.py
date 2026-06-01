@@ -1352,6 +1352,7 @@ async def projections_fetch(request: Request):
         mo_script  = PROJECT_ROOT / "scripts" / "fetch_market_odds_projections.py"
         dff_out    = proj_path.parent / "projections_dff.csv"
         rw_out     = proj_path.parent / "projections_rw.csv"
+        rw_seen_ids_path = proj_path.parent / "projections_rw_seen_ids.json"
         mo_out     = proj_path.parent / "projections_mo.csv"
         mo_sidecar               = proj_path.parent / "projections_mo_fallback.json"
         mo_caps_path             = proj_path.parent / "projections_mo_caps.json"
@@ -1365,7 +1366,7 @@ async def projections_fetch(request: Request):
             return f"data: {json.dumps({'type': 'log', 'line': msg, 'timestamp': int(time.time() * 1000)})}\n\n"
 
         # Clean up any stale temp files left by a prior incomplete fetch.
-        for _p in (dff_out, rw_out, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path, mo_team_warn_path, mo_pitcher_partial_path):
+        for _p in (dff_out, rw_out, rw_seen_ids_path, mo_out, mo_sidecar, mo_caps_path, mo_missing_opt_path, mo_team_warn_path, mo_pitcher_partial_path):
             try:
                 _p.unlink(missing_ok=True)
             except Exception:
@@ -1770,6 +1771,15 @@ async def projections_fetch(request: Request):
                             is_hitter_fallback = ~has_pref & (pool.get("lineup_slot", 0) != 10)
                             pool.loc[is_hitter_fallback, "mean"]    *= 0.9
                             pool.loc[is_hitter_fallback, "std_dev"] *= 0.9
+                            # For pitchers missing only the wins market, use partial MO
+                            # projection + 1.5 pts (win bonus estimate) instead of RW fallback.
+                            is_pitcher_fallback = ~has_pref & (pool.get("lineup_slot", 0) == 10)
+                            if is_pitcher_fallback.any() and mo_pitcher_partials:
+                                for idx in pool[is_pitcher_fallback].index:
+                                    pid = int(pool.at[idx, "player_id"])
+                                    if pid in mo_pitcher_partials:
+                                        pool.at[idx, "mean"]    = mo_pitcher_partials[pid]["mean"] + 1.5
+                                        pool.at[idx, "std_dev"] = mo_pitcher_partials[pid]["std_dev"]
                             fallback_rows = pool.loc[~has_pref] if "name" in pool.columns else pd.DataFrame()
 
                             if not fallback_rows.empty:
@@ -1791,6 +1801,12 @@ async def projections_fetch(request: Request):
                             result_event = _log(
                                 "Warning: Market odds unavailable; using RotoWire projections for all players."
                             )
+                            # RotoWire is systematically optimistic for batters vs
+                            # market-implied values, so scale down even when MO
+                            # failed entirely (e.g. Walks market absent for all batters).
+                            is_hitter = pool.get("lineup_slot", 0) != 10
+                            pool.loc[is_hitter, "mean"]    *= 0.9
+                            pool.loc[is_hitter, "std_dev"] *= 0.9
 
                         pool = _inject_twitter_confirmed(pool)
                         _stale_warn = _write_proj(pool)
@@ -1956,10 +1972,25 @@ async def projections_fetch(request: Request):
                     returncode = 1
                     result_event2 = _log("Error: both projection sources produced no usable data.")
                 else:
-                    # Union: start with RW starters, append any DFF-pool players not in RW
-                    rw_ids    = set(rw_pool["player_id"].tolist()) if not rw_pool.empty else set()
-                    dff_extra = dff_pool[~dff_pool["player_id"].isin(rw_ids)] if not dff_pool.empty else pd.DataFrame()
-                    pool      = pd.concat([rw_pool, dff_extra], ignore_index=True)
+                    # Union: start with RW starters, then append DFF players that RW has
+                    # no knowledge of at all.  Players RW matched (even those excluded from
+                    # the starter output because they lost their lineup slot — e.g. a
+                    # scratched batter) must not re-enter via DFF fallback.
+                    rw_ids: set[int] = set(rw_pool["player_id"].tolist()) if not rw_pool.empty else set()
+
+                    rw_seen_ids: set[int] = set()
+                    try:
+                        if rw_seen_ids_path.exists():
+                            rw_seen_ids = set(json.loads(rw_seen_ids_path.read_text()))
+                    except Exception:
+                        pass
+                    rw_footprint = rw_ids | rw_seen_ids
+
+                    dff_extra = (
+                        dff_pool[~dff_pool["player_id"].isin(rw_footprint)]
+                        if not dff_pool.empty else pd.DataFrame()
+                    )
+                    pool = pd.concat([rw_pool, dff_extra], ignore_index=True)
 
                     # Apply preferred source's mean/std_dev
                     pref_proj_df = dff_df if is_dff_preferred else rw_df
@@ -2042,7 +2073,7 @@ async def projections_fetch(request: Request):
             returncode = 1
             result_event2 = _log(f"Warning: merge error — {exc}")
         finally:
-            for p in (dff_out, rw_out):
+            for p in (dff_out, rw_out, rw_seen_ids_path):
                 try:
                     p.unlink(missing_ok=True)
                 except Exception:

@@ -24,6 +24,8 @@ def generate_optimal_lineups(
     salary_floor: Optional[float] = None,
     seen: Optional[set] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
+    prior_lineups: Optional[list] = None,
+    min_uniques_vs_prior: Optional[int] = None,
 ) -> list[Lineup]:
     """Return up to N optimal lineups by projected mean score.
 
@@ -53,6 +55,13 @@ def generate_optimal_lineups(
         still added), so the solver won't revisit them.
     progress_cb:
         Called with the count of lineups found so far after each lineup.
+    prior_lineups:
+        Lineups from a previously solved batch. No-good cuts are seeded
+        for each at the start of the solve, enforcing min_uniques_vs_prior
+        uniqueness against each of them before any new lineup is generated.
+    min_uniques_vs_prior:
+        Min players that must differ from each lineup in prior_lineups.
+        Defaults to min_uniques when not specified.
     """
     try:
         from ortools.linear_solver import pywraplp
@@ -202,6 +211,16 @@ def generate_optimal_lineups(
         t_forced = team_idx[stack_team]
         c = solver.Constraint(1, 1)
         c.SetCoefficient(z[t_forced], 1)
+
+    # --- Seed no-good cuts from prior batches ---
+    if prior_lineups:
+        _mu_prior = min_uniques_vs_prior if min_uniques_vs_prior is not None else min_uniques
+        for _lu in prior_lineups:
+            _prior_js = sorted({j for pid in _lu.player_ids for j in player_to_js.get(pid, [])})
+            if _prior_js:
+                _c = solver.Constraint(0, float(10 - _mu_prior))
+                for j in _prior_js:
+                    _c.SetCoefficient(xp[j], 1)
 
     # --- Iterative solve with no-good cuts ---
     lineups: list[Lineup] = []

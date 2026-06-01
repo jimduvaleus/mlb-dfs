@@ -374,7 +374,7 @@ export default function App() {
       </header>
 
       <nav className="tabs">
-        {(['config', 'projections', 'slate', 'run', 'portfolio', 'metrics'] as Tab[]).map(tab => (
+        {(['config', 'slate', 'projections', 'run', 'portfolio', 'metrics'] as Tab[]).map(tab => (
           <button
             key={tab}
             className={`tab ${state.activeTab === tab ? 'active' : ''}`}
@@ -400,7 +400,7 @@ export default function App() {
         <div style={{ display: state.activeTab === 'config' ? undefined : 'none' }}>
           {configError && <p className="error">{configError}</p>}
           {state.config ? (
-            <>
+            <div className="config-layout">
               <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} refreshTrigger={projStatusTrigger} />
               <ConfigForm
                 config={state.config}
@@ -425,7 +425,7 @@ export default function App() {
                 }}
                 disabled={running}
               />
-            </>
+            </div>
           ) : (
             <p className="muted">Loading config…</p>
           )}

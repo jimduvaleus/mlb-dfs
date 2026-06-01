@@ -98,6 +98,7 @@ class HybridFieldPortfolioSelector:
         ownership_vec: Optional[np.ndarray] = None,
         team_totals: Optional[dict] = None,
         entry_fee: float = 4.0,
+        max_correlation: float = 0.9,
         rng_seed: Optional[int] = None,
     ) -> None:
         self._candidates = candidates
@@ -106,6 +107,7 @@ class HybridFieldPortfolioSelector:
         self._portfolio_size = portfolio_size
         self._n_field = n_field_lineups
         self._n_hybrid_sims = n_hybrid_sims
+        self._max_correlation = max_correlation
         self._rng = np.random.default_rng(rng_seed)
 
         # Column map: player_id → column index in every fresh sim_matrix.
@@ -114,6 +116,13 @@ class HybridFieldPortfolioSelector:
         self._col_map: dict[int, int] = {
             pid: i for i, pid in enumerate(self._player_ids)
         }
+
+        # Pitcher IDs — used by the fast-track overlap rule.
+        self._pitcher_ids: frozenset[int] = frozenset(
+            int(pid) for pid in players_df.loc[
+                players_df["position"] == "P", "player_id"
+            ]
+        )
 
         # Pre-build col_lineups for all candidates (constant across cycles).
         self._col_lineups = self._build_col_lineups(candidates)  # (M, 10) int32
@@ -188,7 +197,7 @@ class HybridFieldPortfolioSelector:
         for idx in pool_indices[1:]:
             lu = self._candidates[int(idx)]
             pids = frozenset(lu.player_ids)
-            if all(pids.isdisjoint(s) for s in fast_track_sets):
+            if self._is_fast_trackable(pids, fast_track_sets):
                 portfolio.append((lu, float(ev_means[idx])))
                 fast_track_sets.append(pids)
             else:
@@ -259,14 +268,34 @@ class HybridFieldPortfolioSelector:
             )  # (n_hybrid_sims, n_field_actual) ascending
 
             # 4+5. Score candidates and compute mean net payout in batches.
-            # Processing BATCH candidates at a time keeps peak memory at
-            # O(BATCH × n_hybrid_sims) instead of O(M_rem × n_hybrid_sims).
+            # Also compute Pearson correlation of each candidate's score vector
+            # against each committed portfolio lineup's score vector, to cull
+            # near-duplicates that the EV filter misses (a lineup with 9/10
+            # overlapping players still looks +EV because the hybrid field only
+            # displaces 1 of 5000 opponent slots).
             M_rem = len(remaining_indices)
             rem_col_lineups = self._col_lineups[remaining_indices]  # (M_rem, 10)
             invalid = (rem_col_lineups == -1).any(axis=1)
             safe_cols = np.where(rem_col_lineups == -1, 0, rem_col_lineups)
 
+            # Portfolio score vectors for this cycle's fresh sims.
+            # (n_hybrid_sims, n_portfolio) → normalise columns → used for correlation.
+            port_col_lineups = np.array(
+                [
+                    [self._col_map.get(int(pid), 0) for pid in lu.player_ids]
+                    for lu, _ in portfolio
+                ],
+                dtype=np.int32,
+            )  # (n_portfolio, 10)
+            port_scores = sim_mat[:, port_col_lineups].sum(axis=2)  # (n_hybrid_sims, n_portfolio)
+            port_mean = port_scores.mean(axis=0)          # (n_portfolio,)
+            port_std = port_scores.std(axis=0)
+            port_std = np.where(port_std == 0, 1.0, port_std)
+            port_norm = ((port_scores - port_mean) / port_std).astype(np.float32)  # (n_hybrid_sims, n_portfolio)
+
             hybrid_ev = np.empty(M_rem, dtype=np.float32)
+            corr_culled = np.zeros(M_rem, dtype=bool)
+
             for start in range(0, M_rem, _BATCH):
                 end = min(start + _BATCH, M_rem)
                 # (n_hybrid_sims, BATCH, 10) → sum → (n_hybrid_sims, BATCH) → T
@@ -275,6 +304,15 @@ class HybridFieldPortfolioSelector:
                 )  # (BATCH, n_hybrid_sims)
                 if invalid[start:end].any():
                     batch_scores[invalid[start:end]] = 0.0
+
+                # Pearson correlation: (BATCH, n_portfolio)
+                b_mean = batch_scores.mean(axis=1, keepdims=True)
+                b_std = batch_scores.std(axis=1, keepdims=True)
+                b_std = np.where(b_std == 0, 1.0, b_std)
+                b_norm = (batch_scores - b_mean) / b_std   # (BATCH, n_hybrid_sims)
+                corr = (b_norm @ port_norm) / self._n_hybrid_sims  # (BATCH, n_portfolio)
+                corr_culled[start:end] = corr.max(axis=1) > self._max_correlation
+
                 batch_payout = _compute_payout_from_sorted_field(
                     np.ascontiguousarray(batch_scores),
                     field_sorted,
@@ -285,11 +323,12 @@ class HybridFieldPortfolioSelector:
             if invalid.any():
                 hybrid_ev[invalid] = np.finfo(np.float32).min
 
-            # 6. Cull to +EV; re-sort.
-            surviving_mask = hybrid_ev > 0.0
+            # 6. Cull to +EV and low-correlation; re-sort.
+            n_corr_culled = int(corr_culled.sum())
+            surviving_mask = (hybrid_ev > 0.0) & ~corr_culled
             if not surviving_mask.any():
                 logger.info(
-                    "HybridField cycle %d: no +EV candidates remain; stopping.", cycle
+                    "HybridField cycle %d: no +EV low-correlation candidates remain; stopping.", cycle
                 )
                 break
 
@@ -298,7 +337,7 @@ class HybridFieldPortfolioSelector:
             surviving: list[tuple[int, float]] = [
                 (remaining_indices[i], float(hybrid_ev[i]))
                 for i in surviving_order
-                if hybrid_ev[i] > 0.0
+                if surviving_mask[i]
             ]
 
             # 7. Add best + zero-overlap fast-tracks (cumulative within this cycle).
@@ -312,7 +351,7 @@ class HybridFieldPortfolioSelector:
             for orig_idx, _ev in surviving[1:]:
                 lu = self._candidates[orig_idx]
                 pids = frozenset(lu.player_ids)
-                if all(pids.isdisjoint(s) for s in cycle_fast_sets):
+                if self._is_fast_trackable(pids, cycle_fast_sets):
                     portfolio.append((lu, _ev))
                     cycle_fast_sets.append(pids)
                 else:
@@ -324,9 +363,9 @@ class HybridFieldPortfolioSelector:
             _n_added = len(portfolio) - n_portfolio
             logger.info(
                 "HybridField cycle %d: +%d lineups → portfolio=%d, "
-                "remaining=%d, +EV_survivors=%d, cycle_wall=%.2fs",
+                "remaining=%d, +EV_survivors=%d, corr_culled=%d, cycle_wall=%.2fs",
                 cycle, _n_added, len(portfolio),
-                len(remaining_indices), len(surviving), _cycle_wall,
+                len(remaining_indices), len(surviving), n_corr_culled, _cycle_wall,
             )
 
             if progress_cb is not None:
@@ -337,6 +376,7 @@ class HybridFieldPortfolioSelector:
                     "n_added": _n_added,
                     "n_remaining": len(remaining_indices),
                     "n_ev_survivors": len(surviving),
+                    "n_corr_culled": n_corr_culled,
                     "cycle_wall_s": round(_cycle_wall, 2),
                 })
 
@@ -350,6 +390,24 @@ class HybridFieldPortfolioSelector:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _is_fast_trackable(
+        self, pids: frozenset[int], existing_sets: list[frozenset[int]]
+    ) -> bool:
+        """True if pids qualifies for the zero-overlap fast-track vs every set in existing_sets.
+
+        Rules (relaxed from strict 10-player disjoint):
+          - 0 shared hitters  (all 8 hitter slots must differ)
+          - ≤1 shared pitcher (at least 1 of the 2 pitchers must be unique)
+        """
+        p_hitters = pids - self._pitcher_ids
+        p_pitchers = pids & self._pitcher_ids
+        for other in existing_sets:
+            if not p_hitters.isdisjoint(other - self._pitcher_ids):
+                return False
+            if len(p_pitchers & (other & self._pitcher_ids)) >= 2:
+                return False
+        return True
 
     def _build_col_lineups(self, candidates: list[Lineup]) -> np.ndarray:
         """Map each candidate's player_ids to sim_matrix column indices.

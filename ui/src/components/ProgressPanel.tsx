@@ -364,7 +364,7 @@ export function ProgressPanel({ events, running }: Props) {
 
       {/* Hybrid field selection cycle rows */}
       {hybridProgressEvents.length > 0 && (
-        <div className="event-list">
+        <div className="event-list event-list-four-col">
           {hybridProgressEvents.map((ev, i) => {
             const isPhase2 = ev.cycle === 0
             return (
@@ -375,7 +375,7 @@ export function ProgressPanel({ events, running }: Props) {
                 <span className="event-detail">
                   {isPhase2
                     ? `+${ev.n_added} lineups (fast-track) · ${ev.n_ev_survivors} +EV candidates · ${ev.n_remaining} in pool`
-                    : `+${ev.n_added} lineups · ${ev.n_ev_survivors} survived · ${ev.n_remaining} in pool · ${ev.cycle_wall_s.toFixed(1)}s`}
+                    : `+${ev.n_added} lineups · ${ev.n_ev_survivors} survived · ${ev.n_corr_culled > 0 ? `${ev.n_corr_culled} corr-culled · ` : ''}${ev.n_remaining} in pool · ${ev.cycle_wall_s.toFixed(1)}s`}
                 </span>
               </div>
             )

@@ -62,6 +62,7 @@ class GppConfig(BaseModel):
     candidate_floor_relief: int = 2500
     portfolio_method: str = "hybrid_field"
     hybrid_n_sims: int = 10_000
+    hybrid_max_correlation: float = 0.9
 
 
 class AppConfig(BaseModel):

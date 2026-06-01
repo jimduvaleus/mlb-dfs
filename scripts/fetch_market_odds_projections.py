@@ -1780,12 +1780,19 @@ async def _run_playwright(
         game_market_ids: dict[int, dict[str, str]] = {}
         games_needing_mids: list[tuple[str, str, int]] = []
 
+        _all_wanted = set(BATTER_MARKETS + PITCHER_MARKETS)
         for (away, home), game_id in game_id_map.items():
             cached_mids = raw_market_cache.get(str(game_id))
-            if cached_mids:
+            if cached_mids and _all_wanted.issubset(cached_mids):
                 game_market_ids[game_id] = cached_mids
                 log.info("Using cached market IDs for game_id=%d (%s@%s)", game_id, away, home)
             else:
+                if cached_mids:
+                    missing = _all_wanted - set(cached_mids)
+                    log.info(
+                        "Cached market IDs for game_id=%d incomplete (%d missing: %s) — re-fetching",
+                        game_id, len(missing), ", ".join(sorted(missing)),
+                    )
                 games_needing_mids.append((away, home, game_id))
 
         if games_needing_mids:

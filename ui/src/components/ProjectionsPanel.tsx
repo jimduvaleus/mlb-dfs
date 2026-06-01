@@ -100,7 +100,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       if (event.type === 'log') {
         setLog(prev => [...prev, event.line])
       } else if (event.type === 'merge_info') {
-        const players = event.players as Array<{ name: string; team: string; reason?: string; player_id?: number; is_pitcher?: boolean }>
+        const players = event.players as Array<{ name: string; team: string; reason?: string; player_id?: number; is_pitcher?: boolean; partial_mean?: number }>
         const cappedPlayers = (event.capped_players ?? []) as CappedPlayer[]
         const lowTeamProjections = (event.low_team_projections ?? []) as LowTeamProjection[]
         const fallbackTeams = (event.fallback_teams ?? []) as FallbackTeam[]
@@ -109,7 +109,9 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams, missingOptPlayers, teamNameWarnings })
         // Auto-exclude pitchers that fell back to a secondary source at 'candidates'
         // scope — their projections are lower quality but they still model the field.
-        const pitcherIds = players.filter(p => p.is_pitcher && p.player_id).map(p => p.player_id as number)
+        // Pitchers with partial_mean have only the wins market missing; they receive a
+        // +1.5 pt adjustment and remain in the candidate pool.
+        const pitcherIds = players.filter(p => p.is_pitcher && p.player_id && p.partial_mean == null).map(p => p.player_id as number)
         if (pitcherIds.length > 0) {
           fetchSlatePlayers().then(slate => {
             const player_scopes: Record<string, ExclusionScope> = {}
@@ -354,7 +356,8 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         if (!mergeInfo || mergeInfo.count === 0 || status?.is_fresh === false) return null
         const wholeTeams = new Set((mergeInfo.fallbackTeams ?? []).map(ft => ft.team))
         const batters  = mergeInfo.players.filter(p => !p.is_pitcher && !wholeTeams.has(p.team))
-        const pitchers = mergeInfo.players.filter(p => p.is_pitcher)
+        const pitchers = mergeInfo.players.filter(p => p.is_pitcher && p.partial_mean == null)
+        const pitchersWinAdjusted = mergeInfo.players.filter(p => p.is_pitcher && p.partial_mean != null)
 
         const groupByTeam = (players: typeof mergeInfo.players) => {
           const byTeam = players.reduce<Record<string, typeof mergeInfo.players>>((acc, p) => {
@@ -402,6 +405,14 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
                   ⚠ {pitchers.length} pitcher{pitchers.length !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback — added to candidate exclusions
                 </strong>
                 <div className="merge-info-players">{groupByTeam(pitchers)}</div>
+              </div>
+            )}
+            {pitchersWinAdjusted.length > 0 && (
+              <div className="merge-info-pitcher-fallback-callout">
+                <strong>
+                  ⚠ {pitchersWinAdjusted.length} pitcher{pitchersWinAdjusted.length !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback +1.5 pts (wins market unavailable)
+                </strong>
+                <div className="merge-info-players">{groupByTeam(pitchersWinAdjusted)}</div>
               </div>
             )}
           </>

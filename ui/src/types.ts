@@ -56,6 +56,7 @@ export interface GppConfig {
   candidate_floor_relief: number
   portfolio_method: string
   hybrid_n_sims: number
+  hybrid_max_correlation: number
 }
 
 export interface AppConfig {
@@ -298,6 +299,7 @@ export interface GppHybridSelectProgressEvent extends SSEEvent {
   n_added: number        // lineups added this cycle (including zero-overlap fast-tracks)
   n_remaining: number    // candidates still in pool after this cycle
   n_ev_survivors: number // candidates that passed +EV filter (Phase 1 total for cycle=0)
+  n_corr_culled: number  // candidates dropped for exceeding max_correlation with any portfolio lineup
   cycle_wall_s: number   // wall-clock seconds for this cycle (0 for cycle=0)
 }
 

@@ -1,0 +1,50 @@
+gpp:
+  candidate_batch_size: 500
+  candidate_floor_relief: 3000
+  dump_candidate_pool: true
+  holdout_fraction: 0.0
+  hybrid_n_sims: 8000
+  max_attempts_multiplier: 55
+  n_candidates: 15000
+  n_field_lineups: 5000
+  n_field_samples: 3
+  portfolio_method: hybrid_field
+  portfolio_n_iter: 15000
+  portfolio_n_restarts: 5
+  risk: 0.0
+  seed_optimal_lineups: true
+optimizer:
+  early_stopping_threshold: 0.0005
+  early_stopping_window: 15
+  min_batter_value: 1.0
+  min_pitcher_value: 1.0
+  n_chains: 200
+  n_steps: 100
+  n_workers: 8
+  niter_success: 30
+  objective: leverage_surplus
+  payout_beta: 2.0
+  payout_cash_line: null
+  payout_coverage_bonus: 0.0
+  rng_seed: null
+  salary_floor: 48200.0
+  temperature: 0.05
+paths:
+  batter_pca_model: data/processed/batter_pca_model.npz
+  batter_pca_model_fd: ''
+  batter_score_grid: data/processed/batter_score_grid.npy
+  batter_score_grid_fd: ''
+  copula: data/processed/empirical_copula.parquet
+  dk_slate: data/raw/DKSalaries.csv
+  fd_projections: ''
+  fd_slate: data/raw/FanDuel-MLB-2026-04-18-129137-entries-upload-template.csv
+  output_dir: outputs
+  projections: data/processed/projections.csv
+  projections_source: rotowire
+platform: draftkings
+portfolio:
+  size: 10
+  target_percentile: 99
+  target_score: null
+simulation:
+  n_sims: 25000

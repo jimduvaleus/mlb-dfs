@@ -141,11 +141,13 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
           </section>
 
           <section>
-            <h3>Simulation</h3>
-            <FieldRow label="Simulations (n_sims)">
-              <input type="number" min={1000} step={1000} value={draft.simulation.n_sims}
-                onChange={e => set('simulation', 'n_sims', Number(e.target.value))} disabled={disabled} />
+            <h3>Portfolio</h3>
+
+            <FieldRow label="Target percentile">
+              <input type="number" min={1} max={99} value={draft.portfolio.target_percentile}
+                onChange={e => set('portfolio', 'target_percentile', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
+
           </section>
 
           <section>
@@ -171,40 +173,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 </FieldRow>
               </>
             )}
-            <FieldRow label="Chains (n_chains)">
-              <input type="number" min={1} value={draft.optimizer.n_chains}
-                onChange={e => set('optimizer', 'n_chains', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Temperature">
-              <input type="number" step={0.0001} value={draft.optimizer.temperature}
-                onChange={e => set('optimizer', 'temperature', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Steps per chain">
-              <input type="number" min={1} value={draft.optimizer.n_steps}
-                onChange={e => set('optimizer', 'n_steps', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Niter success">
-              <input type="number" min={1} value={draft.optimizer.niter_success}
-                onChange={e => set('optimizer', 'niter_success', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Workers">
-              <input type="number" min={1} value={draft.optimizer.n_workers}
-                onChange={e => set('optimizer', 'n_workers', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-          </section>
-        </div>
-
-        <div>
-          <section>
-            <h3>Optimizer (cont.)</h3>
-            <FieldRow label="Early stop window">
-              <input type="number" min={1} value={draft.optimizer.early_stopping_window}
-                onChange={e => set('optimizer', 'early_stopping_window', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Early stop threshold">
-              <input type="number" step={0.0001} value={draft.optimizer.early_stopping_threshold}
-                onChange={e => set('optimizer', 'early_stopping_threshold', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
             <FieldRow label="Salary floor ($)">
               <input type="number" step={500} value={str(draft.optimizer.salary_floor)}
                 onChange={e => set('optimizer', 'salary_floor', num(e.target.value))} disabled={disabled} />
@@ -222,20 +190,14 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 onChange={e => set('optimizer', 'rng_seed', num(e.target.value))} disabled={disabled} />
             </FieldRow>
           </section>
+        </div>
 
+        <div>
           <section>
-            <h3>Portfolio</h3>
-            <FieldRow label="Portfolio size">
-              <input type="number" min={1} value={draft.portfolio.size}
-                onChange={e => set('portfolio', 'size', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Target percentile">
-              <input type="number" min={1} max={99} value={draft.portfolio.target_percentile}
-                onChange={e => set('portfolio', 'target_percentile', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Target score (blank = auto)">
-              <input type="number" step={0.5} value={str(draft.portfolio.target_score)}
-                onChange={e => set('portfolio', 'target_score', num(e.target.value))} disabled={disabled} />
+            <h3>Simulation</h3>
+            <FieldRow label="Simulations (n_sims)">
+              <input type="number" min={1000} step={1000} value={draft.simulation.n_sims}
+                onChange={e => set('simulation', 'n_sims', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
           </section>
 
@@ -253,18 +215,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
               <FieldRow label="Field samples">
                 <input type="number" min={1} max={10} value={draft.gpp.n_field_samples}
                   onChange={e => setGpp('n_field_samples', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Candidate batch size">
-                <input type="number" min={100} step={100} value={draft.gpp.candidate_batch_size}
-                  onChange={e => setGpp('candidate_batch_size', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Max attempts multiplier">
-                <input type="number" min={1} value={draft.gpp.max_attempts_multiplier}
-                  onChange={e => setGpp('max_attempts_multiplier', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Holdout fraction (0 = off)">
-                <input type="number" step={0.05} min={0} max={0.5} value={draft.gpp.holdout_fraction}
-                  onChange={e => setGpp('holdout_fraction', Number(e.target.value))} disabled={disabled} />
               </FieldRow>
               <FieldRow label="Risk (0 = diverse · 10 = concentrated)">
                 <input type="number" step={1} min={0} max={10} value={draft.gpp.risk}
@@ -294,10 +244,16 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 </select>
               </FieldRow>
               {(draft.gpp.portfolio_method ?? 'hybrid_field') === 'hybrid_field' && (
-                <FieldRow label="Hybrid sims per cycle">
-                  <input type="number" step={1000} min={1000} value={draft.gpp.hybrid_n_sims ?? 10000}
-                    onChange={e => setGpp('hybrid_n_sims', Number(e.target.value))} disabled={disabled} />
-                </FieldRow>
+                <>
+                  <FieldRow label="Hybrid sims per cycle">
+                    <input type="number" step={1000} min={1000} value={draft.gpp.hybrid_n_sims ?? 10000}
+                      onChange={e => setGpp('hybrid_n_sims', Number(e.target.value))} disabled={disabled} />
+                  </FieldRow>
+                  <FieldRow label="Max correlation (0–1)">
+                    <input type="number" step={0.05} min={0} max={1} value={draft.gpp.hybrid_max_correlation ?? 0.9}
+                      onChange={e => setGpp('hybrid_max_correlation', Number(e.target.value))} disabled={disabled} />
+                  </FieldRow>
+                </>
               )}
             </section>
           )}

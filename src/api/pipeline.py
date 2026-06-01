@@ -577,23 +577,23 @@ class PipelineRunner:
 
                     from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
-                    _batch_tasks = [(ss, tm) for ss in _stack_sizes for tm in batter_teams]
                     _all_batches: dict[tuple, list] = {}
+                    _running_count = 0
 
+                    # Phase 1: 5-stack batches (all teams in parallel).
                     with ThreadPoolExecutor() as _executor:
                         _futures = {
                             _executor.submit(
                                 generate_optimal_lineups,
                                 cand_players_df,
-                                n=_batches_per_stack[ss],
+                                n=_batches_per_stack[5],
                                 min_uniques=3,
-                                min_stack=ss,
+                                min_stack=5,
                                 stack_team=tm,
                                 salary_floor=salary_floor_gpp,
-                            ): (ss, tm)
-                            for ss, tm in _batch_tasks
+                            ): (5, tm)
+                            for tm in batter_teams
                         }
-                        _running_count = 0
                         for _fut in _as_completed(_futures):
                             _ss, _tm = _futures[_fut]
                             _all_batches[(_ss, _tm)] = _fut.result()
@@ -603,6 +603,34 @@ class PipelineRunner:
                                 for _f in _futures:
                                     _f.cancel()
                                 break
+
+                    # Phase 2: 4-stack batches, each constrained to >=3 uniques vs
+                    # the 5-stack lineups for the same team.
+                    if not self._stop_check():
+                        with ThreadPoolExecutor() as _executor:
+                            _futures = {
+                                _executor.submit(
+                                    generate_optimal_lineups,
+                                    cand_players_df,
+                                    n=_batches_per_stack[4],
+                                    min_uniques=3,
+                                    min_stack=4,
+                                    stack_team=tm,
+                                    salary_floor=salary_floor_gpp,
+                                    prior_lineups=_all_batches.get((5, tm), []),
+                                    min_uniques_vs_prior=3,
+                                ): (4, tm)
+                                for tm in batter_teams
+                            }
+                            for _fut in _as_completed(_futures):
+                                _ss, _tm = _futures[_fut]
+                                _all_batches[(_ss, _tm)] = _fut.result()
+                                _running_count += len(_all_batches[(_ss, _tm)])
+                                self._cb("gpp_optimal_progress", {"n": _running_count, "total": _n_optimal_target})
+                                if self._stop_check():
+                                    for _f in _futures:
+                                        _f.cancel()
+                                    break
 
                     # Post-hoc collision detection (only 4-stack batches can collide).
                     _seen_keys: dict = {}
@@ -625,6 +653,8 @@ class PipelineRunner:
                             stack_team=_tm2,
                             salary_floor=salary_floor_gpp,
                             seen={_key},
+                            prior_lineups=_all_batches.get((5, _tm2), []) if _ss2 == 4 else None,
+                            min_uniques_vs_prior=3 if _ss2 == 4 else None,
                         )
                         _all_batches[(_ss2, _tm2)] = [
                             _lu for _lu in _all_batches[(_ss2, _tm2)]
@@ -786,11 +816,12 @@ class PipelineRunner:
                     if portfolio_method == "hybrid_field":
                         from src.optimization.hybrid_field_portfolio import HybridFieldPortfolioSelector
                         hybrid_n_sims = int(gpp_cfg.get("hybrid_n_sims", 10_000))
+                        hybrid_max_corr = float(gpp_cfg.get("hybrid_max_correlation", 0.9))
                         _entry_fee = float(_gpp_structure.get("entry_fee", 4.0))
                         logger.info(
                             "HybridField selector — portfolio_size=%d, n_field=%d, "
-                            "n_hybrid_sims=%d",
-                            portfolio_size, n_field, hybrid_n_sims,
+                            "n_hybrid_sims=%d, max_correlation=%.2f",
+                            portfolio_size, n_field, hybrid_n_sims, hybrid_max_corr,
                         )
                         hf_selector = HybridFieldPortfolioSelector(
                             candidates=candidates,
@@ -805,6 +836,7 @@ class PipelineRunner:
                             ownership_vec=ownership_vector,
                             team_totals=team_totals_gpp,
                             entry_fee=_entry_fee,
+                            max_correlation=hybrid_max_corr,
                             rng_seed=opt_cfg.get("rng_seed"),
                         )
                         gpp_result = hf_selector.select(
