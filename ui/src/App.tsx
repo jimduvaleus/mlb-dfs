@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
-import type { AppConfig, CacheStatus, LineupResult, MergeInfo, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, CacheStatus, LineupResult, MergeInfo, PortfolioSweepEntry, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 import { dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchOptimalLineups, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
@@ -22,6 +22,8 @@ interface State {
   config: AppConfig | null
   portfolio: LineupResult[]
   optimalLineups: LineupResult[]
+  portfolioSweep: PortfolioSweepEntry[]
+  activeRisk: number
   runStatus: RunStatus
   activeTab: Tab
   unconfirmedPlayerIds: number[]
@@ -33,6 +35,8 @@ type Action =
   | { type: 'set_config'; config: AppConfig }
   | { type: 'set_portfolio'; portfolio: LineupResult[] }
   | { type: 'set_optimal_lineups'; lineups: LineupResult[] }
+  | { type: 'set_portfolio_sweep'; sweep: PortfolioSweepEntry[] }
+  | { type: 'set_active_risk'; risk: number; lineups: LineupResult[] }
   | { type: 'set_run_status'; status: RunStatus }
   | { type: 'set_tab'; tab: Tab }
   | { type: 'set_unconfirmed'; ids: number[] }
@@ -47,6 +51,10 @@ function reducer(state: State, action: Action): State {
       return { ...state, portfolio: action.portfolio }
     case 'set_optimal_lineups':
       return { ...state, optimalLineups: action.lineups }
+    case 'set_portfolio_sweep':
+      return { ...state, portfolioSweep: action.sweep }
+    case 'set_active_risk':
+      return { ...state, activeRisk: action.risk, portfolio: action.lineups }
     case 'set_run_status':
       return { ...state, runStatus: action.status }
     case 'set_tab':
@@ -64,6 +72,8 @@ const initial: State = {
   config: null,
   portfolio: [],
   optimalLineups: [],
+  portfolioSweep: [],
+  activeRisk: 1,
   runStatus: 'idle',
   activeTab: 'config',
   unconfirmedPlayerIds: [],
@@ -121,16 +131,28 @@ export default function App() {
       .catch(() => {})
   }
 
-  // Load config, existing portfolio, and unconfirmed player IDs on mount
+  // Load config, existing portfolio, sweep portfolios, and unconfirmed player IDs on mount
   useEffect(() => {
     fetchConfig()
       .then(cfg => {
         dispatch({ type: 'set_config', config: cfg })
-        // Load the platform-specific portfolio and optimal lineups for the current platform
-        return Promise.all([fetchPortfolio(cfg.platform), fetchOptimalLineups(cfg.platform)])
+        return Promise.all([
+          fetchPortfolio(cfg.platform),
+          fetchOptimalLineups(cfg.platform),
+          fetch('/api/portfolio/sweep').then(r => r.ok ? r.json() : { sweep: [], active_risk: 1 }),
+        ])
       })
-      .then(([portfolio, optimalLineups]) => {
-        if (portfolio.length > 0) {
+      .then(([portfolio, optimalLineups, sweepData]) => {
+        const sweep: PortfolioSweepEntry[] = sweepData.sweep ?? []
+        const activeRisk: number = sweepData.active_risk ?? 1
+        if (sweep.length > 0) {
+          dispatch({ type: 'set_portfolio_sweep', sweep })
+          const activeEntry = sweep.find(e => e.risk === activeRisk) ?? sweep[0]
+          if (activeEntry) {
+            dispatch({ type: 'set_active_risk', risk: activeEntry.risk, lineups: activeEntry.lineups })
+            dispatch({ type: 'set_run_status', status: 'complete' })
+          }
+        } else if (portfolio.length > 0) {
           dispatch({ type: 'set_portfolio', portfolio })
           dispatch({ type: 'set_run_status', status: 'complete' })
         }
@@ -204,8 +226,13 @@ export default function App() {
     for (const event of events) {
       if (event.stage === 'complete') {
         const ce = event as CompleteEvent
-        dispatch({ type: 'set_portfolio', portfolio: ce.portfolio })
+        const sweep = ce.portfolio_sweep ?? []
+        const defaultEntry = sweep.find(e => e.risk === 1) ?? sweep[0]
+        const defaultLineups = defaultEntry ? defaultEntry.lineups : ce.portfolio
+        dispatch({ type: 'set_portfolio', portfolio: defaultLineups })
         dispatch({ type: 'set_optimal_lineups', lineups: ce.optimal_lineups ?? [] })
+        dispatch({ type: 'set_portfolio_sweep', sweep })
+        if (defaultEntry) dispatch({ type: 'set_active_risk', risk: defaultEntry.risk, lineups: defaultLineups })
         dispatch({ type: 'set_run_status', status: 'complete' })
         dispatch({ type: 'set_tab', tab: 'portfolio' })
       } else if (event.stage === 'stopped') {
@@ -219,6 +246,9 @@ export default function App() {
           setStoppedLineupCount(se.n_lineups)
           setShowUploadDialog(true)
         }
+      } else if (event.stage === 'load_slate') {
+        // New run started — clear stale sweep data.
+        dispatch({ type: 'set_portfolio_sweep', sweep: [] })
       } else if (event.stage === 'error') {
         dispatch({ type: 'set_run_status', status: 'error' })
       }
@@ -304,6 +334,29 @@ export default function App() {
     writeUploadFiles().catch(() => {})
   }
 
+  const handleActivateRisk = async (risk: number) => {
+    // Immediately update displayed portfolio from sweep data.
+    const sweepEntry = state.portfolioSweep.find(e => e.risk === risk)
+    if (sweepEntry) {
+      dispatch({ type: 'set_active_risk', risk, lineups: sweepEntry.lineups })
+    }
+    // Async: tell server to re-write output files for this risk.
+    try {
+      const res = await fetch('/api/portfolio/activate_risk', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ risk }),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        // Use server response (may include entry info not in sweep data).
+        dispatch({ type: 'set_active_risk', risk, lineups: data.lineups })
+      }
+    } catch {
+      // File write failure is non-fatal; displayed portfolio already updated.
+    }
+  }
+
   const handleDeleteLineup = (lineupIndex: number) => {
     setPendingDeleteIndex(lineupIndex)
   }
@@ -353,7 +406,7 @@ export default function App() {
               Stop
             </button>
           )}
-          {state.runStatus === 'complete' && state.config?.optimizer.objective === 'leverage_surplus' && (
+          {state.runStatus === 'complete' && state.config?.optimizer.objective === 'leverage_surplus' && state.config.gpp.portfolio_method === 'mean_variance' && (
             <button
               className="btn-refine"
               onClick={() => setShowReselectDialog(true)}
@@ -463,6 +516,9 @@ export default function App() {
           <PortfolioTable
             lineups={state.portfolio}
             optimalLineups={state.optimalLineups}
+            portfolioSweep={state.portfolioSweep}
+            activeRisk={state.activeRisk}
+            onActivateRisk={handleActivateRisk}
             unconfirmedPlayerIds={state.unconfirmedPlayerIds}
             onDeleteLineup={state.runStatus === 'complete' ? handleDeleteLineup : undefined}
             replacingLineupIndex={replacingIndex}

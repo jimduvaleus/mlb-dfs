@@ -239,6 +239,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
               <FieldRow label="Portfolio method">
                 <select value={draft.gpp.portfolio_method ?? 'hybrid_field'}
                   onChange={e => setGpp('portfolio_method', e.target.value)} disabled={disabled}>
+                  <option value="det_ev">Det-EV (Greedy)</option>
                   <option value="hybrid_field">Hybrid Field</option>
                   <option value="mean_variance">Mean-Variance (SA)</option>
                 </select>

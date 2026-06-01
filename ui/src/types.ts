@@ -57,6 +57,7 @@ export interface GppConfig {
   portfolio_method: string
   hybrid_n_sims: number
   hybrid_max_correlation: number
+  // det_ev_risk_sweep removed — sweep is always [1,2,3,4,5]
 }
 
 export interface AppConfig {
@@ -153,6 +154,8 @@ export type SSEStage =
   | 'gpp_select_progress'
   | 'gpp_mv_select_progress'
   | 'gpp_hybrid_select_progress'
+  | 'gpp_det_risk_start'
+  | 'gpp_det_select_progress'
   | 'gpp_holdout'
   | 'complete'
   | 'stopped'
@@ -291,6 +294,26 @@ export interface GppMvSelectProgressEvent extends SSEEvent {
   restart: number
 }
 
+export interface GppDetRiskStartEvent extends SSEEvent {
+  stage: 'gpp_det_risk_start'
+  risk: number
+  risk_index: number
+  total_risks: number
+}
+
+export interface GppDetSelectProgressEvent extends SSEEvent {
+  stage: 'gpp_det_select_progress'
+  step: number
+  portfolio_size: number
+  lineup_ev: number
+  partial_var: number
+  score: number
+  n_remaining: number
+  risk: number
+  risk_index: number
+  total_risks: number
+}
+
 export interface GppHybridSelectProgressEvent extends SSEEvent {
   stage: 'gpp_hybrid_select_progress'
   portfolio_current: number
@@ -303,11 +326,17 @@ export interface GppHybridSelectProgressEvent extends SSEEvent {
   cycle_wall_s: number   // wall-clock seconds for this cycle (0 for cycle=0)
 }
 
+export interface PortfolioSweepEntry {
+  risk: number
+  lineups: LineupResult[]
+}
+
 export interface CompleteEvent extends SSEEvent {
   stage: 'complete'
   portfolio: LineupResult[]
   n_lineups: number
   optimal_lineups?: LineupResult[]
+  portfolio_sweep?: PortfolioSweepEntry[]
 }
 
 export interface StoppedEvent extends SSEEvent {

@@ -133,6 +133,13 @@ class PipelineRunner:
                 len(entry_files), total_entries,
             )
 
+        # Clear any stale sweep cache so the UI shows empty while the run is in progress.
+        _sweep_cache_clear = os.path.join(output_dir, f"portfolio_sweep_{platform.value}.json")
+        try:
+            os.remove(_sweep_cache_clear)
+        except FileNotFoundError:
+            pass
+
         # --- Load slate --------------------------------------------------
         logger.info("Loading %s slate: %s", platform.value, slate_path)
         ingestor = get_ingestor(platform, slate_path)
@@ -413,6 +420,8 @@ class PipelineRunner:
                 "overall_p99": round(float(np.percentile(best_scores, 99)), 1),
                 "histogram": histogram,
             })
+
+        _portfolio_sweep_raw: list = []  # populated only by det_ev; safe default for other objectives
 
         if objective == "leverage_surplus":
             # ----------------------------------------------------------------
@@ -812,8 +821,85 @@ class PipelineRunner:
                     # Phase 3: portfolio selection — dispatch on portfolio_method
                     portfolio_method = gpp_cfg.get("portfolio_method", "mean_variance")
                     _t_select = time.perf_counter()
+                    _portfolio_sweep_raw: list[tuple[float, list]] = []  # [(risk, raw_portfolio)]
 
-                    if portfolio_method == "hybrid_field":
+                    if portfolio_method == "det_ev":
+                        from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
+                        # Always sweep risk values 1-5; ignore gpp.risk config for det_ev.
+                        _DET_SWEEP_RISKS = [1.0, 2.0, 3.0, 4.0, 5.0]
+                        _portfolio_sweep_raw: list[tuple[float, list]] = []
+
+                        logger.info(
+                            "Det-EV sweep — portfolio_size=%d, risks=%s",
+                            portfolio_size, _DET_SWEEP_RISKS,
+                        )
+
+                        for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
+                            if self._stop_check is not None and self._stop_check():
+                                break
+                            _evw = _sweep_risk * 0.05
+                            logger.info(
+                                "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)",
+                                _risk_idx + 1, len(_DET_SWEEP_RISKS),
+                                _sweep_risk, _evw, 1.0 - _evw,
+                            )
+                            self._cb("gpp_det_risk_start", {
+                                "risk": _sweep_risk,
+                                "risk_index": _risk_idx + 1,
+                                "total_risks": len(_DET_SWEEP_RISKS),
+                            })
+                            _det_sel = DeterminantPortfolioSelector(
+                                robust_payout=robust_payout,
+                                candidates=candidates,
+                                portfolio_size=portfolio_size,
+                                risk=_sweep_risk,
+                            )
+                            _det_result = _det_sel.select(
+                                stop_check=self._stop_check,
+                                progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
+                                    "gpp_det_select_progress",
+                                    {**data, "risk": r, "risk_index": ri + 1,
+                                     "total_risks": len(_DET_SWEEP_RISKS)},
+                                ),
+                            )
+                            _portfolio_sweep_raw.append((_sweep_risk, _det_result))
+
+                        # Default active = risk=1 (first entry).
+                        gpp_result = _portfolio_sweep_raw[0][1] if _portfolio_sweep_raw else []
+                        self._sweep_portfolios_raw = {r: p for r, p in _portfolio_sweep_raw}
+                        self._gpp_robust_payout = robust_payout
+                        self._gpp_candidates = candidates
+                        logger.info(
+                            "[TIMING] Det-EV sweep wall time: %.3fs",
+                            time.perf_counter() - _t_select,
+                        )
+
+                        # Persist sweep to disk so it survives a server restart.
+                        _sweep_cache_path = os.path.join(
+                            output_dir, f"portfolio_sweep_{platform.value}.json"
+                        )
+                        try:
+                            _sweep_cache_data = {
+                                "slate_fingerprint": _slate_fp or "",
+                                "active_risk": 1,
+                                "sweep": [
+                                    {
+                                        "risk": r,
+                                        "lineups": self._serialize_portfolio(
+                                            p, players_df, mean_ev_from_score=True
+                                        ),
+                                    }
+                                    for r, p in _portfolio_sweep_raw
+                                ],
+                            }
+                            os.makedirs(output_dir, exist_ok=True)
+                            with open(_sweep_cache_path, "w") as _sc_f:
+                                json.dump(_sweep_cache_data, _sc_f)
+                            logger.info("Det-EV sweep cache saved to %s", _sweep_cache_path)
+                        except Exception as _sc_e:
+                            logger.warning("Failed to save sweep cache: %s", _sc_e)
+
+                    elif portfolio_method == "hybrid_field":
                         from src.optimization.hybrid_field_portfolio import HybridFieldPortfolioSelector
                         hybrid_n_sims = int(gpp_cfg.get("hybrid_n_sims", 10_000))
                         hybrid_max_corr = float(gpp_cfg.get("hybrid_max_correlation", 0.9))
@@ -1070,11 +1156,71 @@ class PipelineRunner:
                 "optimal_lineups": _optimal_result,
             })
         else:
+            _sweep_payload = [
+                {
+                    "risk": r,
+                    "lineups": self._serialize_portfolio(p, players_df, mean_ev_from_score=True),
+                }
+                for r, p in _portfolio_sweep_raw
+            ] if _portfolio_sweep_raw else []
             self._cb("complete", {
                 "portfolio": result,
                 "n_lineups": len(result),
                 "optimal_lineups": _optimal_result,
+                "portfolio_sweep": _sweep_payload,
             })
+
+        return result
+
+    def activate_sweep_risk(self, risk: float) -> list[dict]:
+        """Switch the active portfolio to a different det_ev sweep risk level.
+
+        Re-saves the portfolio CSV and (if entry files are available) re-runs
+        lineup-to-entry assignment and writes upload CSVs.
+
+        Returns the serialized LineupResult list for the new active portfolio.
+        """
+        sweep = getattr(self, "_sweep_portfolios_raw", {})
+        if not sweep:
+            raise RuntimeError("No det_ev sweep portfolios available.")
+        # Exact match or closest risk in sweep.
+        if risk not in sweep:
+            risk = min(sweep.keys(), key=lambda r: abs(r - risk))
+        portfolio = sweep[risk]
+
+        self._raw_portfolio = portfolio
+        platform_val = self._platform.value if hasattr(self, "_platform") else "draftkings"
+        os.makedirs(self._output_dir, exist_ok=True)
+
+        portfolio_df = self._format_portfolio_df(portfolio, self._players_df, mean_ev_from_score=True)
+        output_path = os.path.join(self._output_dir, f"portfolio_{platform_val}.csv")
+        portfolio_df.to_csv(output_path, index=False)
+        logger.info("Activated risk=%.0f portfolio; saved to %s", risk, output_path)
+
+        result = self._serialize_portfolio(portfolio, self._players_df, mean_ev_from_score=True)
+
+        if self._all_file_entries:
+            self.write_upload_files()
+            entry_map = self._build_lineup_entry_map(self._all_file_entries, portfolio)
+            for lr in result:
+                info = entry_map.get(lr["lineup_index"])
+                if info:
+                    lr.update(info)
+            meta_path = os.path.join(self._output_dir, f"portfolio_entries_{platform_val}.json")
+            with open(meta_path, "w") as f:
+                json.dump({str(k): v for k, v in entry_map.items()}, f)
+
+        # Update active_risk in the sweep cache so the choice persists.
+        _sweep_cache = os.path.join(self._output_dir, f"portfolio_sweep_{platform_val}.json")
+        try:
+            if os.path.exists(_sweep_cache):
+                with open(_sweep_cache) as _f:
+                    _cache = json.load(_f)
+                _cache["active_risk"] = risk
+                with open(_sweep_cache, "w") as _f:
+                    json.dump(_cache, _f)
+        except Exception as _e:
+            logger.warning("Could not update active_risk in sweep cache: %s", _e)
 
         return result
 

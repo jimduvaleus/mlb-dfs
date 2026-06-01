@@ -2259,6 +2259,24 @@ async def run_stream(
     return StreamingResponse(_sse_generator(), media_type="text/event-stream")
 
 
+@app.post("/api/portfolio/activate_risk")
+async def activate_risk_endpoint(body: dict):
+    """Switch the active det_ev portfolio to a different risk level."""
+    if _state["status"] in ("running", "replacing", "reselecting"):
+        raise HTTPException(409, "Cannot switch active portfolio while a run is in progress")
+    runner = _state.get("_runner_last")
+    if runner is None or not getattr(runner, "_sweep_portfolios_raw", None):
+        raise HTTPException(400, "No det_ev sweep portfolios available — please run the pipeline first.")
+    try:
+        risk = float(body.get("risk", 1))
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, runner.activate_sweep_risk, risk)
+        _state["portfolio"] = result
+        return {"lineups": result}
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
 @app.post("/api/portfolio/replace/{lineup_index}")
 async def replace_lineup_endpoint(lineup_index: int):
     if _state["status"] in ("running", "replacing"):
@@ -2288,6 +2306,38 @@ async def replace_lineup_endpoint(lineup_index: int):
         raise HTTPException(500, str(exc))
     finally:
         _state["status"] = "complete"
+
+
+@app.get("/api/portfolio/sweep")
+def get_portfolio_sweep():
+    """Return the persisted det_ev sweep portfolios if they match the current slate."""
+    try:
+        cfg = read_config()
+        platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+        output_dir = cfg.paths.output_dir or "outputs"
+        base = PROJECT_ROOT / output_dir if not Path(output_dir).is_absolute() else Path(output_dir)
+        sweep_path = base / f"portfolio_sweep_{platform_val}.json"
+
+        if not sweep_path.exists():
+            return {"sweep": [], "active_risk": 1}
+
+        with open(sweep_path) as f:
+            data = json.load(f)
+
+        # Validate against the current slate fingerprint.
+        from .slate_exclusions import compute_file_fingerprint
+        if platform_val == "draftkings":
+            slate_rel = cfg.paths.dk_slate or ""
+        else:
+            slate_rel = cfg.paths.fd_slate or ""
+        slate_abs = (PROJECT_ROOT / slate_rel) if slate_rel and not Path(slate_rel).is_absolute() else Path(slate_rel)
+        current_fp = compute_file_fingerprint(slate_abs) if slate_rel else ""
+        if data.get("slate_fingerprint") != current_fp:
+            return {"sweep": [], "active_risk": 1}
+
+        return {"sweep": data.get("sweep", []), "active_risk": data.get("active_risk", 1)}
+    except Exception:
+        return {"sweep": [], "active_risk": 1}
 
 
 @app.get("/api/portfolio")

@@ -1,11 +1,14 @@
 import { useState, useRef, useEffect } from 'react'
-import type { LineupResult, PlatformType, PlayerRow } from '../types'
+import type { LineupResult, PlatformType, PlayerRow, PortfolioSweepEntry } from '../types'
 import { getStackNotation } from '../utils'
 import TeamBadge from './TeamBadge'
 
 interface Props {
   lineups: LineupResult[]
   optimalLineups?: LineupResult[]
+  portfolioSweep?: PortfolioSweepEntry[]
+  activeRisk?: number
+  onActivateRisk?: (risk: number) => void
   unconfirmedPlayerIds?: number[]
   onDeleteLineup?: (lineupIndex: number) => void
   replacingLineupIndex?: number | null
@@ -119,8 +122,10 @@ function playerKey(players: PlayerRow[]): string {
   return [...players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
 }
 
-export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
+export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = [], activeRisk = 1, onActivateRisk, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
   const [activeTab, setActiveTab] = useState<'portfolio' | 'optimal'>('portfolio')
+  // viewingRisk: which risk the user is currently browsing (null = showing active)
+  const [viewingRisk, setViewingRisk] = useState<number | null>(null)
   const [filterPlayer, setFilterPlayer] = useState<PlayerRow | null>(null)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
@@ -145,8 +150,15 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
 
   if (lineups.length === 0) return null
 
+  // Derive displayed lineups. viewingRisk=null shows the active portfolio (state.portfolio).
+  const hasSweep = portfolioSweep.length > 0
+  const displayedRisk = viewingRisk ?? activeRisk
+  const sweepEntry = portfolioSweep.find(e => e.risk === displayedRisk)
+  const activeLineups: LineupResult[] = sweepEntry ? sweepEntry.lineups : lineups
+  const isPrimary = displayedRisk === activeRisk
+
   const allPlayers = Array.from(
-    new Map(lineups.flatMap(l => l.players).map(p => [p.player_id, p])).values()
+    new Map(activeLineups.flatMap(l => l.players).map(p => [p.player_id, p])).values()
   ).sort((a, b) => a.name.localeCompare(b.name))
 
   const searchLower = search.toLowerCase()
@@ -155,8 +167,8 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
     .slice(0, 10)
 
   const visibleLineups = filterPlayer
-    ? lineups.filter(l => l.players.some(p => p.player_id === filterPlayer.player_id))
-    : lineups
+    ? activeLineups.filter(l => l.players.some(p => p.player_id === filterPlayer.player_id))
+    : activeLineups
 
   const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
@@ -183,12 +195,12 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
 
   // portfolio key → lineup_index
   const portfolioKeyMap = new Map<string, number>(
-    lineups.map(l => [playerKey(l.players), l.lineup_index])
+    activeLineups.map(l => [playerKey(l.players), l.lineup_index])
   )
 
   // portfolio lineup_index → LineupResult (for looking up entry info on optimal cards)
   const portfolioLineupByIndex = new Map<number, LineupResult>(
-    lineups.map(l => [l.lineup_index, l])
+    activeLineups.map(l => [l.lineup_index, l])
   )
 
   // optimal key → lineup_index (for showing Opt# on portfolio cards)
@@ -216,7 +228,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
 
   const tabLabel = activeTab === 'optimal'
     ? `Optimal — ${filterOptimalPlayer ? `${visibleOptimalLineups.length} / ${optimalInPortfolio.length}` : optimalInPortfolio.length} Lineup${optimalInPortfolio.length !== 1 ? 's' : ''}`
-    : `Portfolio — ${filterPlayer ? `${visibleLineups.length} / ${lineups.length}` : lineups.length} Lineup${lineups.length !== 1 ? 's' : ''}`
+    : `Portfolio — ${filterPlayer ? `${visibleLineups.length} / ${activeLineups.length}` : activeLineups.length} Lineup${activeLineups.length !== 1 ? 's' : ''}`
 
   return (
     <div className="portfolio-table-wrap">
@@ -321,6 +333,38 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
         </>
       ) : (
       <>
+      {hasSweep && (
+        <div className="portfolio-risk-selector">
+          {portfolioSweep.map(entry => {
+            const isViewing = displayedRisk === entry.risk
+            const isActive = activeRisk === entry.risk
+            return (
+              <div key={entry.risk} className="portfolio-risk-btn-group">
+                <button
+                  className={`portfolio-risk-btn${isViewing ? ' portfolio-risk-btn--viewing' : ''}${isActive ? ' portfolio-risk-btn--active-risk' : ''}`}
+                  onClick={() => {
+                    setViewingRisk(entry.risk === displayedRisk ? null : entry.risk)
+                    setFilterPlayer(null)
+                    setSearch('')
+                  }}
+                >
+                  {isActive && <span className="portfolio-risk-star">★ </span>}Risk {entry.risk}
+                  <span className="portfolio-risk-count"> ({entry.lineups.length})</span>
+                </button>
+                {isViewing && !isActive && onActivateRisk && (
+                  <button
+                    className="portfolio-risk-activate-btn"
+                    onClick={() => { onActivateRisk(entry.risk); setViewingRisk(null) }}
+                    title="Set as active portfolio (writes output files)"
+                  >
+                    Set Active
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
       <div className="portfolio-filter-row">
         <div className="portfolio-filter" ref={searchWrapRef}>
           {filterPlayer ? (
@@ -388,7 +432,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], unconfirmedPlayer
                   ) : (
                     <>
                       {stack && <span className="lineup-card-stack">{stack}</span>}
-                      {onDeleteLineup && (
+                      {isPrimary && onDeleteLineup && (
                         <button
                           className="lineup-card-delete"
                           onClick={() => onDeleteLineup(lineup.lineup_index)}

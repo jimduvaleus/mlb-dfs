@@ -923,3 +923,197 @@ class MeanVariancePortfolioSelector:
                 )
 
         return best_selected, best_f
+
+
+# ------------------------------------------------------------------ #
+#  DeterminantPortfolioSelector                                        #
+# ------------------------------------------------------------------ #
+
+class DeterminantPortfolioSelector:
+    """Greedy portfolio construction via incremental determinant maximisation.
+
+    At each step scores every remaining +EV candidate on a weighted combination of:
+      EVn — normalised mean dollar payout (robust_payout.mean(axis=1))
+      DEn — normalised incremental determinant contribution (partial variance of the
+             candidate's payout vector given the lineups already selected)
+
+    The determinant of the payout correlation matrix measures how jointly the
+    portfolio's dollar returns move across simulations.  Maximising it is
+    equivalent to minimising return correlation — the Shaidy diversification
+    principle applied to dollar EV rather than raw scores.
+
+    The incremental contribution is computed via the Schur complement:
+      partial_var(c) = 1 - r_c^T C_k^{-1} r_c
+    where r_c is the vector of correlations between candidate c and the k
+    already-selected lineups, and C_k^{-1} is maintained with O(k^2) updates.
+
+    No fresh simulations, no hybrid fields, no correlation thresholds —
+    the Phase-1 robust_payout matrix is the only input required.
+
+    Parameters
+    ----------
+    robust_payout : (M, n_sims) float32 — net dollar payout per candidate per sim
+    candidates    : list of M Lineup objects (same ordering as robust_payout rows)
+    portfolio_size : number of lineups to select
+    risk          : 0 = maximise diversity (DEw=0.9), 10 = maximise EV (EVw=0.9)
+    """
+
+    def __init__(
+        self,
+        robust_payout: np.ndarray,
+        candidates: list[Lineup],
+        portfolio_size: int,
+        risk: float = 5.0,
+        rng_seed: Optional[int] = None,  # unused; kept for API consistency
+    ) -> None:
+        self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        self._candidates = candidates
+        self._portfolio_size = portfolio_size
+        # EVw = 0.05 at risk=1, 0.25 at risk=5
+        self._evw = float(np.clip(risk * 0.05, 0.0, 1.0))
+        self._dew = 1.0 - self._evw
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def select(
+        self,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> list[tuple[Lineup, float]]:
+        """Run greedy Det-EV selection and return (lineup, mean_ev) pairs."""
+        t0 = time.perf_counter()
+        n_sims = self._robust_payout.shape[1]
+
+        # --- Phase 1 cull: keep +EV candidates ---
+        pool_ev = self._robust_payout.mean(axis=1)  # (M,) float32
+        pool_mask = pool_ev > 0.0
+        pool_idx = np.where(pool_mask)[0]  # indices into M
+
+        logger.info(
+            "DeterminantSelector: %d / %d candidates are +EV",
+            len(pool_idx), len(self._candidates),
+        )
+        if len(pool_idx) == 0:
+            logger.warning("No +EV candidates; returning empty portfolio.")
+            return []
+
+        pool_ev_vals = pool_ev[pool_idx].astype(np.float64)  # (M_pool,)
+
+        # --- Precompute normalised payout matrix and full correlation matrix ---
+        _t = time.perf_counter()
+        pool_payout = self._robust_payout[pool_idx].astype(np.float64)  # (M_pool, n_sims)
+        mu = pool_payout.mean(axis=1, keepdims=True)
+        std = pool_payout.std(axis=1, keepdims=True)
+        std = np.where(std < 1e-8, 1.0, std)
+        norm_payout = ((pool_payout - mu) / std).astype(np.float32)  # keep float32 for matmul speed
+        del pool_payout
+
+        corr_matrix = (norm_payout.astype(np.float64) @ norm_payout.astype(np.float64).T) / n_sims
+        corr_matrix = corr_matrix.astype(np.float32)
+        del norm_payout
+
+        logger.info(
+            "[TIMING] DeterminantSelector precompute: %.2fs  corr_matrix %s (%.1f MB)",
+            time.perf_counter() - _t, corr_matrix.shape, corr_matrix.nbytes / 1e6,
+        )
+
+        M_pool = len(pool_idx)
+        evw, dew = self._evw, self._dew
+
+        # --- Greedy selection ---
+        selected_in_pool: list[int] = []    # indices into pool (0..M_pool-1)
+        remaining_mask = np.ones(M_pool, dtype=bool)
+
+        # Step 1: highest EV
+        first = int(np.argmax(pool_ev_vals))
+        selected_in_pool.append(first)
+        remaining_mask[first] = False
+        C_inv = np.array([[1.0]])  # 1×1, starts as correlation of lineup with itself
+
+        if progress_cb is not None:
+            progress_cb({
+                "step": 1,
+                "portfolio_size": self._portfolio_size,
+                "lineup_ev": float(pool_ev_vals[first]),
+                "partial_var": 1.0,
+                "score": 1.0,
+                "n_remaining": int(remaining_mask.sum()),
+            })
+
+        # Steps 2…portfolio_size
+        for step in range(2, self._portfolio_size + 1):
+            if stop_check is not None and stop_check():
+                logger.info("DeterminantSelector: stop requested at step %d.", step)
+                break
+
+            remaining_pool_idx = np.where(remaining_mask)[0]  # (M_rem,)
+            M_rem = len(remaining_pool_idx)
+            if M_rem == 0:
+                break
+
+            k = len(selected_in_pool)
+
+            # Correlation of each remaining candidate with each selected lineup
+            R = corr_matrix[np.ix_(remaining_pool_idx, selected_in_pool)].astype(np.float64)  # (M_rem, k)
+
+            # Partial variance: how much independent variance each candidate adds
+            # partial_var[m] = 1 - R[m] @ C_inv @ R[m]
+            temp = R @ C_inv               # (M_rem, k)
+            partial_var = 1.0 - (temp * R).sum(axis=1)   # (M_rem,)
+            partial_var = np.clip(partial_var, 0.0, 1.0)
+
+            # Normalised EV (relative to current remaining pool)
+            ev_rem = pool_ev_vals[remaining_pool_idx]
+            max_ev = ev_rem.max()
+            EVn = ev_rem / max_ev if max_ev > 1e-12 else np.ones(M_rem)
+
+            # Normalised determinant contribution
+            max_pv = partial_var.max()
+            DEn = partial_var / max_pv if max_pv > 1e-8 else np.ones(M_rem)
+
+            score = np.sqrt((evw * EVn) ** 2 + (dew * DEn) ** 2)
+            best_in_rem = int(np.argmax(score))
+            best_pool = int(remaining_pool_idx[best_in_rem])
+
+            selected_in_pool.append(best_pool)
+            remaining_mask[best_pool] = False
+
+            # Schur complement update for C_inv
+            s = float(partial_var[best_in_rem])
+            s = max(s, 1e-10)  # clamp for numerical stability
+            r_new = R[best_in_rem]          # (k,)
+            v = C_inv @ r_new               # (k,)
+            new_row = (-v / s)[None, :]     # (1, k)
+            C_inv = np.block([
+                [C_inv + np.outer(v, v) / s, (-v / s)[:, None]],
+                [new_row,                     np.array([[1.0 / s]])],
+            ])
+
+            logger.debug(
+                "Det-EV step %d: pool_idx=%d  ev=$%.4f  partial_var=%.4f  score=%.4f",
+                step, pool_idx[best_pool],
+                float(pool_ev_vals[best_pool]), float(partial_var[best_in_rem]),
+                float(score[best_in_rem]),
+            )
+
+            if progress_cb is not None:
+                progress_cb({
+                    "step": step,
+                    "portfolio_size": self._portfolio_size,
+                    "lineup_ev": float(pool_ev_vals[best_pool]),
+                    "partial_var": float(partial_var[best_in_rem]),
+                    "score": float(score[best_in_rem]),
+                    "n_remaining": int(remaining_mask.sum()),
+                })
+
+        result = [
+            (self._candidates[pool_idx[i]], float(pool_ev_vals[i]))
+            for i in selected_in_pool
+        ]
+        logger.info(
+            "DeterminantSelector done: %d lineups in %.1fs",
+            len(result), time.perf_counter() - t0,
+        )
+        return result

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppMvSelectProgressEvent, GppOptimalProgressEvent, GppHybridSelectProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppMvSelectProgressEvent, GppOptimalProgressEvent, GppHybridSelectProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -42,7 +42,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
-const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress', 'gpp_mv_select_progress', 'gpp_optimal_progress', 'gpp_hybrid_select_progress'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress', 'gpp_mv_select_progress', 'gpp_optimal_progress', 'gpp_hybrid_select_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
@@ -80,7 +80,9 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_field_inject' ||
       last?.stage === 'gpp_select_progress' ||
       last?.stage === 'gpp_mv_select_progress' ||
-      last?.stage === 'gpp_hybrid_select_progress'
+      last?.stage === 'gpp_hybrid_select_progress' ||
+      last?.stage === 'gpp_det_select_progress' ||
+      last?.stage === 'gpp_det_risk_start'
     if (!isLiveProgressEvent) return
 
     const ts = Date.now()
@@ -113,7 +115,8 @@ export function ProgressPanel({ events, running }: Props) {
     e.stage === 'gpp_generate_start' || e.stage === 'gpp_generate_done' ||
     e.stage === 'gpp_score_start' || e.stage === 'gpp_field_inject' ||
     e.stage === 'gpp_select_progress' || e.stage === 'gpp_mv_select_progress' ||
-    e.stage === 'gpp_hybrid_select_progress'
+    e.stage === 'gpp_hybrid_select_progress' || e.stage === 'gpp_det_select_progress' ||
+    e.stage === 'gpp_det_risk_start'
   )
 
   // --- Optimal lineup seeding progress ---
@@ -146,13 +149,34 @@ export function ProgressPanel({ events, running }: Props) {
   const selectProgressEvents = events.filter(e => e.stage === 'gpp_select_progress') as unknown as GppSelectProgressEvent[]
   const mvSelectProgressEvents = events.filter(e => e.stage === 'gpp_mv_select_progress') as unknown as GppMvSelectProgressEvent[]
   const hybridProgressEvents = events.filter(e => e.stage === 'gpp_hybrid_select_progress') as unknown as GppHybridSelectProgressEvent[]
+  const detProgressEvents = events.filter(e => e.stage === 'gpp_det_select_progress') as unknown as GppDetSelectProgressEvent[]
+  const detRiskStartEvents = events.filter(e => e.stage === 'gpp_det_risk_start') as unknown as GppDetRiskStartEvent[]
   const scoreDone = events.some(e => e.stage === 'gpp_score_done')
   const fieldInjectEvent = events.find(e => e.stage === 'gpp_field_inject') as unknown as { n_field: number; n_k: number } | undefined
 
   let gppPct = 0
   let gppLabel = ''
   if (isGpp) {
-    if (hybridProgressEvents.length > 0) {
+    if (detRiskStartEvents.length > 0 || detProgressEvents.length > 0) {
+      const latestRiskStart = detRiskStartEvents[detRiskStartEvents.length - 1]
+      const latestDetStep = detProgressEvents[detProgressEvents.length - 1]
+      const totalRisks = latestRiskStart?.total_risks ?? latestDetStep?.total_risks ?? 5
+      const portfolioSize = latestDetStep?.portfolio_size ?? 0
+      const totalSteps = totalRisks * portfolioSize
+      const completedRisks = latestDetStep
+        ? latestDetStep.risk_index - 1   // risks fully completed before current
+        : (latestRiskStart ? latestRiskStart.risk_index - 1 : 0)
+      const currentStep = latestDetStep?.risk_index === (latestRiskStart?.risk_index ?? 0)
+        ? (latestDetStep?.step ?? 0) : 0
+      gppPct = totalSteps > 0
+        ? Math.round(((completedRisks * portfolioSize + currentStep) / totalSteps) * 100)
+        : 0
+      const currentRisk = latestDetStep?.risk ?? latestRiskStart?.risk ?? null
+      const riskOfN = latestRiskStart
+        ? `Risk ${latestRiskStart.risk_index}/${latestRiskStart.total_risks}`
+        : currentRisk != null ? `Risk ${currentRisk}` : 'Starting…'
+      gppLabel = `Portfolio (Det-EV): ${riskOfN}${latestDetStep ? ` · step ${latestDetStep.step}/${portfolioSize}` : ''}`
+    } else if (hybridProgressEvents.length > 0) {
       const lastH = hybridProgressEvents[hybridProgressEvents.length - 1]
       gppPct = lastH.portfolio_total > 0
         ? Math.round((lastH.portfolio_current / lastH.portfolio_total) * 100)
@@ -252,6 +276,17 @@ export function ProgressPanel({ events, running }: Props) {
       if (recentIter > 0) {
         const remaining = lastMv.total_iterations - lastMv.iteration
         etaMs = (recentElapsed / recentIter) * remaining
+      }
+    } else if (running && detRiskStartEvents.length >= 2) {
+      // ETA based on time per completed risk.
+      const recent = detRiskStartEvents.slice(-3)
+      const elapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+      const completedCount = recent[recent.length - 1].risk_index - recent[0].risk_index
+      if (completedCount > 0) {
+        const msPerRisk = elapsed / completedCount
+        const totalRisks = recent[recent.length - 1].total_risks
+        const remainingRisks = totalRisks - (recent[recent.length - 1].risk_index - 1)
+        etaMs = msPerRisk * remainingRisks
       }
     } else if (running && hybridProgressEvents.length >= 2) {
       // Use average wall time of the last few cycles (skip cycle=0 which is free).
@@ -361,6 +396,36 @@ export function ProgressPanel({ events, running }: Props) {
           ))}
         </div>
       )}
+
+      {/* Det-EV: one row per risk value showing completion status */}
+      {(detRiskStartEvents.length > 0 || detProgressEvents.length > 0) && (() => {
+        const totalRisks = detRiskStartEvents[0]?.total_risks ?? detProgressEvents[0]?.total_risks ?? 5
+        const lastStep = detProgressEvents[detProgressEvents.length - 1]
+        const currentRiskIdx = lastStep?.risk_index ?? detRiskStartEvents[detRiskStartEvents.length - 1]?.risk_index ?? 0
+        const rows = Array.from({ length: totalRisks }, (_, i) => i + 1)
+        return (
+          <div className="event-list">
+            {rows.map(riskIdx => {
+              const risk = riskIdx  // risk value = risk_index for [1..5]
+              const isComplete = riskIdx < currentRiskIdx
+              const isActive = riskIdx === currentRiskIdx
+              const stepForRisk = isActive ? lastStep : null
+              const label = isComplete ? '✓' : isActive ? '→' : '·'
+              return (
+                <div key={riskIdx} className="event-row event-gpp_det_select_progress">
+                  <span className="event-stage event-stage-lineup">{label} R{risk}</span>
+                  <span className="event-detail">
+                    {isComplete && 'complete'}
+                    {isActive && stepForRisk && `step ${stepForRisk.step}/${stepForRisk.portfolio_size} · EV $${stepForRisk.lineup_ev.toFixed(3)} · det ${(stepForRisk.partial_var * 100).toFixed(1)}%`}
+                    {isActive && !stepForRisk && 'starting…'}
+                    {!isComplete && !isActive && ''}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+        )
+      })()}
 
       {/* Hybrid field selection cycle rows */}
       {hybridProgressEvents.length > 0 && (
