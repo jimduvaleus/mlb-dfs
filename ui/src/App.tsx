@@ -149,7 +149,10 @@ export default function App() {
           dispatch({ type: 'set_portfolio_sweep', sweep })
           const activeEntry = sweep.find(e => e.risk === activeRisk) ?? sweep[0]
           if (activeEntry) {
-            dispatch({ type: 'set_active_risk', risk: activeEntry.risk, lineups: activeEntry.lineups })
+            // Prefer the CSV portfolio (which carries entry meta from portfolio_entries JSON)
+            // over the sweep entry's lineups for the active risk's initial display.
+            const activeLineups = portfolio.length > 0 ? portfolio : activeEntry.lineups
+            dispatch({ type: 'set_active_risk', risk: activeEntry.risk, lineups: activeLineups })
             dispatch({ type: 'set_run_status', status: 'complete' })
           }
         } else if (portfolio.length > 0) {
@@ -228,7 +231,9 @@ export default function App() {
         const ce = event as CompleteEvent
         const sweep = ce.portfolio_sweep ?? []
         const defaultEntry = sweep.find(e => e.risk === 1) ?? sweep[0]
-        const defaultLineups = defaultEntry ? defaultEntry.lineups : ce.portfolio
+        // ce.portfolio is the canonical active portfolio: reordered by diversity and with entry meta.
+        // Prefer it over the sweep entry's lineups for the active risk's initial display.
+        const defaultLineups = ce.portfolio.length > 0 ? ce.portfolio : (defaultEntry?.lineups ?? [])
         dispatch({ type: 'set_portfolio', portfolio: defaultLineups })
         dispatch({ type: 'set_optimal_lineups', lineups: ce.optimal_lineups ?? [] })
         dispatch({ type: 'set_portfolio_sweep', sweep })

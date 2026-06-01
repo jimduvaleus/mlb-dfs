@@ -154,8 +154,10 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
   const hasSweep = portfolioSweep.length > 0
   const displayedRisk = viewingRisk ?? activeRisk
   const sweepEntry = portfolioSweep.find(e => e.risk === displayedRisk)
-  const activeLineups: LineupResult[] = sweepEntry ? sweepEntry.lineups : lineups
   const isPrimary = displayedRisk === activeRisk
+  // When viewing the active risk, prefer the main lineups prop (which carries entry meta from the
+  // server) over the sweep entry's lineups (which may lack entry meta when loaded from disk).
+  const activeLineups: LineupResult[] = (sweepEntry && !isPrimary) ? sweepEntry.lineups : lineups
 
   const allPlayers = Array.from(
     new Map(activeLineups.flatMap(l => l.players).map(p => [p.player_id, p])).values()

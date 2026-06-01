@@ -810,6 +810,55 @@ button { cursor: pointer; }
   white-space: nowrap;
 }
 
+/* Det-EV segmented progress bar */
+.progress-bar-segmented {
+  display: flex;
+  gap: 4px;
+}
+
+.progress-segment {
+  flex: 1;
+  height: 24px;
+  background: #2d3748;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.progress-segment .progress-bar {
+  border-radius: 8px;
+}
+
+.progress-bar-complete {
+  background: #276749;
+}
+
+.progress-segment-labels {
+  display: flex;
+  margin-top: 3px;
+}
+
+.progress-segment-label {
+  flex: 1;
+  text-align: center;
+  font-size: 11px;
+  color: #4a5568;
+}
+
+.progress-segment-label.complete {
+  color: #68d391;
+}
+
+.progress-segment-label.active {
+  color: #e2e8f0;
+  font-weight: 600;
+}
+
+.progress-det-label {
+  font-size: 12px;
+  color: #a0aec0;
+  margin-top: 3px;
+}
+
 /* ── Portfolio cards ── */
 
 

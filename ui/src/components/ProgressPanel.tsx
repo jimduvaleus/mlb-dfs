@@ -154,28 +154,33 @@ export function ProgressPanel({ events, running }: Props) {
   const scoreDone = events.some(e => e.stage === 'gpp_score_done')
   const fieldInjectEvent = events.find(e => e.stage === 'gpp_field_inject') as unknown as { n_field: number; n_k: number } | undefined
 
+  // Det-EV hoisted variables (used in both gppLabel, detSegments, and ETA)
+  const isDetEv = detRiskStartEvents.length > 0 || detProgressEvents.length > 0
+  const latestDetStep = detProgressEvents[detProgressEvents.length - 1]
+  const latestDetRiskStart = detRiskStartEvents[detRiskStartEvents.length - 1]
+  const totalRisksCount = latestDetRiskStart?.total_risks ?? latestDetStep?.total_risks ?? 5
+  const currentActiveRiskIdx = latestDetStep?.risk_index ?? latestDetRiskStart?.risk_index ?? 0
+  const portfolioSizeDet = latestDetStep?.portfolio_size ?? 0
+  const currentDetStepNum = latestDetStep?.step ?? 0
+  const detSegments = isDetEv ? Array.from({ length: totalRisksCount }, (_, i) => {
+    const riskIdx = i + 1
+    const isComplete = riskIdx < currentActiveRiskIdx
+    const isActive = riskIdx === currentActiveRiskIdx
+    const pct = isComplete ? 100 : isActive && portfolioSizeDet > 0
+      ? Math.round((currentDetStepNum / portfolioSizeDet) * 100)
+      : 0
+    return { pct, isComplete, isActive }
+  }) : []
+
   let gppPct = 0
   let gppLabel = ''
   if (isGpp) {
-    if (detRiskStartEvents.length > 0 || detProgressEvents.length > 0) {
-      const latestRiskStart = detRiskStartEvents[detRiskStartEvents.length - 1]
-      const latestDetStep = detProgressEvents[detProgressEvents.length - 1]
-      const totalRisks = latestRiskStart?.total_risks ?? latestDetStep?.total_risks ?? 5
-      const portfolioSize = latestDetStep?.portfolio_size ?? 0
-      const totalSteps = totalRisks * portfolioSize
-      const completedRisks = latestDetStep
-        ? latestDetStep.risk_index - 1   // risks fully completed before current
-        : (latestRiskStart ? latestRiskStart.risk_index - 1 : 0)
-      const currentStep = latestDetStep?.risk_index === (latestRiskStart?.risk_index ?? 0)
-        ? (latestDetStep?.step ?? 0) : 0
-      gppPct = totalSteps > 0
-        ? Math.round(((completedRisks * portfolioSize + currentStep) / totalSteps) * 100)
-        : 0
-      const currentRisk = latestDetStep?.risk ?? latestRiskStart?.risk ?? null
-      const riskOfN = latestRiskStart
-        ? `Risk ${latestRiskStart.risk_index}/${latestRiskStart.total_risks}`
+    if (isDetEv) {
+      const currentRisk = latestDetStep?.risk ?? latestDetRiskStart?.risk ?? null
+      const riskOfN = latestDetRiskStart
+        ? `Risk ${latestDetRiskStart.risk_index}/${latestDetRiskStart.total_risks}`
         : currentRisk != null ? `Risk ${currentRisk}` : 'Starting…'
-      gppLabel = `Portfolio (Det-EV): ${riskOfN}${latestDetStep ? ` · step ${latestDetStep.step}/${portfolioSize}` : ''}`
+      gppLabel = `Portfolio (Det-EV): ${riskOfN}${latestDetStep ? ` · step ${latestDetStep.step}/${portfolioSizeDet}` : ''}`
     } else if (hybridProgressEvents.length > 0) {
       const lastH = hybridProgressEvents[hybridProgressEvents.length - 1]
       gppPct = lastH.portfolio_total > 0
@@ -277,16 +282,35 @@ export function ProgressPanel({ events, running }: Props) {
         const remaining = lastMv.total_iterations - lastMv.iteration
         etaMs = (recentElapsed / recentIter) * remaining
       }
-    } else if (running && detRiskStartEvents.length >= 2) {
-      // ETA based on time per completed risk.
-      const recent = detRiskStartEvents.slice(-3)
-      const elapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
-      const completedCount = recent[recent.length - 1].risk_index - recent[0].risk_index
-      if (completedCount > 0) {
-        const msPerRisk = elapsed / completedCount
-        const totalRisks = recent[recent.length - 1].total_risks
-        const remainingRisks = totalRisks - (recent[recent.length - 1].risk_index - 1)
-        etaMs = msPerRisk * remainingRisks
+    } else if (running && isDetEv) {
+      // ETA for Det-EV: remaining in current risk + (avgMsPerRisk * remaining risks)
+      const currentRiskStartTs = latestDetRiskStart?.timestamp ?? null
+      const elapsedInCurrentRisk = currentRiskStartTs ? now - currentRiskStartTs : 0
+
+      // Remaining time in current risk from step rate
+      let currentRiskRemainingMs: number | null = null
+      if (currentDetStepNum > 0 && portfolioSizeDet > 0 && elapsedInCurrentRisk > 0) {
+        currentRiskRemainingMs = (elapsedInCurrentRisk / currentDetStepNum) * (portfolioSizeDet - currentDetStepNum)
+      }
+
+      // Average time per completed risk (from consecutive risk_start timestamps)
+      let avgMsPerRisk: number | null = null
+      if (detRiskStartEvents.length >= 2) {
+        const durations: number[] = []
+        for (let ri = 1; ri < detRiskStartEvents.length; ri++) {
+          durations.push(detRiskStartEvents[ri].timestamp - detRiskStartEvents[ri - 1].timestamp)
+        }
+        avgMsPerRisk = durations.reduce((a, b) => a + b, 0) / durations.length
+      } else if (portfolioSizeDet > 0 && currentDetStepNum > 0 && elapsedInCurrentRisk > 0) {
+        // Estimate per-risk duration from current rate within first risk
+        avgMsPerRisk = (elapsedInCurrentRisk / currentDetStepNum) * portfolioSizeDet
+      }
+
+      const risksAfterCurrent = totalRisksCount - currentActiveRiskIdx
+      if (currentRiskRemainingMs !== null && avgMsPerRisk !== null) {
+        etaMs = currentRiskRemainingMs + avgMsPerRisk * risksAfterCurrent
+      } else if (avgMsPerRisk !== null && risksAfterCurrent >= 0) {
+        etaMs = avgMsPerRisk * (risksAfterCurrent + 1)
       }
     } else if (running && hybridProgressEvents.length >= 2) {
       // Use average wall time of the last few cycles (skip cycle=0 which is free).
@@ -346,8 +370,35 @@ export function ProgressPanel({ events, running }: Props) {
         </div>
       )}
 
-      {/* GPP progress bar */}
-      {isGpp && running && gppLabel && (
+      {/* GPP progress bar — Det-EV: 5-segment bar */}
+      {isGpp && running && isDetEv && (
+        <div>
+          <div className="progress-bar-segmented">
+            {detSegments.map((seg, i) => (
+              <div key={i} className="progress-segment">
+                <div
+                  className={`progress-bar${seg.isComplete ? ' progress-bar-complete' : ''}`}
+                  style={{ width: `${seg.pct}%` }}
+                />
+              </div>
+            ))}
+          </div>
+          <div className="progress-segment-labels">
+            {detSegments.map((seg, i) => (
+              <span
+                key={i}
+                className={`progress-segment-label${seg.isComplete ? ' complete' : seg.isActive ? ' active' : ''}`}
+              >
+                R{i + 1}
+              </span>
+            ))}
+          </div>
+          {gppLabel && <div className="progress-det-label">{gppLabel}</div>}
+        </div>
+      )}
+
+      {/* GPP progress bar — all other methods */}
+      {isGpp && running && gppLabel && !isDetEv && (
         <div className="progress-bar-wrap">
           <div className="progress-bar" style={{ width: `${gppPct}%` }} />
           <span className="progress-label">{gppLabel}</span>
