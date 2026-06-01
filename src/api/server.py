@@ -1986,10 +1986,40 @@ async def projections_fetch(request: Request):
                         pass
                     rw_footprint = rw_ids | rw_seen_ids
 
-                    dff_extra = (
-                        dff_pool[~dff_pool["player_id"].isin(rw_footprint)]
-                        if not dff_pool.empty else pd.DataFrame()
-                    )
+                    # Also block DFF pitchers for teams where RW already has a
+                    # confirmed starting pitcher.  rw_footprint handles players
+                    # that RW matched and excluded; this handles players that RW
+                    # never mentioned at all (e.g. a same-team alternative SP).
+                    _itm_early = _ensure_id_to_team()
+                    if not rw_pool.empty and "lineup_slot" in rw_pool.columns:
+                        _rw_pitcher_teams: set[str] = {
+                            _itm_early.get(int(pid), "")
+                            for pid in rw_pool.loc[rw_pool["lineup_slot"] == 10, "player_id"].astype(int)
+                        } - {""}
+                    else:
+                        _rw_pitcher_teams = set()
+
+                    if not dff_pool.empty:
+                        _dff_is_pitcher = (
+                            (dff_pool["lineup_slot"] == 10)
+                            if "lineup_slot" in dff_pool.columns
+                            else pd.Series(False, index=dff_pool.index)
+                        )
+                        _dff_team = dff_pool["player_id"].astype(int).map(
+                            lambda pid: _itm_early.get(pid, "")
+                        )
+                        _dff_blocked = _dff_is_pitcher & _dff_team.isin(_rw_pitcher_teams)
+                        dff_extra = dff_pool[
+                            ~dff_pool["player_id"].isin(rw_footprint) & ~_dff_blocked
+                        ]
+                        if _dff_blocked.any():
+                            _logging.getLogger(__name__).info(
+                                "Blocked %d DFF pitcher(s) for teams with RW confirmed starter: %s",
+                                int(_dff_blocked.sum()),
+                                sorted(set(_dff_team[_dff_blocked].tolist())),
+                            )
+                    else:
+                        dff_extra = pd.DataFrame()
                     pool = pd.concat([rw_pool, dff_extra], ignore_index=True)
 
                     # Apply preferred source's mean/std_dev

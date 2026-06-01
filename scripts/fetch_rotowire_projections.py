@@ -624,8 +624,21 @@ def build_projections_csv(
     name_map = name_map or {}
     matched, unmatched = [], []
     for _, row in proj_df.iterrows():
-        if row["projected_fpts"] is None:
-            continue
+        pts = row["projected_fpts"]
+        is_confirmed_starter = (row["lineup_slot"] == 10 and bool(row["slot_confirmed"]))
+        if pts is None:
+            # A confirmed SP with no projection still needs to enter the output so
+            # that the fallback source cannot substitute a different pitcher for the
+            # same team.  Use a salary-based estimate (same heuristic the pipeline
+            # uses when no projections exist at all).
+            if not is_confirmed_starter:
+                continue
+            sal = row.get("rw_salary")
+            pts = float(sal) / 400.0 if sal else 20.0
+            log.info(
+                "Confirmed SP %r has no RotoWire projection — using salary-based default (%.1f pts).",
+                row["rw_name"], pts,
+            )
         rw_name = name_map.get(row["rw_name"], row["rw_name"])
         if rw_name != row["rw_name"]:
             log.debug("Name map: %r → %r", row["rw_name"], rw_name)
@@ -635,7 +648,7 @@ def build_projections_csv(
                 {
                     "player_id": pid,
                     "name": rw_name,
-                    "mean": row["projected_fpts"],
+                    "mean": pts,
                     "position": pos_map.get(pid, row["position"]),
                     "lineup_slot": row["lineup_slot"],
                     "slot_confirmed": row["slot_confirmed"],
