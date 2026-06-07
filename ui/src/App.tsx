@@ -190,6 +190,8 @@ export default function App() {
       setProjStatusTrigger(t => t + 1)
       // Slate path changed — clear optimal lineups (server will also reject stale fingerprint)
       dispatch({ type: 'set_optimal_lineups', lineups: [] })
+      // Server clears twitter-confirmed lineups on slate change; sync UI state
+      refreshTwitterLineups()
     } else {
       setProjFetchExcluded(Array.isArray(all[platform]) ? all[platform] : [])
     }
@@ -242,8 +244,15 @@ export default function App() {
         dispatch({ type: 'set_tab', tab: 'portfolio' })
       } else if (event.stage === 'stopped') {
         const se = event as StoppedEvent
-        dispatch({ type: 'set_portfolio', portfolio: se.portfolio })
+        const sweep = se.portfolio_sweep ?? []
+        const defaultEntry = sweep.find(e => e.risk === 1) ?? sweep[0]
+        const defaultLineups = se.portfolio.length > 0 ? se.portfolio : (defaultEntry?.lineups ?? [])
+        dispatch({ type: 'set_portfolio', portfolio: defaultLineups })
         dispatch({ type: 'set_optimal_lineups', lineups: se.optimal_lineups ?? [] })
+        if (sweep.length > 0) {
+          dispatch({ type: 'set_portfolio_sweep', sweep })
+          if (defaultEntry) dispatch({ type: 'set_active_risk', risk: defaultEntry.risk, lineups: defaultLineups })
+        }
         dispatch({ type: 'set_run_status', status: 'stopped' })
         dispatch({ type: 'set_tab', tab: 'portfolio' })
         setStopPending(false)

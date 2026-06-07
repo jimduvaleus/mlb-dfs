@@ -340,6 +340,11 @@ def delete_notification(notification_id: str):
 # Twitter lineup endpoints
 # ---------------------------------------------------------------------------
 
+def _slate_fingerprint() -> str:
+    """Return the current slate file fingerprint, or '' if no slate is configured."""
+    return compute_file_fingerprint(_get_slate_file_path())
+
+
 @app.post("/api/twitter-lineups/parse")
 def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseResponse:
     team, raw_slots = parse_notification_body(req.body)
@@ -408,23 +413,24 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
 
 @app.get("/api/twitter-lineups")
 def get_twitter_lineups() -> list[TwitterLineupRecord]:
-    return [TwitterLineupRecord(**l) for l in load_twitter_lineups()]
+    return [TwitterLineupRecord(**l) for l in load_twitter_lineups(_slate_fingerprint())]
 
 
 @app.post("/api/twitter-lineups")
 def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
     slots = [s.model_dump() for s in req.slots]
-    record = upsert_twitter_lineup(req.team, req.notification_id, slots)
+    record = upsert_twitter_lineup(req.team, req.notification_id, slots, _slate_fingerprint())
     return TwitterLineupRecord(**record)
 
 
 @app.delete("/api/twitter-lineups/{team}")
 def remove_twitter_lineup(team: str):
-    lineups = load_twitter_lineups()
+    fp = _slate_fingerprint()
+    lineups = load_twitter_lineups(fp)
     lineup = next((l for l in lineups if l.get("team") == team), None)
     if lineup is None:
         raise HTTPException(404, detail="No confirmed lineup for that team")
-    delete_twitter_lineup(team)
+    delete_twitter_lineup(team, fp)
     return {"ok": True}
 
 
@@ -542,6 +548,52 @@ def _get_archive_dir(create: bool = False) -> Path | None:
         return d
     except Exception:
         return None
+
+
+@app.get("/api/contest/analyze")
+def get_contest_analysis():
+    """Return a player-name → FPTS map parsed from the contest standings zip in the archive dir."""
+    import csv as _csv
+    import io as _io
+    import zipfile as _zipfile
+
+    archive_dir = _get_archive_dir()
+    if archive_dir is None:
+        raise HTTPException(status_code=404, detail="Cannot resolve archive directory from slate")
+    if not archive_dir.exists():
+        raise HTTPException(status_code=404, detail=f"Archive directory does not exist: {archive_dir.name}")
+
+    zips = sorted(archive_dir.glob("contest-standings-*.zip"))
+    if not zips:
+        raise HTTPException(status_code=404, detail=f"No contest standings zip found in {archive_dir.name}")
+
+    zip_path = zips[0]
+    try:
+        with _zipfile.ZipFile(zip_path) as zf:
+            csv_name = next(n for n in zf.namelist() if n.endswith(".csv"))
+            content = zf.read(csv_name).decode("utf-8-sig")
+        reader = _csv.reader(_io.StringIO(content))
+        rows = list(reader)
+        if not rows:
+            raise HTTPException(status_code=500, detail="Contest standings CSV is empty")
+        header = rows[0]
+        player_col = header.index("Player")
+        fpts_col   = header.index("FPTS")
+        player_fpts: dict[str, float] = {}
+        for row in rows[1:]:
+            if len(row) > player_col and row[player_col].strip():
+                name = row[player_col].strip()
+                raw  = row[fpts_col].strip() if len(row) > fpts_col else ""
+                if raw:
+                    try:
+                        player_fpts[name] = float(raw)
+                    except ValueError:
+                        pass
+        return {"player_fpts": player_fpts}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to parse contest zip: {exc}")
 
 
 def _load_slate_df():
@@ -847,7 +899,7 @@ def projections_status() -> ProjectionsStatus:
         row_count = len(df)
         if {"slot_confirmed", "player_id"}.issubset(df.columns):
             unconf = df[~df["slot_confirmed"].astype(bool)].copy()
-            confirmed = get_confirmed_team_lineups()
+            confirmed = get_confirmed_team_lineups(_slate_fingerprint())
             if confirmed:
                 twitter_pids = {pid for pid_to_slot in confirmed.values() for pid in pid_to_slot}
                 unconf = unconf[~unconf["player_id"].isin(twitter_pids)]
@@ -912,7 +964,7 @@ def projections_unconfirmed():
             return {"player_ids": []}
         unconfirmed = df[~df["slot_confirmed"].astype(bool)].copy()
 
-        confirmed = get_confirmed_team_lineups()
+        confirmed = get_confirmed_team_lineups(_slate_fingerprint())
         if confirmed:
             # Players in Twitter-confirmed lineups are confirmed regardless of CSV value
             twitter_pids = {pid for pid_to_slot in confirmed.values() for pid in pid_to_slot}
@@ -960,7 +1012,7 @@ def projections_players():
 
         # Twitter confirmed lineups are authoritative: drop scratched batters and
         # update slot/slot_confirmed for the players who are actually starting.
-        confirmed = get_confirmed_team_lineups()
+        confirmed = get_confirmed_team_lineups(_slate_fingerprint())
         if confirmed:
             batter_mask = merged["position"] != "P"
             for team, pid_to_slot in confirmed.items():
@@ -1585,7 +1637,7 @@ async def projections_fetch(request: Request):
         # Falls back to salary / 400.0 heuristic only when no source had them at all.
         def _inject_twitter_confirmed(pool: "pd.DataFrame") -> "pd.DataFrame":
             from .twitter_lineups import get_confirmed_team_lineups
-            confirmed = get_confirmed_team_lineups()
+            confirmed = get_confirmed_team_lineups(_slate_fingerprint())
             if not confirmed:
                 return pool
             slate_file = _slate_path_for_meta

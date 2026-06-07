@@ -4,11 +4,12 @@ DraftKings entry file parser and upload file writer.
 Responsibilities:
   - Scan data/raw/ for *Entries.csv files
   - Parse DK entry files (which have player reference data appended in extra columns)
-  - Assign portfolio lineups to entries in descending entry-fee order
+  - Assign portfolio lineups to entries in ascending (prize_pool / entry_fee) order
   - Write upload_<filename>.csv files ready for DraftKings submission
 """
 import csv
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -28,8 +29,9 @@ class EntryRecord:
     entry_id: str
     contest_name: str
     contest_id: str
-    entry_fee_cents: int   # "$4" -> 400; used as numeric sort key
-    entry_fee_raw: str     # "$4"; written verbatim to upload file
+    entry_fee_cents: int        # "$4" -> 400
+    entry_fee_raw: str          # "$4"; written verbatim to upload file
+    prize_pool_cents: Optional[int] = None  # "$5K" -> 500000; None if not parseable
 
 
 def scan_entry_files(raw_dir: str) -> list[Path]:
@@ -45,6 +47,31 @@ def _parse_fee_cents(fee_str: str) -> int:
         return round(float(cleaned) * 100)
     except ValueError:
         return 0
+
+
+_PRIZE_POOL_RE = re.compile(r"\$(\d+(?:\.\d+)?)(K|M)?", re.IGNORECASE)
+
+def _parse_prize_pool_cents(contest_name: str) -> Optional[int]:
+    """
+    Extract the prize pool from a DK contest name and return it in cents.
+
+    Looks for the first "$<number>[K|M]" token, e.g.:
+      "MLB $5K Chin Music [Single Entry]"  -> 500_000_00 (= $5,000 * 100)
+      "MLB $1.5K Pickoff"                  -> 150_000_00 (= $1,500 * 100)
+      "MLB $20K Four-Seamer"               -> 2_000_000_00 (= $20,000 * 100)
+
+    Returns None if no such token is found.
+    """
+    m = _PRIZE_POOL_RE.search(contest_name)
+    if not m:
+        return None
+    amount = float(m.group(1))
+    suffix = (m.group(2) or "").upper()
+    if suffix == "K":
+        amount *= 1_000
+    elif suffix == "M":
+        amount *= 1_000_000
+    return round(amount * 100)
 
 
 def parse_entry_file(path: Path) -> list[EntryRecord]:
@@ -83,12 +110,14 @@ def parse_entry_file(path: Path) -> list[EntryRecord]:
         if not entry_id:
             continue  # reference-data-only row
         fee_raw = row[3].strip()
+        contest_name = row[1].strip()
         records.append(EntryRecord(
             entry_id=entry_id,
-            contest_name=row[1].strip(),
+            contest_name=contest_name,
             contest_id=row[2].strip(),
             entry_fee_cents=_parse_fee_cents(fee_raw),
             entry_fee_raw=fee_raw,
+            prize_pool_cents=_parse_prize_pool_cents(contest_name),
         ))
 
     return records
@@ -159,32 +188,45 @@ def assign_players_to_slots(
     return [players[match_slot[j]] for j in range(n_slots)]
 
 
+def _sort_ratio(rec: EntryRecord) -> float:
+    """
+    Sort key: prize_pool / entry_fee (ascending = fewest implied entries first).
+
+    When prize_pool is unknown, returns infinity so those entries sort last.
+    """
+    if rec.prize_pool_cents and rec.entry_fee_cents:
+        return rec.prize_pool_cents / rec.entry_fee_cents
+    return float("inf")
+
+
 def assign_lineups_to_entries(
     all_file_entries: list[tuple[Path, list[EntryRecord]]],
     portfolio: list,  # list of (Lineup, float)
 ) -> dict[Path, list[tuple[EntryRecord, object]]]:
     """
-    Assign portfolio lineups to entries across all files in descending fee order.
+    Assign portfolio lineups to entries across all files in ascending
+    (prize_pool / entry_fee) ratio order.
 
-    The highest-fee entry (across all files) receives portfolio[0], the next
-    highest receives portfolio[1], and so on. Within a fee tier, the original
-    file/row order is preserved (stable sort).
+    The entry with the smallest ratio (fewest implied opponents) receives
+    portfolio[0] (the strongest lineup). Within a ratio tier, original
+    file/row order is preserved (stable sort). Entries whose prize pool
+    cannot be parsed from the contest name sort last.
 
     Returns
     -------
     dict mapping each file Path to its list of (EntryRecord, Lineup) pairs,
     in the order they appear in the file.
     """
-    # Flatten: (fee_cents, original_index, file_path, entry_record)
-    flat: list[tuple[int, int, Path, EntryRecord]] = []
+    # Flatten: (sort_ratio, original_index, file_path, entry_record)
+    flat: list[tuple[float, int, Path, EntryRecord]] = []
     idx = 0
     for file_path, records in all_file_entries:
         for rec in records:
-            flat.append((rec.entry_fee_cents, idx, file_path, rec))
+            flat.append((_sort_ratio(rec), idx, file_path, rec))
             idx += 1
 
-    # Sort descending by fee; stable on idx preserves original order within ties
-    flat.sort(key=lambda x: x[0], reverse=True)
+    # Sort ascending by ratio; tie-break descending by fee (higher fee first), then original order
+    flat.sort(key=lambda x: (x[0], -x[3].entry_fee_cents, x[1]))
 
     n_lineups = len(portfolio)
     if len(flat) > n_lineups:

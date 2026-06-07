@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import type { LineupResult, PlatformType, PlayerRow, PortfolioSweepEntry } from '../types'
+import { fetchContestAnalysis } from '../api'
 import { getStackNotation } from '../utils'
 import TeamBadge from './TeamBadge'
 
@@ -118,6 +119,52 @@ function sortAndAssignPositions(
   return result
 }
 
+function buildNormalizedFptsMap(fpts: Record<string, number>): Map<string, number> {
+  const m = new Map<string, number>()
+  for (const [name, val] of Object.entries(fpts)) {
+    m.set(name.toLowerCase(), val)
+  }
+  return m
+}
+
+function lookupFpts(name: string, normalized: Map<string, number>): number {
+  return normalized.get(name.toLowerCase()) ?? 0
+}
+
+function calcLineupFpts(lineup: LineupResult, normalized: Map<string, number>): number {
+  return lineup.players.reduce((sum, p) => sum + lookupFpts(p.name, normalized), 0)
+}
+
+function calcSweepStats(lineups: LineupResult[], norm: Map<string, number>) {
+  const scores = lineups.map(l => calcLineupFpts(l, norm))
+  return {
+    max: Math.max(...scores),
+    avg: scores.reduce((a, b) => a + b, 0) / scores.length,
+  }
+}
+
+function parseFeeCents(entryFee: string | null | undefined): number {
+  if (!entryFee) return 0
+  return Math.round(parseFloat(entryFee.replace(/[^0-9.]/g, '')) * 100)
+}
+
+function entrySortKey(lineup: LineupResult): [number, number, number] {
+  const ratio = lineup.entry_sort_order ?? Infinity
+  const fee = parseFeeCents(lineup.entry_fee)
+  return [ratio, -fee, lineup.lineup_index]
+}
+
+function compareEntrySortKey(a: LineupResult, b: LineupResult): number {
+  const [ra, fa, ia] = entrySortKey(a)
+  const [rb, fb, ib] = entrySortKey(b)
+  return ra !== rb ? ra - rb : fa !== fb ? fa - fb : ia - ib
+}
+
+function sortByEntryRatio(lineups: LineupResult[]): LineupResult[] {
+  if (!lineups.some(l => l.upload_tag)) return lineups
+  return [...lineups].sort(compareEntrySortKey)
+}
+
 function playerKey(players: PlayerRow[]): string {
   return [...players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
 }
@@ -126,27 +173,39 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
   const [activeTab, setActiveTab] = useState<'portfolio' | 'optimal'>('portfolio')
   // viewingRisk: which risk the user is currently browsing (null = showing active)
   const [viewingRisk, setViewingRisk] = useState<number | null>(null)
+  // Shared filter across all risk levels and both tabs
   const [filterPlayer, setFilterPlayer] = useState<PlayerRow | null>(null)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const searchWrapRef = useRef<HTMLDivElement>(null)
-  const [filterOptimalPlayer, setFilterOptimalPlayer] = useState<PlayerRow | null>(null)
-  const [searchOptimal, setSearchOptimal] = useState('')
-  const [searchOptimalOpen, setSearchOptimalOpen] = useState(false)
-  const searchOptimalWrapRef = useRef<HTMLDivElement>(null)
+  // Contest analysis state
+  const [contestNormalized, setContestNormalized] = useState<Map<string, number>>(new Map())
+  const [contestError, setContestError] = useState<string | null>(null)
+  const [contestLoading, setContestLoading] = useState(false)
+  const [sortByActual, setSortByActual] = useState(false)
 
   useEffect(() => {
     function handleClick(e: MouseEvent) {
       if (searchWrapRef.current && !searchWrapRef.current.contains(e.target as Node)) {
         setSearchOpen(false)
       }
-      if (searchOptimalWrapRef.current && !searchOptimalWrapRef.current.contains(e.target as Node)) {
-        setSearchOptimalOpen(false)
-      }
     }
     document.addEventListener('mousedown', handleClick)
     return () => document.removeEventListener('mousedown', handleClick)
   }, [])
+
+  async function handleAnalyzeContest() {
+    setContestLoading(true)
+    setContestError(null)
+    try {
+      const result = await fetchContestAnalysis()
+      setContestNormalized(buildNormalizedFptsMap(result.player_fpts))
+    } catch (e) {
+      setContestError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setContestLoading(false)
+    }
+  }
 
   if (lineups.length === 0) return null
 
@@ -168,9 +227,14 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
     .filter(p => p.name.toLowerCase().includes(searchLower))
     .slice(0, 10)
 
-  const visibleLineups = filterPlayer
-    ? activeLineups.filter(l => l.players.some(p => p.player_id === filterPlayer.player_id))
-    : activeLineups
+  const sortedActiveLineups = sortByEntryRatio(activeLineups)
+  const filteredLineups = filterPlayer
+    ? sortedActiveLineups.filter(l => l.players.some(p => p.player_id === filterPlayer.player_id))
+    : sortedActiveLineups
+  const visibleLineups = (contestNormalized.size > 0 && sortByActual)
+    ? [...filteredLineups].sort((a, b) => calcLineupFpts(b, contestNormalized) - calcLineupFpts(a, contestNormalized))
+    : filteredLineups
+  const filterPlayerMissingFromRisk = filterPlayer !== null && filteredLineups.length === 0
 
   const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
@@ -217,19 +281,29 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
     new Map(optimalInPortfolio.flatMap(l => l.players).map(p => [p.player_id, p])).values()
   ).sort((a, b) => a.name.localeCompare(b.name))
 
-  const searchOptimalLower = searchOptimal.toLowerCase()
   const optimalSearchResults = optimalAllPlayers
-    .filter(p => p.name.toLowerCase().includes(searchOptimalLower))
+    .filter(p => p.name.toLowerCase().includes(searchLower))
     .slice(0, 10)
 
-  const visibleOptimalLineups = filterOptimalPlayer
-    ? optimalInPortfolio.filter(l => l.players.some(p => p.player_id === filterOptimalPlayer.player_id))
+  const hasEntries = activeLineups.some(l => l.upload_tag)
+  const sortedOptimalInPortfolio = hasEntries
+    ? [...optimalInPortfolio].sort((a, b) => {
+        const portA = portfolioLineupByIndex.get(portfolioKeyMap.get(playerKey(a.players))!)
+        const portB = portfolioLineupByIndex.get(portfolioKeyMap.get(playerKey(b.players))!)
+        const proxyA = portA ?? a
+        const proxyB = portB ?? b
+        return compareEntrySortKey(proxyA, proxyB)
+      })
     : optimalInPortfolio
+  const visibleOptimalLineups = filterPlayer
+    ? sortedOptimalInPortfolio.filter(l => l.players.some(p => p.player_id === filterPlayer.player_id))
+    : sortedOptimalInPortfolio
+  const filterPlayerMissingFromOptimal = filterPlayer !== null && visibleOptimalLineups.length === 0
 
   const showOptimalTab = optimalLineups.length > 0
 
   const tabLabel = activeTab === 'optimal'
-    ? `Optimal — ${filterOptimalPlayer ? `${visibleOptimalLineups.length} / ${optimalInPortfolio.length}` : optimalInPortfolio.length} Lineup${optimalInPortfolio.length !== 1 ? 's' : ''}`
+    ? `Optimal — ${filterPlayer ? `${visibleOptimalLineups.length} / ${optimalInPortfolio.length}` : optimalInPortfolio.length} Lineup${optimalInPortfolio.length !== 1 ? 's' : ''}`
     : `Portfolio — ${filterPlayer ? `${visibleLineups.length} / ${activeLineups.length}` : activeLineups.length} Lineup${activeLineups.length !== 1 ? 's' : ''}`
 
   return (
@@ -256,22 +330,22 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
       {activeTab === 'optimal' ? (
         <>
         <div className="portfolio-filter-row">
-          <div className="portfolio-filter" ref={searchOptimalWrapRef}>
-            {filterOptimalPlayer ? (
+          <div className="portfolio-filter" ref={searchWrapRef}>
+            {filterPlayer ? (
               <span className="portfolio-filter-chip">
-                {filterOptimalPlayer.name}
-                <button onClick={() => { setFilterOptimalPlayer(null); setSearchOptimal('') }}>×</button>
+                {filterPlayer.name}
+                <button onClick={() => { setFilterPlayer(null); setSearch('') }}>×</button>
               </span>
             ) : (
               <>
                 <input
                   className="portfolio-filter-input"
                   placeholder="Filter by player…"
-                  value={searchOptimal}
-                  onChange={e => { setSearchOptimal(e.target.value); setSearchOptimalOpen(true) }}
-                  onFocus={() => setSearchOptimalOpen(true)}
+                  value={search}
+                  onChange={e => { setSearch(e.target.value); setSearchOpen(true) }}
+                  onFocus={() => setSearchOpen(true)}
                 />
-                {searchOptimalOpen && optimalSearchResults.length > 0 && (
+                {searchOpen && optimalSearchResults.length > 0 && (
                   <div className="portfolio-filter-results">
                     {optimalSearchResults.map(p => (
                       <button
@@ -279,9 +353,9 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                         className="portfolio-filter-result-btn"
                         onMouseDown={e => {
                           e.preventDefault()
-                          setFilterOptimalPlayer(p)
-                          setSearchOptimal('')
-                          setSearchOptimalOpen(false)
+                          setFilterPlayer(p)
+                          setSearch('')
+                          setSearchOpen(false)
                         }}
                       >
                         <span>{p.name}</span>
@@ -293,6 +367,9 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
               </>
             )}
           </div>
+          {filterPlayerMissingFromOptimal && (
+            <span className="portfolio-filter-empty">No optimal lineups include {filterPlayer!.name}.</span>
+          )}
           <div className={`portfolio-optimal-banner${optimalInPortfolio.length > 0 ? ' portfolio-optimal-banner--hit' : ''}`}>
             <span>{optimalInPortfolio.length} / {optimalLineups.length} optimal lineup{optimalLineups.length !== 1 ? 's' : ''} selected in portfolio</span>
           </div>
@@ -346,12 +423,13 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                   className={`portfolio-risk-btn${isViewing ? ' portfolio-risk-btn--viewing' : ''}${isActive ? ' portfolio-risk-btn--active-risk' : ''}`}
                   onClick={() => {
                     setViewingRisk(entry.risk === displayedRisk ? null : entry.risk)
-                    setFilterPlayer(null)
-                    setSearch('')
                   }}
                 >
                   {isActive && <span className="portfolio-risk-star">★ </span>}Risk {entry.risk}
-                  <span className="portfolio-risk-count"> ({entry.lineups.length})</span>
+                  {contestNormalized.size > 0 && (() => {
+                    const { max, avg } = calcSweepStats(entry.lineups, contestNormalized)
+                    return <span className="portfolio-risk-btn-stats">{avg.toFixed(1)} avg · {max.toFixed(1)} max</span>
+                  })()}
                 </button>
                 {isViewing && !isActive && onActivateRisk && (
                   <button
@@ -405,10 +483,35 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
             </>
           )}
         </div>
+        {filterPlayerMissingFromRisk && (
+          <span className="portfolio-filter-empty">No lineups include {filterPlayer!.name} at this risk level.</span>
+        )}
         <div className={`portfolio-unconfirmed-banner ${totalUnconfirmed === 0 ? 'portfolio-unconfirmed-banner--clear' : ''}`}>
           {totalUnconfirmed === 0
             ? '✓ All lineup slots confirmed'
             : `✕ ${totalUnconfirmed} unconfirmed lineup slot${totalUnconfirmed !== 1 ? 's' : ''} across portfolio${breakdown}`}
+        </div>
+        <div className="portfolio-contest-controls">
+          <button
+            className="portfolio-analyze-btn"
+            onClick={handleAnalyzeContest}
+            disabled={contestLoading}
+          >
+            {contestLoading ? 'Loading…' : contestNormalized.size > 0 ? 'Re-analyze' : 'Analyze Contest'}
+          </button>
+          {contestNormalized.size > 0 && (
+            <button
+              className={`portfolio-analyze-btn${sortByActual ? ' portfolio-analyze-btn--active' : ''}`}
+              onClick={() => setSortByActual(s => !s)}
+            >
+              {sortByActual ? 'Original Order' : 'Sort by Score ↓'}
+            </button>
+          )}
+          {contestError && (
+            <span className="portfolio-contest-error" onClick={() => setContestError(null)} title="Click to dismiss">
+              ✕ {contestError}
+            </span>
+          )}
         </div>
       </div>
       <div className="portfolio-cards">
@@ -451,6 +554,11 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
               {lineup.upload_tag && (
                 <div className="lineup-card-entry-info">
                   {entryInfoText(lineup, platform)}
+                </div>
+              )}
+              {contestNormalized.size > 0 && (
+                <div className="lineup-card-actual-score">
+                  {calcLineupFpts(lineup, contestNormalized).toFixed(2)} FPTS
                 </div>
               )}
               <div className="lineup-card-players">

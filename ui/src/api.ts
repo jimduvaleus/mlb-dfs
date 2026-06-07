@@ -1,4 +1,4 @@
-import type { AppConfig, CacheStatus, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, CacheStatus, ContestAnalysisResponse, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -240,4 +240,15 @@ export async function fetchCacheStatus(): Promise<CacheStatus> {
   } catch {
     return { is_gpp: false, fingerprint: '', candidates: null, field_k: null, n_configured_candidates: 0, n_configured_field_k: 0, n_batter_teams: 0 }
   }
+}
+
+export async function fetchContestAnalysis(): Promise<ContestAnalysisResponse> {
+  const res = await fetch('/api/contest/analyze')
+  if (!res.ok) {
+    const text = await res.text()
+    let detail = text
+    try { detail = JSON.parse(text).detail } catch {}
+    throw new Error(detail)
+  }
+  return res.json()
 }

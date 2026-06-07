@@ -103,6 +103,7 @@ export interface LineupResult {
   upload_tag?: string | null
   entry_fee?: string | null
   contest_name?: string | null
+  entry_sort_order?: number | null
 }
 
 export interface SlateOption {
@@ -344,6 +345,7 @@ export interface StoppedEvent extends SSEEvent {
   portfolio: LineupResult[]
   n_lineups: number
   optimal_lineups?: LineupResult[]
+  portfolio_sweep?: PortfolioSweepEntry[]
 }
 
 export interface ErrorEvent extends SSEEvent {
@@ -553,4 +555,8 @@ export interface TwitterLineupSaveRequest {
   team: string
   notification_id: string
   slots: TwitterLineupSlot[]
+}
+
+export interface ContestAnalysisResponse {
+  player_fpts: Record<string, number>
 }

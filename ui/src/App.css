@@ -1002,7 +1002,6 @@ button { cursor: pointer; }
 .portfolio-risk-btn--viewing { background: #2d3f60; border-color: #4a6fa5; color: #e2e8f0; border-right: none; border-radius: 4px 0 0 4px; }
 .portfolio-risk-btn--active-risk { border-color: #2b6cb0; }
 .portfolio-risk-star { color: #f6c90e; }
-.portfolio-risk-count { opacity: 0.65; font-size: 0.9em; }
 .portfolio-risk-activate-btn {
   padding: 4px 8px;
   border: 1px solid #4a6fa5;
@@ -1014,6 +1013,57 @@ button { cursor: pointer; }
   border-radius: 0 4px 4px 0;
 }
 .portfolio-risk-activate-btn:hover { background: #2b6cb0; color: #fff; }
+
+.portfolio-risk-btn-stats {
+  display: block;
+  font-size: 0.85em;
+  color: #68d391;
+  font-weight: 500;
+  margin-top: 2px;
+  letter-spacing: 0.01em;
+}
+
+.portfolio-contest-controls {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.portfolio-analyze-btn {
+  padding: 4px 10px;
+  border: 1px solid #4a6fa5;
+  background: #253858;
+  color: #90cdf4;
+  cursor: pointer;
+  font-size: 0.78em;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+.portfolio-analyze-btn:hover:not(:disabled) { background: #2b6cb0; color: #fff; }
+.portfolio-analyze-btn:disabled { opacity: 0.5; cursor: default; }
+.portfolio-analyze-btn--active { background: #276749; border-color: #48bb78; color: #9ae6b4; }
+.portfolio-analyze-btn--active:hover { background: #2f855a; color: #c6f6d5; }
+
+.portfolio-contest-error {
+  font-size: 0.78em;
+  color: #fc8181;
+  cursor: pointer;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lineup-card-actual-score {
+  font-size: 13px;
+  font-weight: 600;
+  color: #68d391;
+  padding: 4px 17px;
+  border-bottom: 1px solid #2d3748;
+  letter-spacing: 0.02em;
+}
 
 .portfolio-filter-row {
   display: flex;
@@ -1098,6 +1148,12 @@ button { cursor: pointer; }
   padding: 0;
 }
 .portfolio-filter-chip button:hover { color: #e2e8f0; }
+
+.portfolio-filter-empty {
+  font-size: 12px;
+  color: #718096;
+  font-style: italic;
+}
 
 .portfolio-cards {
   display: grid;

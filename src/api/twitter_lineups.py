@@ -29,7 +29,7 @@ TEAM_NAME_MAP: dict[str, str] = {
     "blue jays": "TOR", "toronto blue jays": "TOR",
     "rays": "TB", "tampa bay rays": "TB",
     "angels": "LAA", "los angeles angels": "LAA",
-    "athletics": "OAK", "oakland athletics": "OAK",
+    "athletics": "ATH", "oakland athletics": "ATH", "las vegas athletics": "ATH", "sacramento athletics": "ATH",
     "reds": "CIN", "cincinnati reds": "CIN",
     "brewers": "MIL", "milwaukee brewers": "MIL",
     "cardinals": "STL", "st. louis cardinals": "STL",
@@ -170,21 +170,41 @@ def match_player_name(abbreviated: str, candidates: list[dict]) -> list[dict]:
     return results
 
 
-def load_twitter_lineups() -> list[dict]:
+def load_twitter_lineups(slate_fingerprint: str = "") -> list[dict]:
+    """Load confirmed lineups.
+
+    If slate_fingerprint is provided and does not match the fingerprint stored with the
+    lineups, the file is cleared and an empty list is returned — the slate file has changed
+    since the lineups were confirmed.
+    """
     try:
-        return json.loads(_DATA_PATH.read_text())
+        raw = json.loads(_DATA_PATH.read_text())
     except Exception:
         return []
 
+    # Support old format (plain list) as well as new format ({"slate_fingerprint": ..., "lineups": [...]})
+    if isinstance(raw, list):
+        lineups = raw
+        stored_fp = ""
+    else:
+        lineups = raw.get("lineups", [])
+        stored_fp = raw.get("slate_fingerprint", "")
 
-def save_twitter_lineups(lineups: list[dict]) -> None:
+    if slate_fingerprint and stored_fp and slate_fingerprint != stored_fp:
+        save_twitter_lineups([], slate_fingerprint=slate_fingerprint)
+        return []
+
+    return lineups
+
+
+def save_twitter_lineups(lineups: list[dict], slate_fingerprint: str = "") -> None:
     _DATA_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _DATA_PATH.write_text(json.dumps(lineups, indent=2))
+    _DATA_PATH.write_text(json.dumps({"slate_fingerprint": slate_fingerprint, "lineups": lineups}, indent=2))
 
 
-def upsert_twitter_lineup(team: str, notification_id: str, slots: list[dict]) -> dict:
+def upsert_twitter_lineup(team: str, notification_id: str, slots: list[dict], slate_fingerprint: str = "") -> dict:
     """Save or replace the confirmed lineup for a team."""
-    lineups = load_twitter_lineups()
+    lineups = load_twitter_lineups(slate_fingerprint)
     lineups = [l for l in lineups if l.get("team") != team]
     record = {
         "team": team,
@@ -193,23 +213,23 @@ def upsert_twitter_lineup(team: str, notification_id: str, slots: list[dict]) ->
         "slots": slots,
     }
     lineups.append(record)
-    save_twitter_lineups(lineups)
+    save_twitter_lineups(lineups, slate_fingerprint)
     return record
 
 
-def delete_twitter_lineup(team: str) -> bool:
-    lineups = load_twitter_lineups()
+def delete_twitter_lineup(team: str, slate_fingerprint: str = "") -> bool:
+    lineups = load_twitter_lineups(slate_fingerprint)
     filtered = [l for l in lineups if l.get("team") != team]
     if len(filtered) == len(lineups):
         return False
-    save_twitter_lineups(filtered)
+    save_twitter_lineups(filtered, slate_fingerprint)
     return True
 
 
-def get_twitter_overrides() -> dict[int, dict]:
+def get_twitter_overrides(slate_fingerprint: str = "") -> dict[int, dict]:
     """Return {player_id: {"slot": int}} for all confirmed twitter lineups."""
     overrides: dict[int, dict] = {}
-    for lineup in load_twitter_lineups():
+    for lineup in load_twitter_lineups(slate_fingerprint):
         for slot_entry in lineup.get("slots", []):
             pid = slot_entry.get("player_id")
             slot = slot_entry.get("slot")
@@ -218,14 +238,14 @@ def get_twitter_overrides() -> dict[int, dict]:
     return overrides
 
 
-def get_confirmed_team_lineups() -> dict[str, dict[int, int]]:
+def get_confirmed_team_lineups(slate_fingerprint: str = "") -> dict[str, dict[int, int]]:
     """Return {team: {player_id: slot}} for all teams with a confirmed Twitter lineup.
 
     Used to determine which batters are authoritative starters (in the map) and
     which are scratched (in the team but not in the map).
     """
     result: dict[str, dict[int, int]] = {}
-    for lineup in load_twitter_lineups():
+    for lineup in load_twitter_lineups(slate_fingerprint):
         team = lineup.get("team")
         if not team:
             continue

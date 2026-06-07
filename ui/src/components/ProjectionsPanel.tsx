@@ -410,7 +410,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
             {pitchersWinAdjusted.length > 0 && (
               <div className="merge-info-pitcher-fallback-callout">
                 <strong>
-                  ⚠ {pitchersWinAdjusted.length} pitcher{pitchersWinAdjusted.length !== 1 ? 's' : ''} using {mergeInfo.secondarySource} fallback +1.5 pts (wins market unavailable)
+                  ⚠ {pitchersWinAdjusted.length} pitcher{pitchersWinAdjusted.length !== 1 ? 's' : ''} using partial market odds +1.5 pts (wins market unavailable)
                 </strong>
                 <div className="merge-info-players">{groupByTeam(pitchersWinAdjusted)}</div>
               </div>

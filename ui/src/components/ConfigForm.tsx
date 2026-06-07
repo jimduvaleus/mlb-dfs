@@ -141,16 +141,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
           </section>
 
           <section>
-            <h3>Portfolio</h3>
-
-            <FieldRow label="Target percentile">
-              <input type="number" min={1} max={99} value={draft.portfolio.target_percentile}
-                onChange={e => set('portfolio', 'target_percentile', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-
-          </section>
-
-          <section>
             <h3>Optimizer</h3>
             <FieldRow label="Objective">
               <select value={draft.optimizer.objective}

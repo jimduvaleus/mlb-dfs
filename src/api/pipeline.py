@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from src.api.dk_entries import _sort_ratio
 from src.ingestion.factory import get_ingestor
 from src.models.batter_model import BatterPCAModel
 from src.models.copula import EmpiricalCopula
@@ -164,7 +165,7 @@ class PipelineRunner:
                 slate_df[["player_id", "name"]], on="player_id", how="left"
             )
 
-        players_df = self._apply_twitter_overrides(players_df)
+        players_df = self._apply_twitter_overrides(players_df, slate_path=slate_path)
         # sim_players_df: "both"-excluded removed — used for simulation + field generation
         # cand_players_df: "candidates"+"both"-excluded removed — used for lineup optimization
         sim_players_df, cand_players_df, excl_stats, game_ppd_pcts = self._apply_exclusions(
@@ -855,7 +856,6 @@ class PipelineRunner:
                                 risk=_sweep_risk,
                             )
                             _det_result = _det_sel.select(
-                                stop_check=self._stop_check,
                                 progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
                                     "gpp_det_select_progress",
                                     {**data, "risk": r, "risk_index": ri + 1,
@@ -1155,10 +1155,18 @@ class PipelineRunner:
                 json.dump({"lineups": _optimal_result, "slate_fingerprint": _slate_fp}, _f)
         if was_stopped:
             logger.info("Run stopped by user after %d lineups.", len(portfolio))
+            _stopped_sweep_payload = [
+                {
+                    "risk": r,
+                    "lineups": self._serialize_portfolio(p, players_df, mean_ev_from_score=True),
+                }
+                for r, p in _portfolio_sweep_raw
+            ] if _portfolio_sweep_raw else []
             self._cb("stopped", {
                 "portfolio": result,
                 "n_lineups": len(result),
                 "optimal_lineups": _optimal_result,
+                "portfolio_sweep": _stopped_sweep_payload,
             })
         else:
             _sweep_payload = [
@@ -1689,15 +1697,18 @@ class PipelineRunner:
         return df[base_cols]
 
     @staticmethod
-    def _apply_twitter_overrides(players_df: pd.DataFrame) -> pd.DataFrame:
+    def _apply_twitter_overrides(players_df: pd.DataFrame, slate_path: str = "") -> pd.DataFrame:
         """Apply confirmed twitter lineup slot/slot_confirmed overrides to players_df.
 
         For each team with a confirmed Twitter lineup, batters from that team who are
         NOT in the lineup are dropped entirely (they are scratched). Batters who ARE
         in the lineup get their slot updated and slot_confirmed set to True.
         """
+        from pathlib import Path as _Path
         from .twitter_lineups import get_confirmed_team_lineups
-        confirmed = get_confirmed_team_lineups()
+        from .slate_exclusions import compute_file_fingerprint
+        _fp = compute_file_fingerprint(_Path(slate_path) if slate_path else None)
+        confirmed = get_confirmed_team_lineups(_fp)
         if not confirmed:
             return players_df
         df = players_df.copy()
@@ -2065,32 +2076,44 @@ class PipelineRunner:
 
     @staticmethod
     def _extract_sorted_fees(all_file_entries: list) -> list[int]:
-        fees = []
+        """Return entry fees in ascending prize_pool/fee ratio order.
+
+        This matches the slot order used by assign_lineups_to_entries, so that
+        fees[k] is the actual fee of the k-th entry slot — used as positional
+        weights in _reorder_by_diversity.
+        """
+        flat = []
         for _, records in all_file_entries:
             for rec in records:
-                fees.append(rec.entry_fee_cents)
-        fees.sort(reverse=True)
-        return fees
+                flat.append((_sort_ratio(rec), len(flat), rec.entry_fee_cents))
+        flat.sort(key=lambda x: (x[0], -x[2], x[1]))
+        return [fee for _, _, fee in flat]
 
     @staticmethod
     def _reorder_by_diversity(portfolio: list, fees: list[int] | None = None) -> list:
-        """Greedy diversity reorder with fee-weighted running exposure.
+        """Greedy diversity reorder: assigns the most underrepresented lineup to each slot.
 
-        At each step k, selects the lineup whose players are most underrepresented
-        relative to their full-portfolio frequency, weighted by entry fees so that
-        higher-fee positions discount their players more when computing residual exposure.
+        At each step k (filling entry slot with fee slot_fees[k]), selects the remaining
+        lineup that maximizes:
+
+            sum over pid: (total_fees * full_freq[pid] - running_fees[pid])
+
+        where total_fees = sum of all entry fees for the slate, full_freq[pid] = fraction
+        of portfolio lineups containing pid, and running_fees[pid] = cumulative entry fees
+        of slots already filled that include pid.
+
+        Lineups whose players are most "underpaid" relative to their portfolio share
+        float to the front.
         """
         if len(portfolio) <= 1:
             return portfolio
         N = len(portfolio)
 
-        if fees:
-            padded = (fees + [0] * N)[:N]
-            total_fees = sum(padded)
-        else:
-            padded, total_fees = [], 0
+        slot_fees: list[int] = list(fees) if fees else []
+        total_fees = sum(slot_fees)
+
         if total_fees == 0:
-            padded = [1] * N
+            slot_fees = [1] * N
             total_fees = N
 
         full_freq: dict[int, float] = {}
@@ -2102,22 +2125,24 @@ class PipelineRunner:
 
         remaining = list(range(N))
         selected: list[int] = []
-        running_weight: dict[int, float] = {}
+        running_fees: dict[int, float] = {}
 
         while remaining:
             k = len(selected)
+            slot_fee = slot_fees[k] if k < len(slot_fees) else 0
             best_i, best_score = remaining[0], float('-inf')
             for i in remaining:
                 lineup, _ = portfolio[i]
-                s = sum(full_freq.get(pid, 0) - running_weight.get(pid, 0.0)
-                        for pid in lineup.player_ids)
+                s = sum(
+                    total_fees * full_freq.get(pid, 0) - running_fees.get(pid, 0.0)
+                    for pid in lineup.player_ids
+                )
                 if s > best_score:
                     best_score, best_i = s, i
             selected.append(best_i)
             remaining.remove(best_i)
-            fee_weight = padded[k] / total_fees
             for pid in portfolio[best_i][0].player_ids:
-                running_weight[pid] = running_weight.get(pid, 0.0) + fee_weight
+                running_fees[pid] = running_fees.get(pid, 0.0) + slot_fee
 
         return [portfolio[i] for i in selected]
 
@@ -2178,21 +2203,22 @@ class PipelineRunner:
     ) -> dict[int, dict]:
         """Return {lineup_index: {upload_tag, entry_fee, contest_name}} from entry assignments.
 
-        Uses the same fee-descending assignment order as assign_lineups_to_entries.
+        Uses the same ascending prize_pool/fee ratio order as assign_lineups_to_entries.
         """
         flat: list = []
         for file_path, records in all_file_entries:
             for rec in records:
-                flat.append((rec.entry_fee_cents, len(flat), file_path, rec))
-        flat.sort(key=lambda x: x[0], reverse=True)
+                flat.append((_sort_ratio(rec), len(flat), file_path, rec))
+        flat.sort(key=lambda x: (x[0], -x[3].entry_fee_cents, x[1]))
         entry_map: dict[int, dict] = {}
-        for i, (_, _, file_path, rec) in enumerate(flat):
+        for i, (ratio, _, file_path, rec) in enumerate(flat):
             if i >= len(portfolio):
                 break
             entry_map[i + 1] = {
                 "upload_tag": _extract_upload_tag(file_path.name),
                 "entry_fee": rec.entry_fee_raw,
                 "contest_name": _shorten_contest_name(rec.contest_name),
+                "entry_sort_order": ratio if ratio != float("inf") else None,
             }
         return entry_map
 
