@@ -50,7 +50,6 @@ Models
                    Aligns the scoring-participation signal with DFS ownership
                    patterns and preserves bot_prec relative to R_scoring.
                    exp ∈ {0.10, 0.20}.
-
 """
 
 import argparse
@@ -478,6 +477,7 @@ def compute_models(
         except Exception as exc:
             print(f"  [{_label} skipped: {exc}]")
 
+
     return models
 
 
@@ -755,6 +755,162 @@ def _compute_model_r(
                 )
 
     return compute_heuristic_ownership(df.drop(columns=["_scoring"], errors="ignore"), team_totals)
+
+
+def _compute_model_v(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    pitopp_exp: float,
+    sal_gate: bool = False,
+    ratio_threshold: float = 0.0,
+) -> np.ndarray:
+    """
+    V_pitopp / V_sal / V_thresh — E_production with post-hoc pitcher-batter opposition adjustment.
+
+    DFS players who roster a pitcher implicitly fade that pitcher's opponents.
+
+    1. Compute base ownership from compute_heuristic_ownership.
+    2. Identify each team's starting pitcher (lowest lineup_slot if available,
+       else highest mean projection).
+    3. Compute pitcher_ratio = starter_own / mean_starter_own.
+    4. Scale each opposing batter's ownership by pitcher_ratio^(-pitopp_exp),
+       then renormalise each batter position group to preserve its ownership total.
+
+    sal_gate=False, ratio_threshold=0.0 (V_pitopp_*): full two-sided adjustment.
+    sal_gate=True   (V_sal_*): skip batters below median batter salary.
+    ratio_threshold>0 (V_thresh_*): skip adjustment unless pitcher is clearly above
+        average (ratio > 1 + ratio_threshold).  No boost for contrarian pitchers,
+        no suppress for barely-above-average ones — only clear chalk pitchers'
+        opponents are discounted.
+    """
+    from src.optimization.ownership import compute_heuristic_ownership
+
+    base = compute_heuristic_ownership(pool_df, team_totals).copy()
+
+    if "opponent" not in pool_df.columns:
+        return base
+
+    positions = pool_df["position"].values
+    teams     = pool_df["team"].values
+    opponents = pool_df["opponent"].values
+    salaries  = pool_df["salary"].values.astype(float)
+    has_slot  = "lineup_slot" in pool_df.columns
+
+    # Identify starting pitcher per team.
+    pitcher_mask = positions == "P"
+    starter_idx: dict[str, int] = {}
+    for team in np.unique(teams[pitcher_mask]):
+        tm_mask = pitcher_mask & (teams == team)
+        grp = pool_df[tm_mask]
+        if has_slot and grp["lineup_slot"].notna().any():
+            best = int(grp.dropna(subset=["lineup_slot"])["lineup_slot"].idxmin())
+        else:
+            best = int(grp["mean"].idxmax())
+        starter_idx[team] = best
+
+    if not starter_idx:
+        return base
+
+    starter_own = {team: float(base[idx]) for team, idx in starter_idx.items()}
+    mean_starter_own = float(np.mean(list(starter_own.values())))
+    if mean_starter_own <= 0:
+        return base
+
+    batter_mask = positions != "P"
+    sal_median = float(np.median(salaries[batter_mask])) if sal_gate else 0.0
+
+    result = base.copy()
+    batter_positions = ["C", "1B", "2B", "3B", "SS", "OF"]
+
+    for pos in batter_positions:
+        pos_mask = positions == pos
+        if not pos_mask.any():
+            continue
+        orig_sum = float(result[pos_mask].sum())
+
+        for i in np.where(pos_mask)[0]:
+            if sal_gate and salaries[i] < sal_median:
+                continue
+            opp_team = opponents[i]
+            opp_starter_own = starter_own.get(opp_team)
+            if opp_starter_own is None:
+                continue
+            ratio = opp_starter_own / mean_starter_own
+            if ratio <= (1.0 + ratio_threshold):
+                continue
+            result[i] *= ratio ** (-pitopp_exp)
+
+        new_sum = float(result[pos_mask].sum())
+        if new_sum > 0:
+            result[pos_mask] *= orig_sum / new_sum
+
+    return result
+
+
+def _compute_model_v_pre(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    pitopp_exp: float,
+) -> np.ndarray:
+    """
+    V_pre — two-pass pitcher-batter opposition adjustment via pre-adjusted means.
+
+    Encodes the pitcher-opposition signal in batter means before calling
+    compute_heuristic_ownership, letting production's sqrt compression and softmax
+    handle redistribution naturally — avoiding the renormalisation artifact of
+    V_pitopp where non-suppressed batters are artificially lifted.
+
+    Pass 1: run production to determine each team's starting pitcher ownership.
+    Pass 2: scale each batter's mean by (opp_starter_own / mean_starter_own)^(-exp),
+            then re-run production on the adjusted pool.
+
+    Starter identification: lowest lineup_slot if available, else highest mean.
+    """
+    from src.optimization.ownership import compute_heuristic_ownership
+
+    base = compute_heuristic_ownership(pool_df, team_totals)
+
+    if "opponent" not in pool_df.columns:
+        return base
+
+    positions = pool_df["position"].values
+    teams     = pool_df["team"].values
+    opponents = pool_df["opponent"].values
+    has_slot  = "lineup_slot" in pool_df.columns
+
+    pitcher_mask = positions == "P"
+    starter_idx: dict[str, int] = {}
+    for team in np.unique(teams[pitcher_mask]):
+        tm_mask = pitcher_mask & (teams == team)
+        grp = pool_df[tm_mask]
+        if has_slot and grp["lineup_slot"].notna().any():
+            best = int(grp.dropna(subset=["lineup_slot"])["lineup_slot"].idxmin())
+        else:
+            best = int(grp["mean"].idxmax())
+        starter_idx[team] = best
+
+    if not starter_idx:
+        return base
+
+    starter_own = {team: float(base[idx]) for team, idx in starter_idx.items()}
+    mean_starter_own = float(np.mean(list(starter_own.values())))
+    if mean_starter_own <= 0:
+        return base
+
+    df = pool_df.copy().reset_index(drop=True)
+    batter_mask = positions != "P"
+
+    for i in np.where(batter_mask)[0]:
+        opp_team = opponents[i]
+        opp_starter_own = starter_own.get(opp_team)
+        if opp_starter_own is None:
+            continue
+        ratio = opp_starter_own / mean_starter_own
+        df.at[i, "mean"] *= ratio ** (-pitopp_exp)
+
+    df["salary_value"] = df["mean"] / df["salary"] * 1000
+
+    return compute_heuristic_ownership(df, team_totals)
 
 
 def fit_historical_tier_spend(training_dirs: list[Path]) -> dict[str, float]:

@@ -153,6 +153,12 @@ _PITCHER_MEAN_FRAC = 0.98
 # (hr_prob / mean_hr_prob) ** _HR_PROB_EXP on _raw ≡ ratio ** (2·exp) on mean.
 _HR_PROB_EXP = 0.11
 
+# Pitcher-opposition batter discount (salary-gated).
+# Batters at or above median salary facing above-average starters are scaled by
+# (starter_own / mean_starter_own)^(-_PITOPP_SAL_EXP).  Calibrated from V_sal_005
+# eval over 20 slates; revisit if slate-size distribution changes significantly.
+_PITOPP_SAL_EXP = 0.05
+
 
 def compute_heuristic_ownership(
     players_df: pd.DataFrame,
@@ -465,5 +471,50 @@ def compute_heuristic_ownership(
                 if under_sum > 0:
                     vals[under] += excess * vals[under] / under_sum
         result[pmask] = vals
+
+    # --- Pitcher-opposition batter discount (salary-gated) --------------------
+    # DFS players who roster a pitcher implicitly fade that pitcher's opponents.
+    # Only applied to batters at or above the median batter salary — cheap batters
+    # are low-owned for price/projection reasons unrelated to pitcher matchups.
+    if "opponent" in df.columns and _PITOPP_SAL_EXP > 0:
+        # Identify each team's starting pitcher (lowest slot if known, else highest mean).
+        starter_idx: dict[str, int] = {}
+        for team in df.loc[pitcher_mask, "team"].unique():
+            tm = pitcher_mask & (df["team"] == team)
+            grp = df[tm]
+            if slot_col and grp[slot_col].notna().any():
+                best = int(grp.dropna(subset=[slot_col])[slot_col].idxmin())
+            else:
+                best = int(grp["mean"].idxmax())
+            starter_idx[team] = best
+
+        if starter_idx:
+            starter_own = {team: float(result[idx]) for team, idx in starter_idx.items()}
+            mean_starter_own = float(np.mean(list(starter_own.values())))
+
+            if mean_starter_own > 0:
+                salaries_arr = df["salary"].values.astype(float)
+                opponents_arr = df["opponent"].values
+                sal_median = float(np.median(salaries_arr[batter_mask]))
+
+                for pos, n_slots in _SLOT_COUNTS.items():
+                    if pos == "P":
+                        continue
+                    pmask = pos_vals == pos
+                    if not pmask.any():
+                        continue
+                    orig_sum = float(result[pmask].sum())
+
+                    for i in np.where(pmask)[0]:
+                        if salaries_arr[i] < sal_median:
+                            continue
+                        opp_own = starter_own.get(opponents_arr[i])
+                        if opp_own is None:
+                            continue
+                        result[i] *= (opp_own / mean_starter_own) ** (-_PITOPP_SAL_EXP)
+
+                    new_sum = float(result[pmask].sum())
+                    if new_sum > 0:
+                        result[pmask] *= orig_sum / new_sum
 
     return result
