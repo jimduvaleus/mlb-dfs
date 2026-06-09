@@ -38,7 +38,7 @@ function scopeLabel(scope: ExclusionScope): string {
 }
 
 
-export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification, onDismissTwitterLineup }: Props) {
+export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilterChange, platform = 'draftkings', notifications = [], onDismissNotification, twitterLineups = [], onParseNotification }: Props) {
   const [slate, setSlate] = useState<SlateGamesResponse | null>(null)
   const [players, setPlayers] = useState<SlatePlayersResponse | null>(null)
   const [saving, setSaving] = useState(false)
@@ -591,87 +591,62 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         </div>
       </div>
 
-      {(notifications.length > 0 || twitterLineups.length > 0) && (
-        <div className="twitter-columns">
-          {notifications.length > 0 && (
-            <div className="twitter-notifications">
-              <div className="twitter-notifications-header">
-                <h3 className="slate-title">X Notifications</h3>
-                <span className="slate-summary">{notifications.length} unread</span>
-              </div>
-              <div className="twitter-notifications-list">
-                {notifications.map(n => (
-                  <div key={n.id} className="twitter-notif-item">
-                    <div className="twitter-notif-body">
-                      <div className="twitter-notif-header">
-                        <span className="twitter-notif-summary">{n.summary}</span>
-                        <span className="twitter-notif-time">{new Date(n.captured_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                      </div>
-                      {n.body && <span className="twitter-notif-text">{n.body}</span>}
-                    </div>
-                    <div className="twitter-notif-actions">
-                      {n.could_be_lineup && (!n.lineup_team || slateTeams.has(n.lineup_team)) && (
-                        <button
-                          className="twitter-notif-parse"
-                          onClick={() => onParseNotification?.(n)}
-                          title="Parse lineup from this notification"
-                        >
-                          Parse
-                        </button>
-                      )}
-                      <button
-                        className="twitter-notif-dismiss"
-                        onClick={() => onDismissNotification?.(n.id)}
-                        title="Dismiss"
-                        aria-label="Dismiss notification"
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {twitterLineups.length > 0 && (
-            <div className="twitter-confirmed-lineups">
-              <div className="twitter-notifications-header">
-                <h3 className="slate-title">Confirmed Lineups</h3>
-                <span className="slate-summary">{twitterLineups.length} team{twitterLineups.length !== 1 ? 's' : ''}</span>
-              </div>
-              <div className="twitter-confirmed-list">
-                {twitterLineups.map(tl => (
-                  <div key={tl.team} className="twitter-confirmed-item">
-                    <div className="twitter-confirmed-header">
-                      <span className="twitter-confirmed-team">{tl.team}</span>
-                      <span className="twitter-confirmed-time">
-                        {new Date(tl.confirmed_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </span>
-                      <button
-                        className="twitter-notif-dismiss"
-                        onClick={() => onDismissTwitterLineup?.(tl.team)}
-                        title={`Remove confirmed lineup for ${tl.team}`}
-                        aria-label={`Dismiss ${tl.team} lineup`}
-                      >
-                        ✕
-                      </button>
-                    </div>
-                    <div className="twitter-confirmed-slots">
-                      {tl.slots.map(s => (
-                        <span key={s.slot} className="twitter-confirmed-slot">
-                          <span className="batting-slot-bubble batting-slot-bubble--confirmed">{s.slot}</span>
-                          {s.name}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+      {/* Compact locked-lineup summary — no dismiss button; manage locks via Projections tab */}
+      {twitterLineups.length > 0 && (
+        <div className="locked-lineups-summary">
+          <span className="locked-lineups-label">🔒 {twitterLineups.length} locked lineup{twitterLineups.length !== 1 ? 's' : ''}:</span>
+          {twitterLineups.map(tl => (
+            <span key={tl.team} className="locked-lineup-chip">{tl.team}</span>
+          ))}
         </div>
       )}
+
+      {/* Only show notifications that haven't already been auto-confirmed */}
+      {(() => {
+        const confirmedTeams = new Set(twitterLineups.map(tl => tl.team))
+        const pending = notifications.filter(n => !n.lineup_team || !confirmedTeams.has(n.lineup_team))
+        if (pending.length === 0) return null
+        return (
+          <div className="twitter-notifications">
+            <div className="twitter-notifications-header">
+              <h3 className="slate-title">X Notifications</h3>
+              <span className="slate-summary">{pending.length} unread</span>
+            </div>
+            <div className="twitter-notifications-list">
+              {pending.map(n => (
+                <div key={n.id} className="twitter-notif-item">
+                  <div className="twitter-notif-body">
+                    <div className="twitter-notif-header">
+                      <span className="twitter-notif-summary">{n.summary}</span>
+                      <span className="twitter-notif-time">{new Date(n.captured_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                    </div>
+                    {n.body && <span className="twitter-notif-text">{n.body}</span>}
+                  </div>
+                  <div className="twitter-notif-actions">
+                    {n.could_be_lineup && (!n.lineup_team || slateTeams.has(n.lineup_team)) && (
+                      <button
+                        className="twitter-notif-parse"
+                        onClick={() => onParseNotification?.(n)}
+                        title="Parse lineup from this notification"
+                      >
+                        Parse
+                      </button>
+                    )}
+                    <button
+                      className="twitter-notif-dismiss"
+                      onClick={() => onDismissNotification?.(n.id)}
+                      title="Dismiss"
+                      aria-label="Dismiss notification"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      })()}
     </div>
   )
 }

@@ -1694,6 +1694,95 @@ button { cursor: pointer; }
   box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.2);
 }
 
+/* Lineup lock controls (padlock + refresh) */
+.lineup-lock-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.btn-lock {
+  background: none;
+  border: none;
+  padding: 2px 4px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0.9;
+  border-radius: 4px;
+  transition: opacity 0.15s, background 0.15s;
+}
+.btn-lock:hover:not(:disabled) {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.08);
+}
+.btn-lock:disabled {
+  cursor: default;
+  opacity: 0.35;
+}
+.btn-lock--locked {
+  color: #f6ad55;
+}
+.btn-lock--unlocked {
+  color: #718096;
+}
+
+.btn-lineup-refresh {
+  background: none;
+  border: none;
+  padding: 2px 5px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  color: #63b3ed;
+  border-radius: 4px;
+  opacity: 0.85;
+  transition: opacity 0.15s, background 0.15s;
+}
+.btn-lineup-refresh:hover:not(:disabled) {
+  opacity: 1;
+  background: rgba(99, 179, 237, 0.12);
+}
+.btn-lineup-refresh--disabled,
+.btn-lineup-refresh:disabled {
+  color: #4a5568;
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+/* Locked lineup card accent */
+.lineup-card--locked {
+  border-color: #c6a832;
+}
+.lineup-card--locked .lineup-card-header {
+  background: rgba(198, 168, 50, 0.07);
+}
+
+/* Placeholder row for lineup members not in the DK salary file */
+.lineup-player--placeholder {
+  background: rgba(113, 128, 150, 0.08);
+  border-radius: 4px;
+  opacity: 0.75;
+}
+.lineup-player--placeholder .lineup-player-name {
+  color: #a0aec0;
+  font-style: italic;
+}
+.lineup-player--placeholder .lineup-player-sal--placeholder {
+  color: #4a5568;
+}
+.lineup-player-not-in-slate {
+  font-size: 10px;
+  color: #718096;
+  font-style: italic;
+  margin-left: 4px;
+  white-space: nowrap;
+}
+
+.lineup-player-no-proj {
+  color: #b7791f;  /* amber — in slate but missing projection */
+}
+
 .game-card--both {
   opacity: 0.45;
   border-style: dashed;
@@ -2390,6 +2479,34 @@ button { cursor: pointer; }
   gap: 4px;
   font-size: 0.78rem;
   color: #a0aec0;
+}
+
+.locked-lineups-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-top: 12px;
+  background: #1a202c;
+  border-radius: 6px;
+  border: 1px solid #2d3748;
+}
+
+.locked-lineups-label {
+  font-size: 0.78rem;
+  color: #a0aec0;
+  white-space: nowrap;
+}
+
+.locked-lineup-chip {
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 4px;
+  background: #2d3748;
+  color: #e2e8f0;
+  letter-spacing: 0.03em;
 }
 
 /* ── Lineup Parser Dialog ── */

@@ -44,7 +44,7 @@ _PITCHER_POSITIONS = {"SP", "RP", "P"}
 _BATTER_POSITIONS = {"DH", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "C"}
 
 _SLOT_LINE_RE = re.compile(
-    r"^([A-Z]\.\s+\S+(?:\s+\S+)*?)\s+(DH|1B|2B|3B|SS|LF|CF|RF|C|SP|RP|P)\s*$"
+    r"^((?:[A-Z]\.\s+)?\S+(?:\s+\S+)*?)\s+(DH|1B|2B|3B|SS|LF|CF|RF|C|SP|RP|P)\s*$"
 )
 _NOTIF_META_RE = re.compile(r"^(@\w+|·|\d+[mhd]|Underdog\s+MLB)$", re.IGNORECASE)
 
@@ -70,11 +70,12 @@ def extract_lineup_team(body: str) -> Optional[str]:
     return None
 
 
-def parse_notification_body(body: str) -> tuple[Optional[str], list[dict]]:
-    """Parse an Underdog MLB notification body into (team_abbrev, slots).
+def parse_notification_body(body: str) -> tuple[Optional[str], list[dict], bool]:
+    """Parse an Underdog MLB notification body into (team_abbrev, slots, is_updated).
 
-    Returns (None, []) if the team name cannot be resolved.
+    Returns (None, [], False) if the team name cannot be resolved.
     slots is a list of {"slot": int, "name": str, "position": str} for the 9 batters.
+    is_updated is True when the team header line started with "Updated".
 
     Handles notification bodies that may contain Twitter metadata before the
     actual lineup content (e.g. account name, handle, timestamp lines).
@@ -83,16 +84,20 @@ def parse_notification_body(body: str) -> tuple[Optional[str], list[dict]]:
     lines = [ln for ln in lines if ln]
 
     if not lines:
-        return None, []
+        return None, [], False
 
     # Scan all lines for the team header line — it matches "Updated? TeamName Date"
     # Skip lines that look like Twitter metadata (@handle, ·, time stamps, "Underdog MLB" account name)
     team_abbrev: Optional[str] = None
     header_idx: int = -1
+    is_updated: bool = False
 
     for i, line in enumerate(lines):
         if _NOTIF_META_RE.match(line):
             continue
+        # Detect "Updated" prefix before stripping
+        if re.match(r"^Updated\s+", line, flags=re.IGNORECASE):
+            is_updated = True
         # Strip "Updated " prefix, then trailing date
         candidate = re.sub(r"^Updated\s+", "", line, flags=re.IGNORECASE).strip()
         candidate = re.sub(r"\s+\d+/\d+(?:/\d+)?\s*$", "", candidate).strip().lower()
@@ -102,7 +107,7 @@ def parse_notification_body(body: str) -> tuple[Optional[str], list[dict]]:
             break
 
     if team_abbrev is None or header_idx == -1:
-        return None, []
+        return None, [], False
 
     slots: list[dict] = []
     for line in lines[header_idx + 1:]:
@@ -117,50 +122,67 @@ def parse_notification_body(body: str) -> tuple[Optional[str], list[dict]]:
             break
         slots.append({"slot": slot_num, "name": name_part, "position": pos})
 
-    return team_abbrev, slots
+    return team_abbrev, slots, is_updated
+
+
+def _strip_accents(s: str) -> str:
+    """Decompose accented characters and drop the combining marks."""
+    import unicodedata
+    return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode("ascii")
 
 
 def match_player_name(abbreviated: str, candidates: list[dict]) -> list[dict]:
-    """Match an abbreviated player name like 'F. Freeman' against a candidate pool.
+    """Match an abbreviated player name like 'F. Freeman' or bare 'Freeman' against a candidate pool.
 
     Each candidate dict must have at least: player_id, name, team, position, salary.
     Returns a list of matching candidates (with match_confidence added), ordered best-first.
     """
-    # Parse abbreviated: expect "X. LastName" or "X. First Last"
-    m = re.match(r"^([A-Z])\.\s+(.+)$", abbreviated.strip())
-    if not m:
+    abbreviated = abbreviated.strip()
+    m = re.match(r"^([A-Z])\.\s+(.+)$", abbreviated)
+    if m:
+        initial: Optional[str] = m.group(1).upper()
+        tokens = m.group(2).strip().split()
+    else:
+        # Last-name-only format: "Schmitt", "De La Cruz", etc.
+        initial = None
+        tokens = abbreviated.split()
+
+    if not tokens:
         return []
 
-    initial = m.group(1).upper()
-    # The last token of the abbreviated name is taken as the last name hint
-    tokens = m.group(2).strip().split()
-    last_hint = tokens[-1].lower()
+    # Normalize accents so e.g. "Narváez" == "Narvaez"
+    last_hint_norm = _strip_accents(tokens[-1]).lower()
 
     results: list[dict] = []
 
-    # First pass: exact last-name match
+    # First pass: exact last-name match (accent-normalized, case-insensitive)
     for c in candidates:
         name_tokens = c["name"].split()
-        c_last = name_tokens[-1].lower()
-        if c_last == last_hint:
+        c_last_norm = _strip_accents(name_tokens[-1]).lower()
+        if c_last_norm == last_hint_norm:
             c_first_initial = name_tokens[0][0].upper() if name_tokens else ""
-            confidence = "exact" if c_first_initial == initial else "fuzzy"
+            if initial is None:
+                confidence = "exact"  # no initial provided — last name match is best we can do
+            else:
+                confidence = "exact" if c_first_initial == initial else "fuzzy"
             results.append({**c, "match_confidence": confidence})
 
-    # Sort exact before fuzzy within last-name matches
     results.sort(key=lambda x: 0 if x["match_confidence"] == "exact" else 1)
     if results:
         return results
 
-    # Second pass: difflib fuzzy match on full last name
-    def _abbrev(name: str) -> str:
-        parts = name.split()
-        return f"{parts[0][0]}. {' '.join(parts[1:])}" if len(parts) > 1 else name
-
+    # Second pass: difflib fuzzy on last name only.
+    # When an initial is known, enforce it — eliminates cross-initial false positives.
     scored: list[tuple[float, dict]] = []
     for c in candidates:
-        ratio = difflib.SequenceMatcher(None, abbreviated.lower(), _abbrev(c["name"]).lower()).ratio()
-        if ratio >= 0.6:
+        name_tokens = c["name"].split()
+        if not name_tokens:
+            continue
+        if initial is not None and name_tokens[0][0].upper() != initial:
+            continue
+        c_last_norm = _strip_accents(name_tokens[-1]).lower()
+        ratio = difflib.SequenceMatcher(None, last_hint_norm, c_last_norm).ratio()
+        if ratio >= 0.72:
             scored.append((ratio, c))
 
     scored.sort(key=lambda x: -x[0])
@@ -202,19 +224,34 @@ def save_twitter_lineups(lineups: list[dict], slate_fingerprint: str = "") -> No
     _DATA_PATH.write_text(json.dumps({"slate_fingerprint": slate_fingerprint, "lineups": lineups}, indent=2))
 
 
-def upsert_twitter_lineup(team: str, notification_id: str, slots: list[dict], slate_fingerprint: str = "") -> dict:
-    """Save or replace the confirmed lineup for a team."""
+def upsert_twitter_lineup(team: str, notification_id: str, slots: list[dict], slate_fingerprint: str = "", locked: bool = True) -> dict:
+    """Save or replace the confirmed lineup for a team. Defaults to locked=True."""
     lineups = load_twitter_lineups(slate_fingerprint)
     lineups = [l for l in lineups if l.get("team") != team]
     record = {
         "team": team,
         "notification_id": notification_id,
         "confirmed_at": time.time(),
+        "locked": locked,
         "slots": slots,
     }
     lineups.append(record)
     save_twitter_lineups(lineups, slate_fingerprint)
     return record
+
+
+def set_twitter_lineup_locked(team: str, locked: bool, slate_fingerprint: str = "") -> bool:
+    """Set the locked state on a team's lineup record. Returns True if found."""
+    lineups = load_twitter_lineups(slate_fingerprint)
+    found = False
+    for lineup in lineups:
+        if lineup.get("team") == team:
+            lineup["locked"] = locked
+            found = True
+            break
+    if found:
+        save_twitter_lineups(lineups, slate_fingerprint)
+    return found
 
 
 def delete_twitter_lineup(team: str, slate_fingerprint: str = "") -> bool:
@@ -239,13 +276,15 @@ def get_twitter_overrides(slate_fingerprint: str = "") -> dict[int, dict]:
 
 
 def get_confirmed_team_lineups(slate_fingerprint: str = "") -> dict[str, dict[int, int]]:
-    """Return {team: {player_id: slot}} for all teams with a confirmed Twitter lineup.
+    """Return {team: {player_id: slot}} for all LOCKED teams with a confirmed Twitter lineup.
 
-    Used to determine which batters are authoritative starters (in the map) and
-    which are scratched (in the team but not in the map).
+    Only locked lineups act as canonical batting orders for the pipeline.
+    Placeholder slots (player_id=None) are skipped — they have no player to constrain.
     """
     result: dict[str, dict[int, int]] = {}
     for lineup in load_twitter_lineups(slate_fingerprint):
+        if not lineup.get("locked", True):  # old records without the key default to locked
+            continue
         team = lineup.get("team")
         if not team:
             continue

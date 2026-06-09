@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
 import type { AppConfig, CacheStatus, LineupResult, MergeInfo, PortfolioSweepEntry, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
-import { dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchOptimalLineups, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, parseTwitterLineup, replaceLineup, saveTwitterLineup, stopRun, writeUploadFiles } from './api'
+import { dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchOptimalLineups, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, lockLineup, parseTwitterLineup, refreshLineup, replaceLineup, saveTwitterLineup, stopRun, unlockLineup, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -92,6 +92,10 @@ export default function App() {
   // Stored per-platform in localStorage; restored once config/platform is known.
   const [projFetchExcluded, setProjFetchExcluded] = useState<string[]>([])
   const projFetchPlatformRef = useRef<string>('')
+  // Track notification IDs already attempted for auto-parse to avoid repeated attempts
+  const seenNotifIdsRef = useRef<Set<string>>(new Set())
+  // Mirror of state.twitterLineups accessible from async callbacks without stale closures
+  const twitterLineupsRef = useRef<TwitterLineupRecord[]>([])
   const [projFetching, setProjFetching] = useState(false)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
@@ -129,6 +133,40 @@ export default function App() {
     fetchTwitterLineups()
       .then(lineups => dispatch({ type: 'set_twitter_lineups', lineups }))
       .catch(() => {})
+  }
+
+  // Keep twitterLineupsRef in sync so async callbacks can read current state without closures
+  useEffect(() => {
+    twitterLineupsRef.current = state.twitterLineups
+  }, [state.twitterLineups])
+
+  // Determine whether a parse result qualifies for silent auto-confirmation
+  function canAutoConfirm(result: TwitterLineupParseResponse): boolean {
+    if (!result.team || !result.team_in_slate) return false
+    // Every slot must have 0 or 1 match (2+ = ambiguous → show in panel)
+    if (result.slots.some(s => s.matches.length > 1)) return false
+    // Locked teams can only be overwritten by an "Updated" notification
+    const existingRecord = twitterLineupsRef.current.find(l => l.team === result.team)
+    if (existingRecord?.locked && !result.is_updated) return false
+    return true
+  }
+
+  // Attempt to auto-parse a notification silently. Dismisses it if successful.
+  async function autoParseNotification(notif: TwitterNotification): Promise<boolean> {
+    try {
+      const result = await parseTwitterLineup(notif.id, notif.body)
+      if (!canAutoConfirm(result)) return false
+      const slots = result.slots.map(s => ({
+        slot: s.slot,
+        player_id: s.matches.length === 1 ? s.matches[0].player_id : null,
+        name: s.matches.length === 1 ? s.matches[0].name : s.raw_name,
+      }))
+      await saveTwitterLineup({ team: result.team!, notification_id: notif.id, slots, locked: true })
+      await dismissNotification(notif.id)
+      return true
+    } catch {
+      return false
+    }
   }
 
   // Load config, existing portfolio, sweep portfolios, and unconfirmed player IDs on mount
@@ -214,17 +252,34 @@ export default function App() {
     document.title = count > 0 ? `MLB Portfolio Tool (${count})` : 'MLB Portfolio Tool'
   }, [state.notifications.length])
 
-  // Poll for X/Twitter notifications every 5 seconds
+  // Poll for X/Twitter notifications every 5 seconds.
+  // For each unambiguous lineup notification, attempt silent auto-parse before showing in panel.
   useEffect(() => {
-    const poll = () => {
-      fetchNotifications()
-        .then(notifications => dispatch({ type: 'set_notifications', notifications }))
-        .catch(() => {})
+    const poll = async () => {
+      const notifications = await fetchNotifications().catch(() => [] as typeof state.notifications)
+      let didAutoConfirm = false
+      for (const notif of notifications) {
+        if (notif.could_be_lineup && !seenNotifIdsRef.current.has(notif.id)) {
+          seenNotifIdsRef.current.add(notif.id)
+          const confirmed = await autoParseNotification(notif)
+          if (confirmed) didAutoConfirm = true
+        }
+      }
+      if (didAutoConfirm) {
+        refreshTwitterLineups()
+        refreshUnconfirmed()
+        refreshProjectionPlayers()
+        // Re-fetch to get the updated (dismissed) list
+        const updated = await fetchNotifications().catch(() => notifications)
+        dispatch({ type: 'set_notifications', notifications: updated })
+      } else {
+        dispatch({ type: 'set_notifications', notifications })
+      }
     }
     poll()
     const id = setInterval(poll, 5000)
     return () => clearInterval(id)
-  }, [])
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // React to SSE events
   useEffect(() => {
@@ -341,6 +396,27 @@ export default function App() {
     refreshUnconfirmed()
     refreshProjectionPlayers()
     setProjStatusTrigger(t => t + 1)
+  }
+
+  const handleLockToggle = async (team: string, locked: boolean) => {
+    try {
+      if (locked) {
+        await lockLineup(team)
+      } else {
+        await unlockLineup(team)
+      }
+      refreshTwitterLineups()
+    } catch {}
+  }
+
+  const handleRefresh = async (team: string) => {
+    try {
+      await refreshLineup(team)
+      refreshTwitterLineups()
+      refreshUnconfirmed()
+      refreshProjectionPlayers()
+      setProjStatusTrigger(t => t + 1)
+    } catch {}
   }
 
   const handleWriteUpload = () => {
@@ -499,7 +575,15 @@ export default function App() {
         </div>
 
         {state.activeTab === 'projections' && (
-          <ProjectionsTable players={projectionPlayers} platform={state.config?.platform} teamTotals={teamTotals} onOwnershipSettingsChanged={refreshProjectionPlayers} />
+          <ProjectionsTable
+            players={projectionPlayers}
+            platform={state.config?.platform}
+            teamTotals={teamTotals}
+            onOwnershipSettingsChanged={refreshProjectionPlayers}
+            twitterLineups={state.twitterLineups}
+            onLockToggle={handleLockToggle}
+            onRefresh={handleRefresh}
+          />
         )}
 
         {state.activeTab === 'slate' && (

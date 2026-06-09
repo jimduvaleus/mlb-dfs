@@ -536,11 +536,12 @@ export interface TwitterLineupParseResponse {
   slots: ParsedSlot[]
   team_in_slate: boolean
   warning: string | null
+  is_updated: boolean
 }
 
 export interface TwitterLineupSlot {
   slot: number
-  player_id: number
+  player_id: number | null  // null for players not in the slate CSV (placeholders)
   name: string
 }
 
@@ -549,12 +550,14 @@ export interface TwitterLineupRecord {
   notification_id: string
   confirmed_at: number
   slots: TwitterLineupSlot[]
+  locked: boolean
 }
 
 export interface TwitterLineupSaveRequest {
   team: string
   notification_id: string
   slots: TwitterLineupSlot[]
+  locked: boolean
 }
 
 export interface ContestAnalysisResponse {

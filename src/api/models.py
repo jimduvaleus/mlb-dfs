@@ -227,11 +227,12 @@ class TwitterLineupParseResponse(BaseModel):
     slots: list[ParsedSlot]
     team_in_slate: bool
     warning: Optional[str] = None
+    is_updated: bool = False
 
 
 class TwitterLineupSlot(BaseModel):
     slot: int
-    player_id: int
+    player_id: Optional[int]  # None for players not in the slate CSV (placeholders)
     name: str
 
 
@@ -240,9 +241,11 @@ class TwitterLineupRecord(BaseModel):
     notification_id: str
     confirmed_at: float
     slots: list[TwitterLineupSlot]
+    locked: bool = True  # old records without the key are treated as locked
 
 
 class TwitterLineupSaveRequest(BaseModel):
     team: str
     notification_id: str
     slots: list[TwitterLineupSlot]
+    locked: bool = True  # old clients that omit the field get locked=True

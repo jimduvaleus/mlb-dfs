@@ -36,6 +36,7 @@ from .twitter_lineups import (
     looks_like_lineup,
     match_player_name,
     parse_notification_body,
+    set_twitter_lineup_locked,
     upsert_twitter_lineup,
 )
 from .projections_meta import (
@@ -78,6 +79,30 @@ _stop_event = threading.Event()
 
 _notifications: deque = deque(maxlen=25)
 _notifications_lock = threading.Lock()
+_NOTIFICATIONS_PATH = PROJECT_ROOT / "data" / "notifications.json"
+
+
+def _save_notifications() -> None:
+    """Persist current notifications to disk. Must be called while holding _notifications_lock."""
+    try:
+        _NOTIFICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _NOTIFICATIONS_PATH.write_text(json.dumps(list(_notifications), indent=2))
+    except Exception:
+        pass
+
+
+def _load_notifications() -> None:
+    """Load persisted notifications into the deque on startup."""
+    try:
+        raw = json.loads(_NOTIFICATIONS_PATH.read_text())
+        if isinstance(raw, list):
+            with _notifications_lock:
+                _notifications.clear()
+                for n in raw:
+                    _notifications.append(n)
+    except Exception:
+        pass
+
 
 _CHROME_APPS = {'chrome', 'chromium', 'google-chrome', 'chromium-browser', 'Google Chrome'}
 _TWITTER_RE = re.compile(
@@ -103,6 +128,7 @@ def _maybe_commit_notification(str_args: list[str]) -> None:
         }
         with _notifications_lock:
             _notifications.append(notif)
+            _save_notifications()
 
 
 def _dbus_monitor_loop() -> None:
@@ -287,6 +313,7 @@ def _load_persisted_optimal_lineups() -> None:
 
 @app.on_event("startup")
 def _start_dbus_monitor() -> None:
+    _load_notifications()
     threading.Thread(target=_dbus_monitor_loop, daemon=True).start()
 
 
@@ -331,6 +358,8 @@ def delete_notification(notification_id: str):
         keep = [n for n in _notifications if n['id'] != notification_id]
         _notifications.clear()
         _notifications.extend(keep)
+        if len(keep) < before:
+            _save_notifications()
     if len(keep) == before:
         raise HTTPException(404, detail="Not found")
     return {"ok": True}
@@ -347,7 +376,7 @@ def _slate_fingerprint() -> str:
 
 @app.post("/api/twitter-lineups/parse")
 def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseResponse:
-    team, raw_slots = parse_notification_body(req.body)
+    team, raw_slots, is_updated = parse_notification_body(req.body)
     if team is None:
         return TwitterLineupParseResponse(
             team=None,
@@ -355,6 +384,7 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
             slots=[],
             team_in_slate=False,
             warning="Team name not recognized",
+            is_updated=False,
         )
 
     # Load all slate hitters for that team (include excluded players — exclusion ≠ slot confirmation)
@@ -408,6 +438,7 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
         slots=parsed_slots,
         team_in_slate=team_in_slate,
         warning=warning,
+        is_updated=is_updated,
     )
 
 
@@ -419,7 +450,7 @@ def get_twitter_lineups() -> list[TwitterLineupRecord]:
 @app.post("/api/twitter-lineups")
 def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
     slots = [s.model_dump() for s in req.slots]
-    record = upsert_twitter_lineup(req.team, req.notification_id, slots, _slate_fingerprint())
+    record = upsert_twitter_lineup(req.team, req.notification_id, slots, _slate_fingerprint(), locked=req.locked)
     return TwitterLineupRecord(**record)
 
 
@@ -432,6 +463,134 @@ def remove_twitter_lineup(team: str):
         raise HTTPException(404, detail="No confirmed lineup for that team")
     delete_twitter_lineup(team, fp)
     return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Lineup lock / refresh endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/lineups/{team}/lock")
+def lock_lineup(team: str):
+    found = set_twitter_lineup_locked(team, True, _slate_fingerprint())
+    if not found:
+        raise HTTPException(404, detail=f"No confirmed lineup for {team}")
+    return {"ok": True, "team": team, "locked": True}
+
+
+@app.delete("/api/lineups/{team}/lock")
+def unlock_lineup(team: str):
+    found = set_twitter_lineup_locked(team, False, _slate_fingerprint())
+    if not found:
+        raise HTTPException(404, detail=f"No confirmed lineup for {team}")
+    return {"ok": True, "team": team, "locked": False}
+
+
+@app.post("/api/lineups/{team}/refresh")
+async def refresh_lineup(team: str):
+    """Fetch a fresh confirmed lineup for an unlocked team from RotoWire (DFF fallback)."""
+    import asyncio
+    import tempfile
+    import os
+    import pandas as pd
+
+    fp = _slate_fingerprint()
+    lineups = load_twitter_lineups(fp)
+    record = next((l for l in lineups if l.get("team") == team), None)
+    if record is not None and record.get("locked", False):
+        raise HTTPException(409, detail=f"{team} lineup is locked — unlock before refreshing")
+
+    cfg = read_config()
+    platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+    python = PROJECT_ROOT / "venv" / "bin" / "python"
+    rw_script = PROJECT_ROOT / "scripts" / "fetch_rotowire_projections.py"
+
+    platform_args: list[str] = ["--platform", platform_val]
+    slate_path = _get_slate_file_path()
+    if slate_path:
+        if platform_val == "fanduel":
+            platform_args += ["--fd-slate", str(slate_path)]
+        else:
+            platform_args += ["--dk-slate", str(slate_path)]
+
+    async def _run_fetch(script: Path, extra_args: list[str]) -> str | None:
+        """Run a fetch script with --team and --output to a temp file. Returns temp path or None."""
+        fd, tmp_path = tempfile.mkstemp(suffix=".csv")
+        os.close(fd)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                str(python), str(script),
+                *platform_args,
+                "--team", team,
+                "--output", tmp_path,
+                *extra_args,
+                cwd=str(PROJECT_ROOT),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=90)
+            return tmp_path
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            return None
+
+    def _extract_confirmed_slots(tmp_path: str) -> list[dict] | None:
+        """Read temp CSV and return confirmed batter slots for the team, or None if none found."""
+        try:
+            df = pd.read_csv(tmp_path)
+        except Exception:
+            return None
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+        if df.empty or "lineup_slot" not in df.columns or "slot_confirmed" not in df.columns:
+            return None
+        confirmed = df[
+            df["slot_confirmed"].astype(str).str.lower().isin(["true", "1"]) &
+            df["lineup_slot"].notna() &
+            (df["lineup_slot"].astype(float) >= 1) &
+            (df["lineup_slot"].astype(float) <= 9)
+        ]
+        if confirmed.empty:
+            return None
+        slots: list[dict] = []
+        for _, row in confirmed.iterrows():
+            pid = int(row["player_id"]) if "player_id" in row and not pd.isna(row["player_id"]) else None
+            slots.append({
+                "slot": int(float(row["lineup_slot"])),
+                "player_id": pid,
+                "name": str(row.get("name", "")),
+            })
+        slots.sort(key=lambda s: s["slot"])
+        return slots if slots else None
+
+    # Try RotoWire first
+    tmp = await _run_fetch(rw_script, [])
+    confirmed_slots = _extract_confirmed_slots(tmp) if tmp else None
+
+    # DFF fallback
+    if confirmed_slots is None:
+        dff_script = PROJECT_ROOT / "scripts" / "fetch_dff_projections.py"
+        if dff_script.exists():
+            tmp = await _run_fetch(dff_script, [])
+            confirmed_slots = _extract_confirmed_slots(tmp) if tmp else None
+
+    if not confirmed_slots:
+        raise HTTPException(422, detail=f"No confirmed lineup data found for {team} in RotoWire or DFF")
+
+    new_record = upsert_twitter_lineup(
+        team=team,
+        notification_id="rotowire-refresh",
+        slots=confirmed_slots,
+        slate_fingerprint=fp,
+        locked=True,
+    )
+    _bake_twitter_lineup_to_projections(new_record)
+    return TwitterLineupRecord(**new_record)
 
 
 def _bake_twitter_lineup_to_projections(lineup: dict) -> None:

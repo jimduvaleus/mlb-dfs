@@ -48,3 +48,4 @@ data/processed/market_odds_fair_odds.json
 data/processed/projections_merge_info.json
 data/processed/contest_stats.json
 data/lineup_cache/
+data/notifications.json

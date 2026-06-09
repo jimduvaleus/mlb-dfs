@@ -194,6 +194,23 @@ export async function dismissTwitterLineup(team: string): Promise<void> {
   await fetch(`/api/twitter-lineups/${encodeURIComponent(team)}`, { method: 'DELETE' })
 }
 
+export async function lockLineup(team: string): Promise<void> {
+  await fetch(`/api/lineups/${encodeURIComponent(team)}/lock`, { method: 'POST' })
+}
+
+export async function unlockLineup(team: string): Promise<void> {
+  await fetch(`/api/lineups/${encodeURIComponent(team)}/lock`, { method: 'DELETE' })
+}
+
+export async function refreshLineup(team: string): Promise<TwitterLineupRecord> {
+  const res = await fetch(`/api/lineups/${encodeURIComponent(team)}/refresh`, { method: 'POST' })
+  if (!res.ok) {
+    const detail = await res.text()
+    throw new Error(`Refresh failed: ${detail}`)
+  }
+  return res.json()
+}
+
 export async function fetchTeamOwnershipReductions(): Promise<TeamOwnershipReductionsResponse> {
   const res = await fetch('/api/slate/ownership-reductions')
   if (!res.ok) return { slate_id: '', team_ownership_reductions: {} }

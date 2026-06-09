@@ -24,16 +24,17 @@ export function LineupParserDialog({ parseResult, onConfirm, onCancel }: Props) 
   const canConfirm = resolvedCount > 0
 
   const handleConfirm = async () => {
-    // Only include slots that were successfully matched
-    const slots: TwitterLineupSlot[] = parseResult.slots
-      .flatMap((s, i) => selections[i] !== null
-        ? [{ slot: s.slot, player_id: selections[i]!, name: s.raw_name }]
-        : []
-      )
+    // Save all slots; unmatched ones get player_id=null so they render as placeholders
+    const slots: TwitterLineupSlot[] = parseResult.slots.map((s, i) => {
+      const pid = selections[i] ?? null
+      const fullName = pid !== null ? (s.matches.find(m => m.player_id === pid)?.name ?? s.raw_name) : s.raw_name
+      return { slot: s.slot, player_id: pid, name: fullName }
+    })
     const req: TwitterLineupSaveRequest = {
       team: parseResult.team!,
       notification_id: parseResult.notification_id,
       slots,
+      locked: true,
     }
     setSaving(true)
     setError(null)
