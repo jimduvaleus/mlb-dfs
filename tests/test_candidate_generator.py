@@ -319,6 +319,8 @@ def test_salary_floor_enforced_when_full_stack_leaves_no_fill():
     )
     ow = compute_heuristic_ownership(df)
     pid_to_salary = dict(zip(df["player_id"], df["salary"]))
+    pid_team = dict(zip(df["player_id"], df["team"]))
+    pid_pos = dict(zip(df["player_id"], df["position"]))
 
     salary_floor = 44_000.0
     gen = CandidateGenerator(df, ow, rng_seed=0, salary_floor=salary_floor,
@@ -328,9 +330,18 @@ def test_salary_floor_enforced_when_full_stack_leaves_no_fill():
     assert len(results) > 0, "Generator produced no lineups — check fixture salaries"
     for lu in results:
         total = sum(pid_to_salary[pid] for pid in lu.player_ids)
-        assert total >= salary_floor, (
-            f"Lineup below salary floor: total={total}, floor={salary_floor}, "
-            f"player_ids={lu.player_ids}"
+        # Each lineup must respect its primary team's effective floor (which may be
+        # lower than the configured floor for teams with cheap rosters).
+        team_h: dict[str, int] = {}
+        for pid in lu.player_ids:
+            if pid_pos[pid] != "P":
+                t = pid_team[pid]
+                team_h[t] = team_h.get(t, 0) + 1
+        primary = max(team_h, key=team_h.get) if team_h else None
+        effective_floor = gen._team_salary_floor.get(primary, salary_floor) if primary else salary_floor
+        assert total >= effective_floor, (
+            f"Lineup below effective floor: total={total}, floor={effective_floor}, "
+            f"primary_team={primary}, player_ids={lu.player_ids}"
         )
 
 
@@ -438,3 +449,147 @@ def test_team_primary_cap_respected(players_df, ownership_vec):
             f"Team {team} has {count} unambiguous primary lineups, exceeds cap {cap} "
             f"(n={n_candidates}, n_teams={n_batter_teams})"
         )
+
+
+# ------------------------------------------------------------------ #
+#  Regression tests                                                   #
+# ------------------------------------------------------------------ #
+
+def test_cheap_primary_team_proportional_with_salary_floor():
+    """Regression: secondary feasibility filter must include pitcher salary in max_from_rest.
+
+    Before the fix, n_after_sec = 10 - primary - secondary counted pitcher slots as batter
+    fill slots, but used self._top_batter_salaries (cheap) instead of pitcher salaries
+    (expensive) for those slots. This made min_sec_sum_needed artificially large for cheap
+    primary teams, blocking all secondary options and producing near-zero lineups.
+
+    Fixture: CHEAP team at $3,500/batter; normal teams at $4,600–$5,000; pitchers $8k–$9.5k;
+    salary_floor = $49,000.
+
+    (5,0) is infeasible at this floor (fill batters can't make up the gap from the cap side).
+    OLD filter: (5,2) and (5,3) also fail because all secondary teams are blocked.
+      e.g. (5,2): min_sec_sum_needed = $49k – $17.5k – (3 × $5k batter) = $16.5k;
+      no secondary team's top-2 sum to $16.5k → 0 CHEAP lineups.
+    NEW filter: pitcher salary included in max_from_rest.
+      (5,2): min_sec_sum_needed = $49k – $17.5k – ($5k fill + $18.5k pitchers) = $8k;
+      secondary team's top-2 = $10k ≥ $8k → valid secondary found → CHEAP lineups generated.
+    """
+    rows = [
+        # Game 1: CHEAP@OPP1 — cheap primary team
+        _make_player(1,  "C",  3500, "CHEAP", "CHEAP@OPP1"),
+        _make_player(2,  "1B", 3500, "CHEAP", "CHEAP@OPP1"),
+        _make_player(3,  "2B", 3500, "CHEAP", "CHEAP@OPP1"),
+        _make_player(4,  "3B", 3500, "CHEAP", "CHEAP@OPP1"),
+        _make_player(5,  "SS", 3500, "CHEAP", "CHEAP@OPP1"),
+        _make_player(6,  "OF", 3500, "CHEAP", "CHEAP@OPP1"),
+        _make_player(7,  "OF", 3500, "CHEAP", "CHEAP@OPP1"),
+        # OPP1 pitchers + batters (OPP1 pitchers are excluded for CHEAP-primary lineups)
+        _make_player(8,  "P",  10000, "OPP1", "CHEAP@OPP1"),
+        _make_player(9,  "P",   9500, "OPP1", "CHEAP@OPP1"),
+        _make_player(10, "OF",  5000, "OPP1", "CHEAP@OPP1"),
+        _make_player(11, "1B",  4800, "OPP1", "CHEAP@OPP1"),
+        _make_player(12, "3B",  4600, "OPP1", "CHEAP@OPP1"),
+        # Game 2: NRM1@NRM2 — source of secondary stacks and pitchers
+        _make_player(20, "P",  9500, "NRM1", "NRM1@NRM2"),
+        _make_player(21, "P",  9000, "NRM1", "NRM1@NRM2"),
+        _make_player(22, "C",  5000, "NRM1", "NRM1@NRM2"),
+        _make_player(23, "1B", 5000, "NRM1", "NRM1@NRM2"),
+        _make_player(24, "2B", 5000, "NRM1", "NRM1@NRM2"),
+        _make_player(25, "3B", 5000, "NRM1", "NRM1@NRM2"),
+        _make_player(26, "SS", 5000, "NRM1", "NRM1@NRM2"),
+        _make_player(27, "OF", 5000, "NRM1", "NRM1@NRM2"),
+        _make_player(28, "OF", 5000, "NRM1", "NRM1@NRM2"),
+        _make_player(29, "P",  9000, "NRM2", "NRM1@NRM2"),
+        _make_player(30, "P",  8500, "NRM2", "NRM1@NRM2"),
+        _make_player(31, "C",  5000, "NRM2", "NRM1@NRM2"),
+        _make_player(32, "1B", 4800, "NRM2", "NRM1@NRM2"),
+        _make_player(33, "2B", 4800, "NRM2", "NRM1@NRM2"),
+        _make_player(34, "3B", 4600, "NRM2", "NRM1@NRM2"),
+        _make_player(35, "SS", 4600, "NRM2", "NRM1@NRM2"),
+        _make_player(36, "OF", 4600, "NRM2", "NRM1@NRM2"),
+        _make_player(37, "OF", 4600, "NRM2", "NRM1@NRM2"),
+        # Game 3: NRM3@NRM4 — pitchers available for CHEAP-primary lineups (not OPP1 or secondary opp)
+        _make_player(40, "P",  9000, "NRM3", "NRM3@NRM4"),
+        _make_player(41, "P",  8500, "NRM3", "NRM3@NRM4"),
+        _make_player(42, "C",  4800, "NRM3", "NRM3@NRM4"),
+        _make_player(43, "1B", 4800, "NRM3", "NRM3@NRM4"),
+        _make_player(44, "2B", 4800, "NRM3", "NRM3@NRM4"),
+        _make_player(45, "3B", 4800, "NRM3", "NRM3@NRM4"),
+        _make_player(46, "SS", 4800, "NRM3", "NRM3@NRM4"),
+        _make_player(47, "OF", 4800, "NRM3", "NRM3@NRM4"),
+        _make_player(48, "OF", 4800, "NRM3", "NRM3@NRM4"),
+        _make_player(49, "P",  8500, "NRM4", "NRM3@NRM4"),
+        _make_player(50, "P",  8000, "NRM4", "NRM3@NRM4"),
+        _make_player(51, "C",  4800, "NRM4", "NRM3@NRM4"),
+        _make_player(52, "1B", 4600, "NRM4", "NRM3@NRM4"),
+        _make_player(53, "2B", 4600, "NRM4", "NRM3@NRM4"),
+        _make_player(54, "3B", 4400, "NRM4", "NRM3@NRM4"),
+        _make_player(55, "SS", 4400, "NRM4", "NRM3@NRM4"),
+        _make_player(56, "OF", 4400, "NRM4", "NRM3@NRM4"),
+        _make_player(57, "OF", 4400, "NRM4", "NRM3@NRM4"),
+    ]
+    df = pd.DataFrame(rows)
+    df["opponent"] = df.apply(
+        lambda row: (
+            row["game"].split("@")[1] if row["team"] == row["game"].split("@")[0]
+            else row["game"].split("@")[0]
+        ),
+        axis=1,
+    )
+    ow = compute_heuristic_ownership(df)
+    pid_salary = dict(zip(df["player_id"], df["salary"]))
+    pid_team = dict(zip(df["player_id"], df["team"]))
+    pid_pos = dict(zip(df["player_id"], df["position"]))
+
+    salary_floor = 49_000.0
+    gen = CandidateGenerator(df, ow, rng_seed=42, salary_floor=salary_floor)
+
+    # CHEAP's max achievable salary is < $49k in this fixture (5-stack at $3,500 × 5 =
+    # $17.5k, pitchers ~$17.5k, secondary ~$10k, fill ~$5k → $50k cap-limited; but
+    # tighter constraints reduce it). Verify the generator lowers CHEAP's floor.
+    assert "CHEAP" in gen._team_salary_floor, "CHEAP not found in team_salary_floor"
+    assert gen._team_salary_floor["CHEAP"] <= salary_floor, (
+        "CHEAP's per-team floor should not exceed the configured floor"
+    )
+    # Normal teams with expensive batters should keep the configured floor.
+    assert gen._team_salary_floor.get("NRM1", salary_floor) == salary_floor, (
+        "NRM1 (expensive batters) should keep the configured floor"
+    )
+
+    results = gen.generate(n_candidates=200, max_attempts_multiplier=500)
+    assert len(results) > 0, "Generator produced no lineups at all"
+
+    # Each lineup must respect its primary team's effective floor (not the global floor).
+    for lu in results:
+        total = sum(pid_salary[pid] for pid in lu.player_ids)
+        team_h: dict[str, int] = {}
+        for pid in lu.player_ids:
+            if pid_pos[pid] != "P":
+                t = pid_team[pid]
+                team_h[t] = team_h.get(t, 0) + 1
+        primary = max(team_h, key=team_h.get) if team_h else None
+        eff_floor = gen._team_salary_floor.get(primary, salary_floor) if primary else salary_floor
+        assert total >= eff_floor, (
+            f"Lineup below effective floor: total={total}, floor={eff_floor}, primary={primary}"
+        )
+
+    # CHEAP should now appear as primary in a meaningful fraction of lineups.
+    # 6 primary-capable batter teams → expected ~1/6 ≈ 33 of 200. Require ≥ 10.
+    cheap_primary_count = 0
+    for lu in results:
+        team_hitters: dict[str, int] = {}
+        for pid in lu.player_ids:
+            if pid_pos[pid] != "P":
+                t = pid_team[pid]
+                team_hitters[t] = team_hitters.get(t, 0) + 1
+        if not team_hitters:
+            continue
+        top = max(team_hitters.values())
+        top_teams = [t for t, c in team_hitters.items() if c == top]
+        if len(top_teams) == 1 and top_teams[0] == "CHEAP" and top >= 4:
+            cheap_primary_count += 1
+
+    assert cheap_primary_count >= 10, (
+        f"CHEAP generated only {cheap_primary_count}/{len(results)} primary lineups; "
+        "expected ≥ 10. Per-team floor may not be lowering correctly for cheap teams."
+    )

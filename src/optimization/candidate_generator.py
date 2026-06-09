@@ -124,6 +124,25 @@ class CandidateGenerator:
         self._min_batter_salary: float = float(min(batter_salaries)) if batter_salaries else 0.0
         self._top_batter_salaries: list[int] = sorted(batter_salaries, reverse=True)
 
+        # Per-team minimum fill batter salary, excluding that team's own batters.
+        # Used in _sample_one fill window so that a cheap primary team's own salary
+        # doesn't artificially inflate the min_sal for fill positions (fill batters
+        # must come from other teams anyway, since the primary batters are already used).
+        self._min_fill_salary_excl_team: dict[str, float] = {
+            team: float(min(
+                (self._pid_salary[pid] for pid in self._pid_to_ow
+                 if self._pid_team[pid] != team),
+                default=self._min_batter_salary,
+            ))
+            for team in self._team_batters
+        }
+
+        # Top-2 pitcher salaries for secondary feasibility estimate (pitchers are NOT batters).
+        p_ids_init, _ = self._pos_pools.get("P", ([], np.array([])))
+        self._top_pitcher_salary_sum: int = sum(
+            sorted((self._pid_salary[pid] for pid in p_ids_init), reverse=True)[:2]
+        )
+
         # Per-team top-k salary sum for secondary feasibility filter (k = 1..5).
         self._team_top_k_salary: dict[str, dict[int, int]] = {}
         for t, pids in self._team_batters.items():
@@ -141,6 +160,124 @@ class CandidateGenerator:
                 if g:
                     self._team_game[t] = g
                     break
+
+        # Per-team effective salary floor.
+        # For each primary team, walk all stack patterns and compute the best salary
+        # achievable: top-k primary batters + best secondary k' from any other team +
+        # top-2 pitchers available (excluding opponent's game) + top fill batters.
+        # The team floor is min(configured_floor, max_achievable_across_patterns).
+        # Teams with cheap rosters automatically get a lower floor so the generator
+        # can produce a proportional share of lineups for them.
+        self._team_salary_floor: dict[str, float] = {}
+        if self._salary_floor is not None:
+            # Derive team→opponent from any batter in that team.
+            _team_to_opp: dict[str, str] = {}
+            for pid, meta in self._pmeta.items():
+                t = meta["team"]
+                if t in self._team_batters and t not in _team_to_opp:
+                    opp = meta.get("opponent", "")
+                    if opp:
+                        _team_to_opp[t] = opp
+
+            # Top-2 pitcher salary sum available for each primary team
+            # (pitchers from the opponent's team are excluded).
+            # Also compute the "typical" pair (median-ranked pitchers) to derive
+            # a realistic floor for cheap-roster teams.
+            _p_ids_all, _ = self._pos_pools.get("P", ([], np.array([])))
+            _team_to_pit_sum: dict[str, int] = {}
+            _team_to_typical_pit_sum: dict[str, int] = {}
+            for _team in self._team_batters:
+                _opp = _team_to_opp.get(_team, "")
+                _avail = sorted(
+                    (self._pid_salary[pid] for pid in _p_ids_all
+                     if self._pid_team[pid] != _opp),
+                    reverse=True,
+                )
+                _n_p = len(_avail)
+                _team_to_pit_sum[_team] = sum(_avail[:2]) if _n_p >= 2 else sum(_avail)
+                # Typical pair: two pitchers centered on the median rank.
+                if _n_p >= 2:
+                    _mid = _n_p // 2
+                    _i1 = min(_mid, _n_p - 2)
+                    _team_to_typical_pit_sum[_team] = _avail[_i1] + _avail[_i1 + 1]
+                else:
+                    _team_to_typical_pit_sum[_team] = sum(_avail)
+
+            # Global median batter salary for typical fill estimation.
+            _all_batter_sals_sorted = sorted(
+                self._pid_salary[p] for p in self._pid_to_ow
+            )
+            _typical_batter_sal = float(
+                np.median(_all_batter_sals_sorted)
+            ) if _all_batter_sals_sorted else 0.0
+
+            # Sorted batter salaries per team (descending).
+            _team_batter_sals: dict[str, list[int]] = {
+                t: sorted(
+                    (self._pid_salary[p] for p in pids if p in self._pid_to_ow),
+                    reverse=True,
+                )
+                for t, pids in self._team_batters.items()
+            }
+
+            for _team, _team_sals in _team_batter_sals.items():
+                _pit_sum = _team_to_pit_sum.get(_team, self._top_pitcher_salary_sum)
+                _typical_pit_sum = _team_to_typical_pit_sum.get(_team, _pit_sum)
+                _max_achievable = 0.0
+                # Typical achievable: track the MINIMUM across patterns so that
+                # even the hardest pattern (e.g. 5-0, no secondary) can succeed
+                # at the derived floor with typical pitcher+fill combinations.
+                # Patterns with secondary always add salary, so the minimum
+                # comes from the no-secondary (or small-secondary) patterns.
+                _typical_achievable_min = float("inf")
+                for _prim_sz, _sec_sz in self.STACK_PATTERNS:
+                    if len(_team_sals) < _prim_sz:
+                        continue
+                    _prim_sum = sum(_team_sals[:_prim_sz])
+                    _sec_sum = (
+                        max(
+                            (self._team_top_k_salary.get(t, {}).get(_sec_sz, 0)
+                             for t in self._team_batters if t != _team),
+                            default=0,
+                        )
+                        if _sec_sz > 0 else 0
+                    )
+                    _n_fill = 8 - _prim_sz - _sec_sz
+                    # Max achievable (best-case pitchers + best-case fill).
+                    _fill_sum = sum(self._top_batter_salaries[:_n_fill]) if _n_fill > 0 else 0
+                    _pat_max = min(
+                        float(SALARY_CAP),
+                        float(_prim_sum + _sec_sum + _pit_sum + _fill_sum),
+                    )
+                    if _pat_max > _max_achievable:
+                        _max_achievable = _pat_max
+                    # Typical achievable (median-ranked pitchers + median fill salary).
+                    _fill_sum_typ = _typical_batter_sal * _n_fill if _n_fill > 0 else 0.0
+                    _pat_typ = min(
+                        float(SALARY_CAP),
+                        float(_prim_sum + _sec_sum + _typical_pit_sum + _fill_sum_typ),
+                    )
+                    if _pat_typ < _typical_achievable_min:
+                        _typical_achievable_min = _pat_typ
+
+                _typical_achievable = (
+                    _typical_achievable_min if _typical_achievable_min < float("inf") else 0.0
+                )
+
+                # Floor = min(configured, typical_achievable). Using the minimum
+                # typical achievable across all patterns ensures cheap-roster teams
+                # get a realistic floor; secondary-heavy patterns (5-3, 4-4) push
+                # the typical high, so we track the minimum so the hardest pattern
+                # (no-secondary) also has a feasible window with typical resources.
+                _floor = min(self._salary_floor, _typical_achievable)
+                self._team_salary_floor[_team] = _floor
+                if _floor < self._salary_floor:
+                    logger.info(
+                        "CandidateGenerator: %s salary floor lowered to %.0f "
+                        "(typical achievable %.0f, max achievable %.0f, configured %.0f)",
+                        _team, _floor, _typical_achievable, _max_achievable,
+                        self._salary_floor,
+                    )
 
     # ------------------------------------------------------------------
     # Public API
@@ -243,8 +380,8 @@ class CandidateGenerator:
             team_attempt = 0
             team_max_attempts = quota * max_attempts_multiplier
 
-            # Per-team dynamic floor: starts at configured floor, can decrease.
-            base_floor = self._salary_floor or 0.0
+            # Per-team dynamic floor: starts at the team's effective floor, can decrease.
+            base_floor = float(self._team_salary_floor.get(primary_team, self._salary_floor or 0.0))
             effective_floor = base_floor
             floor_min_val = max(0.0, base_floor - float(floor_relief))
             team_success_count = 0
@@ -320,7 +457,11 @@ class CandidateGenerator:
             pats = self.STACK_GROUPS[g]
             primary_size, secondary_size = pats[int(rng.integers(len(pats)))]
 
-            ids, pt, st = self._sample_one(rng, primary_team, primary_size, secondary_size)
+            _p2_floor = float(self._team_salary_floor.get(primary_team, self._salary_floor or 0.0))
+            ids, pt, st = self._sample_one(
+                rng, primary_team, primary_size, secondary_size,
+                effective_floor=_p2_floor,
+            )
             if ids is None or not self._check_stack(ids):
                 continue
 
@@ -424,8 +565,12 @@ class CandidateGenerator:
 
             # Salary feasibility pre-filter: can the secondary team's top-K batters
             # contribute enough, given the max possible from remaining slots after secondary?
-            n_after_sec = 10 - primary_size - secondary_size
-            max_from_rest = sum(self._top_batter_salaries[:n_after_sec]) if n_after_sec > 0 else 0
+            # Fill batter slots = 8 batter slots - primary - secondary (pitchers are separate).
+            n_fill_batters = 8 - primary_size - secondary_size
+            max_from_rest = (
+                (sum(self._top_batter_salaries[:n_fill_batters]) if n_fill_batters > 0 else 0)
+                + self._top_pitcher_salary_sum
+            )
             min_sec_sum_needed = max(0, salary_floor_val - current_salary - max_from_rest)
             if min_sec_sum_needed > 0:
                 other_teams = [
@@ -514,10 +659,11 @@ class CandidateGenerator:
         if current_salary + max_pit_sum + max_fill_sum < salary_floor_val:
             return None, '', ''
 
-        # Per-pitcher floor: filter out pitchers that make a feasible pair impossible.
+        # Per-pitcher floor: filter to pitchers where any sampled pair is guaranteed
+        # to sum to >= min_pit_sum. ceil(min_pit_sum/2) is the tightest per-pitcher
+        # lower bound that ensures this regardless of which two are drawn.
         min_pit_sum = max(0, salary_floor_val - current_salary - max_fill_sum)
-        max_single_pit = pit_sals_sorted[0] if pit_sals_sorted else 0
-        min_per_pit = max(0, min_pit_sum - max_single_pit)
+        min_per_pit = max(0, math.ceil(min_pit_sum / 2))
         if min_per_pit > 0:
             pitcher_pool = [pid for pid in pitcher_pool if pid_salary[pid] >= min_per_pit]
         if len(pitcher_pool) < 2:
@@ -542,7 +688,13 @@ class CandidateGenerator:
 
         # --- Fill remaining hitter positions (salary-window-aware) ---
         remaining_fill = n_fill
-        min_batter_sal = self._min_batter_salary
+        # Use the min fill salary excluding the primary team's batters: those are
+        # already used in the stack, so fill slots must come from other teams.
+        # Using the global min (which may be a cheap primary team's own salary)
+        # would make min_sal artificially high for cheap-roster primaries.
+        min_batter_sal = self._min_fill_salary_excl_team.get(
+            primary_team, self._min_batter_salary
+        )
 
         remaining: list[int] = []
         for pos_name in fill_slots:
@@ -589,7 +741,11 @@ class CandidateGenerator:
         if len(set(all_ids)) != 10 or len(all_ids) != 10:
             return None, '', ''
         # Full-stack floor guard (fill_slots empty when primary+secondary cover all 8 slots).
-        if self._salary_floor is not None and current_salary < self._salary_floor:
+        # Use the team's computed effective floor (may be lower than configured for cheap
+        # teams). Do NOT use salary_floor_val — dynamic floor relief can lower it further
+        # and must not override this hard minimum.
+        _hard_floor = self._team_salary_floor.get(primary_team, self._salary_floor)
+        if _hard_floor is not None and current_salary < _hard_floor:
             return None, '', ''
         if not _is_valid_field_lineup(all_ids, pmeta):
             return None, '', ''
