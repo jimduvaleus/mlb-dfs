@@ -897,8 +897,8 @@ def build_projections_csv(
 
     # --- Write output --------------------------------------------------------
     archive_df = out_df.copy()  # preserve full columns (team, proj_score, game_ou) for archive
-    out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
-    out_df = out_df[out_cols].sort_values("mean", ascending=False).reset_index(drop=True)
+    out_cols = ["player_id", "name", "team", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+    out_df = out_df[[c for c in out_cols if c in out_df.columns]].sort_values("mean", ascending=False).reset_index(drop=True)
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_path, index=False)
@@ -970,6 +970,13 @@ def main() -> None:
              "(default: data/name_map.json; silently ignored if absent)",
     )
     parser.add_argument(
+        "--team",
+        default=None,
+        metavar="ABBREV",
+        help="Filter output to a single team abbreviation (e.g. NYY). "
+             "Other teams are excluded from the written CSV.",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print API responses and parsed rows for debugging",
@@ -1025,7 +1032,7 @@ def main() -> None:
         return
 
     # --- Build projections CSV -----------------------------------------------
-    build_projections_csv(
+    out_df = build_projections_csv(
         slate_df=slate_df,
         target_date=target_date,
         output_path=args.output,
@@ -1035,6 +1042,13 @@ def main() -> None:
         debug=args.debug,
         platform=args.platform,
     )
+
+    # --- Apply team filter (--team flag) ------------------------------------
+    if args.team and out_df is not None and "team" in out_df.columns:
+        filtered = out_df[out_df["team"].str.upper() == args.team.strip().upper()].copy()
+        filtered = filtered.drop(columns=["team"], errors="ignore")
+        filtered.to_csv(args.output, index=False)
+        log.info("--team %s: wrote %d rows to %s", args.team, len(filtered), args.output)
 
 
 if __name__ == "__main__":
