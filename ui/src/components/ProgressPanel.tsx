@@ -217,7 +217,7 @@ export function ProgressPanel({ events, running }: Props) {
         ? Math.round((latestRefineProgress.round / latestRefineProgress.rounds) * 100)
         : 0
       gppLabel = latestRefineProgress
-        ? `Refining pool: round ${latestRefineProgress.round} / ${latestRefineProgress.rounds} · +${latestRefineProgress.n_mutants} mutants · top-20 EV $${latestRefineProgress.top20_ev_before.toFixed(2)} → $${latestRefineProgress.top20_ev_after.toFixed(2)}`
+        ? `Refining pool: round ${latestRefineProgress.round} / ${latestRefineProgress.rounds} · +${latestRefineProgress.n_mutants} mutants · top-${latestRefineProgress.top_k} EV $${latestRefineProgress.topk_ev_before.toFixed(2)} → $${latestRefineProgress.topk_ev_after.toFixed(2)}${latestRefineProgress.topk_ev_holdout_after != null ? ` (holdout $${latestRefineProgress.topk_ev_holdout_after.toFixed(2)})` : ''}`
         : `Refining pool: round 1 / ${refineStartEvent.rounds}…`
     } else if (latestScoreProgress) {
       gppPct = Math.round((latestScoreProgress.batches_done / latestScoreProgress.batches_total) * 100)
@@ -471,9 +471,16 @@ export function ProgressPanel({ events, running }: Props) {
             <div key={i} className="event-row event-gpp_refine_progress">
               <span className="event-stage event-stage-lineup">Refine {ev.round}/{ev.rounds}</span>
               <span className="event-detail">
-                +{ev.n_mutants} mutants from {ev.n_parents} parents · {ev.n_beat_parent} beat parent · {ev.n_in_top20} now in top-20 · top-20 EV ${ev.top20_ev_before.toFixed(2)} → ${ev.top20_ev_after.toFixed(2)}
+                +{ev.n_mutants} mutants from {ev.n_parents} parents · {ev.n_beat_parent} beat parent · {ev.n_in_topk} now in top-{ev.top_k} · top-{ev.top_k} EV ${ev.topk_ev_before.toFixed(2)} → ${ev.topk_ev_after.toFixed(2)}
+                {ev.topk_ev_holdout_before != null && ev.topk_ev_holdout_after != null && (
+                  <> (holdout ${ev.topk_ev_holdout_before.toFixed(2)} → ${ev.topk_ev_holdout_after.toFixed(2)})</>
+                )}
                 {ev.best_swap_out.length > 0 && (
-                  <> · best swap: {formatSwap(ev.best_swap_out, ev.best_swap_in)} ({ev.best_swap_ev_delta >= 0 ? '+' : ''}${ev.best_swap_ev_delta.toFixed(2)})</>
+                  <> · best swap: {formatSwap(ev.best_swap_out, ev.best_swap_in)} ({ev.best_swap_ev_delta >= 0 ? '+' : ''}${ev.best_swap_ev_delta.toFixed(2)}
+                    {ev.best_swap_ev_delta_holdout != null && (
+                      <>, holdout {ev.best_swap_ev_delta_holdout >= 0 ? '+' : ''}${ev.best_swap_ev_delta_holdout.toFixed(2)}</>
+                    )})
+                  </>
                 )}
               </span>
             </div>

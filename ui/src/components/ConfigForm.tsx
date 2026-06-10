@@ -234,6 +234,10 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <input type="number" step={1} min={1} max={50} value={draft.gpp.refine_mutants ?? 8}
                   onChange={e => setGpp('refine_mutants', Number(e.target.value))} disabled={disabled} />
               </FieldRow>
+              <FieldRow label="Refine holdout fraction (0 = off)">
+                <input type="number" step={0.05} min={0} max={0.5} value={draft.gpp.refine_holdout_fraction ?? 0.3}
+                  onChange={e => setGpp('refine_holdout_fraction', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
               <FieldRow label="Dump candidate pool">
                 <input type="checkbox" checked={!!draft.gpp.dump_candidate_pool}
                   onChange={e => setGpp('dump_candidate_pool', e.target.checked)} disabled={disabled} />

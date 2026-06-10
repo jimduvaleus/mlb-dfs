@@ -865,12 +865,43 @@ class PipelineRunner:
                     })
                     _ev_before = float(robust_payout.mean(axis=1).max())
                     _pool_size_before_refine = len(candidates)
+
+                    # Optional holdout split: parents are ranked and mutants
+                    # judged on the train columns only, while the same top-K
+                    # set is also measured on held-out columns. Noise-mined
+                    # gains regress toward zero on the holdout; real
+                    # improvements survive.
+                    from src.optimization.refine_stats import (
+                        mutant_round_stats, split_sim_columns,
+                    )
+                    _refine_holdout_frac = float(
+                        gpp_cfg.get("refine_holdout_fraction", 0.3)
+                    )
+                    _train_cols, _hold_cols = split_sim_columns(
+                        robust_payout.shape[1], _refine_holdout_frac,
+                        int(opt_cfg.get("rng_seed") or 42),
+                    )
+
+                    def _refine_ev_means(rp: np.ndarray) -> tuple[np.ndarray, Optional[np.ndarray]]:
+                        """(ranking means, holdout means) for the pool."""
+                        if _train_cols is None:
+                            return rp.mean(axis=1), None
+                        return (
+                            rp[:, _train_cols].mean(axis=1),
+                            rp[:, _hold_cols].mean(axis=1),
+                        )
+
+                    # The frontier depth tracks the selection band: Det-EV
+                    # draws a portfolio_size selection from roughly the top
+                    # 2x portfolio_size candidates by EV.
+                    _top_k = max(20, 2 * portfolio_size)
+
                     for _round in range(refine_rounds):
                         if _gpp_stopped and self._stop_check():
                             break
-                        _ev_means_r = robust_payout.mean(axis=1)
+                        _ev_means_r, _ev_hold_r = _refine_ev_means(robust_payout)
                         _parents: list = []
-                        _parent_evs: list[float] = []
+                        _parent_idx: list[int] = []
                         _parent_team_counts: dict[str, int] = {}
                         for _ci in np.argsort(_ev_means_r)[::-1]:
                             _lu = candidates[int(_ci)]
@@ -879,7 +910,7 @@ class PipelineRunner:
                                 continue
                             _parent_team_counts[_pt] = _parent_team_counts.get(_pt, 0) + 1
                             _parents.append(_lu)
-                            _parent_evs.append(float(_ev_means_r[int(_ci)]))
+                            _parent_idx.append(int(_ci))
                             if len(_parents) >= refine_top:
                                 break
 
@@ -898,72 +929,81 @@ class PipelineRunner:
                             _mutants, stop_check=self._stop_check
                         )
 
-                        # Round telemetry: compare each mutant to its source
-                        # parent (max player overlap) so the UI can show what
-                        # the mutations changed and whether they paid off.
+                        # Round telemetry: what did mutation change, and does
+                        # it hold up on the held-out columns?
                         _n_before = len(candidates)
-                        _top20_before = float(np.sort(_ev_means_r)[-20:].mean())
-                        _parent_sets = [
-                            set(int(p) for p in lu.player_ids) for lu in _parents
-                        ]
-                        _mutant_evs = _payout_new.mean(axis=1)
-                        _n_beat_parent = 0
-                        _best_delta = -np.inf
-                        _best_swap_out: list[str] = []
-                        _best_swap_in: list[str] = []
-                        _best_mutant_ev = 0.0
-                        for _mi, _mu in enumerate(_mutants):
-                            _mset = set(int(p) for p in _mu.player_ids)
-                            _pi = max(
-                                range(len(_parent_sets)),
-                                key=lambda k: len(_mset & _parent_sets[k]),
-                            )
-                            _delta = float(_mutant_evs[_mi]) - _parent_evs[_pi]
-                            if _delta > 0:
-                                _n_beat_parent += 1
-                            if _delta > _best_delta:
-                                _best_delta = _delta
-                                _best_mutant_ev = float(_mutant_evs[_mi])
-                                _best_swap_out = sorted(
-                                    _player_label(p) for p in (_parent_sets[_pi] - _mset)
-                                )
-                                _best_swap_in = sorted(
-                                    _player_label(p) for p in (_mset - _parent_sets[_pi])
-                                )
+                        _mut_evs, _mut_hold = _refine_ev_means(_payout_new)
+                        _stats = mutant_round_stats(
+                            _parents,
+                            [float(_ev_means_r[i]) for i in _parent_idx],
+                            _mutants,
+                            _mut_evs,
+                            _player_label,
+                            parent_evs_holdout=(
+                                [float(_ev_hold_r[i]) for i in _parent_idx]
+                                if _ev_hold_r is not None else None
+                            ),
+                            mutant_evs_holdout=_mut_hold,
+                        )
+                        _topk_idx_before = np.argsort(_ev_means_r)[-_top_k:]
+                        _topk_before = float(_ev_means_r[_topk_idx_before].mean())
+                        _topk_hold_before = (
+                            float(_ev_hold_r[_topk_idx_before].mean())
+                            if _ev_hold_r is not None else None
+                        )
 
                         candidates = candidates + _mutants
                         robust_payout = np.concatenate(
                             [robust_payout, _payout_new], axis=0
                         )
-                        _ev_means_after = robust_payout.mean(axis=1)
-                        _best_ev = float(_ev_means_after.max())
-                        _top20_after = float(np.sort(_ev_means_after)[-20:].mean())
-                        _n_in_top20 = int(
-                            (np.argsort(_ev_means_after)[-20:] >= _n_before).sum()
+                        _ev_means_after, _ev_hold_after = _refine_ev_means(robust_payout)
+                        _best_ev = float(robust_payout.mean(axis=1).max())
+                        _topk_idx_after = np.argsort(_ev_means_after)[-_top_k:]
+                        _topk_after = float(_ev_means_after[_topk_idx_after].mean())
+                        _topk_hold_after = (
+                            float(_ev_hold_after[_topk_idx_after].mean())
+                            if _ev_hold_after is not None else None
                         )
+                        _n_in_topk = int((_topk_idx_after >= _n_before).sum())
                         logger.info(
                             "Refine round %d/%d: +%d mutants (pool %d), %d beat parent, "
-                            "%d in top-20, top-20 EV $%.3f → $%.3f, best swap %s → %s (%+.3f)",
+                            "%d in top-%d, top-%d EV $%.3f → $%.3f%s, best swap %s → %s (%+.3f%s)",
                             _round + 1, refine_rounds, len(_mutants), len(candidates),
-                            _n_beat_parent, _n_in_top20, _top20_before, _top20_after,
-                            ", ".join(_best_swap_out), ", ".join(_best_swap_in), _best_delta,
+                            _stats["n_beat_parent"], _n_in_topk, _top_k, _top_k,
+                            _topk_before, _topk_after,
+                            (f" (holdout ${_topk_hold_before:.3f} → ${_topk_hold_after:.3f})"
+                             if _topk_hold_before is not None else ""),
+                            ", ".join(_stats["best_swap_out"]),
+                            ", ".join(_stats["best_swap_in"]),
+                            _stats["best_swap_ev_delta"],
+                            (f", holdout {_stats['best_swap_ev_delta_holdout']:+.3f}"
+                             if "best_swap_ev_delta_holdout" in _stats else ""),
                         )
-                        self._cb("gpp_refine_progress", {
+                        _refine_event = {
                             "round": _round + 1,
                             "rounds": refine_rounds,
                             "n_parents": len(_parents),
                             "n_mutants": len(_mutants),
                             "pool_size": len(candidates),
                             "best_ev": _best_ev,
-                            "n_beat_parent": _n_beat_parent,
-                            "n_in_top20": _n_in_top20,
-                            "top20_ev_before": _top20_before,
-                            "top20_ev_after": _top20_after,
-                            "best_swap_out": _best_swap_out,
-                            "best_swap_in": _best_swap_in,
-                            "best_swap_ev_delta": float(_best_delta),
-                            "best_mutant_ev": _best_mutant_ev,
-                        })
+                            "n_beat_parent": _stats["n_beat_parent"],
+                            "top_k": _top_k,
+                            "n_in_topk": _n_in_topk,
+                            "topk_ev_before": _topk_before,
+                            "topk_ev_after": _topk_after,
+                            "best_swap_out": _stats["best_swap_out"],
+                            "best_swap_in": _stats["best_swap_in"],
+                            "best_swap_ev_delta": _stats["best_swap_ev_delta"],
+                            "best_mutant_ev": _stats["best_mutant_ev"],
+                        }
+                        if _topk_hold_before is not None:
+                            _refine_event["holdout_fraction"] = _refine_holdout_frac
+                            _refine_event["topk_ev_holdout_before"] = _topk_hold_before
+                            _refine_event["topk_ev_holdout_after"] = _topk_hold_after
+                            _refine_event["best_swap_ev_delta_holdout"] = _stats.get(
+                                "best_swap_ev_delta_holdout"
+                            )
+                        self._cb("gpp_refine_progress", _refine_event)
                     logger.info(
                         "[TIMING] Refinement wall time: %.3fs  best EV $%.3f → $%.3f  "
                         "pool %d",

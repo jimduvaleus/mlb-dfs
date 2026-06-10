@@ -66,6 +66,7 @@ class GppConfig(BaseModel):
     refine_rounds: int = 2
     refine_top: int = 150
     refine_mutants: int = 8
+    refine_holdout_fraction: float = 0.3
 
 
 class AppConfig(BaseModel):

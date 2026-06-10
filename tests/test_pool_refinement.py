@@ -212,3 +212,64 @@ class TestGenerateMutants:
         seen = set()
         mutants = gen.generate_mutants([ghost], n_per_parent=3, seen=seen, rng_seed=1)
         assert mutants == []
+
+
+# ------------------------------------------------------------------ #
+#  refine_stats: mutant_round_stats / split_sim_columns                #
+# ------------------------------------------------------------------ #
+
+class TestRefineStats:
+    def _lineups(self):
+        from src.optimization.refine_stats import mutant_round_stats
+        parent_a = Lineup(player_ids=list(range(1, 11)))       # 1..10
+        parent_b = Lineup(player_ids=list(range(11, 21)))      # 11..20
+        # Mutant of A: swaps 10 -> 99. Mutant of B: swaps 20 -> 88.
+        mutant_a = Lineup(player_ids=list(range(1, 10)) + [99])
+        mutant_b = Lineup(player_ids=list(range(11, 20)) + [88])
+        return mutant_round_stats, [parent_a, parent_b], [mutant_a, mutant_b]
+
+    def test_closest_parent_matching_and_beat_count(self):
+        stats_fn, parents, mutants = self._lineups()
+        stats = stats_fn(
+            parents, [10.0, 5.0], mutants, np.array([9.0, 7.0]), str,
+        )
+        # mutant_a (9.0) vs parent_a (10.0): worse. mutant_b (7.0) vs parent_b (5.0): better.
+        assert stats["n_beat_parent"] == 1
+        assert stats["best_swap_ev_delta"] == pytest.approx(2.0)
+        assert stats["best_mutant_ev"] == pytest.approx(7.0)
+        assert stats["best_swap_out"] == ["20"]
+        assert stats["best_swap_in"] == ["88"]
+
+    def test_holdout_delta_tracks_best_train_pair(self):
+        stats_fn, parents, mutants = self._lineups()
+        stats = stats_fn(
+            parents, [10.0, 5.0], mutants, np.array([9.0, 7.0]), str,
+            parent_evs_holdout=[10.0, 6.0],
+            mutant_evs_holdout=np.array([8.0, 6.5]),
+        )
+        # Best pair by train delta is (mutant_b, parent_b): holdout 6.5 - 6.0.
+        assert stats["best_swap_ev_delta_holdout"] == pytest.approx(0.5)
+
+    def test_no_mutants(self):
+        from src.optimization.refine_stats import mutant_round_stats
+        stats = mutant_round_stats(
+            [Lineup(player_ids=list(range(1, 11)))], [10.0], [], np.array([]), str,
+        )
+        assert stats["n_beat_parent"] == 0
+        assert stats["best_swap_out"] == []
+        assert "best_swap_ev_delta_holdout" not in stats
+
+    def test_split_sim_columns_partition(self):
+        from src.optimization.refine_stats import split_sim_columns
+        train, hold = split_sim_columns(1000, 0.3, rng_seed=7)
+        assert len(hold) == 300 and len(train) == 700
+        assert set(train.tolist()) | set(hold.tolist()) == set(range(1000))
+        assert not (set(train.tolist()) & set(hold.tolist()))
+        # Deterministic for the same seed.
+        train2, hold2 = split_sim_columns(1000, 0.3, rng_seed=7)
+        assert np.array_equal(train, train2) and np.array_equal(hold, hold2)
+
+    def test_split_disabled_for_zero_fraction(self):
+        from src.optimization.refine_stats import split_sim_columns
+        assert split_sim_columns(1000, 0.0, rng_seed=7) == (None, None)
+        assert split_sim_columns(1000, 1.0, rng_seed=7) == (None, None)

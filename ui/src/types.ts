@@ -61,6 +61,7 @@ export interface GppConfig {
   refine_rounds: number
   refine_top: number
   refine_mutants: number
+  refine_holdout_fraction: number
 }
 
 export interface AppConfig {
@@ -289,13 +290,19 @@ export interface GppRefineProgressEvent extends SSEEvent {
   pool_size: number
   best_ev: number
   n_beat_parent: number
-  n_in_top20: number
-  top20_ev_before: number
-  top20_ev_after: number
+  top_k: number
+  n_in_topk: number
+  topk_ev_before: number
+  topk_ev_after: number
   best_swap_out: string[]
   best_swap_in: string[]
   best_swap_ev_delta: number
   best_mutant_ev: number
+  // Present only when refine_holdout_fraction > 0
+  holdout_fraction?: number
+  topk_ev_holdout_before?: number
+  topk_ev_holdout_after?: number
+  best_swap_ev_delta_holdout?: number
 }
 
 export interface GppSelectProgressEvent extends SSEEvent {
