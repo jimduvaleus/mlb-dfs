@@ -169,7 +169,9 @@ def match_player_name(abbreviated: str, candidates: list[dict]) -> list[dict]:
 
     results.sort(key=lambda x: 0 if x["match_confidence"] == "exact" else 1)
     if results:
-        return results
+        # If any exact-initial match exists, drop the cross-initial fuzzy fallbacks.
+        exact_only = [r for r in results if r["match_confidence"] == "exact"]
+        return exact_only if exact_only else results
 
     # Second pass: difflib fuzzy on last name only.
     # When an initial is known, enforce it — eliminates cross-initial false positives.
