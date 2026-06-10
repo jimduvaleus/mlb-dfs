@@ -517,4 +517,31 @@ def compute_heuristic_ownership(
                     if new_sum > 0:
                         result[pmask] *= orig_sum / new_sum
 
+                # Second pass: suppress-only — only batters facing above-average
+                # pitchers are further discounted.  Mirrors V_sal_005's external
+                # reapplication, which empirically outperformed a single two-sided
+                # pass on 20 slates (0.8442 vs 0.8436 composite Spearman+RMSE+prec).
+                for pos, n_slots in _SLOT_COUNTS.items():
+                    if pos == "P":
+                        continue
+                    pmask = pos_vals == pos
+                    if not pmask.any():
+                        continue
+                    orig_sum = float(result[pmask].sum())
+
+                    for i in np.where(pmask)[0]:
+                        if salaries_arr[i] < sal_median:
+                            continue
+                        opp_own = starter_own.get(opponents_arr[i])
+                        if opp_own is None:
+                            continue
+                        ratio = opp_own / mean_starter_own
+                        if ratio <= 1.0:
+                            continue
+                        result[i] *= ratio ** (-_PITOPP_SAL_EXP)
+
+                    new_sum = float(result[pmask].sum())
+                    if new_sum > 0:
+                        result[pmask] *= orig_sum / new_sum
+
     return result
