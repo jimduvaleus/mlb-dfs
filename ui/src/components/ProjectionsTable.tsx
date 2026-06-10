@@ -126,9 +126,12 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
   }
   const teams = [...byTeam.keys()].sort()
 
+  const lockedTeamCount = teams.filter(team => twitterLineups.find(l => l.team === team && l.locked)).length
+  const unlockedTeamCount = teams.length - lockedTeamCount
+
   return (
     <div className="projections-table-wrap">
-      <h3>Projections — {players.length} players, {teams.length} teams</h3>
+      <h3>Projections — {players.length} players, {teams.length} teams{unlockedTeamCount > 0 ? <span className="projections-unlocked-count"> · {unlockedTeamCount} unlocked</span> : null}</h3>
       <div className="portfolio-cards">
         {teams.map(team => {
           const teamPlayers = byTeam.get(team)!

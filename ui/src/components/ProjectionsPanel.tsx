@@ -15,6 +15,7 @@ interface Props {
   projFetchExcluded?: string[]
   onFetchingChange?: (fetching: boolean) => void
   refreshTrigger?: number
+  unlockedBatterCount?: number
 }
 
 function formatET(unixSec: number): string {
@@ -28,7 +29,7 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange, refreshTrigger }: Props) {
+export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange, refreshTrigger, unlockedBatterCount }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
@@ -190,11 +191,14 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
           {status.row_count !== null && (
             <span className="muted">{status.row_count.toLocaleString()} players</span>
           )}
-          {status.unconfirmed_count !== null && status.unconfirmed_count > 0 && (
-            <span className="badge badge-warn">
-              {status.unconfirmed_count} unconfirmed lineup slot{status.unconfirmed_count !== 1 ? 's' : ''}
-            </span>
-          )}
+          {(() => {
+            const count = unlockedBatterCount != null ? unlockedBatterCount : (status.unconfirmed_count ?? 0)
+            return count > 0 ? (
+              <span className="badge badge-warn">
+                {count} unconfirmed lineup slot{count !== 1 ? 's' : ''}
+              </span>
+            ) : null
+          })()}
           {status.no_changes === true && (
             <span className="muted proj-no-changes">No projection changes since last fetch</span>
           )}

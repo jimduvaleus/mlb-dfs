@@ -247,10 +247,12 @@ export default function App() {
   }, [projFetchExcluded])
 
   // Update browser tab title with unread notification count
+  // Use the same filter as SlatePanel: exclude notifications for already-confirmed teams.
   useEffect(() => {
-    const count = state.notifications.length
+    const confirmedTeams = new Set(state.twitterLineups.map(tl => tl.team))
+    const count = state.notifications.filter(n => !n.lineup_team || !confirmedTeams.has(n.lineup_team)).length
     document.title = count > 0 ? `MLB Portfolio Tool (${count})` : 'MLB Portfolio Tool'
-  }, [state.notifications.length])
+  }, [state.notifications, state.twitterLineups])
 
   // Poll for X/Twitter notifications every 5 seconds.
   // For each unambiguous lineup notification, attempt silent auto-parse before showing in panel.
@@ -530,9 +532,11 @@ export default function App() {
             {tab === 'portfolio' && state.portfolio.length > 0 && (
               <span className="tab-count">{state.portfolio.length}</span>
             )}
-            {tab === 'slate' && state.notifications.length > 0 && (
-              <span className="tab-count">{state.notifications.length}</span>
-            )}
+            {tab === 'slate' && (() => {
+              const confirmedTeams = new Set(state.twitterLineups.map(tl => tl.team))
+              const pendingCount = state.notifications.filter(n => !n.lineup_team || !confirmedTeams.has(n.lineup_team)).length
+              return pendingCount > 0 ? <span className="tab-count">{pendingCount}</span> : null
+            })()}
           </button>
         ))}
       </nav>
@@ -544,7 +548,7 @@ export default function App() {
           {configError && <p className="error">{configError}</p>}
           {state.config ? (
             <div className="config-layout">
-              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} refreshTrigger={projStatusTrigger} />
+              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} refreshTrigger={projStatusTrigger} unlockedBatterCount={[...new Set(projectionPlayers.map(p => p.team))].filter(t => t && !state.twitterLineups.find(l => l.team === t && l.locked)).length * 9} />
               <ConfigForm
                 config={state.config}
                 onSaved={cfg => {
