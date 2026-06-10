@@ -105,11 +105,8 @@ class SimulationEngine:
             else:
                 marginals[row_idx] = GaussianMarginal(player['mean'], player['std_dev'])
 
-        for (team, opponent), unit_group in units:
-            # Sample joint quantiles from the copula for this 10-player unit
+        def apply_unit(unit_group: pd.DataFrame, sampled_quantiles: np.ndarray) -> None:
             # sampled_quantiles shape: (n_sims, 10)
-            sampled_quantiles = self.copula.sample(n_sims)
-
             slots = unit_group['slot'].values
             indices = unit_group.index.values
             for i in range(len(indices)):
@@ -122,6 +119,28 @@ class SimulationEngine:
                 if is_batter_flags[row_idx]:
                     simulated_points = np.maximum(simulated_points, 0)
                 all_simulated_points[:, row_idx] = simulated_points
-                
+
+        # When the copula supports game-level sampling, the two units of a game
+        # — (team=A, opponent=B) and (team=B, opponent=A) — share one game draw
+        # so that a team's batters stay correlated with its own pitcher and the
+        # game-level run environment. Copulas without sample_games (e.g., test
+        # stubs) and units without a partner fall back to independent draws.
+        sample_games = getattr(self.copula, 'sample_games', None)
+        unit_map = {key: group for key, group in units}
+        processed = set()
+        for key, unit_group in unit_map.items():
+            if key in processed:
+                continue
+            processed.add(key)
+            team, opponent = key
+            partner_key = (opponent, team)
+            if sample_games is not None and partner_key in unit_map:
+                game_quantiles = sample_games(n_sims)  # (n_sims, 2, 10)
+                apply_unit(unit_group, game_quantiles[:, 0, :])
+                apply_unit(unit_map[partner_key], game_quantiles[:, 1, :])
+                processed.add(partner_key)
+            else:
+                apply_unit(unit_group, self.copula.sample(n_sims))
+
         # Wrap the results in the SimulationResults container
         return SimulationResults(self.players_df['player_id'].tolist(), all_simulated_points)

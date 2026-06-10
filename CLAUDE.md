@@ -79,7 +79,7 @@ Retrosheet EVN ──► process_historical.py  ──► historical_logs.parque
 
 ### The copula unit
 
-Players are grouped by `(team, opponent)` into 10-player "units": the 9 batters of one team plus their opposing pitcher. The empirical copula is a `G × 10` matrix of historical rank-quantiles (one row per historical game-team observation). Simulation bootstrap-samples rows to produce correlated joint quantile vectors.
+Players are grouped by `(team, opponent)` into 10-player "units": the 9 batters of one team plus their opposing pitcher. The empirical copula is a `G × 10` matrix of historical rank-quantiles (one row per historical game-team observation). Simulation samples at the **game level**: `EmpiricalCopula.sample_games()` bootstraps whole historical games and assigns the two paired rows to the game's two opposing units, preserving the correlation between a team's batters and its own pitcher (~+0.10 at the quantile level) and the shared run environment. Units without a partner on the slate (or copulas lacking a `(game_id, team_id)` index) fall back to independent row sampling via `sample()`.
 
 ### Marginal distributions
 
