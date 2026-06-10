@@ -222,6 +222,18 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <input type="number" step={500} min={0} max={10000} value={draft.gpp.candidate_floor_relief}
                   onChange={e => setGpp('candidate_floor_relief', Number(e.target.value))} disabled={disabled} />
               </FieldRow>
+              <FieldRow label="Refine rounds (0 = off)">
+                <input type="number" step={1} min={0} max={10} value={draft.gpp.refine_rounds ?? 2}
+                  onChange={e => setGpp('refine_rounds', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="Refine parents per round">
+                <input type="number" step={10} min={10} value={draft.gpp.refine_top ?? 150}
+                  onChange={e => setGpp('refine_top', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
+              <FieldRow label="Mutants per parent">
+                <input type="number" step={1} min={1} max={50} value={draft.gpp.refine_mutants ?? 8}
+                  onChange={e => setGpp('refine_mutants', Number(e.target.value))} disabled={disabled} />
+              </FieldRow>
               <FieldRow label="Dump candidate pool">
                 <input type="checkbox" checked={!!draft.gpp.dump_candidate_pool}
                   onChange={e => setGpp('dump_candidate_pool', e.target.checked)} disabled={disabled} />

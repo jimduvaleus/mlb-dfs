@@ -484,6 +484,132 @@ class CandidateGenerator:
 
         return results
 
+    def generate_mutants(
+        self,
+        parents: list[Lineup],
+        n_per_parent: int,
+        seen: set,
+        rng_seed: Optional[int] = None,
+        max_attempts_per_mutant: int = 25,
+        salary_locality: float = 2000.0,
+        pitcher_swap_weight: float = 0.15,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> list[Lineup]:
+        """Generate neighborhood mutants of high-EV parent lineups.
+
+        Each mutant swaps 1-2 players for same-primary-position replacements,
+        biased toward similar salary so the cap/floor window stays feasible.
+        Mutants must pass the GPP stack requirement and full lineup validity
+        (bipartite slot matching covers parents that used multi-position
+        players at secondary slots, e.g. ILP-seeded lineups).
+
+        Parameters
+        ----------
+        parents : lineups to mutate (typically the pool's top $EV rows)
+        n_per_parent : mutants to produce per parent
+        seen : set of frozenset(player_ids) covering the whole pool; mutants
+            are deduped against it and added to it
+        salary_locality : exponential decay scale (dollars) for replacement
+            sampling — smaller values keep swaps closer in salary
+        pitcher_swap_weight : relative probability of mutating a pitcher slot
+            vs a batter slot
+        """
+        rng = np.random.default_rng(
+            rng_seed if rng_seed is not None else self._rng_seed
+        )
+
+        # Validation metadata: _pmeta plus eligible_positions when available,
+        # so Lineup.is_valid()'s slot matching honors multi-position players.
+        if not hasattr(self, "_mutant_meta"):
+            self._mutant_meta = {pid: dict(m) for pid, m in self._pmeta.items()}
+            if "eligible_positions" in self._players_df.columns:
+                for r in self._players_df.itertuples(index=False):
+                    ep = r.eligible_positions
+                    if ep is not None:
+                        self._mutant_meta[int(r.player_id)]["eligible_positions"] = list(ep)
+
+        out: list[Lineup] = []
+        for parent in parents:
+            if stop_check is not None and stop_check():
+                break
+            p_ids = [int(pid) for pid in parent.player_ids]
+            if any(pid not in self._pmeta for pid in p_ids):
+                continue
+            parent_salary = sum(self._pid_salary[pid] for pid in p_ids)
+            roster_size = len(p_ids)
+
+            slot_w = np.array(
+                [
+                    pitcher_swap_weight if self._pmeta[pid]["position"] == "P" else 1.0
+                    for pid in p_ids
+                ],
+                dtype=np.float64,
+            )
+            slot_w /= slot_w.sum()
+
+            produced = 0
+            attempts = 0
+            max_attempts = n_per_parent * max_attempts_per_mutant
+            while produced < n_per_parent and attempts < max_attempts:
+                attempts += 1
+                ids = list(p_ids)
+                n_swaps = 1 if rng.random() < 0.6 else 2
+                swap_slots = rng.choice(roster_size, size=n_swaps, replace=False, p=slot_w)
+
+                feasible_swap = True
+                for j in swap_slots:
+                    old_pid = ids[j]
+                    pos = self._pmeta[old_pid]["position"]
+                    pool_ids, _ = self._pos_pools.get(pos, ([], np.array([])))
+                    in_lineup = set(ids)
+                    cand_pids = [pid for pid in pool_ids if pid not in in_lineup]
+                    if not cand_pids:
+                        feasible_swap = False
+                        break
+                    old_sal = self._pid_salary[old_pid]
+                    w = np.array(
+                        [
+                            math.exp(-abs(self._pid_salary[pid] - old_sal) / salary_locality)
+                            for pid in cand_pids
+                        ],
+                        dtype=np.float64,
+                    )
+                    w_sum = w.sum()
+                    if w_sum <= 0:
+                        feasible_swap = False
+                        break
+                    pick = int(np.searchsorted(np.cumsum(w / w_sum), rng.random()))
+                    ids[j] = cand_pids[min(pick, len(cand_pids) - 1)]
+                if not feasible_swap:
+                    continue
+
+                key = frozenset(ids)
+                if key in seen:
+                    continue
+
+                salary = sum(self._pid_salary[pid] for pid in ids)
+                # Parents may sit below the configured floor (floor relief),
+                # so a mutant is acceptable if it meets the floor OR doesn't
+                # fall below its parent's salary.
+                if (
+                    self._salary_floor is not None
+                    and salary < self._salary_floor
+                    and salary < parent_salary
+                ):
+                    continue
+
+                if not self._check_stack(ids):
+                    continue
+                mutant = Lineup(player_ids=ids)
+                if not mutant.is_valid(self._mutant_meta):
+                    continue
+
+                seen.add(key)
+                out.append(mutant)
+                produced += 1
+
+        return out
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

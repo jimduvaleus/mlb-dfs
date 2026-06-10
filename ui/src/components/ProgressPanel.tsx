@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppMvSelectProgressEvent, GppOptimalProgressEvent, GppHybridSelectProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppMvSelectProgressEvent, GppOptimalProgressEvent, GppHybridSelectProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -34,6 +34,8 @@ const STAGE_LABELS: Record<string, string> = {
   gpp_generate_done: 'Generate candidates',
   gpp_score_start: 'Score candidates',
   gpp_score_done: 'Score candidates',
+  gpp_refine_start: 'Refine pool',
+  gpp_refine_done: 'Refine pool',
   gpp_field_inject: 'Field lineups',
   gpp_holdout: 'Holdout evaluation',
   complete: 'Complete',
@@ -42,7 +44,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
-const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_select_progress', 'gpp_mv_select_progress', 'gpp_optimal_progress', 'gpp_hybrid_select_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_refine_progress', 'gpp_select_progress', 'gpp_mv_select_progress', 'gpp_optimal_progress', 'gpp_hybrid_select_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
@@ -77,6 +79,9 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_field_progress' ||
       last?.stage === 'gpp_score_progress' ||
       last?.stage === 'gpp_score_done' ||
+      last?.stage === 'gpp_refine_start' ||
+      last?.stage === 'gpp_refine_progress' ||
+      last?.stage === 'gpp_refine_done' ||
       last?.stage === 'gpp_field_inject' ||
       last?.stage === 'gpp_select_progress' ||
       last?.stage === 'gpp_mv_select_progress' ||
@@ -153,6 +158,10 @@ export function ProgressPanel({ events, running }: Props) {
   const detRiskStartEvents = events.filter(e => e.stage === 'gpp_det_risk_start') as unknown as GppDetRiskStartEvent[]
   const scoreDone = events.some(e => e.stage === 'gpp_score_done')
   const fieldInjectEvent = events.find(e => e.stage === 'gpp_field_inject') as unknown as { n_field: number; n_k: number } | undefined
+  const refineStartEvent = events.find(e => e.stage === 'gpp_refine_start') as unknown as { rounds: number; top: number; mutants_per_parent: number } | undefined
+  const refineProgressEvents = events.filter(e => e.stage === 'gpp_refine_progress') as unknown as GppRefineProgressEvent[]
+  const latestRefineProgress = refineProgressEvents[refineProgressEvents.length - 1]
+  const refineDone = events.some(e => e.stage === 'gpp_refine_done')
 
   // Det-EV hoisted variables (used in both gppLabel, detSegments, and ETA)
   const isDetEv = detRiskStartEvents.length > 0 || detProgressEvents.length > 0
@@ -203,6 +212,13 @@ export function ProgressPanel({ events, running }: Props) {
       const lastSel = selectProgressEvents[selectProgressEvents.length - 1]
       gppPct = 100
       gppLabel = `Portfolio selection: round ${lastSel.round + 1} — ${lastSel.pct_covered.toFixed(1)}% covered`
+    } else if (refineStartEvent && !refineDone) {
+      gppPct = latestRefineProgress
+        ? Math.round((latestRefineProgress.round / latestRefineProgress.rounds) * 100)
+        : 0
+      gppLabel = latestRefineProgress
+        ? `Refining pool: round ${latestRefineProgress.round} / ${latestRefineProgress.rounds} · +${latestRefineProgress.n_mutants} mutants · top-20 EV $${latestRefineProgress.top20_ev_before.toFixed(2)} → $${latestRefineProgress.top20_ev_after.toFixed(2)}`
+        : `Refining pool: round 1 / ${refineStartEvent.rounds}…`
     } else if (latestScoreProgress) {
       gppPct = Math.round((latestScoreProgress.batches_done / latestScoreProgress.batches_total) * 100)
       gppLabel = `Scoring batch ${latestScoreProgress.batches_done} / ${latestScoreProgress.batches_total}`
@@ -448,6 +464,23 @@ export function ProgressPanel({ events, running }: Props) {
         </div>
       )}
 
+      {/* Pool refinement: one row per round showing what mutation changed */}
+      {refineProgressEvents.length > 0 && (
+        <div className="event-list">
+          {refineProgressEvents.map((ev, i) => (
+            <div key={i} className="event-row event-gpp_refine_progress">
+              <span className="event-stage event-stage-lineup">Refine {ev.round}/{ev.rounds}</span>
+              <span className="event-detail">
+                +{ev.n_mutants} mutants from {ev.n_parents} parents · {ev.n_beat_parent} beat parent · {ev.n_in_top20} now in top-20 · top-20 EV ${ev.top20_ev_before.toFixed(2)} → ${ev.top20_ev_after.toFixed(2)}
+                {ev.best_swap_out.length > 0 && (
+                  <> · best swap: {formatSwap(ev.best_swap_out, ev.best_swap_in)} ({ev.best_swap_ev_delta >= 0 ? '+' : ''}${ev.best_swap_ev_delta.toFixed(2)})</>
+                )}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Det-EV: one row per risk value showing completion status */}
       {(detRiskStartEvents.length > 0 || detProgressEvents.length > 0) && (() => {
         const totalRisks = detRiskStartEvents[0]?.total_risks ?? detProgressEvents[0]?.total_risks ?? 5
@@ -546,6 +579,15 @@ export function ProgressPanel({ events, running }: Props) {
   )
 }
 
+function formatSwap(out: string[], inn: string[]): string {
+  // Same-position 1-2 player swaps; labels are "POS Name" sorted, so
+  // index-wise pairing lines the positions up.
+  if (out.length === inn.length) {
+    return out.map((o, i) => `${o} → ${inn[i]}`).join(' · ')
+  }
+  return `${out.join(', ')} → ${inn.join(', ')}`
+}
+
 function buildConfigDetail(events: SSEEvent[]): string {
   const sim = events.find(e => e.stage === 'simulate') as SimulateEvent | undefined
   const target = events.find(e => e.stage === 'compute_target') as unknown as { target: number; percentile: number | null } | undefined
@@ -576,6 +618,7 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
     if (e.stage === 'gpp_optimal_start' && hasEvent('gpp_optimal_done')) continue
     if (e.stage === 'gpp_generate_start' && hasEvent('gpp_generate_done')) continue
     if (e.stage === 'gpp_score_start' && hasEvent('gpp_score_done')) continue
+    if (e.stage === 'gpp_refine_start' && hasEvent('gpp_refine_done')) continue
     // field_inject is a one-shot cache notification; skip once score is done
     if (e.stage === 'gpp_field_inject' && hasEvent('gpp_score_done')) continue
     if (CONFIG_STAGES.has(e.stage)) {
@@ -673,6 +716,15 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'gpp_score_done':
       return 'Scoring complete'
+    case 'gpp_refine_start': {
+      const ev = e as unknown as { rounds: number; top: number; mutants_per_parent: number }
+      return `${ev.rounds} round${ev.rounds !== 1 ? 's' : ''} × ${ev.top} parents × ${ev.mutants_per_parent} mutants…`
+    }
+    case 'gpp_refine_done': {
+      const ev = e as unknown as { pool_size: number; n_added: number; best_ev: number; best_ev_before: number }
+      const uplift = ev.best_ev - ev.best_ev_before
+      return `+${ev.n_added.toLocaleString()} mutants (pool ${ev.pool_size.toLocaleString()}) · best EV $${ev.best_ev_before.toFixed(2)} → $${ev.best_ev.toFixed(2)}${uplift > 0 ? ` (+$${uplift.toFixed(2)})` : ''}`
+    }
     case 'gpp_holdout': {
       const ev = e as unknown as { holdout_mean_payout: number }
       return `Holdout mean payout: ${ev.holdout_mean_payout.toFixed(4)}`

@@ -183,6 +183,9 @@ class ContestScorer:
         self.last_field_sorted: Optional[np.ndarray] = None
         self.last_col_lineups: Optional[np.ndarray] = None
         self.last_raw_field_list: Optional[list[np.ndarray]] = None
+        # Per-sample sorted fields, retained so score_batch() can score
+        # additional candidates against the exact same fields.
+        self._field_sorted_list: Optional[list[np.ndarray]] = None
 
         if payout_arr is None:
             from src.optimization.payout import load_payout_structure, payout_table_to_array
@@ -313,13 +316,62 @@ class ContestScorer:
             self.last_field_sorted.shape, time.perf_counter() - _t_concat,
         )
 
+        self._field_sorted_list = field_sorted_list
+
         _t_col = time.perf_counter()
         M = len(candidates)
         col_lineups = self._build_col_lineups(candidates)  # (M, 10) int32
         self.last_col_lineups = col_lineups
         logger.info("[TIMING] _build_col_lineups M=%d: %.3fs", M, time.perf_counter() - _t_col)
 
-        # --- Score the (possibly enriched) candidate pool against all K fields ---
+        _t_scoring = time.perf_counter()
+        robust_payout = self._score_col_lineups(col_lineups, progress_cb, stop_check)
+        logger.info("[TIMING] Numba scoring loop total: %.3fs", time.perf_counter() - _t_scoring)
+
+        logger.info(
+            "[TIMING] score_candidates total: %.3fs (field=%.3fs, scoring=%.3fs)",
+            time.perf_counter() - _t_phase,
+            time.perf_counter() - _t_phase - (time.perf_counter() - _t_scoring),
+            time.perf_counter() - _t_scoring,
+        )
+        return candidates, robust_payout
+
+    def score_batch(
+        self,
+        candidates: list[Lineup],
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> np.ndarray:
+        """Score additional candidates against the fields built by score_candidates().
+
+        Used by candidate-pool refinement: mutants must be scored against the
+        exact same K field samples as the original pool so their robust_payout
+        rows are directly comparable. Appends the new candidates' column
+        lineups to last_col_lineups to keep coverage consumers consistent.
+
+        Returns robust_payout of shape (len(candidates), n_sims) float32.
+        """
+        if self._field_sorted_list is None:
+            raise RuntimeError("score_batch() requires a prior score_candidates() call.")
+
+        col_lineups = self._build_col_lineups(candidates)
+        robust_payout = self._score_col_lineups(col_lineups, progress_cb, stop_check)
+        if self.last_col_lineups is not None:
+            self.last_col_lineups = np.concatenate(
+                [self.last_col_lineups, col_lineups], axis=0
+            )
+        return robust_payout
+
+    def _score_col_lineups(
+        self,
+        col_lineups: np.ndarray,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> np.ndarray:
+        """Score (M, 10) column lineups against the cached K sorted fields."""
+        n_sims = self._sim_matrix.shape[0]
+        field_sorted_list = self._field_sorted_list
+        M = col_lineups.shape[0]
         robust_payout = np.zeros((M, n_sims), dtype=np.float32)
         n_batches = (M + self._batch_size - 1) // self._batch_size
         logger.info(
@@ -327,7 +379,6 @@ class ContestScorer:
             M, n_batches, self._batch_size,
         )
 
-        _t_scoring = time.perf_counter()
         for batch_idx, start in enumerate(range(0, M, self._batch_size)):
             end = min(start + self._batch_size, M)
             batch_cols = col_lineups[start:end]  # (batch, 10)
@@ -353,8 +404,6 @@ class ContestScorer:
                 logger.info("ContestScorer: stop requested after batch %d/%d.", batch_idx + 1, n_batches)
                 break
 
-        logger.info("[TIMING] Numba scoring loop total: %.3fs", time.perf_counter() - _t_scoring)
-
         # Zero out robust_payout for any candidate whose col_lineups contains -1
         # (a player absent from sim_results). Without this, numpy's -1 index wraps
         # to the last column and inflates the candidate's score, potentially
@@ -368,13 +417,7 @@ class ContestScorer:
                 int(invalid_mask.sum()),
             )
 
-        logger.info(
-            "[TIMING] score_candidates total: %.3fs (field=%.3fs, scoring=%.3fs)",
-            time.perf_counter() - _t_phase,
-            time.perf_counter() - _t_phase - (time.perf_counter() - _t_scoring),
-            time.perf_counter() - _t_scoring,
-        )
-        return candidates, robust_payout
+        return robust_payout
 
     # ------------------------------------------------------------------
     # Internal helpers

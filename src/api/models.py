@@ -63,6 +63,9 @@ class GppConfig(BaseModel):
     portfolio_method: str = "det_ev"
     hybrid_n_sims: int = 10_000
     hybrid_max_correlation: float = 0.9
+    refine_rounds: int = 2
+    refine_top: int = 150
+    refine_mutants: int = 8
 
 
 class AppConfig(BaseModel):

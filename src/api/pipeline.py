@@ -816,6 +816,168 @@ class PipelineRunner:
                     _pct_pos,
                 )
 
+                # Phase 2b: EV-guided pool refinement — mutate the top-$EV
+                # candidates and score the mutants against the same cached
+                # fields, extending the pool along the EV frontier before
+                # selection. The selector can only pick lineups the pool
+                # contains; sampling alone leaves the EV ceiling to chance.
+                refine_rounds = int(gpp_cfg.get("refine_rounds", 2))
+                refine_top = int(gpp_cfg.get("refine_top", 150))
+                refine_mutants = int(gpp_cfg.get("refine_mutants", 8))
+                if (
+                    refine_rounds > 0 and refine_top > 0 and refine_mutants > 0
+                    and not (_gpp_stopped and self._stop_check())
+                ):
+                    _t_refine = time.perf_counter()
+                    _seen_pool = {
+                        frozenset(int(p) for p in lu.player_ids) for lu in candidates
+                    }
+                    # No single primary-stack team may take more than 25% of
+                    # the parent slots, so refinement keeps stack breadth.
+                    _parent_team_cap = max(1, int(np.ceil(refine_top * 0.25)))
+                    _pid_team_r = dict(zip(
+                        cand_players_df["player_id"].astype(int), cand_players_df["team"]
+                    ))
+                    _pid_pos_r = dict(zip(
+                        cand_players_df["player_id"].astype(int), cand_players_df["position"]
+                    ))
+                    _pid_name_r = dict(zip(
+                        cand_players_df["player_id"].astype(int),
+                        cand_players_df.get("name", cand_players_df["player_id"].astype(str)),
+                    ))
+
+                    def _player_label(pid: int) -> str:
+                        return f"{_pid_pos_r.get(pid, '?')} {_pid_name_r.get(pid, pid)}"
+
+                    def _primary_stack_team(lu) -> str:
+                        th: dict[str, int] = {}
+                        for pid in lu.player_ids:
+                            if _pid_pos_r.get(int(pid), "") != "P":
+                                t = _pid_team_r.get(int(pid), "")
+                                if t:
+                                    th[t] = th.get(t, 0) + 1
+                        return max(th, key=th.get) if th else ""
+
+                    self._cb("gpp_refine_start", {
+                        "rounds": refine_rounds,
+                        "top": refine_top,
+                        "mutants_per_parent": refine_mutants,
+                    })
+                    _ev_before = float(robust_payout.mean(axis=1).max())
+                    _pool_size_before_refine = len(candidates)
+                    for _round in range(refine_rounds):
+                        if _gpp_stopped and self._stop_check():
+                            break
+                        _ev_means_r = robust_payout.mean(axis=1)
+                        _parents: list = []
+                        _parent_evs: list[float] = []
+                        _parent_team_counts: dict[str, int] = {}
+                        for _ci in np.argsort(_ev_means_r)[::-1]:
+                            _lu = candidates[int(_ci)]
+                            _pt = _primary_stack_team(_lu)
+                            if _pt and _parent_team_counts.get(_pt, 0) >= _parent_team_cap:
+                                continue
+                            _parent_team_counts[_pt] = _parent_team_counts.get(_pt, 0) + 1
+                            _parents.append(_lu)
+                            _parent_evs.append(float(_ev_means_r[int(_ci)]))
+                            if len(_parents) >= refine_top:
+                                break
+
+                        _mutants = gen.generate_mutants(
+                            _parents, refine_mutants, _seen_pool,
+                            rng_seed=int(opt_cfg.get("rng_seed") or 42) + _round + 1,
+                            stop_check=self._stop_check,
+                        )
+                        if not _mutants:
+                            logger.info(
+                                "Refine round %d/%d: no new mutants; stopping refinement.",
+                                _round + 1, refine_rounds,
+                            )
+                            break
+                        _payout_new = scorer.score_batch(
+                            _mutants, stop_check=self._stop_check
+                        )
+
+                        # Round telemetry: compare each mutant to its source
+                        # parent (max player overlap) so the UI can show what
+                        # the mutations changed and whether they paid off.
+                        _n_before = len(candidates)
+                        _top20_before = float(np.sort(_ev_means_r)[-20:].mean())
+                        _parent_sets = [
+                            set(int(p) for p in lu.player_ids) for lu in _parents
+                        ]
+                        _mutant_evs = _payout_new.mean(axis=1)
+                        _n_beat_parent = 0
+                        _best_delta = -np.inf
+                        _best_swap_out: list[str] = []
+                        _best_swap_in: list[str] = []
+                        _best_mutant_ev = 0.0
+                        for _mi, _mu in enumerate(_mutants):
+                            _mset = set(int(p) for p in _mu.player_ids)
+                            _pi = max(
+                                range(len(_parent_sets)),
+                                key=lambda k: len(_mset & _parent_sets[k]),
+                            )
+                            _delta = float(_mutant_evs[_mi]) - _parent_evs[_pi]
+                            if _delta > 0:
+                                _n_beat_parent += 1
+                            if _delta > _best_delta:
+                                _best_delta = _delta
+                                _best_mutant_ev = float(_mutant_evs[_mi])
+                                _best_swap_out = sorted(
+                                    _player_label(p) for p in (_parent_sets[_pi] - _mset)
+                                )
+                                _best_swap_in = sorted(
+                                    _player_label(p) for p in (_mset - _parent_sets[_pi])
+                                )
+
+                        candidates = candidates + _mutants
+                        robust_payout = np.concatenate(
+                            [robust_payout, _payout_new], axis=0
+                        )
+                        _ev_means_after = robust_payout.mean(axis=1)
+                        _best_ev = float(_ev_means_after.max())
+                        _top20_after = float(np.sort(_ev_means_after)[-20:].mean())
+                        _n_in_top20 = int(
+                            (np.argsort(_ev_means_after)[-20:] >= _n_before).sum()
+                        )
+                        logger.info(
+                            "Refine round %d/%d: +%d mutants (pool %d), %d beat parent, "
+                            "%d in top-20, top-20 EV $%.3f → $%.3f, best swap %s → %s (%+.3f)",
+                            _round + 1, refine_rounds, len(_mutants), len(candidates),
+                            _n_beat_parent, _n_in_top20, _top20_before, _top20_after,
+                            ", ".join(_best_swap_out), ", ".join(_best_swap_in), _best_delta,
+                        )
+                        self._cb("gpp_refine_progress", {
+                            "round": _round + 1,
+                            "rounds": refine_rounds,
+                            "n_parents": len(_parents),
+                            "n_mutants": len(_mutants),
+                            "pool_size": len(candidates),
+                            "best_ev": _best_ev,
+                            "n_beat_parent": _n_beat_parent,
+                            "n_in_top20": _n_in_top20,
+                            "top20_ev_before": _top20_before,
+                            "top20_ev_after": _top20_after,
+                            "best_swap_out": _best_swap_out,
+                            "best_swap_in": _best_swap_in,
+                            "best_swap_ev_delta": float(_best_delta),
+                            "best_mutant_ev": _best_mutant_ev,
+                        })
+                    logger.info(
+                        "[TIMING] Refinement wall time: %.3fs  best EV $%.3f → $%.3f  "
+                        "pool %d",
+                        time.perf_counter() - _t_refine,
+                        _ev_before, float(robust_payout.mean(axis=1).max()),
+                        len(candidates),
+                    )
+                    self._cb("gpp_refine_done", {
+                        "pool_size": len(candidates),
+                        "n_added": len(candidates) - _pool_size_before_refine,
+                        "best_ev": float(robust_payout.mean(axis=1).max()),
+                        "best_ev_before": _ev_before,
+                    })
+
                 if _gpp_stopped and self._stop_check():
                     portfolio = []
                 else:
