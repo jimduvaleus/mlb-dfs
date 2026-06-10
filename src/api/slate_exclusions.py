@@ -2,7 +2,7 @@
 
 Exclusions are stored per (slate_id, file_fingerprint) key so that:
 - each platform's slate keeps its own independent exclusions
-- changing the underlying CSV file (detected via mtime+size fingerprint) resets
+- changing the underlying CSV file (content-hash fingerprint) resets
   exclusions for that slate automatically
 
 Each entity (game, team, player) has an exclusion scope:
@@ -40,15 +40,32 @@ def compute_slate_id(games: list[str]) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
 
-def compute_file_fingerprint(path: Path | None) -> str:
-    """Return a lightweight fingerprint (mtime_ns:size) for a file.
+# Single source of truth for slate-change detection.
+# All callers share this cache so the file is read at most once per inode lifetime.
+# Cache key is (ino, mtime_ns, size): a cheap stat() call per request, MD5 only on miss.
+# This correctly handles `mv` replacement — mv always produces a new inode even when
+# the source file's mtime and size happen to match the old file (e.g. DK preserving
+# the server's Last-Modified timestamp across slate updates).
+_fp_cache: dict[str, tuple[tuple[int, int, int], str]] = {}  # path → (stat_key, digest)
 
-    Returns an empty string if the path is None or does not exist.
+
+def compute_file_fingerprint(path: Path | None) -> str:
+    """Return a content-based fingerprint (MD5 hex digest) for a file.
+
+    Cached by (inode, mtime_ns, size): one stat() per call, file read only when
+    the stat changes.  Returns "" if the path is None or does not exist.
     """
     if path is None or not path.exists():
         return ""
-    stat = path.stat()
-    return f"{stat.st_mtime_ns}:{stat.st_size}"
+    key = str(path.resolve())
+    st = path.stat()
+    stat_key = (st.st_ino, st.st_mtime_ns, st.st_size)
+    cached = _fp_cache.get(key)
+    if cached and cached[0] == stat_key:
+        return cached[1]
+    digest = hashlib.md5(path.read_bytes()).hexdigest()
+    _fp_cache[key] = (stat_key, digest)
+    return digest
 
 
 def _entry_key(slate_id: str, file_fingerprint: str) -> str:
