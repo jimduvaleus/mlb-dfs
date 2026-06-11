@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
-import type { CappedPlayer, ExclusionScope, FallbackTeam, LowTeamProjection, MergeInfo, MissingOptPlayer, OwnershipSyncResult, ProjectionsStatus, TeamNameWarning } from '../types'
+import type { CappedPlayer, ExclusionScope, FallbackTeam, HeuristicPlayer, LowTeamProjection, MergeInfo, MissingOptPlayer, OwnershipSyncResult, ProjectionsStatus, TeamNameWarning } from '../types'
 
 const MARKET_DISPLAY: Record<string, string> = {
   singles: '1B', doubles: '2B', triples: '3B', home_runs: 'HR',
@@ -53,8 +53,9 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       const players = (state.players ?? []) as MergeInfo['players']
       const cappedPlayers = (state.capped_players ?? []) as CappedPlayer[]
       const missingOptPlayers = (state.missing_opt_players ?? []) as MissingOptPlayer[]
+      const heuristicPlayers = (state.heuristic_players ?? []) as HeuristicPlayer[]
       const teamNameWarnings = (state.team_name_warnings ?? []) as TeamNameWarning[]
-      if (players.length || cappedPlayers.length || missingOptPlayers.length || teamNameWarnings.length) {
+      if (players.length || cappedPlayers.length || missingOptPlayers.length || teamNameWarnings.length || heuristicPlayers.length) {
         const fallbackTeams = (state.fallback_teams ?? []) as FallbackTeam[]
         onMergeInfo({
           secondarySource: (state.secondary_source as string) || 'RotoWire',
@@ -62,6 +63,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
           players,
           cappedPlayers,
           missingOptPlayers,
+          heuristicPlayers,
           fallbackTeams,
           teamNameWarnings,
         })
@@ -106,8 +108,9 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         const lowTeamProjections = (event.low_team_projections ?? []) as LowTeamProjection[]
         const fallbackTeams = (event.fallback_teams ?? []) as FallbackTeam[]
         const missingOptPlayers = (event.missing_opt_players ?? []) as MissingOptPlayer[]
+        const heuristicPlayers = (event.heuristic_players ?? []) as HeuristicPlayer[]
         const teamNameWarnings = (event.team_name_warnings ?? []) as TeamNameWarning[]
-        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams, missingOptPlayers, teamNameWarnings })
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams, missingOptPlayers, heuristicPlayers, teamNameWarnings })
         // Auto-exclude pitchers that fell back to a secondary source at 'candidates'
         // scope — their projections are lower quality but they still model the field.
         // Pitchers with partial_mean have only the wins market missing; they receive a
@@ -334,6 +337,31 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
                 </span>
               ))
               .reduce<React.ReactNode[]>((acc, el, i) => i === 0 ? [el] : [...acc, ', ', el], [])}
+          </div>
+        </div>
+      )}
+
+      {mergeInfo && status?.is_fresh !== false && (mergeInfo.heuristicPlayers ?? []).length > 0 && (
+        <div className="merge-info-callout merge-info-player-fallback-callout">
+          <strong>
+            ⚠ {mergeInfo.heuristicPlayers!.length} late add{mergeInfo.heuristicPlayers!.length !== 1 ? 's' : ''} using salary/600 heuristic — no market or {mergeInfo.secondarySource} projection
+          </strong>
+          <div className="merge-info-players">
+            {mergeInfo.heuristicPlayers!.map((p, i) => (
+              <span key={p.player_id} className="merge-info-team-group">
+                {i > 0 && ', '}
+                <span className="merge-info-team-label">{p.team || '—'}</span>
+                {' '}
+                {p.name}
+                <span
+                  className="merge-info-reason"
+                  title={`$${p.salary.toLocaleString()} → ${p.mean.toFixed(2)} pts${p.reason ? ` · markets: ${p.reason}` : ''}`}
+                > ⓘ</span>
+              </span>
+            ))}
+          </div>
+          <div style={{ marginTop: 6, fontSize: '0.8em', opacity: 0.85 }}>
+            Verify these projections manually — they are salary-derived placeholders, not market- or source-based.
           </div>
         </div>
       )}

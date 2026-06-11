@@ -1793,15 +1793,22 @@ async def projections_fetch(request: Request):
         # a player confirmed via Underdog lineup notification may have a projection
         # in the raw source data but be absent from the filtered output.  This
         # ensures they're always included so _apply_twitter_overrides can slot them.
-        # Falls back to salary / 400.0 heuristic only when no source had them at all.
-        def _inject_twitter_confirmed(pool: "pd.DataFrame") -> "pd.DataFrame":
+        # When the market-odds output projected the player (late adds are passed
+        # to the MO fetch via --include-player-ids), that projection is used.
+        # Falls back to the salary / 600.0 heuristic only when no source had
+        # them at all; heuristic injections are surfaced in merge_info.
+        def _inject_twitter_confirmed(
+            pool: "pd.DataFrame",
+            mo_df: "pd.DataFrame | None" = None,
+            mo_reasons: "dict[int, str] | None" = None,
+        ) -> "tuple[pd.DataFrame, list[dict]]":
             from .twitter_lineups import get_confirmed_team_lineups
             confirmed = get_confirmed_team_lineups(_slate_fingerprint())
             if not confirmed:
-                return pool
+                return pool, []
             slate_file = _slate_path_for_meta
             if slate_file is None or not slate_file.exists():
-                return pool
+                return pool, []
             pid_to_slot: dict[int, int] = {
                 pid: slot
                 for pid_to_slot in confirmed.values()
@@ -1816,7 +1823,7 @@ async def projections_fetch(request: Request):
             if is_partial and included_pids:
                 missing_pids &= {int(p) for p in included_pids}
             if not missing_pids:
-                return pool
+                return pool, []
             try:
                 if platform_val == "fanduel":
                     sl = pd.read_csv(slate_file, usecols=["Id", "Nickname", "Salary"])
@@ -1831,27 +1838,50 @@ async def projections_fetch(request: Request):
                     sl = sl[sl["_pid"].isin(missing_pids)]
                     name_col = "Name"
             except Exception:
-                return pool
+                return pool, []
             if sl.empty:
-                return pool
+                return pool, []
+            mo_lookup: dict[int, tuple[float, float]] = {}
+            if mo_df is not None and not mo_df.empty and {"player_id", "mean", "std_dev"}.issubset(mo_df.columns):
+                mo_lookup = {
+                    int(r.player_id): (float(r.mean), float(r.std_dev))
+                    for r in mo_df.drop_duplicates("player_id").itertuples(index=False)
+                }
+            _itm_inj = _ensure_id_to_team()
             rows = []
+            injected: list[dict] = []
             for _, row in sl.iterrows():
                 pid = int(row["_pid"])
                 salary = float(row["Salary"]) if pd.notna(row.get("Salary")) else 3000.0
-                proj_mean = salary / 400.0
+                if pid in mo_lookup:
+                    proj_mean, proj_std = mo_lookup[pid]
+                    source = "market_odds"
+                else:
+                    proj_mean = round(salary / 600.0, 2)
+                    proj_std = round(proj_mean * 0.85, 2)
+                    source = "heuristic"
                 rows.append({
                     "player_id": pid,
                     "name": str(row[name_col]),
-                    "mean": round(proj_mean, 2),
-                    "std_dev": round(proj_mean * 0.85, 2),
+                    "mean": proj_mean,
+                    "std_dev": proj_std,
                     "lineup_slot": pid_to_slot.get(pid, 1),
                     "slot_confirmed": True,
                 })
+                injected.append({
+                    "player_id": pid,
+                    "name": str(row[name_col]),
+                    "team": _itm_inj.get(pid, ""),
+                    "salary": salary,
+                    "mean": proj_mean,
+                    "source": source,
+                    "reason": (mo_reasons or {}).get(pid, ""),
+                })
             if not rows:
-                return pool
+                return pool, []
             new_df = pd.DataFrame(rows)
             new_df["player_id"] = new_df["player_id"].astype("Int64")
-            return pd.concat([pool, new_df], ignore_index=True)
+            return pd.concat([pool, new_df], ignore_index=True), injected
 
         # Clear stale merge-info state at the start of every full (non-partial)
         # fetch so that server restarts don't resurface banners from a prior slate.
@@ -1921,6 +1951,23 @@ async def projections_fetch(request: Request):
                     yield _log("--- Fetching Market Odds (CrazyNinjaOdds) ---")
                     mo_cmd = [str(python), str(mo_script), "--output", str(mo_out),
                               "--rw-output", str(rw_out), *_platform_args]
+                    # Late adds confirmed via Twitter lineups may be absent from
+                    # the RotoWire pool; pass them explicitly so they can receive
+                    # market projections instead of the salary heuristic.
+                    try:
+                        from .twitter_lineups import get_confirmed_team_lineups as _gctl
+                        _confirmed_pids = sorted({
+                            int(pid)
+                            for _m in _gctl(_slate_fingerprint()).values()
+                            for pid in _m
+                        })
+                        if _confirmed_pids:
+                            mo_cmd += [
+                                "--include-player-ids",
+                                ",".join(str(p) for p in _confirmed_pids),
+                            ]
+                    except Exception:
+                        pass
                     if included_pairs:
                         games_arg = ",".join(f"{a}@{h}" for a, h in included_pairs)
                         mo_cmd += ["--games", games_arg]
@@ -2019,7 +2066,18 @@ async def projections_fetch(request: Request):
                             pool.loc[is_hitter, "mean"]    *= 0.9
                             pool.loc[is_hitter, "std_dev"] *= 0.9
 
-                        pool = _inject_twitter_confirmed(pool)
+                        pool, _injected = _inject_twitter_confirmed(
+                            pool, mo_df=mo_df, mo_reasons=mo_sidecar_reasons
+                        )
+                        heuristic_players: list[dict] = [
+                            e for e in _injected if e["source"] == "heuristic"
+                        ]
+                        for e in _injected:
+                            if e["source"] == "market_odds":
+                                _logging.getLogger(__name__).info(
+                                    "Late add %s (%s) projected from market odds.",
+                                    e["name"], e["team"],
+                                )
                         _stale_warn = _write_proj(pool)
                         if _stale_warn:
                             yield _log(f"Warning: {_stale_warn}")
@@ -2069,6 +2127,7 @@ async def projections_fetch(request: Request):
                             fallback_players    = _purge(_prev.get("players", []))         + fallback_players
                             capped_players      = _purge(_prev.get("capped_players", []))  + capped_players
                             missing_opt_players = _purge(_prev.get("missing_opt_players", [])) + missing_opt_players
+                            heuristic_players   = _purge(_prev.get("heuristic_players", [])) + heuristic_players
                             team_name_warnings  = _purge_warnings(_prev.get("team_name_warnings", [])) + team_name_warnings
 
                         _total_batters: dict[str, int] = {}
@@ -2083,13 +2142,14 @@ async def projections_fetch(request: Request):
                             "players":             fallback_players,
                             "capped_players":      capped_players,
                             "missing_opt_players": missing_opt_players,
+                            "heuristic_players":   heuristic_players,
                             "fallback_teams":      fallback_teams,
                             "team_name_warnings":  team_name_warnings,
                             "secondary_source":    "RotoWire",
                         })
 
-                        if fallback_players or capped_players or low_team_projs or missing_opt_players or team_name_warnings:
-                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'team_name_warnings': team_name_warnings, 'timestamp': int(time.time() * 1000)})}\n\n"
+                        if fallback_players or capped_players or low_team_projs or missing_opt_players or team_name_warnings or heuristic_players:
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'heuristic_players': heuristic_players, 'team_name_warnings': team_name_warnings, 'timestamp': int(time.time() * 1000)})}\n\n"
                         elif result_event is None:
                             result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
 
@@ -2274,7 +2334,10 @@ async def projections_fetch(request: Request):
                             if _itm2.get(int(p.get("player_id", 0)), "") in included_teams
                         ]
 
-                    pool = _inject_twitter_confirmed(pool)
+                    pool, _injected2 = _inject_twitter_confirmed(pool)
+                    heuristic_players2: list[dict] = [
+                        e for e in _injected2 if e["source"] == "heuristic"
+                    ]
                     _stale_warn = _write_proj(pool)
                     if _stale_warn:
                         yield _log(f"Warning: {_stale_warn}")
@@ -2295,18 +2358,20 @@ async def projections_fetch(request: Request):
                         def _purge2(lst: list[dict]) -> list[dict]:
                             return [x for x in lst if x.get("team", "") not in included_teams]
                         fallback_players2 = _purge2(_prev2.get("players", [])) + fallback_players2
+                        heuristic_players2 = _purge2(_prev2.get("heuristic_players", [])) + heuristic_players2
 
                     _save_merge_info_state({
                         "players":             fallback_players2,
                         "capped_players":      [],
                         "missing_opt_players": [],
+                        "heuristic_players":   heuristic_players2,
                         "fallback_teams":      fallback_teams2,
                         "team_name_warnings":  [],
                         "secondary_source":    fallback_label,
                     })
 
-                    if fallback_players2 or low_team_projs2:
-                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'timestamp': int(time.time() * 1000)})}\n\n"
+                    if fallback_players2 or low_team_projs2 or heuristic_players2:
+                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'heuristic_players': heuristic_players2, 'timestamp': int(time.time() * 1000)})}\n\n"
                     else:
                         result_event2 = _log(f"All player projections sourced from {preferred_label}.")
 

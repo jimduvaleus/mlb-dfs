@@ -441,6 +441,16 @@ export interface TeamNameWarning {
   market: string     // "Run Line" or "Total Runs"
 }
 
+export interface HeuristicPlayer {
+  player_id: number
+  name: string
+  team: string
+  salary: number
+  mean: number
+  source: string
+  reason?: string
+}
+
 export interface MergeInfo {
   secondarySource: string
   count: number
@@ -449,6 +459,7 @@ export interface MergeInfo {
   lowTeamProjections?: LowTeamProjection[]
   fallbackTeams?: FallbackTeam[]
   missingOptPlayers?: MissingOptPlayer[]
+  heuristicPlayers?: HeuristicPlayer[]
   teamNameWarnings?: TeamNameWarning[]
 }
 
