@@ -83,9 +83,13 @@ Players are grouped by `(team, opponent)` into 10-player "units": the 9 batters 
 
 ### Marginal distributions
 
-- **Pitchers (slot 10)**: Always `GaussianMarginal(mu, sigma)` — direct `scipy.stats.norm.ppf`.
-- **Batters (slots 1-9), Phases 1-3**: `GaussianMarginal` used as a placeholder.
-- **Batters (slots 1-9), Phase 4+**: `BatterMixtureMarginal` — mixture of Exp(λ) + N(μ,σ). At runtime, `BatterPCAModel.project(mu_proj, sigma_proj)` solves a 2×2 linear system to find the point on the fitted PCA plane that satisfies the projection constraints, yielding the full `(w, λ, μ, σ)` parameter set.
+Precedence per player (highest first):
+
+1. **Market-implied quantile grid** (`EmpiricalQuantileMarginal`) — when the market-odds fetcher produced a validated 101-point percentile grid for the player (`data/processed/projections_mo_dist.parquet`, built by a per-player Monte Carlo over the fitted market rates with structural couplings: R ≥ HR, RBI ≥ HR, K ≤ outs, 5-IP win rule, early-exit outs mixture). Grids are matched defensively: applied only when the player's projected mean agrees with the grid mean within ±0.5 (`src/models/quantile_grids.py`), so fallback-sourced or stale entries keep the parametric path.
+2. **Batters (slots 1-9)**: `BatterMixtureMarginal` — mixture of Exp(λ) + N(μ,σ). At runtime, `BatterPCAModel.project(mu_proj, sigma_proj)` solves a 2×2 linear system to find the point on the fitted PCA plane that satisfies the projection constraints, yielding the full `(w, λ, μ, σ)` parameter set.
+3. **Fallback (pitchers without a grid; batters without a PCA model)**: `GaussianMarginal(mu, sigma)` — direct `scipy.stats.norm.ppf`.
+
+`scripts/compare_marginals.py` reports before/after moment and percentile shifts (synthetic archetypes, or per-player when a dist parquet is present).
 
 ### Optimizer
 

@@ -65,6 +65,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 import pandas as pd
 from scipy.optimize import brentq
 from scipy.stats import poisson as scipy_poisson
@@ -1504,7 +1505,11 @@ def _compute_batter_projection(
         + e_sb  * c["sb"]              ** 2
         + e_hbp * c["hbp"]             ** 2
     )
-    return mean, max(math.sqrt(var), 1.0), capped, missing_opt
+    rates = dict(
+        single=e_s, double=e_d, triple=e_t, home_run=e_hr,
+        run=e_r, rbi=e_rbi, walk=e_bb, sb=e_sb, hbp=e_hbp,
+    )
+    return mean, max(math.sqrt(var), 1.0), capped, missing_opt, rates
 
 
 def _compute_pitcher_projection(
@@ -1562,7 +1567,162 @@ def _compute_pitcher_projection(
         + e_hbp * c["hbp"] ** 2
         + p_qs * (1.0 - p_qs) * c["qs"] ** 2  # Bernoulli QS variance
     )
-    return mean, max(math.sqrt(var), 1.0)
+    rates = dict(outs=e_outs, k=e_k, win=e_win, h=e_ha, bb=e_bba, er=e_er, hbp=e_hbp)
+    return mean, max(math.sqrt(var), 1.0), rates
+
+
+# ---------------------------------------------------------------------------
+# Market-implied score distributions (Monte Carlo from fitted rates)
+# ---------------------------------------------------------------------------
+# The per-stat market fits define complete distributions, not just means.
+# A small vectorized Monte Carlo turns them into a full DK/FD score
+# distribution per player, with structural couplings the analytic
+# mean/variance formulas cannot express (a HR also scores a run and drives
+# in at least one; strikeouts cannot exceed outs; a starter must complete
+# 5 innings to win). The 101-point percentile grid is consumed by
+# EmpiricalQuantileMarginal in the simulation engine.
+
+_DIST_N_DRAWS = 50_000
+_DIST_N_QUANTILES = 101
+_DIST_SEED_BASE = 1_234_567
+_WIN_MIN_OUTS = 15          # starter needs 5 complete innings for the W
+_WIN_ER_TILT = 0.35         # win probability tilt per relative ER deviation
+_ER_EXPOSURE_CLIP = (0.25, 1.75)  # bounds on the inverse-exposure ER scale
+
+# Early-exit ("blowup") mixture for outs: the market gives only E[outs], but
+# real outing-length distributions are left-skewed — a Poisson around the
+# mean misses the short-start mode entirely. League-average early-exit rate
+# and its typical length; the main component is re-centered to preserve
+# E[outs] exactly.
+_BLOWUP_PROB = 0.15
+_BLOWUP_MEAN_OUTS = 9.0
+
+# Percentile points for the stored quantile grid. Endpoints are pulled in
+# from the raw sample min/max (P0/P100) to P0.05/P99.95 so a single extreme
+# Monte Carlo draw cannot distort interpolated means in the tail buckets.
+_DIST_PCTL_POINTS = np.linspace(0.0, 100.0, _DIST_N_QUANTILES)
+_DIST_PCTL_POINTS[0] = 0.05
+_DIST_PCTL_POINTS[-1] = 99.95
+
+
+def _distribution_grid(scores: np.ndarray) -> np.ndarray:
+    """Percentile grid (P0.05 .. P99.95 at 101 points) of a score sample."""
+    return np.percentile(scores, _DIST_PCTL_POINTS)
+
+
+def _simulate_batter_distribution(
+    rates: dict[str, float],
+    platform: str = "draftkings",
+    n_draws: int = _DIST_N_DRAWS,
+    seed: int = 0,
+) -> tuple[np.ndarray, float]:
+    """Monte Carlo DK/FD score distribution for a batter.
+
+    Structural coupling: R >= HR and RBI >= HR (a homer scores the batter
+    and drives him in), with the excess drawn so E[R] and E[RBI] match the
+    fitted market means. All other events are independent Poisson draws.
+
+    Returns (percentile grid P0..P100, score std_dev).
+    """
+    c = _FD_BATTER if platform == "fanduel" else _DK_BATTER
+    rng = np.random.default_rng(seed)
+
+    hr = rng.poisson(rates["home_run"], n_draws)
+    s = rng.poisson(rates["single"], n_draws)
+    d = rng.poisson(rates["double"], n_draws)
+    t = rng.poisson(rates["triple"], n_draws)
+    bb = rng.poisson(rates["walk"], n_draws)
+    sb = rng.poisson(rates["sb"], n_draws)
+    hbp = rng.poisson(rates["hbp"], n_draws)
+
+    # R = HR + independent Poisson excess (mean-preserving when e_r >= e_hr).
+    r = hr + rng.poisson(max(rates["run"] - rates["home_run"], 0.0), n_draws)
+    # RBI = HR + NB(r=1) excess, keeping the market's overdispersion.
+    m_excess = max(rates["rbi"] - rates["home_run"], 0.0)
+    if m_excess > 0:
+        rbi = hr + rng.negative_binomial(1, 1.0 / (1.0 + m_excess), n_draws)
+    else:
+        rbi = hr.copy()
+
+    scores = (
+        s * c["single"] + d * c["double"] + t * c["triple"] + hr * c["home_run"]
+        + r * c["run"] + rbi * c["rbi"] + bb * c["walk"] + sb * c["sb"]
+        + hbp * c["hbp"]
+    ).astype(np.float64)
+
+    return _distribution_grid(scores), float(scores.std())
+
+
+def _simulate_pitcher_distribution(
+    rates: dict[str, float],
+    platform: str = "draftkings",
+    n_draws: int = _DIST_N_DRAWS,
+    seed: int = 0,
+) -> tuple[np.ndarray, float]:
+    """Monte Carlo DK/FD score distribution for a pitcher.
+
+    Couplings:
+      - Outs are a two-component mixture: an early-exit mode around
+        _BLOWUP_MEAN_OUTS with probability _BLOWUP_PROB, and a main mode
+        re-centered so E[outs] equals the market's e_outs. This produces
+        the left-skewed outing-length shape a single Poisson cannot.
+      - K ~ Binomial(outs, e_k/e_outs): strikeouts cannot exceed outs and
+        scale with outing length.
+      - H/BB/HBP scale with exposure (outs / e_outs).
+      - ER scales inversely with exposure (short outings carry higher ER
+        rates), clipped to keep E[ER] ~ e_er.
+      - Win requires outs >= 15 and tilts toward low-ER draws, rescaled so
+        the overall win rate matches the market's e_win.
+      - QS (FanDuel) is the literal indicator outs >= 18 and ER <= 3 from
+        the same draws, replacing the independence approximation.
+
+    Returns (percentile grid P0..P100, score std_dev).
+    """
+    c = _FD_PITCHER if platform == "fanduel" else _DK_PITCHER
+    rng = np.random.default_rng(seed)
+
+    e_outs = max(rates["outs"], 1e-6)
+    blowup_mean = min(_BLOWUP_MEAN_OUTS, e_outs)
+    main_mean = (e_outs - _BLOWUP_PROB * blowup_mean) / (1.0 - _BLOWUP_PROB)
+    is_blowup = rng.random(n_draws) < _BLOWUP_PROB
+    outs = np.where(
+        is_blowup,
+        rng.poisson(blowup_mean, n_draws),
+        rng.poisson(main_mean, n_draws),
+    )
+    outs = np.clip(outs, 0, 27)
+    exposure = outs / e_outs
+
+    p_k = min(rates["k"] / e_outs, 1.0)
+    k = rng.binomial(outs, p_k)
+
+    h = rng.poisson(rates["h"] * exposure)
+    bb = rng.poisson(rates["bb"] * exposure)
+    hbp = rng.poisson(rates["hbp"] * exposure)
+
+    er_scale = np.clip(2.0 - exposure, _ER_EXPOSURE_CLIP[0], _ER_EXPOSURE_CLIP[1])
+    er = rng.poisson(rates["er"] * er_scale)
+
+    # Win: eligible only with 5+ IP, tilted toward low-ER outings, rescaled
+    # to preserve the market-implied overall win probability.
+    e_er = max(rates["er"], 0.5)
+    w_weight = np.clip(1.0 + _WIN_ER_TILT * (rates["er"] - er) / e_er, 0.1, 2.5)
+    w_weight = w_weight * (outs >= _WIN_MIN_OUTS)
+    mean_w = w_weight.mean()
+    p_win = (
+        np.clip(rates["win"] * w_weight / mean_w, 0.0, 1.0)
+        if mean_w > 1e-9 else np.zeros(n_draws)
+    )
+    win = rng.random(n_draws) < p_win
+
+    qs = ((outs >= 18) & (er <= 3)) if platform == "fanduel" else np.zeros(n_draws, dtype=bool)
+
+    scores = (
+        outs * c["out"] + k * c["k"] + win * c["win"] + qs * c["qs"]
+        + er * c["er"] + h * c["h"] + bb * c["bb"] + hbp * c["hbp"]
+    ).astype(np.float64)
+
+    return _distribution_grid(scores), float(scores.std())
 
 
 def _compute_pitcher_partial_no_win(
@@ -2048,6 +2208,8 @@ def build_projections_csv(
     log.info("Market data collected for %d player-game entries.", len(all_market_data))
 
     matched: list[dict] = []
+    # Market-implied score-distribution quantile grids (one row per player).
+    dist_rows: list[dict] = []
     unmatched: list[str] = []
     # player_id → reason string for batters that couldn't be projected from market data
     fallback_reasons: dict[int, str] = {}
@@ -2086,7 +2248,10 @@ def build_projections_csv(
                     player_name, pid, list(player_markets.keys()) or "none",
                 )
                 continue
-            mean, std_dev = result
+            mean, _analytic_std, p_rates = result
+            quantile_grid, std_dev = _simulate_pitcher_distribution(
+                p_rates, platform=platform, seed=(_DIST_SEED_BASE + pid) % 2**32
+            )
         else:
             batter_result = _compute_batter_projection(player_markets, platform=platform)
             if batter_result[0] is None:
@@ -2097,9 +2262,10 @@ def build_projections_csv(
                 )
                 fallback_reasons[pid] = reason
                 continue
-            mean, std_dev, capped_markets, missing_opt = (
+            mean, _analytic_std, capped_markets, missing_opt, b_rates = (
                 float(batter_result[0]), float(batter_result[1]),
-                list(batter_result[2]), list(batter_result[3])  # type: ignore[arg-type]
+                list(batter_result[2]), list(batter_result[3]),  # type: ignore[arg-type]
+                dict(batter_result[4]),  # type: ignore[arg-type]
             )
             if missing_opt:
                 missing_opt_warns[pid] = missing_opt
@@ -2112,12 +2278,23 @@ def build_projections_csv(
                     player_name, pid, display,
                 )
                 cap_warnings[pid] = capped_markets
+            quantile_grid, std_dev = _simulate_batter_distribution(
+                b_rates, platform=platform, seed=(_DIST_SEED_BASE + pid) % 2**32
+            )
 
+        # mean stays analytic (exact); std_dev comes from the Monte Carlo,
+        # which captures the HR→R/RBI covariance (batters) and the
+        # outs/K/ER/win couplings (pitchers) the closed forms ignore.
         matched.append({
             "player_id": pid,
             "name": player_name,
             "mean": round(mean, 4),
             "std_dev": round(std_dev, 4),
+        })
+        dist_rows.append({
+            "player_id": pid,
+            "mean": round(mean, 4),
+            **{f"q{i}": float(v) for i, v in enumerate(quantile_grid)},
         })
 
     # Players who appeared in odds tables but had every line ⚠️-flagged never entered
@@ -2166,6 +2343,29 @@ def build_projections_csv(
 
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(output_path, index=False)
+
+    # Quantile grids → projections_mo_dist.parquet (sibling of the CSV).
+    # On a partial (games-filtered) fetch, merge with the existing file so
+    # untouched games keep their grids; new rows win on player_id collision.
+    dist_path = Path(output_path).parent / "projections_mo_dist.parquet"
+    try:
+        dist_df = pd.DataFrame(dist_rows).drop_duplicates("player_id")
+        if games_filter is not None and dist_path.exists():
+            try:
+                existing_dist = pd.read_parquet(dist_path)
+                existing_dist = existing_dist[
+                    ~existing_dist["player_id"].isin(set(dist_df["player_id"]))
+                ]
+                dist_df = pd.concat([existing_dist, dist_df], ignore_index=True)
+            except Exception as exc:
+                log.warning("Could not merge existing dist parquet: %s", exc)
+        dist_df.to_parquet(dist_path, index=False)
+        log.info(
+            "Wrote market-implied score distributions for %d player(s) → %s",
+            len(dist_df), dist_path,
+        )
+    except Exception as exc:
+        log.warning("Could not write score-distribution parquet: %s", exc)
 
     # Auto-archive for historical ownership evaluation
     _archive_market_odds_slate(slate_path, out_df)
@@ -2320,6 +2520,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--include-player-ids",
+        metavar="ID[,...]",
+        default=None,
+        help=(
+            "Comma-separated player_ids to project even when absent from the "
+            "RotoWire pool (e.g. late lineup adds confirmed via Twitter). "
+            "Ignored when --rw-output is not provided (all players are "
+            "projected in that case anyway)."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging (prints raw table rows and per-market data counts)",
@@ -2347,6 +2558,21 @@ def main() -> None:
             log.info("RotoWire player pool: %d players with lineup slots", len(rw_player_ids))
         except Exception as exc:
             log.warning("Could not load RotoWire output %s: %s — projecting all players", args.rw_output, exc)
+
+    if args.include_player_ids and rw_player_ids is not None:
+        try:
+            extra_ids = {
+                int(tok) for tok in args.include_player_ids.split(",") if tok.strip()
+            }
+            n_new = len(extra_ids - rw_player_ids)
+            rw_player_ids |= extra_ids
+            if n_new:
+                log.info(
+                    "Added %d player(s) to the projection pool via --include-player-ids "
+                    "(late adds outside the RotoWire pool).", n_new,
+                )
+        except ValueError as exc:
+            log.warning("Invalid --include-player-ids value: %s", exc)
 
     build_projections_csv(
         dk_path=args.dk_slate,

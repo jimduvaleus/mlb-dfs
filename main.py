@@ -279,11 +279,23 @@ def main(config_path: str) -> None:
             "using Gaussian marginals for batters."
         )
 
+    # --- Market-implied quantile grids (optional) -----------------------------
+    from src.models.quantile_grids import DIST_FILENAME, load_quantile_grids
+    quantile_grids = load_quantile_grids(
+        os.path.join(os.path.dirname(proj_path or ""), DIST_FILENAME), players_df
+    )
+    if quantile_grids:
+        logger.info(
+            "Market-implied score distributions loaded for %d player(s).",
+            len(quantile_grids),
+        )
+
     # --- Simulate -----------------------------------------------------------
     n_sims = int(sim_cfg.get("n_sims", 10_000))
     logger.info("Running %d simulations...", n_sims)
     engine = SimulationEngine(
-        copula, players_df, batter_pca_model=pca_model, score_grid=score_grid
+        copula, players_df, batter_pca_model=pca_model, score_grid=score_grid,
+        quantile_grids=quantile_grids,
     )
     sim_results = engine.simulate(n_sims)
     logger.info(

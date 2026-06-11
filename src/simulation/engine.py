@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Dict, Any, Optional
 from src.models.copula import EmpiricalCopula
-from src.models.marginals import GaussianMarginal
+from src.models.marginals import EmpiricalQuantileMarginal, GaussianMarginal
 from src.models.batter_model import BatterPCAModel, BatterMixtureMarginal
 from src.simulation.results import SimulationResults
 
@@ -25,6 +25,7 @@ class SimulationEngine:
         players_df: pd.DataFrame,
         batter_pca_model: Optional[BatterPCAModel] = None,
         score_grid: Optional[np.ndarray] = None,
+        quantile_grids: Optional[Dict[int, np.ndarray]] = None,
     ):
         """
         Args:
@@ -37,6 +38,11 @@ class SimulationEngine:
             score_grid (np.ndarray | None): Sorted array of unique historical
                 batter DK scores used for mixture PPF discretisation.
                 Required when batter_pca_model is provided.
+            quantile_grids (dict[int, np.ndarray] | None): Market-implied
+                score-distribution quantile grids keyed by player_id.
+                Players with a grid use EmpiricalQuantileMarginal, taking
+                precedence over the PCA mixture (batters) and Gaussian
+                (pitchers); players without one keep the parametric path.
         """
         if batter_pca_model is not None and score_grid is None:
             raise ValueError("score_grid is required when batter_pca_model is provided.")
@@ -45,6 +51,7 @@ class SimulationEngine:
         self.players_df = players_df.copy().reset_index(drop=True)
         self.batter_pca_model = batter_pca_model
         self.score_grid = score_grid
+        self.quantile_grids = quantile_grids or {}
         self._validate_input()
         
     def _validate_input(self):
@@ -86,11 +93,16 @@ class SimulationEngine:
         # no per-player object construction or PCA projection work at runtime.
         marginals: List[Any] = [None] * n_players
         is_batter_flags: List[bool] = [False] * n_players
+        n_grid_marginals = 0
         for row_idx, player in self.players_df.iterrows():
             slot = int(player['slot'])
             is_batter = (1 <= slot <= 9)
             is_batter_flags[row_idx] = is_batter
-            if is_batter and self.batter_pca_model is not None:
+            q_grid = self.quantile_grids.get(int(player['player_id']))
+            if q_grid is not None:
+                marginals[row_idx] = EmpiricalQuantileMarginal(q_grid)
+                n_grid_marginals += 1
+            elif is_batter and self.batter_pca_model is not None:
                 w, lam, mu, sigma = self.batter_pca_model.project(
                     float(player['mean']), float(player['std_dev'])
                 )
@@ -104,6 +116,12 @@ class SimulationEngine:
                     marginals[row_idx] = BatterMixtureMarginal(w, lam, mu, sigma, self.score_grid)
             else:
                 marginals[row_idx] = GaussianMarginal(player['mean'], player['std_dev'])
+
+        if n_grid_marginals:
+            _log.info(
+                "Using market-implied quantile-grid marginals for %d / %d players.",
+                n_grid_marginals, n_players,
+            )
 
         def apply_unit(unit_group: pd.DataFrame, sampled_quantiles: np.ndarray) -> None:
             # sampled_quantiles shape: (n_sims, 10)
