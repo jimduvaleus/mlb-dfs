@@ -234,19 +234,40 @@ class PipelineRunner:
             pca_model = BatterPCAModel.load(pca_path)
             score_grid = np.load(grid_path)
 
+        # --- Market-implied quantile grids (optional) ---------------------
+        # Written by the market-odds fetcher next to the projections CSV;
+        # validated per player against the projected mean so fallback-sourced
+        # or stale entries are skipped.
+        from src.models.quantile_grids import DIST_FILENAME, load_quantile_grids
+        quantile_grids = load_quantile_grids(
+            os.path.join(os.path.dirname(proj_path or ""), DIST_FILENAME),
+            sim_players_df,
+        )
+        if quantile_grids:
+            logger.info(
+                "Market-implied score distributions loaded for %d player(s).",
+                len(quantile_grids),
+            )
+
         # --- Simulate ---------------------------------------------------
         n_sims = int(sim_cfg.get("n_sims", 10_000))
         logger.info("Running %d simulations...", n_sims)
         self._cb("simulate", {"n_sims": n_sims, "objective": str(opt_cfg.get("objective", "expected_surplus"))})
         engine = SimulationEngine(
-            copula, sim_players_df, batter_pca_model=pca_model, score_grid=score_grid
+            copula, sim_players_df, batter_pca_model=pca_model, score_grid=score_grid,
+            quantile_grids=quantile_grids,
         )
         sim_results = engine.simulate(n_sims)
         logger.info("Simulation complete — matrix: %s", sim_results.results_matrix.shape)
 
         # --- PPD zeroing ------------------------------------------------
         if game_ppd_pcts:
-            sim_results, ppd_stats = self._apply_ppd_to_simulation(sim_results, sim_players_df, game_ppd_pcts)
+            # Same seeding convention as field generation: rng_seed when set,
+            # else 42 — PPD row selection is deterministic by default.
+            sim_results, ppd_stats = self._apply_ppd_to_simulation(
+                sim_results, sim_players_df, game_ppd_pcts,
+                rng_seed=int(opt_cfg.get("rng_seed") or 42),
+            )
             self._cb("ppd_applied", {
                 "games": [
                     {"game": g, "ppd_pct": s["ppd_pct"], "n_sims_zeroed": s["n_sims_zeroed"]}
@@ -2027,14 +2048,18 @@ class PipelineRunner:
         sim_results: "SimulationResults",
         players_df: pd.DataFrame,
         game_ppd_pcts: dict,
+        rng_seed: Optional[int] = None,
     ) -> tuple:
         """Zero out players from PPD'd games in an independent random fraction of simulations.
+
+        Seeded so identical runs zero identical rows — unseeded PPD draws would
+        silently break A/B comparisons (e.g. refinement on/off) on PPD slates.
 
         Returns (updated SimulationResults, stats dict {game: {ppd_pct, n_sims_zeroed}}).
         """
         matrix = sim_results.results_matrix.copy()
         col_map = {pid: i for i, pid in enumerate(sim_results.player_ids)}
-        rng = np.random.default_rng()
+        rng = np.random.default_rng(rng_seed)
         stats: dict = {}
         for game, pct in game_ppd_pcts.items():
             if not pct or pct <= 0:
