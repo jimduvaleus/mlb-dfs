@@ -49,3 +49,7 @@ data/processed/projections_merge_info.json
 data/processed/contest_stats.json
 data/lineup_cache/
 data/notifications.json
+data/processed/projections_rw_seen_ids.json
+data/processed/projections_mo_dist.parquet
+data/processed/test_sim_results.parquet
+data/processed/test_sim_results.parquet
