@@ -36,10 +36,29 @@ Key design choices:
   secondary pool.
 
 Constants last tuned: 10-slate differential-evolution regression, 2026-05-15.
+
+Post-hoc isotonic calibration: production ownership is optionally mapped
+through a walk-forward-fitted isotonic (PAVA) curve per group (pitchers /
+batters) stored in data/processed/ownership_calibrator.json (built by
+scripts/fit_ownership_calibrator.py).  21-slate walk-forward eval (W_resid,
+2026-06-11): +0.066 log-RMSE vs uncalibrated, rank order preserved by
+construction, raw RMSE unharmed.  The artifact stores the constants hash it
+was fitted under; load_ownership_calibrator() refuses stale artifacts so a
+constants tweak can never silently combine with an outdated curve.
 """
+import hashlib
+import json
+import logging
 import re
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+logger = logging.getLogger(__name__)
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+OWNERSHIP_CALIBRATOR_PATH = _PROJECT_ROOT / "data" / "processed" / "ownership_calibrator.json"
 
 # DK Classic roster slot counts per position — total = 10.
 # ownership[j] is interpreted as P(player j appears in a random lineup),
@@ -545,3 +564,126 @@ def compute_heuristic_ownership(
                         result[pmask] *= orig_sum / new_sum
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Constants provenance
+# ---------------------------------------------------------------------------
+
+def collect_ownership_constants() -> dict[str, float]:
+    """
+    Snapshot every module-level _UPPER_CASE scalar constant of this module
+    (the 11 DE-tunable parameters plus calibration exponents, caps,
+    thresholds).  Dict-valued tunables (_SLOT_COUNTS, _BATTING_ORDER_MULT)
+    are excluded; the scalars are sufficient for change detection.
+    """
+    return {
+        name: float(value)
+        for name, value in globals().items()
+        if re.fullmatch(r"_[A-Z][A-Z0-9_]*", name)
+        and isinstance(value, (int, float))
+        and not isinstance(value, bool)
+    }
+
+
+def ownership_constants_hash() -> str:
+    """Short stable hash of the current scalar constants — used to detect
+    when a fitted calibrator artifact has gone stale after a constants tweak."""
+    constants_json = json.dumps(collect_ownership_constants(), sort_keys=True)
+    return hashlib.md5(constants_json.encode()).hexdigest()[:10]
+
+
+# ---------------------------------------------------------------------------
+# Post-hoc isotonic calibration
+# ---------------------------------------------------------------------------
+
+def apply_ownership_calibration(
+    ownership: np.ndarray,
+    positions: np.ndarray,
+    calibrator: dict,
+) -> np.ndarray:
+    """
+    Map raw ownership through the fitted isotonic curve (linear interpolation
+    between PAVA knots, clamped at the edges), then renormalise each position
+    group back to its DK slot count.
+
+    calibrator holds per-group knot arrays: {"P": (x, y), "bat": (x, y)};
+    a missing group key means identity for that group.  The curve is monotone
+    non-decreasing, so within-group rank order can never invert.
+    """
+    positions = np.asarray(positions)
+    adjusted = np.asarray(ownership, dtype=float).copy()
+
+    for key, group_mask in (("P", positions == "P"), ("bat", positions != "P")):
+        curve = calibrator.get(key)
+        if curve is None or not group_mask.any():
+            continue
+        x, y = curve
+        adjusted[group_mask] = np.interp(adjusted[group_mask], x, y)
+
+    adjusted = np.maximum(adjusted, 1e-6)
+
+    result = np.zeros_like(adjusted)
+    for pos, n_slots in _SLOT_COUNTS.items():
+        mask = positions == pos
+        if not mask.any():
+            continue
+        vals = adjusted[mask]
+        total = vals.sum()
+        result[mask] = vals / total * n_slots if total > 0 else vals
+    return result
+
+
+def load_ownership_calibrator(
+    path: Path | str = OWNERSHIP_CALIBRATOR_PATH,
+    check_constants_hash: bool = True,
+) -> dict | None:
+    """
+    Load the fitted isotonic calibrator artifact written by
+    scripts/fit_ownership_calibrator.py.
+
+    Returns {"P": (x, y), "bat": (x, y), ...metadata} ready for
+    apply_ownership_calibration, or None when the artifact is missing,
+    malformed, or stale (fitted under different model constants than the
+    ones currently in this module) — callers fall back to uncalibrated
+    ownership in that case.
+    """
+    path = Path(path)
+    if not path.exists():
+        logger.info("Ownership calibrator artifact not found (%s) — using uncalibrated ownership.", path)
+        return None
+
+    try:
+        artifact = json.loads(path.read_text())
+        groups = artifact["groups"]
+        calibrator: dict = {
+            "fitted_at": artifact.get("fitted_at"),
+            "constants_hash": artifact.get("constants_hash"),
+            "n_slates": artifact.get("n_slates"),
+        }
+        for key in ("P", "bat"):
+            if key not in groups:
+                continue
+            x = np.asarray(groups[key]["x"], dtype=float)
+            y = np.asarray(groups[key]["y"], dtype=float)
+            if len(x) != len(y) or len(x) < 2 or np.any(np.diff(x) <= 0) or np.any(np.diff(y) < 0):
+                raise ValueError(f"invalid knots for group {key!r}")
+            calibrator[key] = (x, y)
+        if "P" not in calibrator and "bat" not in calibrator:
+            raise ValueError("no fitted groups in artifact")
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning("Ownership calibrator artifact %s is malformed (%s) — using uncalibrated ownership.", path, exc)
+        return None
+
+    if check_constants_hash:
+        current = ownership_constants_hash()
+        fitted = calibrator.get("constants_hash")
+        if fitted != current:
+            logger.warning(
+                "Ownership calibrator is stale (fitted under constants %s, current %s) — "
+                "using uncalibrated ownership. Re-run scripts/fit_ownership_calibrator.py.",
+                fitted, current,
+            )
+            return None
+
+    return calibrator

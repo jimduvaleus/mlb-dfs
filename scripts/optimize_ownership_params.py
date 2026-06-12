@@ -429,8 +429,17 @@ def _objective(params_vec: np.ndarray, slates: list[_SlateArrays]) -> float:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _load_slates(archive_dirs: list[Path]) -> list[_SlateArrays]:
-    """Load and pre-extract all slates. Returns list of _SlateArrays."""
+def _load_slates_with_frames(
+    archive_dirs: list[Path],
+) -> list[tuple[_SlateArrays, "object", "object", dict | None]]:
+    """
+    Load and pre-extract all slates, keeping the source frames.
+
+    Returns a list of (slate_arrays, pool_df, matched_df, team_totals) so
+    callers (e.g. walk_forward_ownership.py) can score candidate parameters
+    through the full compute_heuristic_ownership model without re-reading
+    the archives.
+    """
     slates = []
     for d in archive_dirs:
         label = d.name
@@ -456,11 +465,104 @@ def _load_slates(archive_dirs: list[Path]) -> list[_SlateArrays]:
                     .to_dict()
                 )
             sa = _preextract(label, pool_df, matched_df, team_totals)
-            slates.append(sa)
+            slates.append((sa, pool_df, matched_df, team_totals))
             print(f"{len(matched_df)} players matched.", flush=True)
         except Exception as exc:
             print(f"ERROR: {exc}", flush=True)
     return slates
+
+
+def _load_slates(archive_dirs: list[Path]) -> list[_SlateArrays]:
+    """Load and pre-extract all slates. Returns list of _SlateArrays."""
+    return [sa for sa, _, _, _ in _load_slates_with_frames(archive_dirs)]
+
+
+# ---------------------------------------------------------------------------
+# Optimization driver (importable — also used by walk_forward_ownership.py)
+# ---------------------------------------------------------------------------
+
+def run_de(
+    slates: list[_SlateArrays],
+    popsize: int = 15,
+    maxiter: int = 300,
+    seed: int = 42,
+    polish: bool = True,
+    init: "str | np.ndarray" = "latinhypercube",
+    tol: float = 1e-4,
+    verbose: bool = True,
+) -> tuple[np.ndarray, float, dict]:
+    """
+    Differential evolution + optional Nelder-Mead polish over PARAM_BOUNDS.
+
+    init may be an (n_candidates, n_params) array to warm-start the DE
+    population (e.g. seeding with the current production constants and a
+    previous fold's optimum).
+
+    Returns (optimal_params, optimal_mean_spearman, info) where info carries
+    de_nit / de_nfev / de_converged for reporting.
+    """
+    callback = None
+    if verbose:
+        iter_log: list[tuple[int, float]] = []
+
+        def callback(xk: np.ndarray, convergence: float) -> bool:
+            neg, _ = _score_slates(xk, slates)
+            n = len(iter_log) + 1
+            iter_log.append((n, -neg))
+            if n % 25 == 0 or n == 1:
+                print(
+                    f"  iter {n:4d}  Spearman={-neg:.4f}"
+                    f"  convergence={convergence:.5f}", flush=True
+                )
+            return False
+
+    de_result = differential_evolution(
+        _objective,
+        bounds=PARAM_BOUNDS,
+        args=(slates,),
+        strategy="best1bin",
+        popsize=popsize,
+        maxiter=maxiter,
+        tol=tol,
+        seed=seed,
+        workers=1,
+        callback=callback,
+        disp=False,
+        init=init,
+    )
+
+    optimal_params = de_result.x.copy()
+    optimal_score  = -de_result.fun
+    if verbose:
+        print(f"\nDE complete: {de_result.nit} iterations, {de_result.nfev} evals, "
+              f"converged={de_result.success}", flush=True)
+
+    if polish:
+        if verbose:
+            print(f"Polishing with Nelder-Mead (DE best: {optimal_score:.4f})...", flush=True)
+        polish_res = minimize(
+            _objective,
+            optimal_params,
+            args=(slates,),
+            method="Nelder-Mead",
+            options={"maxiter": 5000, "xatol": 1e-6, "fatol": 1e-6, "adaptive": True},
+        )
+        polished_score = -polish_res.fun
+        if polished_score > optimal_score:
+            optimal_params = polish_res.x.copy()
+            optimal_score  = polished_score
+            if verbose:
+                print(f"  Polish improved: {polished_score:.4f}", flush=True)
+        elif verbose:
+            print(f"  No improvement ({polished_score:.4f} vs DE {optimal_score:.4f}); "
+                  f"keeping DE result.", flush=True)
+
+    info = {
+        "de_nit":       int(de_result.nit),
+        "de_nfev":      int(de_result.nfev),
+        "de_converged": bool(de_result.success),
+    }
+    return optimal_params, optimal_score, info
 
 
 # ---------------------------------------------------------------------------
@@ -539,57 +641,13 @@ def main() -> None:
     )
     print(f"Estimated runtime: ~{est_min:.1f} min ({n_evals_est:,} evals)\n", flush=True)
 
-    iter_log: list[tuple[int, float]] = []
-
-    def _callback(xk: np.ndarray, convergence: float) -> bool:
-        neg, _ = _score_slates(xk, slates)
-        n = len(iter_log) + 1
-        iter_log.append((n, -neg))
-        if n % 25 == 0 or n == 1:
-            print(
-                f"  iter {n:4d}  Spearman={-neg:.4f}"
-                f"  convergence={convergence:.5f}", flush=True
-            )
-        return False
-
-    de_result = differential_evolution(
-        _objective,
-        bounds=PARAM_BOUNDS,
-        args=(slates,),
-        strategy="best1bin",
+    optimal_params, optimal_score, de_info = run_de(
+        slates,
         popsize=args.popsize,
         maxiter=args.maxiter,
-        tol=1e-4,
         seed=args.seed,
-        workers=1,
-        callback=_callback,
-        disp=False,
-        init="latinhypercube",
+        polish=not args.no_polish,
     )
-
-    optimal_params = de_result.x.copy()
-    optimal_score  = -de_result.fun
-    print(f"\nDE complete: {de_result.nit} iterations, {de_result.nfev} evals, "
-          f"converged={de_result.success}", flush=True)
-
-    # Nelder-Mead local polish
-    if not args.no_polish:
-        print(f"Polishing with Nelder-Mead (DE best: {optimal_score:.4f})...", flush=True)
-        polish = minimize(
-            _objective,
-            optimal_params,
-            args=(slates,),
-            method="Nelder-Mead",
-            options={"maxiter": 5000, "xatol": 1e-6, "fatol": 1e-6, "adaptive": True},
-        )
-        polished_score = -polish.fun
-        if polished_score > optimal_score:
-            optimal_params = polish.x.copy()
-            optimal_score  = polished_score
-            print(f"  Polish improved: {polished_score:.4f}", flush=True)
-        else:
-            print(f"  No improvement ({polished_score:.4f} vs DE {optimal_score:.4f}); "
-                  f"keeping DE result.", flush=True)
 
     # Per-slate breakdown
     _, current_per_slate = _score_slates(current_params, slates)
@@ -648,9 +706,9 @@ def main() -> None:
             }
             for lbl in slates_sorted
         },
-        "de_nit":       int(de_result.nit),
-        "de_nfev":      int(de_result.nfev),
-        "de_converged": bool(de_result.success),
+        "de_nit":       de_info["de_nit"],
+        "de_nfev":      de_info["de_nfev"],
+        "de_converged": de_info["de_converged"],
         "slates_used":  [s.label for s in slates],
         "param_bounds": {n: list(b) for n, b in zip(PARAM_NAMES, PARAM_BOUNDS)},
     }

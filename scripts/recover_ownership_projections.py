@@ -161,6 +161,18 @@ def main(archive_path: str) -> None:
         team_totals=team_totals,
         team_ownership_reductions=team_reductions or None,
     )
+    # Mirror the pipeline's post-hoc isotonic calibration so recovered
+    # projections match what the server computed at run time.
+    from src.optimization.ownership import (
+        apply_ownership_calibration,
+        load_ownership_calibrator,
+    )
+    calibrator = load_ownership_calibrator()
+    if calibrator is not None:
+        ownership_arr = apply_ownership_calibration(
+            ownership_arr, pool["position"].values, calibrator
+        )
+        print(f"Applied ownership calibrator (fitted on {calibrator.get('n_slates')} slates)")
 
     rows = []
     for i, row in pool.reset_index(drop=True).iterrows():

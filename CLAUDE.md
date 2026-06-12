@@ -142,6 +142,7 @@ Two implementations in `src/optimization/portfolio.py`:
 | `data/processed/empirical_copula.parquet` | `scripts/build_copula.py` | `SimulationEngine` |
 | `data/processed/batter_pca_model.npz` | `scripts/fit_batter_pca.py` | `SimulationEngine` |
 | `data/processed/batter_score_grid.npy` | `scripts/fit_batter_pca.py` | `SimulationEngine` |
+| `data/processed/ownership_calibrator.json` | `scripts/fit_ownership_calibrator.py` | pipeline ownership calibration (`load_ownership_calibrator`); stale-checked against the `ownership.py` constants hash — re-fit after any constants change |
 | `data/slate_exclusions.json` | runtime (API) | `slate_exclusions.py` |
 | `data/payout_structures/dk_classic_gpp.json` | manual / reference | `payout.py` (calibration) |
 

@@ -322,7 +322,11 @@ class PipelineRunner:
         # --- Compute ownership vector for leverage_surplus objective ----------
         ownership_vector: Optional[np.ndarray] = None
         if objective == "leverage_surplus":
-            from src.optimization.ownership import compute_heuristic_ownership
+            from src.optimization.ownership import (
+                apply_ownership_calibration,
+                compute_heuristic_ownership,
+                load_ownership_calibrator,
+            )
             from src.api.slate_exclusions import (
                 compute_slate_id as _compute_slate_id,
                 compute_file_fingerprint as _compute_fp,
@@ -361,11 +365,20 @@ class PipelineRunner:
                 cand_players_df, team_totals,
                 team_ownership_reductions=_team_ownership_reductions or None,
             )
+            # Post-hoc isotonic calibration (data/processed/ownership_calibrator.json,
+            # built by scripts/fit_ownership_calibrator.py).  Loader returns None when
+            # the artifact is missing or fitted under different model constants.
+            _calibrator = load_ownership_calibrator()
+            if _calibrator is not None:
+                ownership_vector = apply_ownership_calibration(
+                    ownership_vector, cand_players_df["position"].values, _calibrator
+                )
             logger.info(
-                "Computed heuristic ownership — model %s%s%s, %d players",
+                "Computed heuristic ownership — model %s%s%s%s, %d players",
                 "D" if team_totals else "C",
                 "+HR" if hr_odds else "",
                 f"+RED({len(_team_ownership_reductions)})" if _team_ownership_reductions else "",
+                f"+CAL({_calibrator.get('n_slates')})" if _calibrator is not None else "",
                 len(ownership_vector),
             )
 

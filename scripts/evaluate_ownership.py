@@ -54,10 +54,14 @@ Models
 
 import argparse
 import csv
+import hashlib
 import io
+import json
 import re
+import subprocess
 import sys
 import zipfile
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -70,6 +74,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # DK position tags that appear in lineup strings
 _LINEUP_POSITIONS = {"P", "C", "1B", "2B", "3B", "SS", "OF"}
+
+# Epsilon for log-space ownership metrics. DK reports %Drafted to 0.01% but the
+# practical resolution floor of actual ownership in these contests is ~0.1%
+# (one entry in a ~1k-entry contest), so 0.001 keeps log ratios bounded without
+# swamping genuine low-ownership signal.
+_LOG_EPS = 0.001
 
 # Mapping from multi-position strings in DK salary CSV to a canonical single position
 _POSITION_CANONICAL = {
@@ -387,6 +397,7 @@ def _build_player_pool(
 def compute_models(
     pool_df: pd.DataFrame,
     historical_tier_spend: dict[str, float] | None = None,
+    residual_calibrator: dict | None = None,
 ) -> dict[str, np.ndarray]:
     """
     Return a dict of {model_name: ownership_array} aligned to pool_df index.
@@ -396,6 +407,8 @@ def compute_models(
 
     historical_tier_spend: from fit_historical_tier_spend(); when provided,
         N_fwd_tier (forward-looking, production-eligible) is computed.
+    residual_calibrator: from fit_residual_calibrator(); when provided,
+        W_resid (isotonic magnitude calibration on E_production) is computed.
     """
     models: dict[str, np.ndarray] = {}
 
@@ -431,14 +444,10 @@ def compute_models(
         except Exception as exc:
             print(f"  [{_label} skipped: {exc}]")
 
-    # J: sweep _PITCHER_MATCHUP_EXP around current production value
-    _MATCHUP_EXPS = [0.30]
-    for _exp in _MATCHUP_EXPS:
-        _label = f"J_mexp_{int(_exp * 100):03d}"
-        try:
-            models[_label] = _compute_model_j(pool_df, team_totals, _exp)
-        except Exception as exc:
-            print(f"  [{_label} skipped: {exc}]")
+    # J_mexp_* (pitcher matchup-exponent sweep) retired 2026-06-11: 21-slate
+    # paired eval showed it significantly worse than E_production on all three
+    # metrics, and the walk-forward harness showed DE-tuned matchup exponents
+    # don't generalize OOS.
 
     # U: post-hoc power-law calibration sweep to address chalk under-prediction.
     # Applies ownership^b per position group (renormalised), including pitchers.
@@ -477,6 +486,13 @@ def compute_models(
         except Exception as exc:
             print(f"  [{_label} skipped: {exc}]")
 
+    # W: isotonic residual calibrator trained walk-forward on prior slates.
+    # Monotone — preserves E_production's rank order; targets magnitude error.
+    if residual_calibrator is not None:
+        try:
+            models["W_resid"] = _compute_model_w(pool_df, team_totals, residual_calibrator)
+        except Exception as exc:
+            print(f"  [W_resid skipped: {exc}]")
 
     return models
 
@@ -550,31 +566,6 @@ def _compute_model_i(
     df.loc[rh_vs_lhp, "mean"] *= boost
     df.loc[rh_vs_lhp, "salary_value"] = df.loc[rh_vs_lhp, "mean"] / df.loc[rh_vs_lhp, "salary"] * 1000
     return compute_heuristic_ownership(df, team_totals)
-
-
-def _compute_model_j(
-    pool_df: pd.DataFrame,
-    team_totals: dict[str, float] | None,
-    matchup_exp: float,
-) -> np.ndarray:
-    """
-    J_mexp_* — production model with _PITCHER_MATCHUP_EXP swept to matchup_exp.
-
-    Temporarily patches the module-level constant so compute_heuristic_ownership
-    uses the candidate exponent, then restores the original value.  Isolates the
-    effect of the matchup exponent without duplicating the rest of the model.
-
-    Current production value is 2.0; sweep covers 0.25–1.75.
-    """
-    import src.optimization.ownership as _own_mod
-    from src.optimization.ownership import compute_heuristic_ownership
-
-    old_exp = _own_mod._PITCHER_MATCHUP_EXP
-    try:
-        _own_mod._PITCHER_MATCHUP_EXP = matchup_exp
-        return compute_heuristic_ownership(pool_df, team_totals)
-    finally:
-        _own_mod._PITCHER_MATCHUP_EXP = old_exp
 
 
 def _compute_model_k(
@@ -682,6 +673,119 @@ def _compute_model_u(
         total = cal.sum()
         result[mask] = cal / total * n_slots if total > 0 else vals
     return result
+
+
+def _pava(y: np.ndarray, w: np.ndarray | None = None) -> np.ndarray:
+    """
+    Pool-adjacent-violators algorithm: least-squares monotone (non-decreasing)
+    fit to y, optionally weighted.  Pure numpy/list implementation — sklearn
+    is not a project dependency.
+    """
+    y = np.asarray(y, dtype=float)
+    w = np.ones(len(y)) if w is None else np.asarray(w, dtype=float)
+    blocks: list[list[float]] = []  # [value, weight, count]
+    for yi, wi in zip(y, w):
+        blocks.append([float(yi), float(wi), 1])
+        while len(blocks) > 1 and blocks[-2][0] > blocks[-1][0]:
+            v2, w2, c2 = blocks.pop()
+            v1, w1, c1 = blocks.pop()
+            tw = w1 + w2
+            blocks.append([(v1 * w1 + v2 * w2) / tw, tw, c1 + c2])
+    if not blocks:
+        return np.array([], dtype=float)
+    return np.concatenate([np.full(int(c), v) for v, _, c in blocks])
+
+
+def _fit_isotonic_groups(
+    all_df: pd.DataFrame,
+    min_pitcher_pts: int = 40,
+    min_batter_pts: int = 200,
+) -> dict:
+    """
+    PAVA-fit predicted → actual ownership per group from pooled training
+    points.  all_df must have columns: position, pred, actual.
+
+    Returns {"P": (x, y), "bat": (x, y)} — a group key is absent when it has
+    too few training points (identity is used instead).
+    """
+    calibrator: dict = {}
+    for key, min_pts in (("P", min_pitcher_pts), ("bat", min_batter_pts)):
+        mask = (all_df["position"] == "P") if key == "P" else (all_df["position"] != "P")
+        sub = all_df[mask]
+        if len(sub) < min_pts:
+            continue
+        order = np.argsort(sub["pred"].values, kind="stable")
+        x = sub["pred"].values[order].astype(float)
+        y = _pava(sub["actual"].values[order].astype(float))
+        # Collapse duplicate x (mean y per x — monotone, so means stay ordered)
+        # to keep np.interp well-defined.
+        knots = pd.DataFrame({"x": x, "y": y}).groupby("x", as_index=False)["y"].mean()
+        calibrator[key] = (knots["x"].values, knots["y"].values)
+    return calibrator
+
+
+def fit_residual_calibrator(
+    training_dirs: list[Path],
+    min_slates: int = 5,
+    min_pitcher_pts: int = 40,
+    min_batter_pts: int = 200,
+) -> dict | None:
+    """
+    Fit the W_resid isotonic calibrator (predicted → actual ownership) on
+    prior slates' ownership_eval.csv files, separately for pitchers and the
+    pooled batter group.
+
+    Monotone by construction, so it can never change rank order — it targets
+    only magnitude error (rmse / log_rmse / calibration slope).  Mirrors
+    fit_batter_calibration_exp's training-data source, with the same caveat:
+    the prior CSVs reflect whatever constants were in effect when they were
+    last written, so evaluate slates oldest-first (the default ordering) to
+    keep them fresh.  (The production artifact built by
+    scripts/fit_ownership_calibrator.py recomputes predictions fresh instead.)
+
+    Returns {"P": (x, y), "bat": (x, y), "n_slates": k} — a group key is
+    absent when it has too few training points (identity is used instead).
+    Returns None when fewer than min_slates usable prior slates exist.
+    """
+    dfs = []
+    for d in training_dirs:
+        fp = Path(d) / "ownership_eval.csv"
+        if not fp.exists():
+            continue
+        df = pd.read_csv(fp)
+        if {"pred_E_production", "pct_drafted", "position"}.issubset(df.columns):
+            dfs.append(
+                df[["pred_E_production", "pct_drafted", "position"]]
+                .dropna()
+                .rename(columns={"pred_E_production": "pred", "pct_drafted": "actual"})
+            )
+
+    if len(dfs) < min_slates:
+        return None
+
+    all_df = pd.concat(dfs, ignore_index=True)
+    calibrator = _fit_isotonic_groups(all_df, min_pitcher_pts, min_batter_pts)
+    calibrator["n_slates"] = len(dfs)
+    return calibrator
+
+
+def _compute_model_w(
+    pool_df: pd.DataFrame,
+    team_totals: dict[str, float] | None,
+    calibrator: dict,
+) -> np.ndarray:
+    """
+    W_resid — E_production output mapped through the walk-forward-trained
+    isotonic calibrator, exactly as production applies it (same
+    apply_ownership_calibration code path the pipeline uses).
+    """
+    from src.optimization.ownership import (
+        apply_ownership_calibration,
+        compute_heuristic_ownership,
+    )
+
+    base = compute_heuristic_ownership(pool_df, team_totals)
+    return apply_ownership_calibration(base, pool_df["position"].values, calibrator)
 
 
 def _compute_model_r(
@@ -1148,19 +1252,32 @@ def _evaluate(
     actual: np.ndarray,
     predicted: np.ndarray,
     top_pct: float = 0.20,
+    eps: float = _LOG_EPS,
 ) -> dict:
     """
     Compute evaluation metrics for a single ownership model.
 
-    Returns dict with: spearman_r, rmse, top_precision, bottom_precision.
+    Returns dict with: spearman_r, rmse, log_rmse, top_precision,
+    bottom_precision.
+
+    log_rmse is RMSE in log(ownership + eps) space.  Downstream, ownership
+    feeds leverage computations where *relative* error matters: predicting 2%
+    for a 0.5% player is a 4× leverage error but contributes almost nothing to
+    raw RMSE.  log_rmse weights that error by its multiplicative size.
     """
     mask = np.isfinite(actual) & np.isfinite(predicted)
     a, p = actual[mask], predicted[mask]
     if len(a) < 5:
-        return {"spearman_r": np.nan, "rmse": np.nan, "top_precision": np.nan, "bottom_precision": np.nan}
+        return {
+            "spearman_r": np.nan, "rmse": np.nan, "log_rmse": np.nan,
+            "top_precision": np.nan, "bottom_precision": np.nan,
+        }
 
     r, _ = spearmanr(a, p)
     rmse = float(np.sqrt(np.mean((a - p) ** 2)))
+    log_rmse = float(np.sqrt(np.mean(
+        (np.log(np.clip(p, 0.0, None) + eps) - np.log(np.clip(a, 0.0, None) + eps)) ** 2
+    )))
 
     n_top = max(1, int(len(a) * top_pct))
     actual_top = set(np.argsort(a)[-n_top:])
@@ -1174,9 +1291,169 @@ def _evaluate(
     return {
         "spearman_r": round(float(r), 4),
         "rmse": round(rmse, 6),
+        "log_rmse": round(log_rmse, 4),
         "top_precision": round(top_prec, 3),
         "bottom_precision": round(bot_prec, 3),
     }
+
+
+def _calibration_metrics(
+    actual: np.ndarray,
+    predicted: np.ndarray,
+    positions: np.ndarray,
+    eps: float = _LOG_EPS,
+    min_points: int = 8,
+) -> dict:
+    """
+    Fit log(actual + eps) ~ log(predicted + eps) by OLS, separately for
+    pitchers and batters.
+
+    The fitted slope is directly interpretable as the power-law calibration
+    exponent the model output needs: slope > 1 means the model's spread is
+    compressed relative to the field (the systematic error _BATTER_CALIB_EXP /
+    _PITCHER_CALIB_EXP patch), slope < 1 means it is too spread out.  On a
+    perfectly calibrated model slope ≈ 1 and intercept ≈ 0.
+
+    Returns calib_slope_P / calib_int_P / calib_slope_bat / calib_int_bat,
+    NaN for any group with fewer than min_points finite observations.
+    """
+    out = {
+        "calib_slope_P": np.nan, "calib_int_P": np.nan,
+        "calib_slope_bat": np.nan, "calib_int_bat": np.nan,
+    }
+    finite = np.isfinite(actual) & np.isfinite(predicted)
+    for group, suffix in ((positions == "P", "P"), (positions != "P", "bat")):
+        mask = finite & group
+        if mask.sum() < min_points:
+            continue
+        log_a = np.log(np.clip(actual[mask], 0.0, None) + eps)
+        log_p = np.log(np.clip(predicted[mask], 0.0, None) + eps)
+        if np.ptp(log_p) == 0:
+            continue
+        slope, intercept = np.polyfit(log_p, log_a, 1)
+        out[f"calib_slope_{suffix}"] = round(float(slope), 4)
+        out[f"calib_int_{suffix}"]   = round(float(intercept), 4)
+    return out
+
+
+def _field_points_bias(
+    merged: pd.DataFrame,
+    predicted: np.ndarray,
+    standings_df: pd.DataFrame,
+) -> dict:
+    """
+    End-to-end check of the quantity the optimizer actually consumes:
+    field_mean = sim_matrix @ ownership_vector (leverage_surplus objective),
+    evaluated here at the realized player outcomes.
+
+    pred_field_pts    = Σ pred_own_j × actual_fpts_j   over matched players
+    matched_field_pts = Σ pct_drafted_j × actual_fpts_j over the SAME players —
+                        ground truth on an identical player set, so the bias
+                        isolates ownership error from name-matching coverage.
+    contest_mean_pts  = mean entry score from the standings (includes lineup
+                        players missing from the projected pool) — coverage
+                        diagnostic only.
+    """
+    fpts_ok = merged["actual_fpts"].notna().values
+    fpts = merged.loc[fpts_ok, "actual_fpts"].values.astype(float)
+    own_actual = merged.loc[fpts_ok, "pct_drafted"].values.astype(float)
+    pred = predicted[fpts_ok]
+
+    pred_field_pts    = float(np.nansum(pred * fpts))
+    matched_field_pts = float(np.nansum(own_actual * fpts))
+    contest_mean_pts  = (
+        float(standings_df["points"].mean()) if len(standings_df) else np.nan
+    )
+
+    return {
+        "pred_field_pts":    round(pred_field_pts, 2),
+        "matched_field_pts": round(matched_field_pts, 2),
+        "contest_mean_pts":  round(contest_mean_pts, 2),
+        "field_pts_bias":    round(pred_field_pts - matched_field_pts, 2),
+        "field_pts_coverage": (
+            round(matched_field_pts / contest_mean_pts, 4)
+            if contest_mean_pts and np.isfinite(contest_mean_pts) and contest_mean_pts > 0
+            else np.nan
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Paired statistical comparison across slates
+# ---------------------------------------------------------------------------
+
+def _bootstrap_delta_ci(
+    deltas: np.ndarray,
+    n_boot: int = 10_000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> tuple[float, float, float]:
+    """
+    Bootstrap CI for the mean of per-slate metric deltas (resampling slates
+    with replacement).  Returns (mean, ci_lo, ci_hi).
+    """
+    deltas = np.asarray(deltas, dtype=float)
+    deltas = deltas[np.isfinite(deltas)]
+    if len(deltas) == 0:
+        return (np.nan, np.nan, np.nan)
+    mean = float(deltas.mean())
+    if len(deltas) == 1:
+        return (mean, mean, mean)
+    rng = np.random.default_rng(seed)
+    idx = rng.integers(0, len(deltas), size=(n_boot, len(deltas)))
+    boot_means = deltas[idx].mean(axis=1)
+    lo, hi = np.percentile(boot_means, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return (mean, float(lo), float(hi))
+
+
+def _paired_comparison_table(
+    combined: pd.DataFrame,
+    baseline: str = "E_production",
+    metrics: tuple[str, ...] = ("spearman_r", "log_rmse", "rmse"),
+    min_slates_wilcoxon: int = 6,
+) -> pd.DataFrame:
+    """
+    Per-slate paired deltas of each model vs the baseline, with bootstrap 95%
+    CI on the mean delta and a Wilcoxon signed-rank p-value.
+
+    rmse-type metrics are sign-flipped so positive delta always means "better
+    than baseline".  Slates where either model is NaN are dropped pairwise.
+    """
+    from scipy.stats import wilcoxon
+
+    lower_is_better = {"rmse", "log_rmse"}
+    rows = []
+    for metric in metrics:
+        if metric not in combined.columns:
+            continue
+        pivot = combined.pivot_table(index="slate", columns="model", values=metric)
+        if baseline not in pivot.columns:
+            continue
+        sign = -1.0 if metric in lower_is_better else 1.0
+        for model in pivot.columns:
+            if model == baseline:
+                continue
+            deltas = (sign * (pivot[model] - pivot[baseline])).dropna().values
+            if len(deltas) == 0:
+                continue
+            mean, lo, hi = _bootstrap_delta_ci(deltas)
+            p_value = np.nan
+            if len(deltas) >= min_slates_wilcoxon and np.any(deltas != 0):
+                try:
+                    p_value = float(wilcoxon(deltas).pvalue)
+                except ValueError:
+                    pass
+            rows.append({
+                "model": model,
+                "metric": metric,
+                "n_slates": len(deltas),
+                "mean_delta": round(mean, 4),
+                "ci_lo": round(lo, 4),
+                "ci_hi": round(hi, 4),
+                "wilcoxon_p": round(p_value, 4) if np.isfinite(p_value) else np.nan,
+                "sig": bool(lo > 0 or hi < 0),
+            })
+    return pd.DataFrame(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -1365,6 +1642,7 @@ def _salary_bias_metrics(
 def evaluate_slate(
     archive_dir: Path,
     historical_tier_spend: dict[str, float] | None = None,
+    residual_calibrator: dict | None = None,
 ) -> pd.DataFrame | None:
     """
     Run ownership model evaluation for one archive directory.
@@ -1374,6 +1652,8 @@ def evaluate_slate(
 
     historical_tier_spend: from fit_historical_tier_spend(); when provided,
         N_fwd_tier (forward-looking tier tilt) is computed alongside other models.
+    residual_calibrator: from fit_residual_calibrator() on strictly-older
+        slates; when provided, W_resid is computed alongside other models.
     """
     archive_dir = Path(archive_dir)
     slate_label = archive_dir.name
@@ -1420,7 +1700,11 @@ def evaluate_slate(
     else:
         actual_lineup_salaries = None
 
-    models = compute_models(pool_df, historical_tier_spend=historical_tier_spend or {})
+    models = compute_models(
+        pool_df,
+        historical_tier_spend=historical_tier_spend or {},
+        residual_calibrator=residual_calibrator,
+    )
 
     # Add predicted ownership columns to merged
     pid_to_model: dict[str, dict[int, float]] = {}
@@ -1428,12 +1712,21 @@ def evaluate_slate(
         pid_to_model[model_name] = dict(zip(pool_df["player_id"], ownership_arr))
 
     actual = merged["pct_drafted"].values
+    merged_positions = merged["position"].values
+    slate_meta = {
+        "n_games": int(pool_df["game"].nunique()) if "game" in pool_df.columns else 0,
+        "n_pool": len(pool_df),
+        "n_players_matched": len(merged),
+        "n_entries": len(standings_df),
+    }
     rows = []
     e_prod_pos_bias: dict | None = None
     e_prod_ownership: np.ndarray | None = None
     for model_name, pid_map in pid_to_model.items():
         predicted = merged["player_id"].map(pid_map).values.astype(float)
         metrics = _evaluate(actual, predicted)
+        metrics.update(_calibration_metrics(actual, predicted, merged_positions))
+        metrics.update(_field_points_bias(merged, predicted, standings_df))
         if salary_stats is not None:
             sal_metrics = _salary_bias_metrics(pool_df, models[model_name], salary_stats)
             pos_bias = sal_metrics.pop("pos_bias", {})
@@ -1441,7 +1734,19 @@ def evaluate_slate(
             if model_name == "E_production":
                 e_prod_pos_bias = pos_bias
                 e_prod_ownership = models[model_name]
-        rows.append({"slate": slate_label, "model": model_name, **metrics})
+        rows.append({"slate": slate_label, "model": model_name, **slate_meta, **metrics})
+
+    # One-line field-points summary for the production model.
+    e_prod_row = next((r for r in rows if r["model"] == "E_production"), None)
+    if e_prod_row is not None and np.isfinite(e_prod_row.get("pred_field_pts", np.nan)):
+        print(
+            f"[{slate_label}] Field points (E_production): "
+            f"pred={e_prod_row['pred_field_pts']:.1f} "
+            f"actual_own={e_prod_row['matched_field_pts']:.1f} "
+            f"contest_mean={e_prod_row['contest_mean_pts']:.1f} "
+            f"bias={e_prod_row['field_pts_bias']:+.1f} "
+            f"coverage={e_prod_row['field_pts_coverage']:.3f}"
+        )
 
     # Print per-position salary bias table for E_production.
     if e_prod_pos_bias:
@@ -1587,6 +1892,83 @@ def dry_run_slate(archive_dir: Path) -> None:
     print(f"[{slate_label}] Projections written → {out_path}")
 
 
+def _slate_sort_key(name: str) -> tuple:
+    """
+    Chronological sort key for archive slate dir names like '05252026' or
+    '05252026e' (MMDDYYYY + optional suffix).  Lexical comparison of MMDDYYYY
+    breaks across a year boundary; parse the date instead, falling back to
+    the raw name for non-date dirs.
+    """
+    try:
+        return (datetime.strptime(name[:8], "%m%d%Y"), name)
+    except ValueError:
+        return (datetime.min, name)
+
+
+# ---------------------------------------------------------------------------
+# Provenance — model-version stamps for the persisted summary
+# ---------------------------------------------------------------------------
+
+def _collect_production_constants() -> dict[str, float]:
+    """Snapshot the scalar tunable constants of the production ownership
+    model.  Delegates to the module's own introspection so the summary's
+    constants_hash always matches ownership_constants_hash() (which gates
+    calibrator-artifact staleness)."""
+    from src.optimization.ownership import collect_ownership_constants
+
+    return collect_ownership_constants()
+
+
+def _git_commit_hash() -> str:
+    """Short git commit hash of the repo, '+dirty' if uncommitted changes,
+    'unknown' if git is unavailable."""
+    try:
+        rev = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=5,
+        )
+        if rev.returncode != 0:
+            return "unknown"
+        commit = rev.stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True, timeout=5,
+        )
+        if status.returncode == 0 and status.stdout.strip():
+            commit += "+dirty"
+        return commit
+    except Exception:
+        return "unknown"
+
+
+def _append_summary(combined: pd.DataFrame, summary_path: Path) -> None:
+    """
+    Append this run's per-slate results to the persistent summary CSV,
+    stamped with run timestamp, git commit, and a hash + JSON dump of the
+    production model constants.
+
+    The model constants are tweaked semi-regularly; the stamps keep historical
+    rows comparable (rows with different constants_hash were produced by
+    different models).  Read-concat-rewrite keeps a single header as the
+    schema grows; legacy rows NaN-fill any new columns.
+    """
+    combined = combined.copy()
+    constants = _collect_production_constants()
+    constants_json = json.dumps(constants, sort_keys=True)
+    combined["run_ts"] = datetime.now().isoformat(timespec="seconds")
+    combined["git_commit"] = _git_commit_hash()
+    combined["constants_hash"] = hashlib.md5(constants_json.encode()).hexdigest()[:10]
+    combined["constants_json"] = constants_json
+
+    if summary_path.exists():
+        try:
+            old = pd.read_csv(summary_path)
+            combined = pd.concat([old, combined], ignore_index=True)
+        except Exception as exc:
+            print(f"Warning: could not read existing {summary_path} ({exc}) — overwriting.")
+    combined.to_csv(summary_path, index=False)
+
+
 # ---------------------------------------------------------------------------
 # Multi-slate aggregate
 # ---------------------------------------------------------------------------
@@ -1595,8 +1977,9 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
     # Discover all full slates in the archive for computing historical tier spend.
     archive_root = PROJECT_ROOT / "archive"
     all_full_slates = sorted(
-        d for d in archive_root.iterdir()
-        if d.is_dir() and any(d.glob("contest-standings-*.zip"))
+        (d for d in archive_root.iterdir()
+         if d.is_dir() and any(d.glob("contest-standings-*.zip"))),
+        key=lambda d: _slate_sort_key(d.name),
     )
 
     all_results = []
@@ -1604,7 +1987,10 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
         # Forward-looking: train on all slates strictly older than the current one.
         # Leave-one-out keeps each slate out of its own calibration, which avoids
         # circular influence and gives better out-of-sample Spearman.
-        prior_slates = [s for s in all_full_slates if s.name < d.name]
+        prior_slates = [
+            s for s in all_full_slates
+            if _slate_sort_key(s.name) < _slate_sort_key(d.name)
+        ]
         if prior_slates:
             print(f"[{d.name}] Computing historical tier spend from {len(prior_slates)} prior slate(s)...")
             hist_tier = fit_historical_tier_spend(prior_slates)
@@ -1613,7 +1999,15 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
             hist_tier = {}
             print(f"[{d.name}] No prior slates for historical tier spend — N_fwd_tier will be skipped.")
 
-        result = evaluate_slate(d, historical_tier_spend=hist_tier)
+        resid_cal = fit_residual_calibrator(prior_slates)
+        if resid_cal is None:
+            print(f"[{d.name}] <5 usable prior slates for residual calibrator — W_resid will be skipped.")
+        else:
+            groups = [k for k in ("P", "bat") if k in resid_cal]
+            print(f"[{d.name}] Residual calibrator fitted on {resid_cal['n_slates']} prior slate(s) "
+                  f"(groups: {', '.join(groups) or 'none — identity'})")
+
+        result = evaluate_slate(d, historical_tier_spend=hist_tier, residual_calibrator=resid_cal)
         if result is not None:
             all_results.append(result)
 
@@ -1629,24 +2023,44 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
     print("=" * 70)
     print(combined.to_string(index=False))
 
-    # Aggregate table — include salary_bias_pct when available.
-    base_metric_cols = ["spearman_r", "rmse", "top_precision", "bottom_precision"]
-    sal_cols = [c for c in ["salary_bias_pct"] if c in combined.columns]
+    # Aggregate table — include diagnostic columns when available.
+    base_metric_cols = ["spearman_r", "rmse", "log_rmse", "top_precision", "bottom_precision"]
+    extra_cols = [
+        c for c in ["salary_bias_pct", "calib_slope_P", "calib_slope_bat", "field_pts_bias"]
+        if c in combined.columns
+    ]
     agg = (
-        combined.groupby("model")[base_metric_cols + sal_cols]
+        combined.groupby("model")[base_metric_cols + extra_cols]
         .mean()
         .round(4)
         .reset_index()
     )
-    col_names = ["model", "mean_spearman_r", "mean_rmse", "mean_top_prec", "mean_bot_prec"]
-    if sal_cols:
-        col_names.append("mean_sal_bias_pct")
-    agg.columns = col_names
+    rename_map = {
+        "spearman_r": "mean_spearman_r", "rmse": "mean_rmse", "log_rmse": "mean_log_rmse",
+        "top_precision": "mean_top_prec", "bottom_precision": "mean_bot_prec",
+        "salary_bias_pct": "mean_sal_bias_pct",
+        "calib_slope_P": "mean_calib_slope_P", "calib_slope_bat": "mean_calib_slope_bat",
+        "field_pts_bias": "mean_field_pts_bias",
+    }
+    agg.rename(columns=rename_map, inplace=True)
 
     print("\n" + "=" * 70)
     print(f"AGGREGATE RESULTS ({len(all_results)} slate(s))")
     print("=" * 70)
     print(agg.to_string(index=False))
+
+    # Paired statistical comparison vs E_production — the headline table.
+    # Composite ranking below remains as a secondary, history-comparable view.
+    paired = _paired_comparison_table(combined)
+    if not paired.empty:
+        print("\n" + "=" * 70)
+        print("PAIRED COMPARISON vs E_production (per-slate deltas, + = better)")
+        print("  mean delta with bootstrap 95% CI; sig = CI excludes 0")
+        print("=" * 70)
+        for metric in paired["metric"].unique():
+            sub = paired[paired["metric"] == metric].sort_values("mean_delta", ascending=False)
+            print(f"\n  [{metric}]")
+            print(sub.drop(columns=["metric"]).to_string(index=False))
 
     # Composite rank score: rank each model per metric, sum ranks.
     # RMSE is double-weighted (magnitude accuracy drives opponent field quality).
@@ -1684,10 +2098,10 @@ def run_evaluation(archive_dirs: list[Path]) -> None:
           f"Spearman={best['mean_spearman_r']:.4f}  RMSE={best['mean_rmse']:.4f}  "
           f"composite_rank={best['composite_rank']:.1f}  →  Phase 2: {verdict}")
 
-    # Save aggregate summary
+    # Append to the persistent summary with provenance stamps.
     summary_path = PROJECT_ROOT / "archive" / "ownership_summary.csv"
-    combined.to_csv(summary_path, index=False)
-    print(f"\nSummary saved → {summary_path}")
+    _append_summary(combined, summary_path)
+    print(f"\nSummary appended → {summary_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -1701,8 +2115,9 @@ def _find_recent_full_slates(n: int) -> list[Path]:
     """
     archive_root = PROJECT_ROOT / "archive"
     full = sorted(
-        d for d in archive_root.iterdir()
-        if d.is_dir() and any(d.glob("contest-standings-*.zip"))
+        (d for d in archive_root.iterdir()
+         if d.is_dir() and any(d.glob("contest-standings-*.zip"))),
+        key=lambda d: _slate_sort_key(d.name),
     )
     return full[-n:]
 
