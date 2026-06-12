@@ -14,9 +14,20 @@ import { RunOptionsDialog } from './components/RunOptionsDialog'
 import { DeleteConfirmModal } from './components/DeleteConfirmModal'
 import { LineupParserDialog } from './components/LineupParserDialog'
 import { ReselectDialog } from './components/ReselectDialog'
+import LateSwapPanel from './components/LateSwapPanel'
 import './App.css'
 
-type Tab = 'config' | 'projections' | 'slate' | 'run' | 'portfolio' | 'metrics'
+type Tab = 'config' | 'projections' | 'slate' | 'run' | 'portfolio' | 'metrics' | 'lateswap'
+
+const TAB_LABELS: Record<Tab, string> = {
+  config: 'Config',
+  projections: 'Projections',
+  slate: 'Slate',
+  run: 'Run',
+  portfolio: 'Portfolio',
+  metrics: 'Metrics',
+  lateswap: 'Late Swap',
+}
 
 interface State {
   config: AppConfig | null
@@ -519,14 +530,14 @@ export default function App() {
       </header>
 
       <nav className="tabs">
-        {(['config', 'slate', 'projections', 'run', 'portfolio', 'metrics'] as Tab[]).map(tab => (
+        {(['config', 'slate', 'projections', 'run', 'portfolio', 'metrics', 'lateswap'] as Tab[]).map(tab => (
           <button
             key={tab}
             className={`tab ${state.activeTab === tab ? 'active' : ''}`}
             onClick={() => dispatch({ type: 'set_tab', tab })}
             disabled={tabDisabled(tab)}
           >
-            {tab.charAt(0).toUpperCase() + tab.slice(1)}
+            {TAB_LABELS[tab]}
             {tab === 'config' && projFetching && <span className="tab-dot" />}
             {tab === 'run' && running && <span className="tab-dot" />}
             {tab === 'portfolio' && state.portfolio.length > 0 && (
@@ -633,6 +644,10 @@ export default function App() {
 
         {state.activeTab === 'metrics' && (
           <MetricsPanel lineups={state.portfolio} events={events} />
+        )}
+
+        {state.activeTab === 'lateswap' && (
+          <LateSwapPanel platform={state.config?.platform} />
         )}
       </main>
 

@@ -605,3 +605,90 @@ export interface TwitterLineupSaveRequest {
 export interface ContestAnalysisResponse {
   player_fpts: Record<string, number>
 }
+
+// ---------------------------------------------------------------------------
+// Late swap
+// ---------------------------------------------------------------------------
+
+export interface LateSwapPlayer {
+  player_id: number | null
+  name: string
+  team: string
+  position: string
+  eligible_positions: string[]
+  salary: number | null
+  mean: number | null
+  game: string
+  game_start_time: string
+}
+
+export interface LateSwapSwappedIn extends LateSwapPlayer {
+  locked: boolean
+}
+
+export interface LateSwapSlot {
+  slot_index: number
+  slot_position: string
+  player: LateSwapPlayer | null   // null = empty cell (unfilled reservation)
+  locked: boolean
+  missing_from_slate: boolean
+  swapped_in: LateSwapSwappedIn | null
+  swap_source: 'auto' | 'manual' | null
+}
+
+export interface LateSwapWarning {
+  slot_index: number | null
+  reason: string
+}
+
+export interface LateSwapEntry {
+  entry_id: string
+  source_file: string
+  contest_name: string
+  contest_id: string
+  entry_fee: string
+  n_swappable: number
+  warnings: LateSwapWarning[]
+  slots: LateSwapSlot[]
+}
+
+export type LateSwapStatus = 'ok' | 'no_slate' | 'no_entries' | 'unsupported_platform'
+
+export interface LateSwapState {
+  status: LateSwapStatus
+  now: string | null
+  files: { file_name: string; n_entries: number }[]
+  entries: LateSwapEntry[]
+  bulk_marked_player_ids: number[]
+  bulk_marked_teams: string[]
+  teams: string[]
+  last_run_at: string | null
+  written_files: string[]
+}
+
+export interface LateSwapRunRequest {
+  entry_marks: Record<string, number[]>
+  bulk_marked_player_ids: number[]
+  bulk_marked_teams: string[]
+}
+
+export interface LateSwapCandidate {
+  player_id: number
+  name: string
+  team: string
+  position: string
+  eligible_positions: string[]
+  salary: number
+  mean: number | null
+  score: number
+}
+
+export interface LateSwapCandidatesResponse {
+  candidates: LateSwapCandidate[]
+  max_salary: number | null
+}
+
+export interface LateSwapOverrideResponse {
+  entry: LateSwapEntry
+  written_files: string[]
+}

@@ -10,7 +10,7 @@ Responsibilities:
 import csv
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +25,12 @@ UPLOAD_HEADER = ["Entry ID", "Contest Name", "Contest ID", "Entry Fee",
 
 
 @dataclass
+class EntrySlotPlayer:
+    name: str
+    player_id: Optional[int]   # None if the "(ID)" suffix is absent/unparseable
+
+
+@dataclass
 class EntryRecord:
     entry_id: str
     contest_name: str
@@ -32,6 +38,9 @@ class EntryRecord:
     entry_fee_cents: int        # "$4" -> 400
     entry_fee_raw: str          # "$4"; written verbatim to upload file
     prize_pool_cents: Optional[int] = None  # "$5K" -> 500000; None if not parseable
+    # Columns 4-13 of the entry row (slots P,P,C,1B,2B,3B,SS,OF,OF,OF).
+    # None element = empty cell (unfilled reservation).
+    slot_players: list = field(default_factory=list)
 
 
 def scan_entry_files(raw_dir: str) -> list[Path]:
@@ -50,6 +59,36 @@ def _parse_fee_cents(fee_str: str) -> int:
 
 
 _PRIZE_POOL_RE = re.compile(r"\$(\d+(?:\.\d+)?)(K|M)?", re.IGNORECASE)
+
+_PLAYER_CELL_RE = re.compile(r"^\s*(.*?)\s*\((\d+)\)\s*$")
+_BARE_ID_RE = re.compile(r"^\s*(\d+)\s*$")
+
+
+def _parse_slot_players(row: list[str]) -> list:
+    """Parse entry-row columns 4-13 into 10 Optional[EntrySlotPlayer] slots.
+
+    Cells come in two formats: "Name (ID)" (DK entry downloads) or a bare
+    integer ID (upload_*.csv files written by write_upload_files). Bare-ID
+    players get an empty name — callers resolve display names via the slate.
+    """
+    cells = row[4:14]
+    cells += [""] * (10 - len(cells))
+    slots: list = []
+    for cell in cells:
+        cell = cell.strip()
+        if not cell:
+            slots.append(None)
+            continue
+        m = _PLAYER_CELL_RE.match(cell)
+        if m:
+            slots.append(EntrySlotPlayer(name=m.group(1), player_id=int(m.group(2))))
+            continue
+        m = _BARE_ID_RE.match(cell)
+        if m:
+            slots.append(EntrySlotPlayer(name="", player_id=int(m.group(1))))
+        else:
+            slots.append(EntrySlotPlayer(name=cell, player_id=None))
+    return slots
 
 def _parse_prize_pool_cents(contest_name: str) -> Optional[int]:
     """
@@ -118,6 +157,7 @@ def parse_entry_file(path: Path) -> list[EntryRecord]:
             entry_fee_cents=_parse_fee_cents(fee_raw),
             entry_fee_raw=fee_raw,
             prize_pool_cents=_parse_prize_pool_cents(contest_name),
+            slot_players=_parse_slot_players(row),
         ))
 
     return records

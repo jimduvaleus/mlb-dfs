@@ -1,4 +1,4 @@
-import type { AppConfig, CacheStatus, ContestAnalysisResponse, ExclusionsUpdate, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, CacheStatus, ContestAnalysisResponse, ExclusionsUpdate, LateSwapCandidatesResponse, LateSwapOverrideResponse, LateSwapRunRequest, LateSwapState, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -267,5 +267,53 @@ export async function fetchContestAnalysis(): Promise<ContestAnalysisResponse> {
     try { detail = JSON.parse(text).detail } catch {}
     throw new Error(detail)
   }
+  return res.json()
+}
+
+export async function fetchLateSwapState(): Promise<LateSwapState> {
+  const res = await fetch('/api/late-swap/state')
+  if (!res.ok) throw new Error(`Failed to load late swap state: ${res.statusText}`)
+  return res.json()
+}
+
+export async function runLateSwap(req: LateSwapRunRequest): Promise<LateSwapState> {
+  const res = await fetch('/api/late-swap/run', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    let detail = text
+    try { const body = JSON.parse(text); if (typeof body?.detail === 'string') detail = body.detail } catch {}
+    throw new Error(`Swap failed: ${detail}`)
+  }
+  return res.json()
+}
+
+export async function fetchLateSwapCandidates(entryId: string, slotIndex: number): Promise<LateSwapCandidatesResponse> {
+  const res = await fetch(`/api/late-swap/candidates?entry_id=${encodeURIComponent(entryId)}&slot_index=${slotIndex}`)
+  if (!res.ok) throw new Error(`Failed to load candidates: ${res.statusText}`)
+  return res.json()
+}
+
+export async function overrideLateSwap(entryId: string, slotIndex: number, playerId: number): Promise<LateSwapOverrideResponse> {
+  const res = await fetch('/api/late-swap/override', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ entry_id: entryId, slot_index: slotIndex, player_id: playerId }),
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    let detail = text
+    try { const body = JSON.parse(text); if (typeof body?.detail === 'string') detail = body.detail } catch {}
+    throw new Error(`Override failed: ${detail}`)
+  }
+  return res.json()
+}
+
+export async function resetLateSwap(): Promise<LateSwapState> {
+  const res = await fetch('/api/late-swap/reset', { method: 'POST' })
+  if (!res.ok) throw new Error(`Failed to reset late swap: ${res.statusText}`)
   return res.json()
 }

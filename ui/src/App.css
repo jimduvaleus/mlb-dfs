@@ -2649,3 +2649,216 @@ button { cursor: pointer; }
   cursor: pointer;
   z-index: 200;
 }
+
+/* ---------------------------------------------------------------------------
+   Late swap
+--------------------------------------------------------------------------- */
+
+.lateswap-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.lateswap-toolbar-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.lateswap-team-select {
+  background: #1a1f2e;
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  color: #a0aec0;
+  font-size: 14px;
+  padding: 7px 10px;
+}
+.lateswap-team-select:focus { outline: none; border-color: #3182ce; }
+
+.lateswap-summary {
+  font-size: 14px;
+  color: #a0aec0;
+}
+
+.lateswap-bulk-chips {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+
+.lateswap-bulk-chip { color: #fc8181; }
+
+.lateswap-banner {
+  background: #1a472a;
+  border: 1px solid #2f855a;
+  border-radius: 6px;
+  color: #68d391;
+  font-size: 14px;
+  padding: 8px 14px;
+  margin-bottom: 12px;
+}
+.lateswap-banner-time { color: #9ae6b4; opacity: 0.7; }
+
+.lateswap-card-swappable {
+  font-size: 13px;
+  font-weight: 600;
+  color: #90cdf4;
+}
+
+.lateswap-card-warning {
+  font-size: 13px;
+  color: #f6ad55;
+  padding: 5px 17px;
+  border-bottom: 1px solid #2d3748;
+}
+
+/* Row states (.lineup-player is display: contents — style the children) */
+.lineup-player--locked > * { opacity: 0.45; }
+.lineup-player--marked > .lineup-player-name {
+  color: #fc8181;
+  text-decoration: line-through;
+}
+.lineup-player--marked > * { background: rgba(197, 48, 48, 0.08); }
+.lineup-player--swapped > * { background: rgba(47, 133, 90, 0.10); }
+
+.lateswap-lock {
+  margin-left: 6px;
+  font-size: 13px;
+  cursor: default;
+}
+
+.lineup-player-swap-toggle {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  color: #718096;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  margin-left: 6px;
+  padding: 2px 5px;
+}
+.lineup-player-swap-toggle:hover:not(:disabled) {
+  color: #fc8181;
+  background: rgba(252, 129, 129, 0.12);
+}
+.lineup-player-swap-toggle--on {
+  color: #fff;
+  background: #c53030;
+}
+.lineup-player-swap-toggle--on:hover:not(:disabled) {
+  color: #fff;
+  background: #e53e3e;
+}
+.lineup-player-swap-toggle:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.lateswap-sal-cell {
+  display: flex;
+  align-items: center;
+  padding-right: 12px;
+}
+
+.lateswap-empty-slot { color: #718096; font-style: italic; }
+
+.lateswap-swapped-cell { position: relative; }
+
+.lateswap-swapped-name {
+  background: none;
+  border: none;
+  border-bottom: 1px dashed #68d391;
+  color: #68d391;
+  cursor: pointer;
+  font-size: inherit;
+  font-weight: 600;
+  padding: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lateswap-swapped-name:hover:not(:disabled) { color: #9ae6b4; }
+.lateswap-swapped-name:disabled { cursor: default; border-bottom-style: solid; opacity: 0.7; }
+
+.lateswap-manual-badge {
+  margin-left: 6px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #90cdf4;
+  background: rgba(49, 130, 206, 0.18);
+  border-radius: 3px;
+  padding: 1px 4px;
+  flex-shrink: 0;
+}
+
+.lateswap-was {
+  margin-left: 8px;
+  font-size: 12px;
+  color: #718096;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lateswap-slot-warning {
+  margin-left: 6px;
+  font-size: 13px;
+  cursor: default;
+}
+
+.swap-candidates-dropdown {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  z-index: 30;
+  min-width: 300px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: #1a1f2e;
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+}
+
+.swap-candidate-btn {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  background: none;
+  border: none;
+  border-bottom: 1px solid #1a202c;
+  color: #e2e8f0;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 7px 12px;
+  text-align: left;
+}
+.swap-candidate-btn:last-child { border-bottom: none; }
+.swap-candidate-btn:hover:not(:disabled) { background: #232b3d; }
+.swap-candidate-btn:disabled { opacity: 0.45; cursor: default; }
+
+.swap-candidate-name { font-weight: 500; white-space: nowrap; }
+
+.swap-candidate-meta {
+  font-size: 12px;
+  color: #a0aec0;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.swap-candidates-empty,
+.swap-candidates-error {
+  padding: 10px 12px;
+  font-size: 13px;
+  color: #a0aec0;
+}
+.swap-candidates-error { color: #fc8181; }

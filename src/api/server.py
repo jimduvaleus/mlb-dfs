@@ -2787,6 +2787,244 @@ async def portfolio_reselect(
 
 
 # ---------------------------------------------------------------------------
+# Late swap
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel as _BaseModel
+
+
+class LateSwapRunRequest(_BaseModel):
+    entry_marks: dict[str, list[int]] = {}
+    bulk_marked_player_ids: list[int] = []
+    bulk_marked_teams: list[str] = []
+
+
+class LateSwapOverrideRequest(_BaseModel):
+    entry_id: str
+    slot_index: int
+    player_id: int
+
+
+_late_swap_lock = threading.Lock()
+
+
+def _now_eastern():
+    """Naive Eastern-time now — slate start times are naive Eastern ISO strings."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+
+
+def _output_dir_path() -> Path:
+    cfg = read_config()
+    output_dir = cfg.paths.output_dir or "outputs"
+    return PROJECT_ROOT / output_dir if not Path(output_dir).is_absolute() else Path(output_dir)
+
+
+def _late_swap_context(apply_saved: bool = True) -> dict:
+    """Parse entries + slate, build pools/lookup/states, apply persisted swaps.
+
+    Pass apply_saved=False to get pristine states (run_swap recomputes from
+    the original entry files, so a re-run must not start from prior swaps).
+
+    Returns {"status": "ok", ...} or a terminal {"status": <reason>}.
+    """
+    import pandas as pd
+    from . import late_swap
+    from .dk_entries import parse_entry_file
+    from .slate_exclusions import compute_slate_id
+
+    cfg = read_config()
+    platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
+    if platform_val != "draftkings":
+        return {"status": "unsupported_platform"}
+    slate_path = _get_slate_file_path()
+    if slate_path is None:
+        return {"status": "no_slate"}
+    # Entries come from outputs/ (the upload_*.csv files written at portfolio
+    # completion reflect what was actually submitted to DK), not data/raw.
+    entry_files = late_swap.scan_swap_entry_files(str(_output_dir_path()))
+    if not entry_files:
+        return {"status": "no_entries"}
+    slate_df = _load_slate_df()
+    if slate_df is None or slate_df.empty:
+        return {"status": "no_slate"}
+
+    proj_path = _resolve_proj_path(cfg)
+    proj_df = pd.read_csv(proj_path) if proj_path.exists() else None
+
+    fingerprint = compute_file_fingerprint(slate_path)
+    slate_id = compute_slate_id(sorted({str(g) for g in slate_df["game"] if g}))
+    exclusions = read_exclusions(slate_id, fingerprint)
+
+    lookup_df, candidates_df = late_swap.build_swap_pools(slate_df, proj_df, exclusions)
+    lookup = late_swap.build_player_lookup(lookup_df)
+    raw_salaries = late_swap.load_raw_salaries(slate_path)
+    now = _now_eastern()
+
+    all_file_entries = [(p, parse_entry_file(p)) for p in entry_files]
+    states = late_swap.build_entry_states(all_file_entries, lookup, raw_salaries, now)
+
+    output_dir = str(_output_dir_path())
+    saved = late_swap.load_state(output_dir, fingerprint)
+    if saved and apply_saved:
+        late_swap.apply_saved_state(states, saved)
+
+    return {
+        "status": "ok",
+        "states": states,
+        "lookup": lookup,
+        "candidates_df": candidates_df,
+        "slate_df": slate_df,
+        "now": now,
+        "fingerprint": fingerprint,
+        "saved": saved,
+        "output_dir": output_dir,
+        "all_file_entries": all_file_entries,
+    }
+
+
+def _late_swap_state_response(ctx: dict) -> dict:
+    from . import late_swap
+
+    if ctx["status"] != "ok":
+        return {
+            "status": ctx["status"], "now": None, "files": [], "entries": [],
+            "bulk_marked_player_ids": [], "bulk_marked_teams": [], "teams": [],
+            "last_run_at": None, "written_files": [],
+        }
+    saved = ctx.get("saved") or {}
+    file_counts: dict[str, int] = {}
+    for path, records in ctx["all_file_entries"]:
+        file_counts[path.name] = len(records)
+    return {
+        "status": "ok",
+        "now": ctx["now"].isoformat(),
+        "files": [{"file_name": n, "n_entries": c} for n, c in file_counts.items()],
+        "entries": [
+            late_swap.entry_to_dict(e, ctx["lookup"], ctx["now"]) for e in ctx["states"]
+        ],
+        "bulk_marked_player_ids": saved.get("bulk_marked_player_ids", []),
+        "bulk_marked_teams": saved.get("bulk_marked_teams", []),
+        "teams": sorted({str(t) for t in ctx["slate_df"]["team"] if t}),
+        "last_run_at": saved.get("run_at"),
+        "written_files": saved.get("written_files", []),
+    }
+
+
+@app.get("/api/late-swap/state")
+def get_late_swap_state():
+    return _late_swap_state_response(_late_swap_context())
+
+
+@app.post("/api/late-swap/run")
+def run_late_swap(req: LateSwapRunRequest):
+    from . import late_swap
+
+    if not _late_swap_lock.acquire(blocking=False):
+        raise HTTPException(409, "A late swap run is already in progress")
+    try:
+        ctx = _late_swap_context(apply_saved=False)
+        if ctx["status"] != "ok":
+            raise HTTPException(400, f"Late swap unavailable: {ctx['status']}")
+        bulk_pids = set(req.bulk_marked_player_ids)
+        bulk_teams = set(req.bulk_marked_teams)
+        entry_marks = {k: set(v) for k, v in req.entry_marks.items()}
+        late_swap.run_swap(
+            ctx["states"], entry_marks, bulk_pids, bulk_teams,
+            ctx["candidates_df"], ctx["lookup"], late_swap.HeuristicScorer(),
+            ctx["now"],
+        )
+        written = late_swap.write_swap_files(ctx["states"], ctx["output_dir"])
+        late_swap.save_state(
+            ctx["output_dir"], ctx["fingerprint"], ctx["now"].isoformat(),
+            bulk_pids, bulk_teams, ctx["states"], written,
+        )
+        ctx["saved"] = late_swap.load_state(ctx["output_dir"], ctx["fingerprint"])
+        return _late_swap_state_response(ctx)
+    finally:
+        _late_swap_lock.release()
+
+
+@app.get("/api/late-swap/candidates")
+def get_late_swap_candidates(entry_id: str, slot_index: int):
+    from . import late_swap
+
+    ctx = _late_swap_context()
+    if ctx["status"] != "ok":
+        raise HTTPException(400, f"Late swap unavailable: {ctx['status']}")
+    entry = next((e for e in ctx["states"] if e.entry_id == entry_id), None)
+    if entry is None:
+        raise HTTPException(404, f"Entry {entry_id} not found")
+    if not (0 <= slot_index < len(entry.slots)):
+        raise HTTPException(404, f"Invalid slot index {slot_index}")
+    saved = ctx.get("saved") or {}
+    cands = late_swap.candidates_for_slot(
+        entry, slot_index, ctx["candidates_df"], ctx["lookup"],
+        set(saved.get("bulk_marked_player_ids", [])),
+        set(saved.get("bulk_marked_teams", [])),
+        ctx["now"],
+    )
+    return {
+        "candidates": [
+            {
+                "player_id": c["player_id"], "name": c["name"], "team": c["team"],
+                "position": c["position"], "eligible_positions": c["eligible_positions"],
+                "salary": c["salary"], "mean": c["mean"], "score": c["score"],
+            }
+            for c in cands
+        ],
+        "max_salary": late_swap.slot_max_salary(entry, slot_index, ctx["lookup"]),
+    }
+
+
+@app.post("/api/late-swap/override")
+def override_late_swap(req: LateSwapOverrideRequest):
+    from . import late_swap
+
+    if not _late_swap_lock.acquire(blocking=False):
+        raise HTTPException(409, "A late swap run is already in progress")
+    try:
+        ctx = _late_swap_context()
+        if ctx["status"] != "ok":
+            raise HTTPException(400, f"Late swap unavailable: {ctx['status']}")
+        entry = next((e for e in ctx["states"] if e.entry_id == req.entry_id), None)
+        if entry is None:
+            raise HTTPException(404, f"Entry {req.entry_id} not found")
+        saved = ctx.get("saved") or {}
+        bulk_pids = set(saved.get("bulk_marked_player_ids", []))
+        bulk_teams = set(saved.get("bulk_marked_teams", []))
+        err = late_swap.apply_override(
+            entry, req.slot_index, req.player_id,
+            ctx["candidates_df"], ctx["lookup"], bulk_pids, bulk_teams, ctx["now"],
+        )
+        if err:
+            raise HTTPException(422, err)
+        written = late_swap.write_swap_files(ctx["states"], ctx["output_dir"])
+        late_swap.save_state(
+            ctx["output_dir"], ctx["fingerprint"],
+            saved.get("run_at") or ctx["now"].isoformat(),
+            bulk_pids, bulk_teams, ctx["states"], written,
+        )
+        return {
+            "entry": late_swap.entry_to_dict(entry, ctx["lookup"], ctx["now"]),
+            "written_files": written,
+        }
+    finally:
+        _late_swap_lock.release()
+
+
+@app.post("/api/late-swap/reset")
+def reset_late_swap():
+    from . import late_swap
+
+    output_dir = str(_output_dir_path())
+    late_swap.clear_state(output_dir)
+    late_swap.delete_swap_files(output_dir)
+    return _late_swap_state_response(_late_swap_context())
+
+
+# ---------------------------------------------------------------------------
 # Static files (React SPA)
 # ---------------------------------------------------------------------------
 
