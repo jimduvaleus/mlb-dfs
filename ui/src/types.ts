@@ -49,15 +49,8 @@ export interface GppConfig {
   candidate_batch_size: number
   max_attempts_multiplier: number
   seed_optimal_lineups: boolean
-  risk: number
-  portfolio_n_iter: number
-  portfolio_n_restarts: number
   dump_candidate_pool: boolean
   candidate_floor_relief: number
-  portfolio_method: string
-  hybrid_n_sims: number
-  hybrid_max_correlation: number
-  // det_ev_risk_sweep removed — sweep is always [1,2,3,4,5]
   refine_rounds: number
   refine_top: number
   refine_mutants: number
@@ -314,18 +307,6 @@ export interface GppSelectProgressEvent extends SSEEvent {
   pct_covered: number
 }
 
-export interface GppMvSelectProgressEvent extends SSEEvent {
-  stage: 'gpp_mv_select_progress'
-  iteration: number
-  total_iterations: number
-  temperature: number
-  current_f: number
-  acceptance_rate: number
-  portfolio_mean: number
-  portfolio_std: number
-  restart: number
-}
-
 export interface GppDetRiskStartEvent extends SSEEvent {
   stage: 'gpp_det_risk_start'
   risk: number
@@ -344,18 +325,6 @@ export interface GppDetSelectProgressEvent extends SSEEvent {
   risk: number
   risk_index: number
   total_risks: number
-}
-
-export interface GppHybridSelectProgressEvent extends SSEEvent {
-  stage: 'gpp_hybrid_select_progress'
-  portfolio_current: number
-  portfolio_total: number
-  cycle: number          // 0 = Phase 2 fast-track; 1+ = hybrid field cycles
-  n_added: number        // lineups added this cycle (including zero-overlap fast-tracks)
-  n_remaining: number    // candidates still in pool after this cycle
-  n_ev_survivors: number // candidates that passed +EV filter (Phase 1 total for cycle=0)
-  n_corr_culled: number  // candidates dropped for exceeding max_correlation with any portfolio lineup
-  cycle_wall_s: number   // wall-clock seconds for this cycle (0 for cycle=0)
 }
 
 export interface PortfolioSweepEntry {

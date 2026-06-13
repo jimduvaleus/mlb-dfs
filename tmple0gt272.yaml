@@ -3,15 +3,10 @@ gpp:
   candidate_floor_relief: 3000
   dump_candidate_pool: true
   holdout_fraction: 0.0
-  hybrid_n_sims: 8000
   max_attempts_multiplier: 55
   n_candidates: 15000
   n_field_lineups: 5000
   n_field_samples: 3
-  portfolio_method: hybrid_field
-  portfolio_n_iter: 15000
-  portfolio_n_restarts: 5
-  risk: 0.0
   seed_optimal_lineups: true
 optimizer:
   early_stopping_threshold: 0.0005

@@ -55,14 +55,8 @@ class GppConfig(BaseModel):
     candidate_batch_size: int = 500
     max_attempts_multiplier: int = 50
     seed_optimal_lineups: bool = False
-    risk: float = 0.0
-    portfolio_n_iter: int = 10_000
-    portfolio_n_restarts: int = 3
     dump_candidate_pool: bool = False
     candidate_floor_relief: int = 2500
-    portfolio_method: str = "det_ev"
-    hybrid_n_sims: int = 10_000
-    hybrid_max_correlation: float = 0.9
     refine_rounds: int = 2
     refine_top: int = 150
     refine_mutants: int = 8

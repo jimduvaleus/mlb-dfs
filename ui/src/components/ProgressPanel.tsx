@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppMvSelectProgressEvent, GppOptimalProgressEvent, GppHybridSelectProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -44,7 +44,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
-const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_refine_progress', 'gpp_select_progress', 'gpp_mv_select_progress', 'gpp_optimal_progress', 'gpp_hybrid_select_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_refine_progress', 'gpp_select_progress', 'gpp_optimal_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
@@ -152,8 +152,6 @@ export function ProgressPanel({ events, running }: Props) {
   const scoreProgressEvents = events.filter(e => e.stage === 'gpp_score_progress') as unknown as GppScoreProgressEvent[]
   const latestScoreProgress = scoreProgressEvents[scoreProgressEvents.length - 1]
   const selectProgressEvents = events.filter(e => e.stage === 'gpp_select_progress') as unknown as GppSelectProgressEvent[]
-  const mvSelectProgressEvents = events.filter(e => e.stage === 'gpp_mv_select_progress') as unknown as GppMvSelectProgressEvent[]
-  const hybridProgressEvents = events.filter(e => e.stage === 'gpp_hybrid_select_progress') as unknown as GppHybridSelectProgressEvent[]
   const detProgressEvents = events.filter(e => e.stage === 'gpp_det_select_progress') as unknown as GppDetSelectProgressEvent[]
   const detRiskStartEvents = events.filter(e => e.stage === 'gpp_det_risk_start') as unknown as GppDetRiskStartEvent[]
   const scoreDone = events.some(e => e.stage === 'gpp_score_done')
@@ -190,24 +188,6 @@ export function ProgressPanel({ events, running }: Props) {
         ? `Risk ${latestDetRiskStart.risk_index}/${latestDetRiskStart.total_risks}`
         : currentRisk != null ? `Risk ${currentRisk}` : 'Starting…'
       gppLabel = `Portfolio (Det-EV): ${riskOfN}${latestDetStep ? ` · step ${latestDetStep.step}/${portfolioSizeDet}` : ''}`
-    } else if (hybridProgressEvents.length > 0) {
-      const lastH = hybridProgressEvents[hybridProgressEvents.length - 1]
-      gppPct = lastH.portfolio_total > 0
-        ? Math.round((lastH.portfolio_current / lastH.portfolio_total) * 100)
-        : 100
-      const cycleStr = lastH.cycle === 0
-        ? 'Phase 2 fast-track'
-        : `Cycle ${lastH.cycle}`
-      gppLabel = `Portfolio (Hybrid): ${lastH.portfolio_current} / ${lastH.portfolio_total} lineups · ${cycleStr} · ${lastH.n_remaining} remaining`
-    } else if (mvSelectProgressEvents.length > 0) {
-      const lastMv = mvSelectProgressEvents[mvSelectProgressEvents.length - 1]
-      gppPct = lastMv.total_iterations > 0
-        ? Math.round((lastMv.iteration / lastMv.total_iterations) * 100)
-        : 100
-      const bestF = Math.max(...mvSelectProgressEvents.map(ev => ev.current_f))
-      const fStr = (f: number) => (f >= 0 ? `+${f.toFixed(2)}` : f.toFixed(2))
-      const isCurrent = lastMv.current_f >= bestF
-      gppLabel = `Portfolio (SA): restart ${lastMv.restart + 1} · score ${fStr(lastMv.current_f)}${isCurrent ? ' ★ best' : ` (best ${fStr(bestF)})`} · ${gppPct}% done`
     } else if (selectProgressEvents.length > 0) {
       const lastSel = selectProgressEvents[selectProgressEvents.length - 1]
       gppPct = 100
@@ -289,15 +269,6 @@ export function ProgressPanel({ events, running }: Props) {
         const remaining = latestScoreProgress.batches_total - latestScoreProgress.batches_done
         if (remaining > 0) etaMs = avgPerBatch * remaining
       }
-    } else if (running && mvSelectProgressEvents.length >= 2) {
-      const lastMv = mvSelectProgressEvents[mvSelectProgressEvents.length - 1]
-      const recent = mvSelectProgressEvents.slice(-4)
-      const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
-      const recentIter = recent[recent.length - 1].iteration - recent[0].iteration
-      if (recentIter > 0) {
-        const remaining = lastMv.total_iterations - lastMv.iteration
-        etaMs = (recentElapsed / recentIter) * remaining
-      }
     } else if (running && isDetEv) {
       // ETA for Det-EV: remaining in current risk + (avgMsPerRisk * remaining risks)
       const currentRiskStartTs = latestDetRiskStart?.timestamp ?? null
@@ -327,19 +298,6 @@ export function ProgressPanel({ events, running }: Props) {
         etaMs = currentRiskRemainingMs + avgMsPerRisk * risksAfterCurrent
       } else if (avgMsPerRisk !== null && risksAfterCurrent >= 0) {
         etaMs = avgMsPerRisk * (risksAfterCurrent + 1)
-      }
-    } else if (running && hybridProgressEvents.length >= 2) {
-      // Use average wall time of the last few cycles (skip cycle=0 which is free).
-      const cycleEvents = hybridProgressEvents.filter(e => e.cycle > 0)
-      if (cycleEvents.length >= 1) {
-        const recentCycles = cycleEvents.slice(-4)
-        const avgWallMs = recentCycles.reduce((s, e) => s + e.cycle_wall_s * 1000, 0) / recentCycles.length
-        const avgAdded = recentCycles.reduce((s, e) => s + e.n_added, 0) / recentCycles.length
-        const lastH = hybridProgressEvents[hybridProgressEvents.length - 1]
-        const remaining = lastH.portfolio_total - lastH.portfolio_current
-        if (avgAdded > 0 && remaining > 0) {
-          etaMs = (remaining / avgAdded) * avgWallMs
-        }
       }
     }
   } else {
@@ -518,70 +476,6 @@ export function ProgressPanel({ events, running }: Props) {
         )
       })()}
 
-      {/* Hybrid field selection cycle rows */}
-      {hybridProgressEvents.length > 0 && (
-        <div className="event-list event-list-four-col">
-          {hybridProgressEvents.map((ev, i) => {
-            const isPhase2 = ev.cycle === 0
-            return (
-              <div key={i} className="event-row event-gpp_hybrid_select_progress">
-                <span className="event-stage event-stage-lineup">
-                  {isPhase2 ? 'P2' : `C${ev.cycle}`}
-                </span>
-                <span className="event-detail">
-                  {isPhase2
-                    ? `+${ev.n_added} lineups (fast-track) · ${ev.n_ev_survivors} +EV candidates · ${ev.n_remaining} in pool`
-                    : `+${ev.n_added} lineups · ${ev.n_ev_survivors} survived · ${ev.n_corr_culled > 0 ? `${ev.n_corr_culled} corr-culled · ` : ''}${ev.n_remaining} in pool · ${ev.cycle_wall_s.toFixed(1)}s`}
-                </span>
-              </div>
-            )
-          })}
-        </div>
-      )}
-
-      {/* GPP MV SA selection rows */}
-      {mvSelectProgressEvents.length > 0 && (() => {
-        const fStr = (f: number) => (f >= 0 ? `+${f.toFixed(2)}` : f.toFixed(2))
-        // Derive n_iter from the global iteration offset of the first restart-1 event.
-        // Each event is emitted every 250 iterations; sample ~4 rows per restart.
-        const firstRestart1 = mvSelectProgressEvents.find(ev => ev.restart >= 1)
-        const nIter = firstRestart1
-          ? firstRestart1.iteration
-          : mvSelectProgressEvents[0].total_iterations
-        const eventsPerRestart = Math.max(1, Math.round(nIter / 250))
-        const sampleEvery = Math.max(1, Math.round(eventsPerRestart / 4))
-        let runningBestF = -Infinity
-        const sampled = mvSelectProgressEvents
-          .filter((_, i) => i % sampleEvery === 0 || i === mvSelectProgressEvents.length - 1)
-          .map(ev => {
-            const isNewBest = ev.current_f > runningBestF
-            if (isNewBest) runningBestF = ev.current_f
-            return { ev, isNewBest }
-          })
-        return (
-          <div className="event-list">
-            {sampled.map(({ ev, isNewBest }, i, arr) => {
-              const isFirstOfRestart = i > 0 && arr[i - 1].ev.restart !== ev.restart
-              return (
-                <div key={i}>
-                  {isFirstOfRestart && (
-                    <div className="event-row">
-                      <span className="event-stage muted">Restart {ev.restart + 1}</span>
-                      <span className="event-detail muted">exploring new combinations</span>
-                    </div>
-                  )}
-                  <div className="event-row event-gpp_mv_select_progress">
-                    <span className="event-stage event-stage-lineup">R{ev.restart + 1} · {ev.iteration.toLocaleString()}</span>
-                    <span className="event-detail">
-                      {isNewBest ? '★ ' : ''}score {fStr(ev.current_f)} · avg ${ev.portfolio_mean.toFixed(2)} · spread ±${ev.portfolio_std.toFixed(2)} · {(ev.acceptance_rate * 100).toFixed(0)}% accepting
-                    </span>
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        )
-      })()}
     </div>
   )
 }

@@ -464,7 +464,7 @@ class PipelineRunner:
             # marginal-EV greedy selection.
             # ----------------------------------------------------------------
             from src.optimization.candidate_generator import CandidateGenerator
-            from src.optimization.gpp_portfolio import ContestScorer, EVPortfolioSelector, MeanVariancePortfolioSelector
+            from src.optimization.gpp_portfolio import ContestScorer, EVPortfolioSelector
 
             def _candidate_team_distribution(cands, players_df):
                 """Return {team: count} of unambiguous 4/5-hitter primary stacks."""
@@ -490,13 +490,9 @@ class PipelineRunner:
             n_candidates = int(gpp_cfg.get("n_candidates", 10_000))
             n_field = int(gpp_cfg.get("n_field_lineups", 5_000))
             n_k = int(gpp_cfg.get("n_field_samples", 3))
-            holdout_frac = float(gpp_cfg.get("holdout_fraction", 0.0))
             cand_batch = int(gpp_cfg.get("candidate_batch_size", 500))
             max_attempts_mult = int(gpp_cfg.get("max_attempts_multiplier", 50))
             candidate_floor_relief = int(gpp_cfg.get("candidate_floor_relief", 2500))
-            mv_risk = float(gpp_cfg.get("risk", 0.0))
-            mv_n_iter = int(gpp_cfg.get("portfolio_n_iter", 10_000))
-            mv_n_restarts = int(gpp_cfg.get("portfolio_n_restarts", 3))
             salary_floor_gpp = (
                 float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None
             )
@@ -1055,187 +1051,92 @@ class PipelineRunner:
                 if _gpp_stopped and self._stop_check():
                     portfolio = []
                 else:
-                    # Phase 3: portfolio selection — dispatch on portfolio_method
-                    portfolio_method = gpp_cfg.get("portfolio_method", "mean_variance")
+                    # Phase 3: Det-EV portfolio selection
                     _t_select = time.perf_counter()
                     _portfolio_sweep_raw: list[tuple[float, list]] = []  # [(risk, raw_portfolio)]
 
-                    if portfolio_method == "det_ev":
-                        from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
-                        # Always sweep risk values 1-5; ignore gpp.risk config for det_ev.
-                        _DET_SWEEP_RISKS = [1.0, 2.0, 3.0, 4.0, 5.0]
-                        _portfolio_sweep_raw: list[tuple[float, list]] = []
+                    from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
+                    # Always sweep risk values 1-5; ignore gpp.risk config for det_ev.
+                    _DET_SWEEP_RISKS = [1.0, 2.0, 3.0, 4.0, 5.0]
+                    _portfolio_sweep_raw: list[tuple[float, list]] = []
 
+                    logger.info(
+                        "Det-EV sweep — portfolio_size=%d, risks=%s",
+                        portfolio_size, _DET_SWEEP_RISKS,
+                    )
+
+                    for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
+                        if self._stop_check is not None and self._stop_check():
+                            break
+                        _evw = _sweep_risk * 0.05
                         logger.info(
-                            "Det-EV sweep — portfolio_size=%d, risks=%s",
-                            portfolio_size, _DET_SWEEP_RISKS,
+                            "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)",
+                            _risk_idx + 1, len(_DET_SWEEP_RISKS),
+                            _sweep_risk, _evw, 1.0 - _evw,
                         )
-
-                        for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
-                            if self._stop_check is not None and self._stop_check():
-                                break
-                            _evw = _sweep_risk * 0.05
-                            logger.info(
-                                "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)",
-                                _risk_idx + 1, len(_DET_SWEEP_RISKS),
-                                _sweep_risk, _evw, 1.0 - _evw,
-                            )
-                            self._cb("gpp_det_risk_start", {
-                                "risk": _sweep_risk,
-                                "risk_index": _risk_idx + 1,
-                                "total_risks": len(_DET_SWEEP_RISKS),
-                            })
-                            _det_sel = DeterminantPortfolioSelector(
-                                robust_payout=robust_payout,
-                                candidates=candidates,
-                                portfolio_size=portfolio_size,
-                                risk=_sweep_risk,
-                            )
-                            _det_result = _det_sel.select(
-                                progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
-                                    "gpp_det_select_progress",
-                                    {**data, "risk": r, "risk_index": ri + 1,
-                                     "total_risks": len(_DET_SWEEP_RISKS)},
-                                ),
-                            )
-                            _portfolio_sweep_raw.append((_sweep_risk, _det_result))
-
-                        # Reorder all sweep portfolios by entry-fee-weighted diversity now,
-                        # so the ordering is final from the outset and never needs to be
-                        # repeated when a risk level is activated or the sweep is displayed.
-                        _sweep_fees = PipelineRunner._extract_sorted_fees(all_file_entries)
-                        _portfolio_sweep_raw = [
-                            (r, PipelineRunner._reorder_by_diversity(p, _sweep_fees))
-                            for r, p in _portfolio_sweep_raw
-                        ]
-
-                        # Default active = risk=1 (first entry).
-                        gpp_result = _portfolio_sweep_raw[0][1] if _portfolio_sweep_raw else []
-                        self._sweep_portfolios_raw = {r: p for r, p in _portfolio_sweep_raw}
-                        self._gpp_robust_payout = robust_payout
-                        self._gpp_candidates = candidates
-                        logger.info(
-                            "[TIMING] Det-EV sweep wall time: %.3fs",
-                            time.perf_counter() - _t_select,
-                        )
-
-                        # Persist sweep to disk so it survives a server restart.
-                        _sweep_cache_path = os.path.join(
-                            output_dir, f"portfolio_sweep_{platform.value}.json"
-                        )
-                        try:
-                            _sweep_cache_data = {
-                                "slate_fingerprint": _slate_fp or "",
-                                "active_risk": 1,
-                                "sweep": [
-                                    {
-                                        "risk": r,
-                                        "lineups": self._serialize_portfolio(
-                                            p, players_df, mean_ev_from_score=True
-                                        ),
-                                    }
-                                    for r, p in _portfolio_sweep_raw
-                                ],
-                            }
-                            os.makedirs(output_dir, exist_ok=True)
-                            with open(_sweep_cache_path, "w") as _sc_f:
-                                json.dump(_sweep_cache_data, _sc_f)
-                            logger.info("Det-EV sweep cache saved to %s", _sweep_cache_path)
-                        except Exception as _sc_e:
-                            logger.warning("Failed to save sweep cache: %s", _sc_e)
-
-                    elif portfolio_method == "hybrid_field":
-                        from src.optimization.hybrid_field_portfolio import HybridFieldPortfolioSelector
-                        hybrid_n_sims = int(gpp_cfg.get("hybrid_n_sims", 10_000))
-                        hybrid_max_corr = float(gpp_cfg.get("hybrid_max_correlation", 0.9))
-                        _entry_fee = float(_gpp_structure.get("entry_fee", 4.0))
-                        logger.info(
-                            "HybridField selector — portfolio_size=%d, n_field=%d, "
-                            "n_hybrid_sims=%d, max_correlation=%.2f",
-                            portfolio_size, n_field, hybrid_n_sims, hybrid_max_corr,
-                        )
-                        hf_selector = HybridFieldPortfolioSelector(
-                            candidates=candidates,
+                        self._cb("gpp_det_risk_start", {
+                            "risk": _sweep_risk,
+                            "risk_index": _risk_idx + 1,
+                            "total_risks": len(_DET_SWEEP_RISKS),
+                        })
+                        _det_sel = DeterminantPortfolioSelector(
                             robust_payout=robust_payout,
-                            sim_engine=engine,
-                            players_df=cand_players_df,
-                            payout_arr=_gpp_payout_arr,
+                            candidates=candidates,
                             portfolio_size=portfolio_size,
-                            n_field_lineups=n_field,
-                            n_hybrid_sims=hybrid_n_sims,
-                            field_players_df=sim_players_df,
-                            ownership_vec=ownership_vector,
-                            team_totals=team_totals_gpp,
-                            entry_fee=_entry_fee,
-                            max_correlation=hybrid_max_corr,
-                            rng_seed=opt_cfg.get("rng_seed"),
+                            risk=_sweep_risk,
                         )
-                        gpp_result = hf_selector.select(
-                            stop_check=self._stop_check,
-                            progress_cb=lambda data: self._cb(
-                                "gpp_hybrid_select_progress", data
+                        _det_result = _det_sel.select(
+                            progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
+                                "gpp_det_select_progress",
+                                {**data, "risk": r, "risk_index": ri + 1,
+                                 "total_risks": len(_DET_SWEEP_RISKS)},
                             ),
                         )
-                        logger.info(
-                            "[TIMING] HybridFieldPortfolioSelector.select() wall time: %.3fs",
-                            time.perf_counter() - _t_select,
-                        )
-                        # Cache artifacts (no selector object for replace_lineup).
-                        self._gpp_robust_payout = robust_payout
-                        self._gpp_candidates = candidates
+                        _portfolio_sweep_raw.append((_sweep_risk, _det_result))
 
-                    else:
-                        # Default: mean-variance simulated-annealing selector.
-                        _field_sorted = scorer.last_field_sorted    # (n_sims, N_field)
-                        _col_lineups = scorer.last_col_lineups       # (M, 10)
-                        _sim_mat = scorer._sim_matrix                # (n_sims, n_players)
-                        _n_field = _field_sorted.shape[1]
-                        logger.info(
-                            "[TIMING] EV phase setup — field_sorted %s (%.1f MB), "
-                            "col_lineups %s, sim_mat %s (%.1f MB), n_field=%d",
-                            _field_sorted.shape, _field_sorted.nbytes / 1e6,
-                            _col_lineups.shape,
-                            _sim_mat.shape, _sim_mat.nbytes / 1e6,
-                            _n_field,
-                        )
-                        selector = MeanVariancePortfolioSelector(
-                            robust_payout=robust_payout,
-                            candidates=candidates,
-                            portfolio_size=portfolio_size,
-                            risk=mv_risk,
-                            n_iter=mv_n_iter,
-                            n_restarts=mv_n_restarts,
-                            holdout_fraction=holdout_frac,
-                            rng_seed=opt_cfg.get("rng_seed"),
-                        )
-                        gpp_result = selector.select(
-                            stop_check=self._stop_check,
-                            progress_cb=lambda itr, tot, T, f, acc, mean, std, restart: self._cb(
-                                "gpp_mv_select_progress",
+                    # Reorder all sweep portfolios by entry-fee-weighted diversity now,
+                    # so the ordering is final from the outset and never needs to be
+                    # repeated when a risk level is activated or the sweep is displayed.
+                    _sweep_fees = PipelineRunner._extract_sorted_fees(all_file_entries)
+                    _portfolio_sweep_raw = [
+                        (r, PipelineRunner._reorder_by_diversity(p, _sweep_fees))
+                        for r, p in _portfolio_sweep_raw
+                    ]
+
+                    # Default active = risk=1 (first entry).
+                    gpp_result = _portfolio_sweep_raw[0][1] if _portfolio_sweep_raw else []
+                    self._sweep_portfolios_raw = {r: p for r, p in _portfolio_sweep_raw}
+                    self._gpp_robust_payout = robust_payout
+                    self._gpp_candidates = candidates
+                    logger.info(
+                        "[TIMING] Det-EV sweep wall time: %.3fs",
+                        time.perf_counter() - _t_select,
+                    )
+
+                    # Persist sweep to disk so it survives a server restart.
+                    _sweep_cache_path = os.path.join(
+                        output_dir, f"portfolio_sweep_{platform.value}.json"
+                    )
+                    try:
+                        _sweep_cache_data = {
+                            "slate_fingerprint": _slate_fp or "",
+                            "active_risk": 1,
+                            "sweep": [
                                 {
-                                    "iteration": itr,
-                                    "total_iterations": tot,
-                                    "temperature": round(float(T), 6),
-                                    "current_f": round(float(f), 6),
-                                    "acceptance_rate": round(float(acc), 4),
-                                    "portfolio_mean": round(float(mean), 4),
-                                    "portfolio_std": round(float(std), 4),
-                                    "restart": restart,
-                                },
-                            ),
-                        )
-                        logger.info(
-                            "[TIMING] MeanVariancePortfolioSelector.select() wall time: %.3fs",
-                            time.perf_counter() - _t_select,
-                        )
-                        if selector.holdout_score() is not None:
-                            self._cb("gpp_holdout", {
-                                "holdout_mean_payout": round(selector.holdout_score(), 6),
-                            })
-                        # Cache GPP artifacts for replace_lineup.
-                        self._gpp_robust_payout = robust_payout
-                        self._gpp_candidates = candidates
-                        self._gpp_selector = selector
+                                    "risk": r,
+                                    "lineups": self._serialize_portfolio(
+                                        p, players_df, mean_ev_from_score=True
+                                    ),
+                                }
+                                for r, p in _portfolio_sweep_raw
+                            ],
+                        }
+                        os.makedirs(output_dir, exist_ok=True)
+                        with open(_sweep_cache_path, "w") as _sc_f:
+                            json.dump(_sweep_cache_data, _sc_f)
+                        logger.info("Det-EV sweep cache saved to %s", _sweep_cache_path)
+                    except Exception as _sc_e:
+                        logger.warning("Failed to save sweep cache: %s", _sc_e)
 
                     portfolio = gpp_result
 
@@ -1669,169 +1570,6 @@ class PipelineRunner:
             self.write_upload_files()
 
             entry_map = self._build_lineup_entry_map(self._all_file_entries, self._raw_portfolio)
-            for lr in result:
-                info = entry_map.get(lr["lineup_index"])
-                if info:
-                    lr.update(info)
-            meta_path = os.path.join(self._output_dir, f"portfolio_entries_{platform_val}.json")
-            with open(meta_path, "w") as f:
-                json.dump({str(k): v for k, v in entry_map.items()}, f)
-
-        return result
-
-    def reselect_portfolio(
-        self,
-        risk: float,
-        n_iter: int,
-        n_restarts: int,
-        progress_cb,
-        stop_check=None,
-    ) -> list[dict]:
-        """Re-run SA portfolio selection with new settings using the cached payout matrix.
-
-        Skips all upstream stages (candidate generation, field simulation, EV
-        scoring). Requires that a full leverage_surplus run has already
-        completed and populated _gpp_robust_payout / _gpp_candidates /
-        _sim_results on this runner.
-
-        Returns the same serialized list[dict] as run().
-        """
-        if stop_check is None:
-            stop_check = lambda: False
-
-        if not hasattr(self, "_gpp_robust_payout") or self._gpp_robust_payout is None:
-            raise RuntimeError(
-                "No cached GPP payout matrix — run the full pipeline first."
-            )
-        if not hasattr(self, "_gpp_candidates") or self._gpp_candidates is None:
-            raise RuntimeError(
-                "No cached candidates — run the full pipeline first."
-            )
-        if not hasattr(self, "_sim_results") or self._sim_results is None:
-            raise RuntimeError(
-                "Simulation results unavailable — run the full pipeline first."
-            )
-
-        from src.optimization.gpp_portfolio import MeanVariancePortfolioSelector
-        from pathlib import Path as _Path
-
-        # _config_path may be a now-deleted temp file (seed_optimal run); fall
-        # back to config.yaml in the same directory.
-        _cfg_file = _Path(self._config_path)
-        if not _cfg_file.exists():
-            _cfg_file = _cfg_file.parent / "config.yaml"
-        with open(_cfg_file) as _f:
-            cfg = yaml.safe_load(_f) or {}
-        gpp_cfg = cfg.get("gpp", {})
-        opt_cfg = cfg.get("optimizer", {})
-        port_cfg = cfg.get("portfolio", {})
-
-        holdout_frac = float(gpp_cfg.get("holdout_fraction", 0.0))
-        config_size = int(port_cfg.get("size", 20))
-        all_file_entries = getattr(self, "_all_file_entries", None) or []
-        total_entries = sum(len(recs) for _, recs in all_file_entries) if all_file_entries else 0
-        portfolio_size = max(config_size, total_entries) if total_entries > 0 else config_size
-        rng_seed = opt_cfg.get("rng_seed")
-
-        selector = MeanVariancePortfolioSelector(
-            robust_payout=self._gpp_robust_payout,
-            candidates=self._gpp_candidates,
-            portfolio_size=portfolio_size,
-            risk=risk,
-            n_iter=n_iter,
-            n_restarts=n_restarts,
-            holdout_fraction=holdout_frac,
-            rng_seed=rng_seed,
-        )
-
-        portfolio = selector.select(
-            stop_check=stop_check,
-            progress_cb=lambda itr, tot, T, f, acc, mean, std, restart: progress_cb(
-                "gpp_mv_select_progress",
-                {
-                    "iteration": itr,
-                    "total_iterations": tot,
-                    "temperature": round(float(T), 6),
-                    "current_f": round(float(f), 6),
-                    "acceptance_rate": round(float(acc), 4),
-                    "portfolio_mean": round(float(mean), 4),
-                    "portfolio_std": round(float(std), 4),
-                    "restart": restart,
-                },
-            ),
-        )
-
-        if selector.holdout_score() is not None:
-            progress_cb("gpp_holdout", {
-                "holdout_mean_payout": round(selector.holdout_score(), 6),
-            })
-
-        self._gpp_selector = selector
-
-        # Compute best_scores for portfolio_stats.
-        col_map = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
-        sim_mat = self._sim_results.results_matrix.astype(np.float32)
-        best_scores = np.zeros(self._sim_results.n_sims, dtype=np.float64)
-        for lu, _ in portfolio:
-            cols = [col_map[pid] for pid in lu.player_ids if pid in col_map]
-            if len(cols) == 10:
-                lu_scores = sim_mat[:, cols].sum(axis=1).astype(np.float64)
-                np.maximum(best_scores, lu_scores, out=best_scores)
-
-        target = self._target
-        n_sims_ps = len(best_scores)
-        covered_mask = best_scores >= target
-        covered = best_scores[covered_mask]
-        score_min = float(best_scores.min())
-        score_max = float(best_scores.max())
-        n_buckets = 40
-        bucket_size = (score_max - score_min) / n_buckets if score_max > score_min else 1.0
-        histogram = []
-        for k in range(n_buckets):
-            lo = score_min + k * bucket_size
-            hi = lo + bucket_size
-            histogram.append({
-                "lo": round(lo, 1),
-                "hi": round(hi, 1),
-                "mid": round((lo + hi) / 2, 1),
-                "count": int(((best_scores >= lo) & (best_scores < hi)).sum()),
-            })
-
-        def _pct(arr: np.ndarray, q: float) -> Optional[float]:
-            return round(float(np.percentile(arr, q)), 1) if len(arr) > 0 else None
-
-        progress_cb("portfolio_stats", {
-            "target": round(target, 1),
-            "great_threshold": round(target + 15.0, 1),
-            "n_sims": n_sims_ps,
-            "covered_count": int(covered_mask.sum()),
-            "covered_mean": round(float(covered.mean()), 1) if len(covered) > 0 else None,
-            "covered_p50": _pct(covered, 50),
-            "covered_p90": _pct(covered, 90),
-            "covered_p95": _pct(covered, 95),
-            "covered_p99": _pct(covered, 99),
-            "overall_p90": round(float(np.percentile(best_scores, 90)), 1),
-            "overall_p95": round(float(np.percentile(best_scores, 95)), 1),
-            "overall_p99": round(float(np.percentile(best_scores, 99)), 1),
-            "histogram": histogram,
-        })
-
-        _fees = PipelineRunner._extract_sorted_fees(all_file_entries)
-        # portfolio = PipelineRunner._reorder_by_diversity(portfolio, _fees)
-        self._raw_portfolio = portfolio
-
-        result = self._serialize_portfolio(portfolio, self._players_df, mean_ev_from_score=True)
-
-        os.makedirs(self._output_dir, exist_ok=True)
-        portfolio_df = self._format_portfolio_df(portfolio, self._players_df, mean_ev_from_score=True)
-        platform_val = self._platform.value if hasattr(self, "_platform") else "draftkings"
-        output_path = os.path.join(self._output_dir, f"portfolio_{platform_val}.csv")
-        portfolio_df.to_csv(output_path, index=False)
-        logger.info("Reselect complete; portfolio saved to %s", output_path)
-
-        if all_file_entries:
-            self.write_upload_files()
-            entry_map = self._build_lineup_entry_map(all_file_entries, portfolio)
             for lr in result:
                 info = entry_map.get(lr["lineup_index"])
                 if info:

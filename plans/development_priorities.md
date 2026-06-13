@@ -1,1 +1,1 @@
-- BIG late swap?
+- when detecting player out of lineup, bump notification count and add a banner

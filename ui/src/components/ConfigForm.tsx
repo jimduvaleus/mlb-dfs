@@ -206,18 +206,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <input type="number" min={1} max={10} value={draft.gpp.n_field_samples}
                   onChange={e => setGpp('n_field_samples', Number(e.target.value))} disabled={disabled} />
               </FieldRow>
-              <FieldRow label="Risk (0 = diverse · 10 = concentrated)">
-                <input type="number" step={1} min={0} max={10} value={draft.gpp.risk}
-                  onChange={e => setGpp('risk', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="SA iterations">
-                <input type="number" step={1000} min={1000} value={draft.gpp.portfolio_n_iter}
-                  onChange={e => setGpp('portfolio_n_iter', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="SA restarts">
-                <input type="number" step={1} min={1} max={10} value={draft.gpp.portfolio_n_restarts}
-                  onChange={e => setGpp('portfolio_n_restarts', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
               <FieldRow label="Candidate floor relief ($)">
                 <input type="number" step={500} min={0} max={10000} value={draft.gpp.candidate_floor_relief}
                   onChange={e => setGpp('candidate_floor_relief', Number(e.target.value))} disabled={disabled} />
@@ -242,26 +230,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <input type="checkbox" checked={!!draft.gpp.dump_candidate_pool}
                   onChange={e => setGpp('dump_candidate_pool', e.target.checked)} disabled={disabled} />
               </FieldRow>
-              <FieldRow label="Portfolio method">
-                <select value={draft.gpp.portfolio_method ?? 'hybrid_field'}
-                  onChange={e => setGpp('portfolio_method', e.target.value)} disabled={disabled}>
-                  <option value="det_ev">Det-EV (Greedy)</option>
-                  <option value="hybrid_field">Hybrid Field</option>
-                  <option value="mean_variance">Mean-Variance (SA)</option>
-                </select>
-              </FieldRow>
-              {(draft.gpp.portfolio_method ?? 'hybrid_field') === 'hybrid_field' && (
-                <>
-                  <FieldRow label="Hybrid sims per cycle">
-                    <input type="number" step={1000} min={1000} value={draft.gpp.hybrid_n_sims ?? 10000}
-                      onChange={e => setGpp('hybrid_n_sims', Number(e.target.value))} disabled={disabled} />
-                  </FieldRow>
-                  <FieldRow label="Max correlation (0–1)">
-                    <input type="number" step={0.05} min={0} max={1} value={draft.gpp.hybrid_max_correlation ?? 0.9}
-                      onChange={e => setGpp('hybrid_max_correlation', Number(e.target.value))} disabled={disabled} />
-                  </FieldRow>
-                </>
-              )}
+
             </section>
           )}
         </div>
