@@ -474,8 +474,51 @@ def get_twitter_lineups() -> list[TwitterLineupRecord]:
 
 @app.post("/api/twitter-lineups")
 def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
+    fp = _slate_fingerprint()
+
+    # When updating a locked lineup, inject a diff notification showing who's in/out
+    existing_lineups = load_twitter_lineups(fp)
+    existing = next((l for l in existing_lineups if l.get("team") == req.team), None)
+    if existing and existing.get("locked"):
+        old_ids = {s["player_id"] for s in existing.get("slots", []) if s.get("player_id") is not None}
+        new_ids = {s.player_id for s in req.slots if s.player_id is not None}
+        added_ids = new_ids - old_ids
+        removed_ids = old_ids - new_ids
+        if added_ids or removed_ids:
+            name_map: dict[int, str] = {}
+            slate_df = _load_slate_df()
+            if slate_df is not None:
+                for pid in added_ids | removed_ids:
+                    row = slate_df[slate_df["player_id"] == pid]
+                    if not row.empty:
+                        name_map[pid] = str(row.iloc[0]["name"])
+            for s in req.slots:
+                if s.player_id is not None and s.player_id not in name_map:
+                    name_map[s.player_id] = s.name
+            for s in existing.get("slots", []):
+                pid = s.get("player_id")
+                if pid is not None and pid not in name_map:
+                    name_map[pid] = s.get("name", str(pid))
+
+            parts: list[str] = []
+            if added_ids:
+                parts.append("In: " + ", ".join(name_map.get(p, str(p)) for p in sorted(added_ids)))
+            if removed_ids:
+                parts.append("Out: " + ", ".join(name_map.get(p, str(p)) for p in sorted(removed_ids)))
+
+            diff_notif = {
+                "id": str(uuid.uuid4()),
+                "summary": f"{req.team} lineup update",
+                "body": " | ".join(parts),
+                "app_name": "system",
+                "captured_at": time.time(),
+            }
+            with _notifications_lock:
+                _notifications.append(diff_notif)
+                _save_notifications()
+
     slots = [s.model_dump() for s in req.slots]
-    record = upsert_twitter_lineup(req.team, req.notification_id, slots, _slate_fingerprint(), locked=req.locked)
+    record = upsert_twitter_lineup(req.team, req.notification_id, slots, fp, locked=req.locked)
     return TwitterLineupRecord(**record)
 
 
