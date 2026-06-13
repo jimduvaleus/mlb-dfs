@@ -142,27 +142,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
 
           <section>
             <h3>Optimizer</h3>
-            <FieldRow label="Objective">
-              <select value={draft.optimizer.objective}
-                onChange={e => set('optimizer', 'objective', e.target.value)} disabled={disabled}>
-                <option value="expected_surplus">Expected Surplus</option>
-                <option value="p_hit">Probability Hit</option>
-                <option value="marginal_payout">Marginal Payout</option>
-                <option value="leverage_surplus">Leverage Surplus</option>
-              </select>
-            </FieldRow>
-            {draft.optimizer.objective === 'marginal_payout' && (
-              <>
-                <FieldRow label="Payout beta (blank = auto)">
-                  <input type="number" step={0.1} min={1} max={8} value={str(draft.optimizer.payout_beta)}
-                    onChange={e => set('optimizer', 'payout_beta', num(e.target.value))} disabled={disabled} />
-                </FieldRow>
-                <FieldRow label="Coverage bonus (0 = off)">
-                  <input type="number" step={10} min={0} value={draft.optimizer.payout_coverage_bonus}
-                    onChange={e => set('optimizer', 'payout_coverage_bonus', Number(e.target.value))} disabled={disabled} />
-                </FieldRow>
-              </>
-            )}
             <FieldRow label="Salary floor ($)">
               <input type="number" step={500} value={str(draft.optimizer.salary_floor)}
                 onChange={e => set('optimizer', 'salary_floor', num(e.target.value))} disabled={disabled} />
@@ -191,48 +170,45 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
             </FieldRow>
           </section>
 
-          {draft.optimizer.objective === 'leverage_surplus' && (
-            <section>
-              <h3>GPP</h3>
-              <FieldRow label="Candidates">
-                <input type="number" min={100} value={draft.gpp.n_candidates}
-                  onChange={e => setGpp('n_candidates', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Field lineups">
-                <input type="number" min={100} value={draft.gpp.n_field_lineups}
-                  onChange={e => setGpp('n_field_lineups', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Field samples">
-                <input type="number" min={1} max={10} value={draft.gpp.n_field_samples}
-                  onChange={e => setGpp('n_field_samples', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Candidate floor relief ($)">
-                <input type="number" step={500} min={0} max={10000} value={draft.gpp.candidate_floor_relief}
-                  onChange={e => setGpp('candidate_floor_relief', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Refine rounds (0 = off)">
-                <input type="number" step={1} min={0} max={10} value={draft.gpp.refine_rounds ?? 2}
-                  onChange={e => setGpp('refine_rounds', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Refine parents per round">
-                <input type="number" step={10} min={10} value={draft.gpp.refine_top ?? 150}
-                  onChange={e => setGpp('refine_top', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Mutants per parent">
-                <input type="number" step={1} min={1} max={50} value={draft.gpp.refine_mutants ?? 8}
-                  onChange={e => setGpp('refine_mutants', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Refine holdout fraction (0 = off)">
-                <input type="number" step={0.05} min={0} max={0.5} value={draft.gpp.refine_holdout_fraction ?? 0.3}
-                  onChange={e => setGpp('refine_holdout_fraction', Number(e.target.value))} disabled={disabled} />
-              </FieldRow>
-              <FieldRow label="Dump candidate pool">
-                <input type="checkbox" checked={!!draft.gpp.dump_candidate_pool}
-                  onChange={e => setGpp('dump_candidate_pool', e.target.checked)} disabled={disabled} />
-              </FieldRow>
-
-            </section>
-          )}
+          <section>
+            <h3>GPP</h3>
+            <FieldRow label="Candidates">
+              <input type="number" min={100} value={draft.gpp.n_candidates}
+                onChange={e => setGpp('n_candidates', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Field lineups">
+              <input type="number" min={100} value={draft.gpp.n_field_lineups}
+                onChange={e => setGpp('n_field_lineups', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Field samples">
+              <input type="number" min={1} max={10} value={draft.gpp.n_field_samples}
+                onChange={e => setGpp('n_field_samples', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Candidate floor relief ($)">
+              <input type="number" step={500} min={0} max={10000} value={draft.gpp.candidate_floor_relief}
+                onChange={e => setGpp('candidate_floor_relief', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Refine rounds (0 = off)">
+              <input type="number" step={1} min={0} max={10} value={draft.gpp.refine_rounds ?? 2}
+                onChange={e => setGpp('refine_rounds', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Refine parents per round">
+              <input type="number" step={10} min={10} value={draft.gpp.refine_top ?? 150}
+                onChange={e => setGpp('refine_top', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Mutants per parent">
+              <input type="number" step={1} min={1} max={50} value={draft.gpp.refine_mutants ?? 8}
+                onChange={e => setGpp('refine_mutants', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Refine holdout fraction (0 = off)">
+              <input type="number" step={0.05} min={0} max={0.5} value={draft.gpp.refine_holdout_fraction ?? 0.3}
+                onChange={e => setGpp('refine_holdout_fraction', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Dump candidate pool">
+              <input type="checkbox" checked={!!draft.gpp.dump_candidate_pool}
+                onChange={e => setGpp('dump_candidate_pool', e.target.checked)} disabled={disabled} />
+            </FieldRow>
+          </section>
         </div>
       </div>
 

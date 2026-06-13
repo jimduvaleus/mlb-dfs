@@ -43,7 +43,7 @@ const STAGE_LABELS: Record<string, string> = {
   error: 'Error',
 }
 
-const CONFIG_STAGES = new Set(['simulate', 'compute_target', 'calibrate_beta'])
+const CONFIG_STAGES = new Set(['simulate', 'compute_target'])
 const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_refine_progress', 'gpp_select_progress', 'gpp_optimal_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
 
 export function ProgressPanel({ events, running }: Props) {
@@ -491,18 +491,8 @@ function formatSwap(out: string[], inn: string[]): string {
 
 function buildConfigDetail(events: SSEEvent[]): string {
   const sim = events.find(e => e.stage === 'simulate') as SimulateEvent | undefined
-  const target = events.find(e => e.stage === 'compute_target') as unknown as { target: number; percentile: number | null } | undefined
-  const beta = [...events].reverse().find(e => e.stage === 'calibrate_beta') as unknown as { payout_beta?: number } | undefined
-
   const parts: string[] = []
   if (sim) parts.push(`${sim.n_sims.toLocaleString()} simulations`)
-  if (target && sim?.objective !== 'leverage_surplus') {
-    const tStr = target.percentile
-      ? `${target.target.toFixed(1)} pts (p${target.percentile})`
-      : `${target.target.toFixed(1)} pts (manual)`
-    parts.push(`target: ${tStr}`)
-  }
-  if (beta?.payout_beta != null) parts.push(`payout beta: ${beta.payout_beta}`)
   return parts.join(', ')
 }
 
@@ -573,10 +563,6 @@ function renderDetail(e: SSEEvent): string {
       return ev.percentile
         ? `Target: ${ev.target.toFixed(1)} pts (p${ev.percentile})`
         : `Target: ${ev.target.toFixed(1)} pts (manual)`
-    }
-    case 'calibrate_beta': {
-      const ev = e as unknown as { payout_beta?: number; payout_cash_line?: number }
-      return ev.payout_beta != null ? `Payout beta: ${ev.payout_beta}` : 'Calibrating…'
     }
     case 'optimize_lineup': {
       const ev = e as OptimizeLineupEvent

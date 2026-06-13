@@ -20,7 +20,6 @@ from src.ingestion.factory import get_ingestor
 from src.models.batter_model import BatterPCAModel
 from src.models.copula import EmpiricalCopula
 from src.optimization.lineup import ROSTER_REQUIREMENTS, SLOTS
-from src.optimization.portfolio import PortfolioConstructor
 from src.platforms.base import Platform
 from src.platforms.registry import get_roster, get_slot_eligibility
 from src.simulation.engine import SimulationEngine
@@ -252,7 +251,7 @@ class PipelineRunner:
         # --- Simulate ---------------------------------------------------
         n_sims = int(sim_cfg.get("n_sims", 10_000))
         logger.info("Running %d simulations...", n_sims)
-        self._cb("simulate", {"n_sims": n_sims, "objective": str(opt_cfg.get("objective", "expected_surplus"))})
+        self._cb("simulate", {"n_sims": n_sims})
         engine = SimulationEngine(
             copula, sim_players_df, batter_pca_model=pca_model, score_grid=score_grid,
             quantile_grids=quantile_grids,
@@ -294,99 +293,78 @@ class PipelineRunner:
             logger.info("Using configured target: %.1f DK pts", target)
             self._cb("compute_target", {"target": target, "percentile": None})
 
-        # --- Resolve payout beta and cash line ----------------------------------
-        objective = str(opt_cfg.get("objective", "expected_surplus"))
-        payout_beta_cfg = opt_cfg.get("payout_beta")
-        _BETA_MAX = 4.0
+        # --- Reference score distribution for target/stats ---------------------
         score_dist = self._best_lineup_score_distribution(
             cand_players_df, sim_results, rules=roster_rules, slot_eligibility=slot_elig
         )
         fixed_ref_p90 = float(np.percentile(score_dist, 90))
         fixed_ref_p99 = float(np.percentile(score_dist, 99))
-        if objective == "marginal_payout":
-            from src.optimization.payout import load_payout_structure, get_cash_line_score
-            score_percentiles = np.percentile(score_dist, np.arange(1, 101))
-            structure = load_payout_structure("dk_classic_gpp")
-            payout_cash_line = get_cash_line_score(structure, score_percentiles)
-            logger.info("Payout cash line score: %.1f DK pts", payout_cash_line)
-            raw_beta = float(payout_beta_cfg) if payout_beta_cfg is not None else 2.5
-            payout_beta = min(raw_beta, _BETA_MAX)
-            if payout_beta != raw_beta:
-                logger.info("Payout beta capped from %.2f to %.2f", raw_beta, _BETA_MAX)
-            logger.info("Payout beta: %.2f", payout_beta)
-            self._cb("calibrate_beta", {"payout_beta": round(payout_beta, 2), "payout_cash_line": round(float(payout_cash_line), 1)})
-        else:
-            payout_cash_line = None
-            payout_beta = float(payout_beta_cfg) if payout_beta_cfg is not None else 2.5
 
-        # --- Compute ownership vector for leverage_surplus objective ----------
-        ownership_vector: Optional[np.ndarray] = None
-        if objective == "leverage_surplus":
-            from src.optimization.ownership import (
-                apply_ownership_calibration,
-                compute_heuristic_ownership,
-                load_ownership_calibrator,
+        # --- Compute ownership vector -------------------------------------------
+        from src.optimization.ownership import (
+            apply_ownership_calibration,
+            compute_heuristic_ownership,
+            load_ownership_calibrator,
+        )
+        from src.api.slate_exclusions import (
+            compute_slate_id as _compute_slate_id,
+            compute_file_fingerprint as _compute_fp,
+            read_exclusions as _read_exclusions,
+        )
+        team_totals = self._load_team_totals(slate_path)
+        hr_odds = self._load_hr_fair_odds(slate_path)
+        if hr_odds:
+            import unicodedata as _ud, re as _re
+            def _norm(n: str) -> str:
+                nfkd = _ud.normalize("NFKD", n)
+                return _re.sub(r"[^a-z ]", "", nfkd.encode("ascii", "ignore").decode("ascii").lower()).strip()
+            cand_players_df = cand_players_df.copy()
+            name_col = "name" if "name" in cand_players_df.columns else None
+            cand_players_df["hr_prob"] = (
+                cand_players_df[name_col].apply(lambda n: hr_odds.get(_norm(str(n))))
+                if name_col else np.nan
             )
-            from src.api.slate_exclusions import (
-                compute_slate_id as _compute_slate_id,
-                compute_file_fingerprint as _compute_fp,
-                read_exclusions as _read_exclusions,
-            )
-            team_totals = self._load_team_totals(slate_path)
-            hr_odds = self._load_hr_fair_odds(slate_path)
-            if hr_odds:
-                import unicodedata as _ud, re as _re
-                def _norm(n: str) -> str:
-                    nfkd = _ud.normalize("NFKD", n)
-                    return _re.sub(r"[^a-z ]", "", nfkd.encode("ascii", "ignore").decode("ascii").lower()).strip()
-                cand_players_df = cand_players_df.copy()
-                name_col = "name" if "name" in cand_players_df.columns else None
-                cand_players_df["hr_prob"] = (
-                    cand_players_df[name_col].apply(lambda n: hr_odds.get(_norm(str(n))))
-                    if name_col else np.nan
+        # Load per-team ownership reductions from persisted exclusions.
+        _team_ownership_reductions: dict = {}
+        try:
+            _slate_games = [
+                str(g) for g in cand_players_df["game"].dropna().unique()
+                if g
+            ]
+            if _slate_games and slate_path:
+                from pathlib import Path as _Path
+                _sid = _compute_slate_id(_slate_games)
+                _fp = _compute_fp(_Path(slate_path) if slate_path else None)
+                _team_ownership_reductions = (
+                    _read_exclusions(_sid, _fp).get("team_ownership_reductions", {}) or {}
                 )
-            # Load per-team ownership reductions from persisted exclusions.
-            _team_ownership_reductions: dict = {}
-            try:
-                _slate_games = [
-                    str(g) for g in cand_players_df["game"].dropna().unique()
-                    if g
-                ]
-                if _slate_games and slate_path:
-                    from pathlib import Path as _Path
-                    _sid = _compute_slate_id(_slate_games)
-                    _fp = _compute_fp(_Path(slate_path) if slate_path else None)
-                    _team_ownership_reductions = (
-                        _read_exclusions(_sid, _fp).get("team_ownership_reductions", {}) or {}
-                    )
-            except Exception:
-                pass
-            ownership_vector = compute_heuristic_ownership(
-                cand_players_df, team_totals,
-                team_ownership_reductions=_team_ownership_reductions or None,
+        except Exception:
+            pass
+        ownership_vector = compute_heuristic_ownership(
+            cand_players_df, team_totals,
+            team_ownership_reductions=_team_ownership_reductions or None,
+        )
+        # Post-hoc isotonic calibration (data/processed/ownership_calibrator.json,
+        # built by scripts/fit_ownership_calibrator.py).  Loader returns None when
+        # the artifact is missing or fitted under different model constants.
+        _calibrator = load_ownership_calibrator()
+        if _calibrator is not None:
+            ownership_vector = apply_ownership_calibration(
+                ownership_vector, cand_players_df["position"].values, _calibrator
             )
-            # Post-hoc isotonic calibration (data/processed/ownership_calibrator.json,
-            # built by scripts/fit_ownership_calibrator.py).  Loader returns None when
-            # the artifact is missing or fitted under different model constants.
-            _calibrator = load_ownership_calibrator()
-            if _calibrator is not None:
-                ownership_vector = apply_ownership_calibration(
-                    ownership_vector, cand_players_df["position"].values, _calibrator
-                )
-            logger.info(
-                "Computed heuristic ownership — model %s%s%s%s, %d players",
-                "D" if team_totals else "C",
-                "+HR" if hr_odds else "",
-                f"+RED({len(_team_ownership_reductions)})" if _team_ownership_reductions else "",
-                f"+CAL({_calibrator.get('n_slates')})" if _calibrator is not None else "",
-                len(ownership_vector),
-            )
+        logger.info(
+            "Computed heuristic ownership — model %s%s%s%s, %d players",
+            "D" if team_totals else "C",
+            "+HR" if hr_odds else "",
+            f"+RED({len(_team_ownership_reductions)})" if _team_ownership_reductions else "",
+            f"+CAL({_calibrator.get('n_slates')})" if _calibrator is not None else "",
+            len(ownership_vector),
+        )
 
         # Store simulation artifacts for post-run operations (lineup replacement).
         self._sim_results = sim_results
         self._players_df = cand_players_df
         self._target = target
-        self._objective = objective
         self._ownership_vector = ownership_vector
         self._optimizer_kwargs_replace = dict(
             n_chains=int(opt_cfg.get("n_chains", 250)),
@@ -398,9 +376,6 @@ class PipelineRunner:
             early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
             early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
             salary_floor=float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None,
-            objective=objective,
-            payout_beta=payout_beta,
-            payout_cash_line=payout_cash_line,
             ownership_vector=ownership_vector,
             rules=roster_rules,
             slot_eligibility=slot_elig,
@@ -458,180 +433,207 @@ class PipelineRunner:
 
         _portfolio_sweep_raw: list = []  # populated only by det_ev; safe default for other objectives
 
-        if objective == "leverage_surplus":
-            # ----------------------------------------------------------------
-            # GPP portfolio: rapid candidate pool + contest simulation +
-            # marginal-EV greedy selection.
-            # ----------------------------------------------------------------
-            from src.optimization.candidate_generator import CandidateGenerator
-            from src.optimization.gpp_portfolio import ContestScorer, EVPortfolioSelector
+        # ----------------------------------------------------------------
+        # GPP portfolio: rapid candidate pool + contest simulation +
+        # marginal-EV greedy selection.
+        # ----------------------------------------------------------------
+        from src.optimization.candidate_generator import CandidateGenerator
+        from src.optimization.gpp_portfolio import ContestScorer, EVPortfolioSelector
 
-            def _candidate_team_distribution(cands, players_df):
-                """Return {team: count} of unambiguous 4/5-hitter primary stacks."""
-                pid_team = dict(zip(players_df["player_id"].astype(int), players_df["team"]))
-                pid_pos = dict(zip(players_df["player_id"].astype(int), players_df["position"]))
-                dist: dict[str, int] = {}
-                for lu in cands:
-                    th: dict[str, int] = {}
-                    for pid in lu.player_ids:
-                        if pid_pos.get(int(pid), "") != "P":
-                            t = pid_team.get(int(pid), "")
-                            if t:
-                                th[t] = th.get(t, 0) + 1
-                    if not th:
-                        continue
-                    top = max(th.values())
-                    top_teams = [t for t, c in th.items() if c == top]
-                    if top >= 4 and len(top_teams) == 1:
-                        dist[top_teams[0]] = dist.get(top_teams[0], 0) + 1
-                return dist
+        def _candidate_team_distribution(cands, players_df):
+            """Return {team: count} of unambiguous 4/5-hitter primary stacks."""
+            pid_team = dict(zip(players_df["player_id"].astype(int), players_df["team"]))
+            pid_pos = dict(zip(players_df["player_id"].astype(int), players_df["position"]))
+            dist: dict[str, int] = {}
+            for lu in cands:
+                th: dict[str, int] = {}
+                for pid in lu.player_ids:
+                    if pid_pos.get(int(pid), "") != "P":
+                        t = pid_team.get(int(pid), "")
+                        if t:
+                            th[t] = th.get(t, 0) + 1
+                if not th:
+                    continue
+                top = max(th.values())
+                top_teams = [t for t, c in th.items() if c == top]
+                if top >= 4 and len(top_teams) == 1:
+                    dist[top_teams[0]] = dist.get(top_teams[0], 0) + 1
+            return dist
 
-            gpp_cfg = cfg.get("gpp", {})
-            n_candidates = int(gpp_cfg.get("n_candidates", 10_000))
-            n_field = int(gpp_cfg.get("n_field_lineups", 5_000))
-            n_k = int(gpp_cfg.get("n_field_samples", 3))
-            cand_batch = int(gpp_cfg.get("candidate_batch_size", 500))
-            max_attempts_mult = int(gpp_cfg.get("max_attempts_multiplier", 50))
-            candidate_floor_relief = int(gpp_cfg.get("candidate_floor_relief", 2500))
-            salary_floor_gpp = (
-                float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None
-            )
+        gpp_cfg = cfg.get("gpp", {})
+        n_candidates = int(gpp_cfg.get("n_candidates", 10_000))
+        n_field = int(gpp_cfg.get("n_field_lineups", 5_000))
+        n_k = int(gpp_cfg.get("n_field_samples", 3))
+        cand_batch = int(gpp_cfg.get("candidate_batch_size", 500))
+        max_attempts_mult = int(gpp_cfg.get("max_attempts_multiplier", 50))
+        candidate_floor_relief = int(gpp_cfg.get("candidate_floor_relief", 2500))
+        salary_floor_gpp = (
+            float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None
+        )
 
-            logger.info(
-                "GPP portfolio — %d candidates, N=%d field lineups × K=%d samples, "
-                "size=%d",
-                n_candidates, n_field, n_k, portfolio_size,
-            )
+        logger.info(
+            "GPP portfolio — %d candidates, N=%d field lineups × K=%d samples, "
+            "size=%d",
+            n_candidates, n_field, n_k, portfolio_size,
+        )
 
-            _gpp_stopped = self._stop_check is not None and self._stop_check
-            self._optimal_lineups: list = []  # populated only on fresh (non-cached) runs
+        _gpp_stopped = self._stop_check is not None and self._stop_check
+        self._optimal_lineups: list = []  # populated only on fresh (non-cached) runs
 
-            # Compute slate fingerprint for lineup cache (mtime_ns:size)
-            from pathlib import Path as _Path
-            from src.api.slate_exclusions import compute_file_fingerprint
-            from src.api.lineup_cache import (
-                load_candidates, save_candidates,
-                load_field, save_field,
-            )
-            _config_root = _Path(self._config_path).resolve().parent
-            _slate_fp = compute_file_fingerprint(_config_root / slate_path)
+        # Compute slate fingerprint for lineup cache (mtime_ns:size)
+        from pathlib import Path as _Path
+        from src.api.slate_exclusions import compute_file_fingerprint
+        from src.api.lineup_cache import (
+            load_candidates, save_candidates,
+            load_field, save_field,
+        )
+        _config_root = _Path(self._config_path).resolve().parent
+        _slate_fp = compute_file_fingerprint(_config_root / slate_path)
 
-            # Phase 1: generate stacked candidate pool (with optional cache)
-            gen = CandidateGenerator(
-                cand_players_df, ownership_vector,
-                rng_seed=opt_cfg.get("rng_seed"),
-                salary_floor=salary_floor_gpp,
-            )
+        # Phase 1: generate stacked candidate pool (with optional cache)
+        gen = CandidateGenerator(
+            cand_players_df, ownership_vector,
+            rng_seed=opt_cfg.get("rng_seed"),
+            salary_floor=salary_floor_gpp,
+        )
 
-            _t_gpp_start = time.perf_counter()
-            _preloaded_cands = (
-                load_candidates(_slate_fp) if (self._use_cached_candidates and _slate_fp) else None
-            )
-            if _preloaded_cands is not None:
-                # Validate cached candidates against the current eligible player pool.
-                # If a player's value has shifted across the cutoff, or exclusions have
-                # changed, cached lineups referencing now-ineligible players must be
-                # dropped before entering the scoring pipeline.
-                _eligible_pids = set(int(p) for p in cand_players_df["player_id"])
-                _n_raw = len(_preloaded_cands)
-                _preloaded_cands = [
-                    lu for lu in _preloaded_cands
-                    if all(int(pid) in _eligible_pids for pid in lu.player_ids)
-                ]
-                _n_dropped = _n_raw - len(_preloaded_cands)
-                if _n_dropped:
-                    logger.warning(
-                        "Dropped %d cached candidate(s) referencing players not in "
-                        "current eligible pool (value cutoff or exclusion change?).",
-                        _n_dropped,
-                    )
-                    self._cb("gpp_cache_filtered", {
-                        "n_dropped": _n_dropped, "n_remaining": len(_preloaded_cands),
-                    })
+        _t_gpp_start = time.perf_counter()
+        _preloaded_cands = (
+            load_candidates(_slate_fp) if (self._use_cached_candidates and _slate_fp) else None
+        )
+        if _preloaded_cands is not None:
+            # Validate cached candidates against the current eligible player pool.
+            # If a player's value has shifted across the cutoff, or exclusions have
+            # changed, cached lineups referencing now-ineligible players must be
+            # dropped before entering the scoring pipeline.
+            _eligible_pids = set(int(p) for p in cand_players_df["player_id"])
+            _n_raw = len(_preloaded_cands)
+            _preloaded_cands = [
+                lu for lu in _preloaded_cands
+                if all(int(pid) in _eligible_pids for pid in lu.player_ids)
+            ]
+            _n_dropped = _n_raw - len(_preloaded_cands)
+            if _n_dropped:
+                logger.warning(
+                    "Dropped %d cached candidate(s) referencing players not in "
+                    "current eligible pool (value cutoff or exclusion change?).",
+                    _n_dropped,
+                )
+                self._cb("gpp_cache_filtered", {
+                    "n_dropped": _n_dropped, "n_remaining": len(_preloaded_cands),
+                })
 
-                n_cached = len(_preloaded_cands)
-                if n_cached >= n_candidates:
-                    candidates = _preloaded_cands[:n_candidates]
-                    logger.info("Using %d candidates from cache.", len(candidates))
-                    self._cb("gpp_generate_done", {
-                        "n_generated": len(candidates), "from_cache": True,
-                        "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
-                    })
-                else:
-                    need = n_candidates - n_cached
-                    logger.info(
-                        "Partial cache: %d candidates cached, generating %d more.",
-                        n_cached, need,
-                    )
-                    self._cb("gpp_generate_start", {
-                        "n_candidates": need, "n_from_cache": n_cached,
-                    })
-                    new_cands = gen.generate(
-                        n_candidates=need,
-                        max_attempts_multiplier=max_attempts_mult,
-                        floor_relief=candidate_floor_relief,
-                        stop_check=self._stop_check,
-                        progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
-                    )
-                    candidates = _preloaded_cands + new_cands
-                    self._cb("gpp_generate_done", {
-                        "n_generated": len(candidates),
-                        "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
-                    })
-                    if _slate_fp and not (_gpp_stopped and self._stop_check()):
-                        save_candidates(_slate_fp, candidates)
-
-                # Restore optimal lineups from persisted JSON if fingerprints match.
-                try:
-                    _opt_json = os.path.join(output_dir, f"optimal_lineups_{platform.value}.json")
-                    if os.path.exists(_opt_json):
-                        with open(_opt_json) as _f:
-                            _opt_data = json.load(_f)
-                        if _opt_data.get("slate_fingerprint") == _slate_fp and _opt_data.get("lineups"):
-                            from src.optimization.lineup import Lineup as _Lineup
-                            self._optimal_lineups = [
-                                _Lineup(player_ids=[p["player_id"] for p in lr["players"]])
-                                for lr in _opt_data["lineups"]
-                            ]
-                            logger.info(
-                                "Restored %d optimal lineups from cache.", len(self._optimal_lineups)
-                            )
-                except Exception:
-                    pass
+            n_cached = len(_preloaded_cands)
+            if n_cached >= n_candidates:
+                candidates = _preloaded_cands[:n_candidates]
+                logger.info("Using %d candidates from cache.", len(candidates))
+                self._cb("gpp_generate_done", {
+                    "n_generated": len(candidates), "from_cache": True,
+                    "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
+                })
             else:
-                # Optionally seed the first N candidates with ILP-optimal lineups.
-                seed_optimal = gpp_cfg.get("seed_optimal_lineups", False)
-                _optimal_lineups: list = []
+                need = n_candidates - n_cached
+                logger.info(
+                    "Partial cache: %d candidates cached, generating %d more.",
+                    n_cached, need,
+                )
+                self._cb("gpp_generate_start", {
+                    "n_candidates": need, "n_from_cache": n_cached,
+                })
+                new_cands = gen.generate(
+                    n_candidates=need,
+                    max_attempts_multiplier=max_attempts_mult,
+                    floor_relief=candidate_floor_relief,
+                    stop_check=self._stop_check,
+                    progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
+                )
+                candidates = _preloaded_cands + new_cands
+                self._cb("gpp_generate_done", {
+                    "n_generated": len(candidates),
+                    "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
+                })
+                if _slate_fp and not (_gpp_stopped and self._stop_check()):
+                    save_candidates(_slate_fp, candidates)
 
-                if seed_optimal and not (_gpp_stopped and self._stop_check()):
-                    from src.optimization.optimal_lineups import generate_optimal_lineups
+            # Restore optimal lineups from persisted JSON if fingerprints match.
+            try:
+                _opt_json = os.path.join(output_dir, f"optimal_lineups_{platform.value}.json")
+                if os.path.exists(_opt_json):
+                    with open(_opt_json) as _f:
+                        _opt_data = json.load(_f)
+                    if _opt_data.get("slate_fingerprint") == _slate_fp and _opt_data.get("lineups"):
+                        from src.optimization.lineup import Lineup as _Lineup
+                        self._optimal_lineups = [
+                            _Lineup(player_ids=[p["player_id"] for p in lr["players"]])
+                            for lr in _opt_data["lineups"]
+                        ]
+                        logger.info(
+                            "Restored %d optimal lineups from cache.", len(self._optimal_lineups)
+                        )
+            except Exception:
+                pass
+        else:
+            # Optionally seed the first N candidates with ILP-optimal lineups.
+            seed_optimal = gpp_cfg.get("seed_optimal_lineups", False)
+            _optimal_lineups: list = []
 
-                    batter_teams = sorted(
-                        cand_players_df[cand_players_df["position"] != "P"]["team"].unique().tolist()
-                    )
-                    _batches_per_stack = {5: 35, 4: 25}
-                    _stack_sizes = [5, 4]
-                    _n_optimal_target = len(batter_teams) * sum(_batches_per_stack.values())
+            if seed_optimal and not (_gpp_stopped and self._stop_check()):
+                from src.optimization.optimal_lineups import generate_optimal_lineups
 
-                    self._cb("gpp_optimal_start", {"n_optimal": _n_optimal_target})
+                batter_teams = sorted(
+                    cand_players_df[cand_players_df["position"] != "P"]["team"].unique().tolist()
+                )
+                _batches_per_stack = {5: 35, 4: 25}
+                _stack_sizes = [5, 4]
+                _n_optimal_target = len(batter_teams) * sum(_batches_per_stack.values())
 
-                    from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+                self._cb("gpp_optimal_start", {"n_optimal": _n_optimal_target})
 
-                    _all_batches: dict[tuple, list] = {}
-                    _running_count = 0
+                from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
-                    # Phase 1: 5-stack batches (all teams in parallel).
+                _all_batches: dict[tuple, list] = {}
+                _running_count = 0
+
+                # Phase 1: 5-stack batches (all teams in parallel).
+                with ThreadPoolExecutor() as _executor:
+                    _futures = {
+                        _executor.submit(
+                            generate_optimal_lineups,
+                            cand_players_df,
+                            n=_batches_per_stack[5],
+                            min_uniques=3,
+                            min_stack=5,
+                            stack_team=tm,
+                            salary_floor=salary_floor_gpp,
+                        ): (5, tm)
+                        for tm in batter_teams
+                    }
+                    for _fut in _as_completed(_futures):
+                        _ss, _tm = _futures[_fut]
+                        _all_batches[(_ss, _tm)] = _fut.result()
+                        _running_count += len(_all_batches[(_ss, _tm)])
+                        self._cb("gpp_optimal_progress", {"n": _running_count, "total": _n_optimal_target})
+                        if self._stop_check():
+                            for _f in _futures:
+                                _f.cancel()
+                            break
+
+                # Phase 2: 4-stack batches, each constrained to >=3 uniques vs
+                # the 5-stack lineups for the same team.
+                if not self._stop_check():
                     with ThreadPoolExecutor() as _executor:
                         _futures = {
                             _executor.submit(
                                 generate_optimal_lineups,
                                 cand_players_df,
-                                n=_batches_per_stack[5],
+                                n=_batches_per_stack[4],
                                 min_uniques=3,
-                                min_stack=5,
+                                min_stack=4,
                                 stack_team=tm,
                                 salary_floor=salary_floor_gpp,
-                            ): (5, tm)
+                                prior_lineups=_all_batches.get((5, tm), []),
+                                min_uniques_vs_prior=3,
+                            ): (4, tm)
                             for tm in batter_teams
                         }
                         for _fut in _as_completed(_futures):
@@ -644,592 +646,489 @@ class PipelineRunner:
                                     _f.cancel()
                                 break
 
-                    # Phase 2: 4-stack batches, each constrained to >=3 uniques vs
-                    # the 5-stack lineups for the same team.
-                    if not self._stop_check():
-                        with ThreadPoolExecutor() as _executor:
-                            _futures = {
-                                _executor.submit(
-                                    generate_optimal_lineups,
-                                    cand_players_df,
-                                    n=_batches_per_stack[4],
-                                    min_uniques=3,
-                                    min_stack=4,
-                                    stack_team=tm,
-                                    salary_floor=salary_floor_gpp,
-                                    prior_lineups=_all_batches.get((5, tm), []),
-                                    min_uniques_vs_prior=3,
-                                ): (4, tm)
-                                for tm in batter_teams
-                            }
-                            for _fut in _as_completed(_futures):
-                                _ss, _tm = _futures[_fut]
-                                _all_batches[(_ss, _tm)] = _fut.result()
-                                _running_count += len(_all_batches[(_ss, _tm)])
-                                self._cb("gpp_optimal_progress", {"n": _running_count, "total": _n_optimal_target})
-                                if self._stop_check():
-                                    for _f in _futures:
-                                        _f.cancel()
-                                    break
+                # Post-hoc collision detection (only 4-stack batches can collide).
+                _seen_keys: dict = {}
+                _collisions: list = []
+                for (_ss, _tm), _lineups in _all_batches.items():
+                    for _lu in _lineups:
+                        _key = frozenset(_lu.player_ids)
+                        if _key in _seen_keys:
+                            _collisions.append((_key, _seen_keys[_key], (_ss, _tm)))
+                        else:
+                            _seen_keys[_key] = (_ss, _tm)
 
-                    # Post-hoc collision detection (only 4-stack batches can collide).
-                    _seen_keys: dict = {}
-                    _collisions: list = []
-                    for (_ss, _tm), _lineups in _all_batches.items():
-                        for _lu in _lineups:
-                            _key = frozenset(_lu.player_ids)
-                            if _key in _seen_keys:
-                                _collisions.append((_key, _seen_keys[_key], (_ss, _tm)))
-                            else:
-                                _seen_keys[_key] = (_ss, _tm)
-
-                    # Re-solve to replace colliding lineups in the second owner's batch.
-                    for _key, _first, (_ss2, _tm2) in _collisions:
-                        _replacements = generate_optimal_lineups(
-                            cand_players_df,
-                            n=1,
-                            min_uniques=3,
-                            min_stack=_ss2,
-                            stack_team=_tm2,
-                            salary_floor=salary_floor_gpp,
-                            seen={_key},
-                            prior_lineups=_all_batches.get((5, _tm2), []) if _ss2 == 4 else None,
-                            min_uniques_vs_prior=3 if _ss2 == 4 else None,
-                        )
-                        _all_batches[(_ss2, _tm2)] = [
-                            _lu for _lu in _all_batches[(_ss2, _tm2)]
-                            if frozenset(_lu.player_ids) != _key
-                        ] + _replacements
-
-                    _all_optimal: list = [_lu for _lus in _all_batches.values() for _lu in _lus]
-
-                    _mean_map = dict(zip(
-                        cand_players_df["player_id"].astype(int),
-                        cand_players_df["mean"].astype(float),
-                    ))
-                    _optimal_lineups = sorted(
-                        _all_optimal,
-                        key=lambda lu: sum(_mean_map.get(pid, 0.0) for pid in lu.player_ids),
-                        reverse=True,
+                # Re-solve to replace colliding lineups in the second owner's batch.
+                for _key, _first, (_ss2, _tm2) in _collisions:
+                    _replacements = generate_optimal_lineups(
+                        cand_players_df,
+                        n=1,
+                        min_uniques=3,
+                        min_stack=_ss2,
+                        stack_team=_tm2,
+                        salary_floor=salary_floor_gpp,
+                        seen={_key},
+                        prior_lineups=_all_batches.get((5, _tm2), []) if _ss2 == 4 else None,
+                        min_uniques_vs_prior=3 if _ss2 == 4 else None,
                     )
-                    self._cb("gpp_optimal_done", {"n_generated": len(_optimal_lineups)})
+                    _all_batches[(_ss2, _tm2)] = [
+                        _lu for _lu in _all_batches[(_ss2, _tm2)]
+                        if frozenset(_lu.player_ids) != _key
+                    ] + _replacements
 
-                n_random = max(0, n_candidates - len(_optimal_lineups))
-                self._cb("gpp_generate_start", {
-                    "n_candidates": n_random + len(_optimal_lineups),
-                    **({"n_from_optimal": len(_optimal_lineups)} if _optimal_lineups else {}),
-                })
-                random_cands = gen.generate(
-                    n_candidates=n_random,
-                    max_attempts_multiplier=max_attempts_mult,
-                    floor_relief=candidate_floor_relief,
-                    stop_check=self._stop_check,
-                    progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
+                _all_optimal: list = [_lu for _lus in _all_batches.values() for _lu in _lus]
+
+                _mean_map = dict(zip(
+                    cand_players_df["player_id"].astype(int),
+                    cand_players_df["mean"].astype(float),
+                ))
+                _optimal_lineups = sorted(
+                    _all_optimal,
+                    key=lambda lu: sum(_mean_map.get(pid, 0.0) for pid in lu.player_ids),
+                    reverse=True,
                 )
-                candidates = _optimal_lineups + random_cands
-                self._cb("gpp_generate_done", {
-                    "n_generated": len(candidates),
-                    "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
-                })
-                if _slate_fp and candidates and not (_gpp_stopped and self._stop_check()):
-                    save_candidates(_slate_fp, candidates)
-                self._optimal_lineups = _optimal_lineups
+                self._cb("gpp_optimal_done", {"n_generated": len(_optimal_lineups)})
 
-            logger.info("Candidate pool: %d lineups.", len(candidates))
-            logger.info(
-                "[TIMING] Candidate phase (load+generate): %.3fs  from_cache=%s",
-                time.perf_counter() - _t_gpp_start,
-                _preloaded_cands is not None,
+            n_random = max(0, n_candidates - len(_optimal_lineups))
+            self._cb("gpp_generate_start", {
+                "n_candidates": n_random + len(_optimal_lineups),
+                **({"n_from_optimal": len(_optimal_lineups)} if _optimal_lineups else {}),
+            })
+            random_cands = gen.generate(
+                n_candidates=n_random,
+                max_attempts_multiplier=max_attempts_mult,
+                floor_relief=candidate_floor_relief,
+                stop_check=self._stop_check,
+                progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
             )
+            candidates = _optimal_lineups + random_cands
+            self._cb("gpp_generate_done", {
+                "n_generated": len(candidates),
+                "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
+            })
+            if _slate_fp and candidates and not (_gpp_stopped and self._stop_check()):
+                save_candidates(_slate_fp, candidates)
+            self._optimal_lineups = _optimal_lineups
 
-            if gpp_cfg.get("dump_candidate_pool", False) and candidates:
-                _dump_path = os.path.join(output_dir, "candidate_pool_debug.csv")
-                _pid_meta = {
-                    int(r["player_id"]): r
-                    for r in cand_players_df.to_dict("records")
-                }
-                import csv as _csv
-                with open(_dump_path, "w", newline="") as _f:
-                    _w = _csv.writer(_f)
-                    _w.writerow(["lineup_index", "player_id", "name", "position", "team", "salary", "mean"])
-                    for _li, _lu in enumerate(candidates):
-                        for _pid in _lu.player_ids:
-                            _m = _pid_meta.get(int(_pid), {})
-                            _w.writerow([
-                                _li,
-                                int(_pid),
-                                _m.get("name", ""),
-                                _m.get("position", ""),
-                                _m.get("team", ""),
-                                _m.get("salary", ""),
-                                round(float(_m.get("mean", 0)), 3),
-                            ])
-                logger.info("Candidate pool written to %s", _dump_path)
+        logger.info("Candidate pool: %d lineups.", len(candidates))
+        logger.info(
+            "[TIMING] Candidate phase (load+generate): %.3fs  from_cache=%s",
+            time.perf_counter() - _t_gpp_start,
+            _preloaded_cands is not None,
+        )
 
-            if not candidates or (_gpp_stopped and self._stop_check()):
-                portfolio = []
-            else:
-                # Phase 2: score candidates against K simulated opponent fields
-                self._cb("gpp_score_start", {
-                    "n_candidates": len(candidates),
-                    "n_field_lineups": n_field,
-                    "n_field_samples": n_k,
-                })
-                team_totals_gpp = self._load_team_totals(slate_path)
-                from src.optimization.payout import load_payout_structure, payout_table_to_array
-                _gpp_structure = load_payout_structure("dk_classic_gpp_5001")
-                _gpp_payout_arr = payout_table_to_array(_gpp_structure).astype(np.float32)
-                _cand_excluded_pids = (
-                    set(sim_players_df["player_id"].tolist())
-                    - set(cand_players_df["player_id"].tolist())
-                )
+        if gpp_cfg.get("dump_candidate_pool", False) and candidates:
+            _dump_path = os.path.join(output_dir, "candidate_pool_debug.csv")
+            _pid_meta = {
+                int(r["player_id"]): r
+                for r in cand_players_df.to_dict("records")
+            }
+            import csv as _csv
+            with open(_dump_path, "w", newline="") as _f:
+                _w = _csv.writer(_f)
+                _w.writerow(["lineup_index", "player_id", "name", "position", "team", "salary", "mean"])
+                for _li, _lu in enumerate(candidates):
+                    for _pid in _lu.player_ids:
+                        _m = _pid_meta.get(int(_pid), {})
+                        _w.writerow([
+                            _li,
+                            int(_pid),
+                            _m.get("name", ""),
+                            _m.get("position", ""),
+                            _m.get("team", ""),
+                            _m.get("salary", ""),
+                            round(float(_m.get("mean", 0)), 3),
+                        ])
+            logger.info("Candidate pool written to %s", _dump_path)
 
-                _cached_field = (
-                    load_field(_slate_fp) if (self._use_cached_field and _slate_fp) else None
-                )
-                if _cached_field is not None:
-                    logger.info("Using %d field samples from cache.", len(_cached_field))
-                    self._cb("gpp_field_inject", {"n_field": n_field, "n_k": len(_cached_field)})
-
-                scorer = ContestScorer(
-                    sim_results=sim_results,
-                    players_df=cand_players_df,
-                    field_players_df=sim_players_df,
-                    n_field_lineups=n_field,
-                    n_field_samples=n_k,
-                    payout_arr=_gpp_payout_arr,
-                    field_rng_seed=int(opt_cfg.get("rng_seed") or 42),
-                    ownership_vec=ownership_vector,
-                    team_totals=team_totals_gpp,
-                    candidate_batch_size=cand_batch,
-                    portfolio_size=portfolio_size,
-                    cand_excluded_player_ids=_cand_excluded_pids,
-                    preloaded_field=_cached_field,
-                )
-                _t_score = time.perf_counter()
-                candidates, robust_payout = scorer.score_candidates(
-                    candidates,
-                    stop_check=self._stop_check,
-                    progress_cb=lambda done, total: self._cb(
-                        "gpp_score_progress",
-                        {"batches_done": done, "batches_total": total},
-                    ),
-                    field_progress_cb=lambda n_done, n_total: self._cb(
-                        "gpp_field_progress",
-                        {"n_done": n_done, "n_total": n_total},
-                    ),
-                )
-                logger.info(
-                    "[TIMING] score_candidates wall time: %.3fs  "
-                    "robust_payout shape=%s (%.1f MB)  field_from_cache=%s",
-                    time.perf_counter() - _t_score,
-                    robust_payout.shape, robust_payout.nbytes / 1e6,
-                    _cached_field is not None,
-                )
-                if _cached_field is None and scorer.last_raw_field_list and _slate_fp:
-                    save_field(_slate_fp, scorer.last_raw_field_list)
-                self._cb("gpp_score_done", {})
-
-                # Diagnostic: log candidate EV distribution so we can tell if the
-                # simulation is producing any +EV lineups at all.
-                _ev_means = robust_payout.mean(axis=1)
-                _pct_pos = float((_ev_means > 0).mean() * 100)
-                logger.info(
-                    "Candidate EV distribution (net, post-fee): "
-                    "min=$%.3f  p10=$%.3f  p50=$%.3f  p90=$%.3f  max=$%.3f  "
-                    "+EV candidates: %.1f%%",
-                    float(_ev_means.min()),
-                    float(np.percentile(_ev_means, 10)),
-                    float(np.percentile(_ev_means, 50)),
-                    float(np.percentile(_ev_means, 90)),
-                    float(_ev_means.max()),
-                    _pct_pos,
-                )
-
-                # Phase 2b: EV-guided pool refinement — mutate the top-$EV
-                # candidates and score the mutants against the same cached
-                # fields, extending the pool along the EV frontier before
-                # selection. The selector can only pick lineups the pool
-                # contains; sampling alone leaves the EV ceiling to chance.
-                refine_rounds = int(gpp_cfg.get("refine_rounds", 2))
-                refine_top = int(gpp_cfg.get("refine_top", 150))
-                refine_mutants = int(gpp_cfg.get("refine_mutants", 8))
-                if (
-                    refine_rounds > 0 and refine_top > 0 and refine_mutants > 0
-                    and not (_gpp_stopped and self._stop_check())
-                ):
-                    _t_refine = time.perf_counter()
-                    _seen_pool = {
-                        frozenset(int(p) for p in lu.player_ids) for lu in candidates
-                    }
-                    # No single primary-stack team may take more than 25% of
-                    # the parent slots, so refinement keeps stack breadth.
-                    _parent_team_cap = max(1, int(np.ceil(refine_top * 0.25)))
-                    _pid_team_r = dict(zip(
-                        cand_players_df["player_id"].astype(int), cand_players_df["team"]
-                    ))
-                    _pid_pos_r = dict(zip(
-                        cand_players_df["player_id"].astype(int), cand_players_df["position"]
-                    ))
-                    _pid_name_r = dict(zip(
-                        cand_players_df["player_id"].astype(int),
-                        cand_players_df.get("name", cand_players_df["player_id"].astype(str)),
-                    ))
-
-                    def _player_label(pid: int) -> str:
-                        return f"{_pid_pos_r.get(pid, '?')} {_pid_name_r.get(pid, pid)}"
-
-                    def _primary_stack_team(lu) -> str:
-                        th: dict[str, int] = {}
-                        for pid in lu.player_ids:
-                            if _pid_pos_r.get(int(pid), "") != "P":
-                                t = _pid_team_r.get(int(pid), "")
-                                if t:
-                                    th[t] = th.get(t, 0) + 1
-                        return max(th, key=th.get) if th else ""
-
-                    self._cb("gpp_refine_start", {
-                        "rounds": refine_rounds,
-                        "top": refine_top,
-                        "mutants_per_parent": refine_mutants,
-                    })
-                    _ev_before = float(robust_payout.mean(axis=1).max())
-                    _pool_size_before_refine = len(candidates)
-
-                    # Optional holdout split: parents are ranked and mutants
-                    # judged on the train columns only, while the same top-K
-                    # set is also measured on held-out columns. Noise-mined
-                    # gains regress toward zero on the holdout; real
-                    # improvements survive.
-                    from src.optimization.refine_stats import (
-                        mutant_round_stats, split_sim_columns,
-                    )
-                    _refine_holdout_frac = float(
-                        gpp_cfg.get("refine_holdout_fraction", 0.3)
-                    )
-                    _train_cols, _hold_cols = split_sim_columns(
-                        robust_payout.shape[1], _refine_holdout_frac,
-                        int(opt_cfg.get("rng_seed") or 42),
-                    )
-
-                    def _refine_ev_means(rp: np.ndarray) -> tuple[np.ndarray, Optional[np.ndarray]]:
-                        """(ranking means, holdout means) for the pool."""
-                        if _train_cols is None:
-                            return rp.mean(axis=1), None
-                        return (
-                            rp[:, _train_cols].mean(axis=1),
-                            rp[:, _hold_cols].mean(axis=1),
-                        )
-
-                    # The frontier depth tracks the selection band: Det-EV
-                    # draws a portfolio_size selection from roughly the top
-                    # 2x portfolio_size candidates by EV.
-                    _top_k = max(20, 2 * portfolio_size)
-
-                    for _round in range(refine_rounds):
-                        if _gpp_stopped and self._stop_check():
-                            break
-                        _ev_means_r, _ev_hold_r = _refine_ev_means(robust_payout)
-                        _parents: list = []
-                        _parent_idx: list[int] = []
-                        _parent_team_counts: dict[str, int] = {}
-                        for _ci in np.argsort(_ev_means_r)[::-1]:
-                            _lu = candidates[int(_ci)]
-                            _pt = _primary_stack_team(_lu)
-                            if _pt and _parent_team_counts.get(_pt, 0) >= _parent_team_cap:
-                                continue
-                            _parent_team_counts[_pt] = _parent_team_counts.get(_pt, 0) + 1
-                            _parents.append(_lu)
-                            _parent_idx.append(int(_ci))
-                            if len(_parents) >= refine_top:
-                                break
-
-                        _mutants = gen.generate_mutants(
-                            _parents, refine_mutants, _seen_pool,
-                            rng_seed=int(opt_cfg.get("rng_seed") or 42) + _round + 1,
-                            stop_check=self._stop_check,
-                        )
-                        if not _mutants:
-                            logger.info(
-                                "Refine round %d/%d: no new mutants; stopping refinement.",
-                                _round + 1, refine_rounds,
-                            )
-                            break
-                        _payout_new = scorer.score_batch(
-                            _mutants, stop_check=self._stop_check
-                        )
-
-                        # Round telemetry: what did mutation change, and does
-                        # it hold up on the held-out columns?
-                        _n_before = len(candidates)
-                        _mut_evs, _mut_hold = _refine_ev_means(_payout_new)
-                        _stats = mutant_round_stats(
-                            _parents,
-                            [float(_ev_means_r[i]) for i in _parent_idx],
-                            _mutants,
-                            _mut_evs,
-                            _player_label,
-                            parent_evs_holdout=(
-                                [float(_ev_hold_r[i]) for i in _parent_idx]
-                                if _ev_hold_r is not None else None
-                            ),
-                            mutant_evs_holdout=_mut_hold,
-                        )
-                        _topk_idx_before = np.argsort(_ev_means_r)[-_top_k:]
-                        _topk_before = float(_ev_means_r[_topk_idx_before].mean())
-                        _topk_hold_before = (
-                            float(_ev_hold_r[_topk_idx_before].mean())
-                            if _ev_hold_r is not None else None
-                        )
-
-                        candidates = candidates + _mutants
-                        robust_payout = np.concatenate(
-                            [robust_payout, _payout_new], axis=0
-                        )
-                        _ev_means_after, _ev_hold_after = _refine_ev_means(robust_payout)
-                        _best_ev = float(robust_payout.mean(axis=1).max())
-                        _topk_idx_after = np.argsort(_ev_means_after)[-_top_k:]
-                        _topk_after = float(_ev_means_after[_topk_idx_after].mean())
-                        _topk_hold_after = (
-                            float(_ev_hold_after[_topk_idx_after].mean())
-                            if _ev_hold_after is not None else None
-                        )
-                        _n_in_topk = int((_topk_idx_after >= _n_before).sum())
-                        logger.info(
-                            "Refine round %d/%d: +%d mutants (pool %d), %d beat parent, "
-                            "%d in top-%d, top-%d EV $%.3f → $%.3f%s, best swap %s → %s (%+.3f%s)",
-                            _round + 1, refine_rounds, len(_mutants), len(candidates),
-                            _stats["n_beat_parent"], _n_in_topk, _top_k, _top_k,
-                            _topk_before, _topk_after,
-                            (f" (holdout ${_topk_hold_before:.3f} → ${_topk_hold_after:.3f})"
-                             if _topk_hold_before is not None else ""),
-                            ", ".join(_stats["best_swap_out"]),
-                            ", ".join(_stats["best_swap_in"]),
-                            _stats["best_swap_ev_delta"],
-                            (f", holdout {_stats['best_swap_ev_delta_holdout']:+.3f}"
-                             if "best_swap_ev_delta_holdout" in _stats else ""),
-                        )
-                        _refine_event = {
-                            "round": _round + 1,
-                            "rounds": refine_rounds,
-                            "n_parents": len(_parents),
-                            "n_mutants": len(_mutants),
-                            "pool_size": len(candidates),
-                            "best_ev": _best_ev,
-                            "n_beat_parent": _stats["n_beat_parent"],
-                            "top_k": _top_k,
-                            "n_in_topk": _n_in_topk,
-                            "topk_ev_before": _topk_before,
-                            "topk_ev_after": _topk_after,
-                            "best_swap_out": _stats["best_swap_out"],
-                            "best_swap_in": _stats["best_swap_in"],
-                            "best_swap_ev_delta": _stats["best_swap_ev_delta"],
-                            "best_mutant_ev": _stats["best_mutant_ev"],
-                        }
-                        if _topk_hold_before is not None:
-                            _refine_event["holdout_fraction"] = _refine_holdout_frac
-                            _refine_event["topk_ev_holdout_before"] = _topk_hold_before
-                            _refine_event["topk_ev_holdout_after"] = _topk_hold_after
-                            _refine_event["best_swap_ev_delta_holdout"] = _stats.get(
-                                "best_swap_ev_delta_holdout"
-                            )
-                        self._cb("gpp_refine_progress", _refine_event)
-                    logger.info(
-                        "[TIMING] Refinement wall time: %.3fs  best EV $%.3f → $%.3f  "
-                        "pool %d",
-                        time.perf_counter() - _t_refine,
-                        _ev_before, float(robust_payout.mean(axis=1).max()),
-                        len(candidates),
-                    )
-                    self._cb("gpp_refine_done", {
-                        "pool_size": len(candidates),
-                        "n_added": len(candidates) - _pool_size_before_refine,
-                        "best_ev": float(robust_payout.mean(axis=1).max()),
-                        "best_ev_before": _ev_before,
-                    })
-
-                if _gpp_stopped and self._stop_check():
-                    portfolio = []
-                else:
-                    # Phase 3: Det-EV portfolio selection
-                    _t_select = time.perf_counter()
-                    _portfolio_sweep_raw: list[tuple[float, list]] = []  # [(risk, raw_portfolio)]
-
-                    from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
-                    # Always sweep risk values 1-5; ignore gpp.risk config for det_ev.
-                    _DET_SWEEP_RISKS = [1.0, 2.0, 3.0, 4.0, 5.0]
-                    _portfolio_sweep_raw: list[tuple[float, list]] = []
-
-                    logger.info(
-                        "Det-EV sweep — portfolio_size=%d, risks=%s",
-                        portfolio_size, _DET_SWEEP_RISKS,
-                    )
-
-                    for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
-                        if self._stop_check is not None and self._stop_check():
-                            break
-                        _evw = _sweep_risk * 0.05
-                        logger.info(
-                            "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)",
-                            _risk_idx + 1, len(_DET_SWEEP_RISKS),
-                            _sweep_risk, _evw, 1.0 - _evw,
-                        )
-                        self._cb("gpp_det_risk_start", {
-                            "risk": _sweep_risk,
-                            "risk_index": _risk_idx + 1,
-                            "total_risks": len(_DET_SWEEP_RISKS),
-                        })
-                        _det_sel = DeterminantPortfolioSelector(
-                            robust_payout=robust_payout,
-                            candidates=candidates,
-                            portfolio_size=portfolio_size,
-                            risk=_sweep_risk,
-                        )
-                        _det_result = _det_sel.select(
-                            progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
-                                "gpp_det_select_progress",
-                                {**data, "risk": r, "risk_index": ri + 1,
-                                 "total_risks": len(_DET_SWEEP_RISKS)},
-                            ),
-                        )
-                        _portfolio_sweep_raw.append((_sweep_risk, _det_result))
-
-                    # Reorder all sweep portfolios by entry-fee-weighted diversity now,
-                    # so the ordering is final from the outset and never needs to be
-                    # repeated when a risk level is activated or the sweep is displayed.
-                    _sweep_fees = PipelineRunner._extract_sorted_fees(all_file_entries)
-                    _portfolio_sweep_raw = [
-                        (r, PipelineRunner._reorder_by_diversity(p, _sweep_fees))
-                        for r, p in _portfolio_sweep_raw
-                    ]
-
-                    # Default active = risk=1 (first entry).
-                    gpp_result = _portfolio_sweep_raw[0][1] if _portfolio_sweep_raw else []
-                    self._sweep_portfolios_raw = {r: p for r, p in _portfolio_sweep_raw}
-                    self._gpp_robust_payout = robust_payout
-                    self._gpp_candidates = candidates
-                    logger.info(
-                        "[TIMING] Det-EV sweep wall time: %.3fs",
-                        time.perf_counter() - _t_select,
-                    )
-
-                    # Persist sweep to disk so it survives a server restart.
-                    _sweep_cache_path = os.path.join(
-                        output_dir, f"portfolio_sweep_{platform.value}.json"
-                    )
-                    try:
-                        _sweep_cache_data = {
-                            "slate_fingerprint": _slate_fp or "",
-                            "active_risk": 1,
-                            "sweep": [
-                                {
-                                    "risk": r,
-                                    "lineups": self._serialize_portfolio(
-                                        p, players_df, mean_ev_from_score=True
-                                    ),
-                                }
-                                for r, p in _portfolio_sweep_raw
-                            ],
-                        }
-                        os.makedirs(output_dir, exist_ok=True)
-                        with open(_sweep_cache_path, "w") as _sc_f:
-                            json.dump(_sweep_cache_data, _sc_f)
-                        logger.info("Det-EV sweep cache saved to %s", _sweep_cache_path)
-                    except Exception as _sc_e:
-                        logger.warning("Failed to save sweep cache: %s", _sc_e)
-
-                    portfolio = gpp_result
-
-                    # Compute best_scores for portfolio_stats event.
-                    col_map_ps = {pid: i for i, pid in enumerate(sim_results.player_ids)}
-                    sim_mat_ps = sim_results.results_matrix.astype(np.float32)
-                    best_scores_gpp = np.zeros(sim_mat_ps.shape[0], dtype=np.float64)
-                    for lu, _ in portfolio:
-                        cols = [col_map_ps[pid] for pid in lu.player_ids if pid in col_map_ps]
-                        if len(cols) == 10:
-                            lu_scores = sim_mat_ps[:, cols].sum(axis=1).astype(np.float64)
-                            np.maximum(best_scores_gpp, lu_scores, out=best_scores_gpp)
-                    if not (_gpp_stopped and self._stop_check()):
-                        _on_portfolio_complete(best_scores_gpp)
-
+        if not candidates or (_gpp_stopped and self._stop_check()):
+            portfolio = []
         else:
-            # ----------------------------------------------------------------
-            # Original PortfolioConstructor path (all other objectives).
-            # ----------------------------------------------------------------
-            logger.info(
-                "Constructing portfolio — size=%d, target=%.1f, chains=%d",
-                portfolio_size, target, opt_cfg.get("n_chains", 250),
+            # Phase 2: score candidates against K simulated opponent fields
+            self._cb("gpp_score_start", {
+                "n_candidates": len(candidates),
+                "n_field_lineups": n_field,
+                "n_field_samples": n_k,
+            })
+            team_totals_gpp = self._load_team_totals(slate_path)
+            from src.optimization.payout import load_payout_structure, payout_table_to_array
+            _gpp_structure = load_payout_structure("dk_classic_gpp_5001")
+            _gpp_payout_arr = payout_table_to_array(_gpp_structure).astype(np.float32)
+            _cand_excluded_pids = (
+                set(sim_players_df["player_id"].tolist())
+                - set(cand_players_df["player_id"].tolist())
             )
-            constructor = PortfolioConstructor(
+
+            _cached_field = (
+                load_field(_slate_fp) if (self._use_cached_field and _slate_fp) else None
+            )
+            if _cached_field is not None:
+                logger.info("Using %d field samples from cache.", len(_cached_field))
+                self._cb("gpp_field_inject", {"n_field": n_field, "n_k": len(_cached_field)})
+
+            scorer = ContestScorer(
                 sim_results=sim_results,
                 players_df=cand_players_df,
-                target=target,
+                field_players_df=sim_players_df,
+                n_field_lineups=n_field,
+                n_field_samples=n_k,
+                payout_arr=_gpp_payout_arr,
+                field_rng_seed=int(opt_cfg.get("rng_seed") or 42),
+                ownership_vec=ownership_vector,
+                team_totals=team_totals_gpp,
+                candidate_batch_size=cand_batch,
                 portfolio_size=portfolio_size,
-                n_chains=int(opt_cfg.get("n_chains", 250)),
-                temperature=float(opt_cfg.get("temperature", 0.1)),
-                n_steps=int(opt_cfg.get("n_steps", 100)),
-                niter_success=int(opt_cfg.get("niter_success", 25)),
-                n_workers=int(opt_cfg.get("n_workers", 1)),
-                rng_seed=opt_cfg.get("rng_seed"),
-                early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
-                early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
-                salary_floor=float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None,
-                objective=objective,
-                payout_beta=payout_beta,
-                payout_cash_line=payout_cash_line,
-                payout_coverage_bonus=float(opt_cfg.get("payout_coverage_bonus", 0.0)),
-                n_seed_lineups=int(opt_cfg.get("n_seed_lineups", 5)),
-                ref_p90=fixed_ref_p90,
-                ref_p99=fixed_ref_p99,
-                ownership_vector=ownership_vector,
-                rules=roster_rules,
-                slot_eligibility=slot_elig,
+                cand_excluded_player_ids=_cand_excluded_pids,
+                preloaded_field=_cached_field,
             )
-
-            def _on_lineup_complete(
-                lineup_index: int, total: int, score: float,
-                arg4: int, arg5: int, arg6: Optional[float] = None,
-                arg7: Optional[float] = None, arg8: Optional[float] = None,
-                arg9: Optional[float] = None,
-            ) -> None:
-                if objective in ("marginal_payout",):
-                    self._cb("optimize_lineup", {
-                        "lineup_index": lineup_index,
-                        "total": total,
-                        "score": round(score, 4),
-                        "sims_great": arg4,
-                        "sims_good": arg5,
-                        "sims_uncovered": arg6,
-                        "pct_above_p90": round(arg7, 1) if arg7 is not None else None,
-                        "pct_above_p99": round(arg8, 1) if arg8 is not None else None,
-                        "pct_above_target": round(arg9, 1) if arg9 is not None else None,
-                        "target_percentile": target_percentile,
-                        "objective": objective,
-                    })
-                else:
-                    self._cb("optimize_lineup", {
-                        "lineup_index": lineup_index,
-                        "total": total,
-                        "score": round(score, 4),
-                        "sims_covered": arg4,
-                        "sims_remaining": arg5,
-                        "pct_above_p90": round(arg6, 1) if arg6 is not None else None,
-                        "pct_above_p99": round(arg7, 1) if arg7 is not None else None,
-                        "pct_above_target": round(arg8, 1) if arg8 is not None else None,
-                        "target_percentile": target_percentile,
-                        "objective": objective,
-                    })
-
-            portfolio = constructor.construct(
-                on_lineup_complete=_on_lineup_complete,
-                on_portfolio_complete=_on_portfolio_complete if objective == "marginal_payout" else None,
+            _t_score = time.perf_counter()
+            candidates, robust_payout = scorer.score_candidates(
+                candidates,
                 stop_check=self._stop_check,
-                target_percentile=target_percentile if objective == "marginal_payout" else None,
+                progress_cb=lambda done, total: self._cb(
+                    "gpp_score_progress",
+                    {"batches_done": done, "batches_total": total},
+                ),
+                field_progress_cb=lambda n_done, n_total: self._cb(
+                    "gpp_field_progress",
+                    {"n_done": n_done, "n_total": n_total},
+                ),
             )
+            logger.info(
+                "[TIMING] score_candidates wall time: %.3fs  "
+                "robust_payout shape=%s (%.1f MB)  field_from_cache=%s",
+                time.perf_counter() - _t_score,
+                robust_payout.shape, robust_payout.nbytes / 1e6,
+                _cached_field is not None,
+            )
+            if _cached_field is None and scorer.last_raw_field_list and _slate_fp:
+                save_field(_slate_fp, scorer.last_raw_field_list)
+            self._cb("gpp_score_done", {})
+
+            # Diagnostic: log candidate EV distribution so we can tell if the
+            # simulation is producing any +EV lineups at all.
+            _ev_means = robust_payout.mean(axis=1)
+            _pct_pos = float((_ev_means > 0).mean() * 100)
+            logger.info(
+                "Candidate EV distribution (net, post-fee): "
+                "min=$%.3f  p10=$%.3f  p50=$%.3f  p90=$%.3f  max=$%.3f  "
+                "+EV candidates: %.1f%%",
+                float(_ev_means.min()),
+                float(np.percentile(_ev_means, 10)),
+                float(np.percentile(_ev_means, 50)),
+                float(np.percentile(_ev_means, 90)),
+                float(_ev_means.max()),
+                _pct_pos,
+            )
+
+            # Phase 2b: EV-guided pool refinement — mutate the top-$EV
+            # candidates and score the mutants against the same cached
+            # fields, extending the pool along the EV frontier before
+            # selection. The selector can only pick lineups the pool
+            # contains; sampling alone leaves the EV ceiling to chance.
+            refine_rounds = int(gpp_cfg.get("refine_rounds", 2))
+            refine_top = int(gpp_cfg.get("refine_top", 150))
+            refine_mutants = int(gpp_cfg.get("refine_mutants", 8))
+            if (
+                refine_rounds > 0 and refine_top > 0 and refine_mutants > 0
+                and not (_gpp_stopped and self._stop_check())
+            ):
+                _t_refine = time.perf_counter()
+                _seen_pool = {
+                    frozenset(int(p) for p in lu.player_ids) for lu in candidates
+                }
+                # No single primary-stack team may take more than 25% of
+                # the parent slots, so refinement keeps stack breadth.
+                _parent_team_cap = max(1, int(np.ceil(refine_top * 0.25)))
+                _pid_team_r = dict(zip(
+                    cand_players_df["player_id"].astype(int), cand_players_df["team"]
+                ))
+                _pid_pos_r = dict(zip(
+                    cand_players_df["player_id"].astype(int), cand_players_df["position"]
+                ))
+                _pid_name_r = dict(zip(
+                    cand_players_df["player_id"].astype(int),
+                    cand_players_df.get("name", cand_players_df["player_id"].astype(str)),
+                ))
+
+                def _player_label(pid: int) -> str:
+                    return f"{_pid_pos_r.get(pid, '?')} {_pid_name_r.get(pid, pid)}"
+
+                def _primary_stack_team(lu) -> str:
+                    th: dict[str, int] = {}
+                    for pid in lu.player_ids:
+                        if _pid_pos_r.get(int(pid), "") != "P":
+                            t = _pid_team_r.get(int(pid), "")
+                            if t:
+                                th[t] = th.get(t, 0) + 1
+                    return max(th, key=th.get) if th else ""
+
+                self._cb("gpp_refine_start", {
+                    "rounds": refine_rounds,
+                    "top": refine_top,
+                    "mutants_per_parent": refine_mutants,
+                })
+                _ev_before = float(robust_payout.mean(axis=1).max())
+                _pool_size_before_refine = len(candidates)
+
+                # Optional holdout split: parents are ranked and mutants
+                # judged on the train columns only, while the same top-K
+                # set is also measured on held-out columns. Noise-mined
+                # gains regress toward zero on the holdout; real
+                # improvements survive.
+                from src.optimization.refine_stats import (
+                    mutant_round_stats, split_sim_columns,
+                )
+                _refine_holdout_frac = float(
+                    gpp_cfg.get("refine_holdout_fraction", 0.3)
+                )
+                _train_cols, _hold_cols = split_sim_columns(
+                    robust_payout.shape[1], _refine_holdout_frac,
+                    int(opt_cfg.get("rng_seed") or 42),
+                )
+
+                def _refine_ev_means(rp: np.ndarray) -> tuple[np.ndarray, Optional[np.ndarray]]:
+                    """(ranking means, holdout means) for the pool."""
+                    if _train_cols is None:
+                        return rp.mean(axis=1), None
+                    return (
+                        rp[:, _train_cols].mean(axis=1),
+                        rp[:, _hold_cols].mean(axis=1),
+                    )
+
+                # The frontier depth tracks the selection band: Det-EV
+                # draws a portfolio_size selection from roughly the top
+                # 2x portfolio_size candidates by EV.
+                _top_k = max(20, 2 * portfolio_size)
+
+                for _round in range(refine_rounds):
+                    if _gpp_stopped and self._stop_check():
+                        break
+                    _ev_means_r, _ev_hold_r = _refine_ev_means(robust_payout)
+                    _parents: list = []
+                    _parent_idx: list[int] = []
+                    _parent_team_counts: dict[str, int] = {}
+                    for _ci in np.argsort(_ev_means_r)[::-1]:
+                        _lu = candidates[int(_ci)]
+                        _pt = _primary_stack_team(_lu)
+                        if _pt and _parent_team_counts.get(_pt, 0) >= _parent_team_cap:
+                            continue
+                        _parent_team_counts[_pt] = _parent_team_counts.get(_pt, 0) + 1
+                        _parents.append(_lu)
+                        _parent_idx.append(int(_ci))
+                        if len(_parents) >= refine_top:
+                            break
+
+                    _mutants = gen.generate_mutants(
+                        _parents, refine_mutants, _seen_pool,
+                        rng_seed=int(opt_cfg.get("rng_seed") or 42) + _round + 1,
+                        stop_check=self._stop_check,
+                    )
+                    if not _mutants:
+                        logger.info(
+                            "Refine round %d/%d: no new mutants; stopping refinement.",
+                            _round + 1, refine_rounds,
+                        )
+                        break
+                    _payout_new = scorer.score_batch(
+                        _mutants, stop_check=self._stop_check
+                    )
+
+                    # Round telemetry: what did mutation change, and does
+                    # it hold up on the held-out columns?
+                    _n_before = len(candidates)
+                    _mut_evs, _mut_hold = _refine_ev_means(_payout_new)
+                    _stats = mutant_round_stats(
+                        _parents,
+                        [float(_ev_means_r[i]) for i in _parent_idx],
+                        _mutants,
+                        _mut_evs,
+                        _player_label,
+                        parent_evs_holdout=(
+                            [float(_ev_hold_r[i]) for i in _parent_idx]
+                            if _ev_hold_r is not None else None
+                        ),
+                        mutant_evs_holdout=_mut_hold,
+                    )
+                    _topk_idx_before = np.argsort(_ev_means_r)[-_top_k:]
+                    _topk_before = float(_ev_means_r[_topk_idx_before].mean())
+                    _topk_hold_before = (
+                        float(_ev_hold_r[_topk_idx_before].mean())
+                        if _ev_hold_r is not None else None
+                    )
+
+                    candidates = candidates + _mutants
+                    robust_payout = np.concatenate(
+                        [robust_payout, _payout_new], axis=0
+                    )
+                    _ev_means_after, _ev_hold_after = _refine_ev_means(robust_payout)
+                    _best_ev = float(robust_payout.mean(axis=1).max())
+                    _topk_idx_after = np.argsort(_ev_means_after)[-_top_k:]
+                    _topk_after = float(_ev_means_after[_topk_idx_after].mean())
+                    _topk_hold_after = (
+                        float(_ev_hold_after[_topk_idx_after].mean())
+                        if _ev_hold_after is not None else None
+                    )
+                    _n_in_topk = int((_topk_idx_after >= _n_before).sum())
+                    logger.info(
+                        "Refine round %d/%d: +%d mutants (pool %d), %d beat parent, "
+                        "%d in top-%d, top-%d EV $%.3f → $%.3f%s, best swap %s → %s (%+.3f%s)",
+                        _round + 1, refine_rounds, len(_mutants), len(candidates),
+                        _stats["n_beat_parent"], _n_in_topk, _top_k, _top_k,
+                        _topk_before, _topk_after,
+                        (f" (holdout ${_topk_hold_before:.3f} → ${_topk_hold_after:.3f})"
+                         if _topk_hold_before is not None else ""),
+                        ", ".join(_stats["best_swap_out"]),
+                        ", ".join(_stats["best_swap_in"]),
+                        _stats["best_swap_ev_delta"],
+                        (f", holdout {_stats['best_swap_ev_delta_holdout']:+.3f}"
+                         if "best_swap_ev_delta_holdout" in _stats else ""),
+                    )
+                    _refine_event = {
+                        "round": _round + 1,
+                        "rounds": refine_rounds,
+                        "n_parents": len(_parents),
+                        "n_mutants": len(_mutants),
+                        "pool_size": len(candidates),
+                        "best_ev": _best_ev,
+                        "n_beat_parent": _stats["n_beat_parent"],
+                        "top_k": _top_k,
+                        "n_in_topk": _n_in_topk,
+                        "topk_ev_before": _topk_before,
+                        "topk_ev_after": _topk_after,
+                        "best_swap_out": _stats["best_swap_out"],
+                        "best_swap_in": _stats["best_swap_in"],
+                        "best_swap_ev_delta": _stats["best_swap_ev_delta"],
+                        "best_mutant_ev": _stats["best_mutant_ev"],
+                    }
+                    if _topk_hold_before is not None:
+                        _refine_event["holdout_fraction"] = _refine_holdout_frac
+                        _refine_event["topk_ev_holdout_before"] = _topk_hold_before
+                        _refine_event["topk_ev_holdout_after"] = _topk_hold_after
+                        _refine_event["best_swap_ev_delta_holdout"] = _stats.get(
+                            "best_swap_ev_delta_holdout"
+                        )
+                    self._cb("gpp_refine_progress", _refine_event)
+                logger.info(
+                    "[TIMING] Refinement wall time: %.3fs  best EV $%.3f → $%.3f  "
+                    "pool %d",
+                    time.perf_counter() - _t_refine,
+                    _ev_before, float(robust_payout.mean(axis=1).max()),
+                    len(candidates),
+                )
+                self._cb("gpp_refine_done", {
+                    "pool_size": len(candidates),
+                    "n_added": len(candidates) - _pool_size_before_refine,
+                    "best_ev": float(robust_payout.mean(axis=1).max()),
+                    "best_ev_before": _ev_before,
+                })
+
+            if _gpp_stopped and self._stop_check():
+                portfolio = []
+            else:
+                # Phase 3: Det-EV portfolio selection
+                _t_select = time.perf_counter()
+                _portfolio_sweep_raw: list[tuple[float, list]] = []  # [(risk, raw_portfolio)]
+
+                from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
+                # Always sweep risk values 1-5; ignore gpp.risk config for det_ev.
+                _DET_SWEEP_RISKS = [1.0, 2.0, 3.0, 4.0, 5.0]
+                _portfolio_sweep_raw: list[tuple[float, list]] = []
+
+                logger.info(
+                    "Det-EV sweep — portfolio_size=%d, risks=%s",
+                    portfolio_size, _DET_SWEEP_RISKS,
+                )
+
+                for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
+                    if self._stop_check is not None and self._stop_check():
+                        break
+                    _evw = _sweep_risk * 0.05
+                    logger.info(
+                        "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)",
+                        _risk_idx + 1, len(_DET_SWEEP_RISKS),
+                        _sweep_risk, _evw, 1.0 - _evw,
+                    )
+                    self._cb("gpp_det_risk_start", {
+                        "risk": _sweep_risk,
+                        "risk_index": _risk_idx + 1,
+                        "total_risks": len(_DET_SWEEP_RISKS),
+                    })
+                    _det_sel = DeterminantPortfolioSelector(
+                        robust_payout=robust_payout,
+                        candidates=candidates,
+                        portfolio_size=portfolio_size,
+                        risk=_sweep_risk,
+                    )
+                    _det_result = _det_sel.select(
+                        progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
+                            "gpp_det_select_progress",
+                            {**data, "risk": r, "risk_index": ri + 1,
+                             "total_risks": len(_DET_SWEEP_RISKS)},
+                        ),
+                    )
+                    _portfolio_sweep_raw.append((_sweep_risk, _det_result))
+
+                # Reorder all sweep portfolios by entry-fee-weighted diversity now,
+                # so the ordering is final from the outset and never needs to be
+                # repeated when a risk level is activated or the sweep is displayed.
+                _sweep_fees = PipelineRunner._extract_sorted_fees(all_file_entries)
+                _portfolio_sweep_raw = [
+                    (r, PipelineRunner._reorder_by_diversity(p, _sweep_fees))
+                    for r, p in _portfolio_sweep_raw
+                ]
+
+                # Default active = risk=1 (first entry).
+                gpp_result = _portfolio_sweep_raw[0][1] if _portfolio_sweep_raw else []
+                self._sweep_portfolios_raw = {r: p for r, p in _portfolio_sweep_raw}
+                self._gpp_robust_payout = robust_payout
+                self._gpp_candidates = candidates
+                logger.info(
+                    "[TIMING] Det-EV sweep wall time: %.3fs",
+                    time.perf_counter() - _t_select,
+                )
+
+                # Persist sweep to disk so it survives a server restart.
+                _sweep_cache_path = os.path.join(
+                    output_dir, f"portfolio_sweep_{platform.value}.json"
+                )
+                try:
+                    _sweep_cache_data = {
+                        "slate_fingerprint": _slate_fp or "",
+                        "active_risk": 1,
+                        "sweep": [
+                            {
+                                "risk": r,
+                                "lineups": self._serialize_portfolio(
+                                    p, players_df, mean_ev_from_score=True
+                                ),
+                            }
+                            for r, p in _portfolio_sweep_raw
+                        ],
+                    }
+                    os.makedirs(output_dir, exist_ok=True)
+                    with open(_sweep_cache_path, "w") as _sc_f:
+                        json.dump(_sweep_cache_data, _sc_f)
+                    logger.info("Det-EV sweep cache saved to %s", _sweep_cache_path)
+                except Exception as _sc_e:
+                    logger.warning("Failed to save sweep cache: %s", _sc_e)
+
+                portfolio = gpp_result
+
+                # Compute best_scores for portfolio_stats event.
+                col_map_ps = {pid: i for i, pid in enumerate(sim_results.player_ids)}
+                sim_mat_ps = sim_results.results_matrix.astype(np.float32)
+                best_scores_gpp = np.zeros(sim_mat_ps.shape[0], dtype=np.float64)
+                for lu, _ in portfolio:
+                    cols = [col_map_ps[pid] for pid in lu.player_ids if pid in col_map_ps]
+                    if len(cols) == 10:
+                        lu_scores = sim_mat_ps[:, cols].sum(axis=1).astype(np.float64)
+                        np.maximum(best_scores_gpp, lu_scores, out=best_scores_gpp)
+                if not (_gpp_stopped and self._stop_check()):
+                    _on_portfolio_complete(best_scores_gpp)
 
         logger.info("Portfolio complete: %d lineups.", len(portfolio))
 
-        _portfolio_has_dollar_ev = objective == "leverage_surplus"
+        _portfolio_has_dollar_ev = True
 
         # Store raw artifacts for on-demand upload file writing.
         self._raw_portfolio = portfolio
@@ -1439,121 +1338,66 @@ class PipelineRunner:
         full_matrix = self._sim_results.results_matrix
         col_map = {pid: i for i, pid in enumerate(self._sim_results.player_ids)}
 
-        if self._objective == "leverage_surplus":
-            # GPP path: pick next-best candidate from the pre-scored pool.
-            if not hasattr(self, '_gpp_candidates') or not hasattr(self, '_gpp_robust_payout'):
-                raise RuntimeError("GPP artifacts unavailable — please re-run the portfolio")
+        # GPP path: pick next-best candidate from the pre-scored pool.
+        if not hasattr(self, '_gpp_candidates') or not hasattr(self, '_gpp_robust_payout'):
+            raise RuntimeError("GPP artifacts unavailable — please re-run the portfolio")
 
-            # Build pid-set → candidate-index map.
-            cand_pid_sets = [frozenset(lu.player_ids) for lu in self._gpp_candidates]
-            pid_set_to_ci = {ps: ci for ci, ps in enumerate(cand_pid_sets)}
+        # Build pid-set → candidate-index map.
+        cand_pid_sets = [frozenset(lu.player_ids) for lu in self._gpp_candidates]
+        pid_set_to_ci = {ps: ci for ci, ps in enumerate(cand_pid_sets)}
 
-            # Excluded = remaining portfolio lineups + all previously discarded lineups.
-            remaining_pid_sets = {frozenset(lu.player_ids) for lu, _ in remaining}
-            excluded = remaining_pid_sets | self._discarded_lineups
+        # Excluded = remaining portfolio lineups + all previously discarded lineups.
+        remaining_pid_sets = {frozenset(lu.player_ids) for lu, _ in remaining}
+        excluded = remaining_pid_sets | self._discarded_lineups
 
-            # Seed best_payout from remaining portfolio lineups.
-            n_sims_gpp = self._gpp_robust_payout.shape[1]
-            best_payout = np.zeros(n_sims_gpp, dtype=np.float32)
-            for lu, _ in remaining:
-                ci = pid_set_to_ci.get(frozenset(lu.player_ids))
-                if ci is not None:
-                    np.maximum(best_payout, self._gpp_robust_payout[ci], out=best_payout)
+        # Seed best_payout from remaining portfolio lineups.
+        n_sims_gpp = self._gpp_robust_payout.shape[1]
+        best_payout = np.zeros(n_sims_gpp, dtype=np.float32)
+        for lu, _ in remaining:
+            ci = pid_set_to_ci.get(frozenset(lu.player_ids))
+            if ci is not None:
+                np.maximum(best_payout, self._gpp_robust_payout[ci], out=best_payout)
 
-            remaining_ci = [
-                pid_set_to_ci[ps]
-                for ps in [frozenset(lu.player_ids) for lu, _ in remaining]
-                if ps in pid_set_to_ci
-            ]
-            deleted_ci = pid_set_to_ci.get(frozenset(deleted_lineup.player_ids))
-            discarded_ci = {
-                pid_set_to_ci[ps]
-                for ps in self._discarded_lineups
-                if ps in pid_set_to_ci
-            }
+        remaining_ci = [
+            pid_set_to_ci[ps]
+            for ps in [frozenset(lu.player_ids) for lu, _ in remaining]
+            if ps in pid_set_to_ci
+        ]
+        deleted_ci = pid_set_to_ci.get(frozenset(deleted_lineup.player_ids))
+        discarded_ci = {
+            pid_set_to_ci[ps]
+            for ps in self._discarded_lineups
+            if ps in pid_set_to_ci
+        }
 
-            if hasattr(self, '_gpp_selector'):
-                new_ci = self._gpp_selector.find_replacement(
-                    current_portfolio_indices=remaining_ci,
-                    exclude_index=deleted_ci,
-                    additional_excluded=discarded_ci,
-                )
-                logger.info("replace_lineup: MV find_replacement → candidate %d", new_ci)
-            else:
-                # Backward compat: old artifacts without _gpp_selector — marginal EV fallback.
-                avail_payout = self._gpp_robust_payout[
-                    np.array(
-                        [ci for ci, ps in enumerate(cand_pid_sets) if ps not in excluded],
-                        dtype=np.int32,
-                    )
-                ]
-                ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
-                avail_list = [ci for ci, ps in enumerate(cand_pid_sets) if ps not in excluded]
-                new_ci = avail_list[int(np.argmax(ev_vals))]
-                logger.info(
-                    "replace_lineup: no _gpp_selector, using marginal EV fallback → candidate %d",
-                    new_ci,
-                )
-
-            if new_ci is None or new_ci < 0:
-                raise RuntimeError("No available candidates remain after excluding discarded lineups")
-
-            new_lineup = self._gpp_candidates[new_ci]
-            full_score = float(self._gpp_robust_payout[new_ci].mean())
-
-        elif self._objective == "marginal_payout":
-            best_scores = np.zeros(self._sim_results.n_sims, dtype=np.float64)
-            for lineup, _ in remaining:
-                cols = [col_map[pid] for pid in lineup.player_ids]
-                best_scores = np.maximum(best_scores, full_matrix[:, cols].sum(axis=1))
-            optimizer = BasinHoppingOptimizer(
-                sim_results=self._sim_results,
-                players_df=self._players_df,
-                target=self._target,
-                best_scores=best_scores,
-                **self._optimizer_kwargs_replace,
+        if hasattr(self, '_gpp_selector'):
+            new_ci = self._gpp_selector.find_replacement(
+                current_portfolio_indices=remaining_ci,
+                exclude_index=deleted_ci,
+                additional_excluded=discarded_ci,
             )
-            # Request more candidates to clear the full discard history.
-            n_candidates = max(10, len(self._discarded_lineups) + 5)
-            candidates = optimizer.optimize_top_k(n_candidates)
-            new_lineup, _ = next(
-                (
-                    (lu, sc) for lu, sc in candidates
-                    if frozenset(lu.player_ids) not in self._discarded_lineups
-                ),
-                candidates[0],
-            )
-            cols = [col_map[pid] for pid in new_lineup.player_ids]
-            full_score = float((full_matrix[:, cols].sum(axis=1) >= self._target).mean())
-
+            logger.info("replace_lineup: MV find_replacement → candidate %d", new_ci)
         else:
-            active_mask = np.ones(self._sim_results.n_sims, dtype=bool)
-            for lineup, _ in remaining:
-                cols = [col_map[pid] for pid in lineup.player_ids]
-                active_mask[full_matrix[:, cols].sum(axis=1) >= self._target] = False
-            active_sim = SimulationResults(
-                player_ids=self._sim_results.player_ids,
-                results_matrix=full_matrix[active_mask],
+            # Backward compat: old artifacts without _gpp_selector — marginal EV fallback.
+            avail_payout = self._gpp_robust_payout[
+                np.array(
+                    [ci for ci, ps in enumerate(cand_pid_sets) if ps not in excluded],
+                    dtype=np.int32,
+                )
+            ]
+            ev_vals = np.maximum(0.0, avail_payout - best_payout[np.newaxis, :]).mean(axis=1)
+            avail_list = [ci for ci, ps in enumerate(cand_pid_sets) if ps not in excluded]
+            new_ci = avail_list[int(np.argmax(ev_vals))]
+            logger.info(
+                "replace_lineup: no _gpp_selector, using marginal EV fallback → candidate %d",
+                new_ci,
             )
-            optimizer = BasinHoppingOptimizer(
-                sim_results=active_sim,
-                players_df=self._players_df,
-                target=self._target,
-                **self._optimizer_kwargs_replace,
-            )
-            # Request more candidates to clear the full discard history.
-            n_candidates = max(10, len(self._discarded_lineups) + 5)
-            candidates = optimizer.optimize_top_k(n_candidates)
-            new_lineup, _ = next(
-                (
-                    (lu, sc) for lu, sc in candidates
-                    if frozenset(lu.player_ids) not in self._discarded_lineups
-                ),
-                candidates[0],
-            )
-            cols = [col_map[pid] for pid in new_lineup.player_ids]
-            full_score = float((full_matrix[:, cols].sum(axis=1) >= self._target).mean())
 
+        if new_ci is None or new_ci < 0:
+            raise RuntimeError("No available candidates remain after excluding discarded lineups")
+
+        new_lineup = self._gpp_candidates[new_ci]
+        full_score = float(self._gpp_robust_payout[new_ci].mean())
         _has_ev = getattr(self, "_portfolio_has_dollar_ev", False)
         _fees_re = PipelineRunner._extract_sorted_fees(self._all_file_entries)
         self._raw_portfolio = PipelineRunner._reorder_by_diversity(remaining + [(new_lineup, full_score)], _fees_re)

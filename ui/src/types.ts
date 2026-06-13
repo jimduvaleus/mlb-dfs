@@ -28,9 +28,6 @@ export interface OptimizerConfig {
   early_stopping_threshold: number
   salary_floor: number | null
   rng_seed: number | null
-  objective: string
-  payout_beta: number | null
-  payout_coverage_bonus: number
   min_pitcher_value: number | null
   min_batter_value: number | null
 }
@@ -132,7 +129,6 @@ export type SSEStage =
   | 'simulate'
   | 'ppd_applied'
   | 'compute_target'
-  | 'calibrate_beta'
   | 'optimize_lineup'
   | 'portfolio_stats'
   | 'contest_ev_start'
@@ -184,7 +180,6 @@ export interface LoadSlateEvent extends SSEEvent {
 export interface SimulateEvent extends SSEEvent {
   stage: 'simulate'
   n_sims: number
-  objective?: string
 }
 
 export interface ComputeTargetEvent extends SSEEvent {

@@ -1,1 +1,3 @@
 - when detecting player out of lineup, bump notification count and add a banner
+- check on basin hopping use/disuse
+- update MD

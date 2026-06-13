@@ -13,7 +13,7 @@ import os
 
 import numpy as np
 import pandas as pd
-from numba import njit, prange, set_num_threads as _numba_set_num_threads
+from numba import njit, set_num_threads as _numba_set_num_threads
 
 from src.optimization.lineup import (
     Lineup,
@@ -65,65 +65,6 @@ def _build_player_meta(players_df: pd.DataFrame) -> PlayerMeta:
 #  Objective functions                                                  #
 # ------------------------------------------------------------------ #
 
-# Supported objective names (used in config and API).
-OBJECTIVES = ("p_hit", "expected_surplus", "marginal_payout", "leverage_surplus")
-
-
-def _score_totals_p_hit(totals: np.ndarray, target: float) -> float:
-    """P(lineup total >= target)."""
-    return float((totals >= target).mean())
-
-
-def _score_totals_surplus(totals: np.ndarray, target: float) -> float:
-    """E[max(lineup total - target, 0)]."""
-    return float(np.maximum(totals - target, 0.0).mean())
-
-
-@njit(cache=True)
-def _score_swap_candidates_p_hit(
-    sim_matrix: np.ndarray,
-    totals: np.ndarray,
-    col_out: int,
-    cand_cols: np.ndarray,
-    target: float,
-) -> np.ndarray:
-    """Score all swap candidates using P(hit) objective (Numba-accelerated)."""
-    n_sims = totals.shape[0]
-    n_cands = cand_cols.shape[0]
-    cand_scores = np.empty(n_cands, dtype=np.float64)
-    for j in range(n_cands):
-        count = 0.0
-        col_in = cand_cols[j]
-        for i in range(n_sims):
-            if totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in] >= target:
-                count += 1.0
-        cand_scores[j] = count / n_sims
-    return cand_scores
-
-
-@njit(cache=True)
-def _score_swap_candidates_surplus(
-    sim_matrix: np.ndarray,
-    totals: np.ndarray,
-    col_out: int,
-    cand_cols: np.ndarray,
-    target: float,
-) -> np.ndarray:
-    """Score all swap candidates using expected surplus objective (Numba-accelerated)."""
-    n_sims = totals.shape[0]
-    n_cands = cand_cols.shape[0]
-    cand_scores = np.empty(n_cands, dtype=np.float64)
-    for j in range(n_cands):
-        surplus = 0.0
-        col_in = cand_cols[j]
-        for i in range(n_sims):
-            val = totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in]
-            if val > target:
-                surplus += val - target
-        cand_scores[j] = surplus / n_sims
-    return cand_scores
-
-
 def _score_totals_leverage(
     totals: np.ndarray, field_mean: np.ndarray, best_scores: np.ndarray
 ) -> float:
@@ -155,55 +96,6 @@ def _score_swap_candidates_leverage(
             if diff > 0.0:
                 surplus += diff
         cand_scores[j] = surplus / n_sims
-    return cand_scores
-
-
-def _score_totals_payout(
-    totals: np.ndarray, cash_line: float, best_scores: np.ndarray, beta: float,
-    coverage_bonus: float = 0.0,
-) -> float:
-    """E[payout(max(best_scores, lineup_scores))] using two-component payout."""
-    effective = np.maximum(totals, best_scores)
-    diff = np.maximum(effective - cash_line, 0.0)
-    payout = diff ** beta
-    if coverage_bonus > 0.0:
-        payout = payout + coverage_bonus * (effective > cash_line).astype(np.float64)
-    return float(np.mean(payout))
-
-
-@njit(parallel=True, cache=True)
-def _score_swap_candidates_payout(
-    sim_matrix: np.ndarray,
-    totals: np.ndarray,
-    col_out: int,
-    cand_cols: np.ndarray,
-    cash_line: float,
-    best_scores: np.ndarray,
-    beta: float,
-    coverage_bonus: float,
-) -> np.ndarray:
-    """Score all swap candidates using two-component marginal payout objective.
-
-    For each candidate, computes E[P(max(best_scores, new_total))] where
-    P(s) = max(0, s - cash_line)^beta + coverage_bonus * 1{s > cash_line}.
-
-    Candidates are scored in parallel via Numba prange. In worker processes,
-    numba thread count is capped to cpu_count // n_workers to prevent
-    over-subscription; in single-process mode all threads are available.
-    """
-    n_sims = totals.shape[0]
-    n_cands = cand_cols.shape[0]
-    cand_scores = np.empty(n_cands, dtype=np.float64)
-    for j in prange(n_cands):
-        total_payout = 0.0
-        col_in = cand_cols[j]
-        for i in range(n_sims):
-            new_total = totals[i] - sim_matrix[i, col_out] + sim_matrix[i, col_in]
-            effective = new_total if best_scores[i] <= new_total else best_scores[i]
-            diff = effective - cash_line
-            if diff > 0.0:
-                total_payout += diff ** beta + coverage_bonus
-        cand_scores[j] = total_payout / n_sims
     return cand_scores
 
 
@@ -321,17 +213,11 @@ class _ChainRunner:
         n_steps: int,
         niter_success: int = 25,
         salary_floor: Optional[float] = None,
-        objective: str = "expected_surplus",
         best_scores: Optional[np.ndarray] = None,
-        payout_beta: float = 2.5,
-        payout_cash_line: Optional[float] = None,
-        payout_coverage_bonus: float = 0.0,
         rules=None,
         slot_eligibility: Optional[Dict[str, set]] = None,
         ownership_vector: Optional[np.ndarray] = None,
     ):
-        if objective not in OBJECTIVES:
-            raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
         self.sim_matrix = sim_matrix
         self.player_meta = player_meta
         self.col_map = col_map
@@ -341,7 +227,6 @@ class _ChainRunner:
         self.n_steps = n_steps
         self.niter_success = niter_success
         self.salary_floor = salary_floor
-        self.objective = objective
 
         # Platform rules — default to DK if not provided.
         if rules is None:
@@ -355,42 +240,18 @@ class _ChainRunner:
         self.slot_eligibility = slot_eligibility
         self._slots: List[str] = list(rules.slots)
 
-        # Bind the right scoring functions based on objective
-        if objective == "p_hit":
-            self._score_totals = _score_totals_p_hit
-            self._score_swap_candidates = _score_swap_candidates_p_hit
-        elif objective == "marginal_payout":
-            if best_scores is None:
-                best_scores = np.zeros(sim_matrix.shape[0], dtype=np.float64)
-            self._best_scores = best_scores
-            self._payout_beta = payout_beta
-            self._payout_cash_line = payout_cash_line if payout_cash_line is not None else target
-            self._payout_coverage_bonus = payout_coverage_bonus
-            self._score_totals = lambda totals, tgt: _score_totals_payout(
-                totals, self._payout_cash_line, self._best_scores, self._payout_beta,
-                self._payout_coverage_bonus,
-            )
-            self._score_swap_candidates = lambda sm, t, co, cc, tgt: _score_swap_candidates_payout(
-                sm, t, co, cc, self._payout_cash_line, self._best_scores, self._payout_beta,
-                self._payout_coverage_bonus,
-            )
-        elif objective == "leverage_surplus":
-            if ownership_vector is None:
-                raise ValueError("leverage_surplus objective requires ownership_vector")
-            if best_scores is None:
-                best_scores = np.zeros(sim_matrix.shape[0], dtype=np.float64)
-            self._best_scores = best_scores
-            # Pre-compute field mean once: E[field score | sim i] = ownership @ sim_matrix[i,:]
-            self._field_mean = sim_matrix @ ownership_vector.astype(np.float64)
-            self._score_totals = lambda totals, tgt: _score_totals_leverage(
-                totals, self._field_mean, self._best_scores
-            )
-            self._score_swap_candidates = lambda sm, t, co, cc, tgt: _score_swap_candidates_leverage(
-                sm, t, co, cc, self._field_mean, self._best_scores
-            )
-        else:
-            self._score_totals = _score_totals_surplus
-            self._score_swap_candidates = _score_swap_candidates_surplus
+        if ownership_vector is None:
+            raise ValueError("ownership_vector is required")
+        if best_scores is None:
+            best_scores = np.zeros(sim_matrix.shape[0], dtype=np.float64)
+        self._best_scores = best_scores
+        self._field_mean = sim_matrix @ ownership_vector.astype(np.float64)
+        self._score_totals = lambda totals, tgt: _score_totals_leverage(
+            totals, self._field_mean, self._best_scores
+        )
+        self._score_swap_candidates = lambda sm, t, co, cc, tgt: _score_swap_candidates_leverage(
+            sm, t, co, cc, self._field_mean, self._best_scores
+        )
 
         # Pre-built parallel arrays for each position pool so _local_search
         # can collect cand_ids and cand_cols in one pass without a second
@@ -1012,7 +873,7 @@ def _worker_init() -> None:
 
 # Module-level worker function required for ProcessPoolExecutor pickling
 def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
-    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, objective, best_scores, payout_beta, payout_cash_line, payout_coverage_bonus, n_workers, rules, slot_eligibility, initial_lineup, ownership_vector = args
+    seed, shm_name, shm_shape, shm_dtype, player_meta, col_map, players_by_pos, target, temperature, n_steps, niter_success, salary_floor, best_scores, n_workers, rules, slot_eligibility, initial_lineup, ownership_vector = args
     # Cap Numba intra-op threads so that n_workers processes don't collectively
     # over-subscribe the CPU.  Single-process mode (n_workers=1) leaves Numba
     # free to use all available cores for prange parallelism.
@@ -1035,11 +896,7 @@ def _chain_worker(args: tuple) -> Tuple[Lineup, float]:
             n_steps=n_steps,
             niter_success=niter_success,
             salary_floor=salary_floor,
-            objective=objective,
             best_scores=best_scores,
-            payout_beta=payout_beta,
-            payout_cash_line=payout_cash_line,
-            payout_coverage_bonus=payout_coverage_bonus,
             rules=rules,
             slot_eligibility=slot_eligibility,
             ownership_vector=ownership_vector,
@@ -1087,17 +944,11 @@ class BasinHoppingOptimizer:
         early_stopping_window: int = 25,
         early_stopping_threshold: float = 0.001,
         salary_floor: Optional[float] = None,
-        objective: str = "expected_surplus",
         best_scores: Optional[np.ndarray] = None,
-        payout_beta: float = 2.5,
-        payout_cash_line: Optional[float] = None,
-        payout_coverage_bonus: float = 0.0,
         rules=None,
         slot_eligibility: Optional[Dict[str, set]] = None,
         ownership_vector: Optional[np.ndarray] = None,
     ):
-        if objective not in OBJECTIVES:
-            raise ValueError(f"Unknown objective '{objective}'. Must be one of {OBJECTIVES}")
 
         # Resolve platform rules — default to DK if not provided.
         if rules is None:
@@ -1129,11 +980,7 @@ class BasinHoppingOptimizer:
         self.early_stopping_window = early_stopping_window
         self.early_stopping_threshold = early_stopping_threshold
         self.salary_floor = salary_floor
-        self.objective = objective
         self.best_scores = best_scores
-        self.payout_beta = payout_beta
-        self.payout_cash_line = payout_cash_line
-        self.payout_coverage_bonus = payout_coverage_bonus
 
         # Align ownership_vector to sim_results.player_ids column ordering.
         # compute_heuristic_ownership() returns values in players_df row order,
@@ -1172,11 +1019,7 @@ class BasinHoppingOptimizer:
             n_steps=self.n_steps,
             niter_success=self.niter_success,
             salary_floor=self.salary_floor,
-            objective=self.objective,
             best_scores=self.best_scores,
-            payout_beta=self.payout_beta,
-            payout_cash_line=self.payout_cash_line,
-            payout_coverage_bonus=self.payout_coverage_bonus,
             rules=self.rules,
             slot_eligibility=self.slot_eligibility,
             ownership_vector=self.ownership_vector,
@@ -1234,11 +1077,7 @@ class BasinHoppingOptimizer:
                     self.n_steps,
                     self.niter_success,
                     self.salary_floor,
-                    self.objective,
                     self.best_scores,
-                    self.payout_beta,
-                    self.payout_cash_line,
-                    self.payout_coverage_bonus,
                     self.n_workers,
                     self.rules,
                     self.slot_eligibility,

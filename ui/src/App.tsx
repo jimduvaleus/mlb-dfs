@@ -353,17 +353,15 @@ export default function App() {
 
   const handleRun = async () => {
     if (running) return
-    if (state.config?.optimizer?.objective === 'leverage_surplus') {
-      try {
-        const status = await fetchCacheStatus()
-        if (status.is_gpp) {
-          setPendingCacheStatus(status)
-          setShowRunOptionsDialog(true)
-          return
-        }
-      } catch {
-        // fall through to immediate start
+    try {
+      const status = await fetchCacheStatus()
+      if (status.is_gpp) {
+        setPendingCacheStatus(status)
+        setShowRunOptionsDialog(true)
+        return
       }
+    } catch {
+      // fall through to immediate start
     }
     _doStartRun(false, false)
   }

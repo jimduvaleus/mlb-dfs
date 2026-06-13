@@ -33,10 +33,6 @@ class OptimizerConfig(BaseModel):
     early_stopping_threshold: float = 0.001
     salary_floor: Optional[float] = 45000
     rng_seed: Optional[int] = None
-    objective: str = "expected_surplus"
-    payout_beta: Optional[float] = None
-    payout_cash_line: Optional[float] = None
-    payout_coverage_bonus: float = 0.0
     min_pitcher_value: Optional[float] = None
     min_batter_value: Optional[float] = None
 
