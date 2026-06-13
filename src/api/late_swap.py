@@ -95,6 +95,7 @@ def build_swap_pools(
     slate_df: pd.DataFrame,
     proj_df: Optional[pd.DataFrame],
     exclusions: Optional[dict] = None,
+    confirmed_team_lineups: Optional[Dict[str, Dict[int, int]]] = None,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Build (lookup_df, candidates_df) from the slate and projections.
@@ -103,12 +104,28 @@ def build_swap_pools(
     salary/600 heuristic when no projection exists). Used to display and
     value players already rostered in entries.
 
-    candidates_df: the swap-in pool — projected starters only (rows with a
+    candidates_df: the swap-in pool — projected starters (rows with a
     non-null lineup_slot when projections carry that column, mirroring
-    PipelineRunner._build_players_df), minus slate/player exclusions
-    (both "both" and "candidates" scopes — excluded players were kept out
-    of optimization, so they must not enter via swap either).
+    PipelineRunner._build_players_df) plus any player in a currently
+    confirmed Twitter lineup ({team: {pid: slot}}), minus slate/player
+    exclusions (both "both" and "candidates" scopes — excluded players were
+    kept out of optimization, so they must not enter via swap either).
+
+    Confirmed lineups also scratch: batters on a confirmed team who are NOT
+    in that team's lineup are dropped from the pool (same rule the pipeline
+    applies via _apply_twitter_overrides). Confirmed players absent from the
+    projections pool get the salary/600 heuristic mean and are flagged
+    `newly_confirmed` — a late lineup announcement (e.g. a post-lock
+    replacement) whose heuristic projection understates a guaranteed
+    starter, so the scorer boosts them.
     """
+    confirmed_pids: set = {
+        int(pid)
+        for slots in (confirmed_team_lineups or {}).values()
+        for pid in slots
+    }
+    confirmed_teams = set((confirmed_team_lineups or {}).keys())
+
     lookup_df = slate_df.copy()
     starters_pids: Optional[set] = None
     if proj_df is not None and not proj_df.empty:
@@ -131,7 +148,21 @@ def build_swap_pools(
 
     candidates_df = lookup_df
     if starters_pids is not None:
-        candidates_df = candidates_df[candidates_df["player_id"].isin(starters_pids)]
+        candidates_df = candidates_df[
+            candidates_df["player_id"].isin(starters_pids | confirmed_pids)
+        ]
+    if confirmed_teams:
+        scratched = (
+            (candidates_df["position"] != "P")
+            & candidates_df["team"].isin(confirmed_teams)
+            & ~candidates_df["player_id"].isin(confirmed_pids)
+        )
+        candidates_df = candidates_df[~scratched]
+
+    candidates_df = candidates_df.copy()
+    candidates_df["newly_confirmed"] = candidates_df["player_id"].isin(
+        confirmed_pids - (starters_pids or set())
+    )
 
     if exclusions:
         excl_teams = set(exclusions.get("excluded_teams", [])) | set(
@@ -168,6 +199,7 @@ def _player_record(row) -> dict:
         "game": str(row.get("game", "")),
         "game_start_time": str(row["game_start_time"]) if row.get("game_start_time") else "",
         "missing_from_slate": False,
+        "newly_confirmed": bool(row.get("newly_confirmed", False)),
     }
 
 
@@ -384,20 +416,28 @@ class CandidateScorer(Protocol):
 
 
 class HeuristicScorer:
-    """projection mean + same-team stack bonus - capped diversity penalty.
+    """projection mean + same-team stack bonus + newly-confirmed boost
+    - capped diversity penalty.
 
     The diversity penalty only reorders valid candidates — capped at 1.2
     FPTS it can never leave a slot unfilled or force a clearly worse pick
     (failing to swap costs far more EV than concentrated swaps).
+
+    The newly-confirmed boost prioritizes players announced into a lineup
+    after projections were fetched (post-lock replacements): their
+    salary/600 heuristic mean understates a guaranteed starter.
     """
-    W_STACK = 0.5       # FPTS per kept same-team batter, capped at 4 (+2.0 max)
-    W_DIVERSITY = 0.3   # per prior auto swap-in of this player this run
+    W_STACK = 0.5            # FPTS per kept same-team batter, capped at 4 (+2.0 max)
+    W_DIVERSITY = 0.3        # per prior auto swap-in of this player this run
+    W_NEWLY_CONFIRMED = 2.0  # confirmed in a lineup but absent from the projections pool
 
     def score(self, cand: dict, entry: EntrySwapState,
               kept_batter_teams: Counter, usage: Counter) -> float:
         s = float(cand["mean"] or 0.0)
         if cand["position"] != "P":
             s += self.W_STACK * min(kept_batter_teams.get(cand["team"], 0), 4)
+        if cand.get("newly_confirmed"):
+            s += self.W_NEWLY_CONFIRMED
         s -= min(self.W_DIVERSITY * usage.get(cand["player_id"], 0), 1.2)
         return s
 
@@ -590,7 +630,8 @@ def apply_override(
     bulk_teams: Set[str],
     now: datetime,
 ) -> Optional[str]:
-    """Manually set a slot's swap-in. Returns an error reason, or None on success."""
+    """Manually set a slot's swap-in. Passing the slot's original player id
+    reverts the swap. Returns an error reason, or None on success."""
     if not (0 <= slot_index < len(entry.slots)):
         return "invalid_slot"
     slot = entry.slots[slot_index]
@@ -600,6 +641,17 @@ def apply_override(
         lookup.get(slot.swapped_in_id, {}).get("game_start_time"), now
     ):
         return "slot_locked"
+    orig_id = slot.original.player_id if slot.original else None
+    if player_id == orig_id and slot.swapped_in_id is not None:
+        # Revert to the original player. Other swaps in the entry may have
+        # spent the salary this swap freed, so re-validate before committing.
+        prev_id, prev_source = slot.swapped_in_id, slot.swap_source
+        slot.swapped_in_id = None
+        slot.swap_source = None
+        if not _entry_is_valid(entry, lookup):
+            slot.swapped_in_id, slot.swap_source = prev_id, prev_source
+            return "not_eligible"
+        return None
     cands = [
         c for c in (_player_record(r) for _, r in candidates_df.iterrows())
         if c["player_id"] == player_id

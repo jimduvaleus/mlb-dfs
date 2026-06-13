@@ -761,3 +761,106 @@ class TestEntryToDict:
         assert s9["swapped_in"]["player_id"] == 18
         assert s9["swapped_in"]["locked"] is False
         assert s9["swap_source"] == "auto"
+
+
+# ---------------------------------------------------------------------------
+# Portfolio display order harmonization
+# ---------------------------------------------------------------------------
+
+class TestUploadDisplayOrder:
+    def test_serialized_players_match_upload_columns(self, slate_df):
+        from src.api.dk_entries import assign_players_to_slots
+        from src.api.pipeline import PipelineRunner
+
+        shuffled = [19, 14, 30, 16, 2, 1, 13, 17, 7, 15]  # entry1, scrambled
+        ordered = PipelineRunner._upload_display_order(shuffled, slate_df)
+        assert ordered == assign_players_to_slots(shuffled, slate_df)
+        # pitchers land in the two P columns in input order: 30 before 1
+        assert [pid for pid in ordered if pid in (1, 30)] == ordered[:2]
+        assert sorted(ordered) == sorted(shuffled)
+
+    def test_fallback_on_unassignable_roster(self, slate_df):
+        from src.api.pipeline import PipelineRunner
+
+        nine = ENTRY1_PIDS[:9]  # FD-sized roster can't fill 10 DK slots
+        assert PipelineRunner._upload_display_order(nine, slate_df) == nine
+
+
+# ---------------------------------------------------------------------------
+# Confirmed-lineup pool inclusion and newly-confirmed priority
+# ---------------------------------------------------------------------------
+
+class TestConfirmedLineupPool:
+    def test_confirmed_player_joins_pool_with_heuristic_mean(self, slate_df):
+        slate = slate_df.drop(columns=["mean"])
+        # Projections know starters 13/17 only; pid 20 (DDD) is announced in
+        # a confirmed lineup after the fetch (the Chad Stevens case).
+        proj = pd.DataFrame({"player_id": [13, 17], "mean": [9.9, 11.1],
+                             "lineup_slot": [3.0, 5.0]})
+        confirmed = {"DDD": {20: 7, 15: 5}}
+        _, candidates_df = build_swap_pools(slate, proj, confirmed_team_lineups=confirmed)
+        cands = candidates_df.set_index("player_id")
+        assert 20 in cands.index
+        assert cands.loc[20, "mean"] == round(3500 / 600.0, 2)  # heuristic
+        assert bool(cands.loc[20, "newly_confirmed"]) is True
+        assert bool(cands.loc[13, "newly_confirmed"]) is False
+
+    def test_scratched_batters_dropped_from_confirmed_team(self, slate_df):
+        # DDD has a confirmed lineup without 19/22 — they're scratched.
+        confirmed = {"DDD": {20: 7, 15: 5, 16: 6, 23: 4, 21: 2}}
+        _, candidates_df = build_swap_pools(slate_df.drop(columns=["mean"]), None,
+                                            confirmed_team_lineups=confirmed)
+        pids = set(candidates_df["player_id"])
+        assert 19 not in pids and 22 not in pids  # scratched DDD batters
+        assert 11 in pids                          # DDD pitcher unaffected
+        assert 17 in pids                          # other teams unaffected
+
+    def test_newly_confirmed_scorer_boost(self):
+        scorer = HeuristicScorer()
+        entry = EntrySwapState("1", "f.csv", "c", "1", "$1", slots=[])
+        base = {"player_id": 99, "position": "OF", "team": "CCC", "mean": 6.0}
+        plain = scorer.score(dict(base), entry, Counter(), Counter())
+        boosted = scorer.score(dict(base, newly_confirmed=True), entry, Counter(), Counter())
+        assert boosted == pytest.approx(plain + scorer.W_NEWLY_CONFIRMED)
+
+    def test_newly_confirmed_wins_swap(self, tmp_path, lookup, slate_df):
+        # 20 (mean 7.0) loses to 33 (9.0) normally; with the +2.0 boost and
+        # +1.0 DDD stack bonus (kept 15/16) it wins: 7.0+2.0+1.0 > 9.0.
+        candidates_df = slate_df[slate_df["player_id"].isin([20, 33])].copy()
+        candidates_df["newly_confirmed"] = candidates_df["player_id"] == 20
+        states = _states_for(tmp_path, lookup,
+                             {"MEDKEntries.csv": [_entry("100", ENTRY1_PIDS)]})
+        run_swap(states, {"100": {19}}, set(), set(), candidates_df, lookup,
+                 HeuristicScorer(), NOW)
+        assert states[0].slots[9].swapped_in_id == 20
+
+
+class TestOverrideRevert:
+    def _swapped_entry(self, tmp_path, lookup, slate_df):
+        states = _states_for(tmp_path, lookup,
+                             {"MEDKEntries.csv": [_entry("100", ENTRY1_PIDS)]})
+        run_swap(states, {"100": {19}}, set(), set(), slate_df, lookup,
+                 HeuristicScorer(), NOW)
+        return states[0]
+
+    def test_revert_to_original(self, tmp_path, lookup, slate_df):
+        entry = self._swapped_entry(tmp_path, lookup, slate_df)
+        assert entry.slots[9].swapped_in_id == 18
+        err = apply_override(entry, 9, 19, slate_df, lookup, set(), set(), NOW)
+        assert err is None
+        assert entry.slots[9].swapped_in_id is None
+        assert entry.slots[9].swap_source is None
+        assert not entry.changed
+
+    def test_revert_rejected_when_entry_would_be_invalid(self, tmp_path, lookup, slate_df):
+        # Swap OF 19 ($5300) down to 20 ($3500), then upgrade 1B 13 ($4100)
+        # to 23 ($4400) using the freed salary. Reverting the OF swap would
+        # push the total over the cap, so it must be rejected.
+        states = _states_for(tmp_path, lookup,
+                             {"MEDKEntries.csv": [_entry("100", ENTRY1_PIDS)]})
+        entry = states[0]
+        assert apply_override(entry, 9, 20, slate_df, lookup, set(), set(), NOW) is None
+        assert apply_override(entry, 3, 23, slate_df, lookup, set(), set(), NOW) is None
+        err = apply_override(entry, 9, 19, slate_df, lookup, set(), set(), NOW)
+        assert err == "not_eligible"
+        assert entry.slots[9].swapped_in_id == 20  # unchanged

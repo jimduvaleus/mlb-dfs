@@ -30,6 +30,7 @@ from .config_io import read_config, write_config
 from .models import AppConfig, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
 from .twitter_lineups import (
     delete_twitter_lineup,
+    get_confirmed_team_lineups,
     get_twitter_overrides,
     load_twitter_lineups,
     extract_lineup_team,
@@ -209,6 +210,25 @@ def _portfolio_entries_path(platform_val: str | None = None) -> Path:
     return base / f"portfolio_entries_{platform_val}.json"
 
 
+def _upload_order_players(players: list[dict]) -> list[dict]:
+    """Reorder serialized players into DK upload column order so persisted
+    portfolios written before the ordering change display consistently with
+    the upload_*.csv files. No-op when assignment doesn't apply (FD rosters)."""
+    import pandas as pd
+    from .dk_entries import assign_players_to_slots
+    try:
+        sub = pd.DataFrame({
+            "player_id": [p["player_id"] for p in players],
+            "position": [str(p["position"]).split("/")[0] for p in players],
+            "eligible_positions": [str(p["position"]).split("/") for p in players],
+        })
+        ordered = assign_players_to_slots([p["player_id"] for p in players], sub)
+        by_id = {p["player_id"]: p for p in players}
+        return [by_id[pid] for pid in ordered]
+    except Exception:
+        return players
+
+
 def _load_portfolio_from_csv(platform_val: str) -> list[dict] | None:
     """Load a persisted portfolio from a platform-specific CSV. Returns None if unavailable."""
     import pandas as pd
@@ -239,7 +259,7 @@ def _load_portfolio_from_csv(platform_val: str) -> list[dict] | None:
                 "p_hit_target": float(first["p_hit_target"]),
                 "lineup_salary": int(first["lineup_salary"]),
                 "mean_ev": float(first["mean_ev"]) if "mean_ev" in first and pd.notna(first["mean_ev"]) else None,
-                "players": players,
+                "players": _upload_order_players(players),
             })
         if not portfolio:
             return None
@@ -279,7 +299,12 @@ def _load_optimal_lineups_from_json(platform_val: str) -> list[dict] | None:
             if current_fp != stored_fp:
                 return None  # slate changed — discard
         lineups = data.get("lineups")
-        return lineups if lineups else None
+        if not lineups:
+            return None
+        for lr in lineups:
+            if isinstance(lr.get("players"), list):
+                lr["players"] = _upload_order_players(lr["players"])
+        return lineups
     except Exception:
         return None
 
@@ -2856,8 +2881,11 @@ def _late_swap_context(apply_saved: bool = True) -> dict:
     fingerprint = compute_file_fingerprint(slate_path)
     slate_id = compute_slate_id(sorted({str(g) for g in slate_df["game"] if g}))
     exclusions = read_exclusions(slate_id, fingerprint)
+    confirmed_lineups = get_confirmed_team_lineups(fingerprint)
 
-    lookup_df, candidates_df = late_swap.build_swap_pools(slate_df, proj_df, exclusions)
+    lookup_df, candidates_df = late_swap.build_swap_pools(
+        slate_df, proj_df, exclusions, confirmed_team_lineups=confirmed_lineups,
+    )
     lookup = late_swap.build_player_lookup(lookup_df)
     raw_salaries = late_swap.load_raw_salaries(slate_path)
     now = _now_eastern()
@@ -2937,7 +2965,7 @@ def run_late_swap(req: LateSwapRunRequest):
         )
         written = late_swap.write_swap_files(ctx["states"], ctx["output_dir"])
         late_swap.save_state(
-            ctx["output_dir"], ctx["fingerprint"], ctx["now"].isoformat(),
+            ctx["output_dir"], ctx["fingerprint"], _now_eastern().isoformat(),
             bulk_pids, bulk_teams, ctx["states"], written,
         )
         ctx["saved"] = late_swap.load_state(ctx["output_dir"], ctx["fingerprint"])
@@ -2971,6 +2999,7 @@ def get_late_swap_candidates(entry_id: str, slot_index: int):
                 "player_id": c["player_id"], "name": c["name"], "team": c["team"],
                 "position": c["position"], "eligible_positions": c["eligible_positions"],
                 "salary": c["salary"], "mean": c["mean"], "score": c["score"],
+                "newly_confirmed": bool(c.get("newly_confirmed", False)),
             }
             for c in cands
         ],
@@ -3001,14 +3030,16 @@ def override_late_swap(req: LateSwapOverrideRequest):
         if err:
             raise HTTPException(422, err)
         written = late_swap.write_swap_files(ctx["states"], ctx["output_dir"])
+        # Stamp the write time so the UI banner reflects the latest file update.
+        updated_at = _now_eastern().isoformat()
         late_swap.save_state(
-            ctx["output_dir"], ctx["fingerprint"],
-            saved.get("run_at") or ctx["now"].isoformat(),
+            ctx["output_dir"], ctx["fingerprint"], updated_at,
             bulk_pids, bulk_teams, ctx["states"], written,
         )
         return {
             "entry": late_swap.entry_to_dict(entry, ctx["lookup"], ctx["now"]),
             "written_files": written,
+            "last_run_at": updated_at,
         }
     finally:
         _late_swap_lock.release()

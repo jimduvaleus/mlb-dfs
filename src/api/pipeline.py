@@ -2387,6 +2387,19 @@ class PipelineRunner:
         return [portfolio[i] for i in selected]
 
     @staticmethod
+    def _upload_display_order(player_ids: list, players_df: pd.DataFrame) -> list:
+        """Reorder a lineup's player ids into DK upload column order
+        (P,P,C,1B,2B,3B,SS,OF,OF,OF) — the same assignment write_upload_files
+        uses — so portfolio cards match the upload_*.csv columns (and the
+        Late Swap tab, which pins those columns). Falls back to the given
+        order when slot assignment doesn't apply (e.g. FanDuel rosters)."""
+        from .dk_entries import assign_players_to_slots
+        try:
+            return assign_players_to_slots(list(player_ids), players_df)
+        except Exception:
+            return list(player_ids)
+
+    @staticmethod
     def _serialize_portfolio(
         portfolio: list,
         players_df: pd.DataFrame,
@@ -2412,6 +2425,7 @@ class PipelineRunner:
         for i, (lineup, score) in enumerate(portfolio, start=1):
             pid_to_assigned = PipelineRunner._assigned_positions(lineup, player_meta)
             total_salary = sum(id_to_salary.get(pid, 0) for pid in lineup.player_ids)
+            ordered_ids = PipelineRunner._upload_display_order(lineup.player_ids, players_df)
             players = [
                 {
                     "player_id": pid,
@@ -2424,7 +2438,7 @@ class PipelineRunner:
                     "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
                     "slot_confirmed": bool(id_to_confirmed[pid]) if pid in id_to_confirmed else False,
                 }
-                for pid in lineup.player_ids
+                for pid in ordered_ids
             ]
             mean_ev: Optional[float] = round(float(score), 4) if mean_ev_from_score else None
             result.append({
@@ -2487,7 +2501,7 @@ class PipelineRunner:
             pid_to_assigned = PipelineRunner._assigned_positions(lineup, player_meta)
             total_salary = sum(id_to_salary.get(pid, 0) for pid in lineup.player_ids)
             mean_ev: Optional[float] = round(float(score), 4) if mean_ev_from_score else None
-            for pid in lineup.player_ids:
+            for pid in PipelineRunner._upload_display_order(lineup.player_ids, players_df):
                 rows.append({
                     "lineup": i,
                     "p_hit_target": round(score, 4),
