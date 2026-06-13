@@ -681,6 +681,7 @@ export interface LateSwapCandidate {
   salary: number
   mean: number | null
   score: number
+  newly_confirmed?: boolean
 }
 
 export interface LateSwapCandidatesResponse {
@@ -691,4 +692,5 @@ export interface LateSwapCandidatesResponse {
 export interface LateSwapOverrideResponse {
   entry: LateSwapEntry
   written_files: string[]
+  last_run_at?: string | null
 }

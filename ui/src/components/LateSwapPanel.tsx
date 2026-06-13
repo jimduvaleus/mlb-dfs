@@ -28,13 +28,31 @@ function entrySalary(entry: LateSwapEntry): number {
   return total
 }
 
+// Same abbreviation the portfolio cards use: upload tag + fee + shortened
+// contest name, e.g. "upload_GEDKEntries.csv · MLB $12K Skipper [Single
+// Entry]" -> "GE $25 Skipper".
+function entryInfoText(entry: LateSwapEntry): string {
+  const tag = entry.source_file
+    .replace(/^upload_/i, '')
+    .replace(/DKEntries\.csv$/i, '')
+  const contest = entry.contest_name
+    .replace(/^MLB\s+/, '')
+    .replace(/^\$[\d.,]+[KkMm]?\s+/, '')
+    .replace(/\s*\[.*?\]\s*$/, '')
+    .trim()
+  return [tag, entry.entry_fee, contest].filter(Boolean).join(' ')
+}
+
 export default function LateSwapPanel({ platform }: Props) {
   const [state, setState] = useState<LateSwapState | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [running, setRunning] = useState(false)
 
-  // Marks (client-side until Run Swap is pressed)
+  // Row-level marks are per-entry: the ✗ on a card marks the player for swap
+  // in that lineup only. The toolbar search/team controls mark in bulk —
+  // across all lineups, with the player/team also globally excluded as a
+  // swap-in candidate.
   const [entryMarks, setEntryMarks] = useState<Map<string, Set<number>>>(new Map())
   const [bulkPids, setBulkPids] = useState<Set<number>>(new Set())
   const [bulkTeams, setBulkTeams] = useState<Set<string>>(new Set())
@@ -59,18 +77,26 @@ export default function LateSwapPanel({ platform }: Props) {
 
   const applyState = useCallback((s: LateSwapState) => {
     setState(s)
-    // Re-derive marks from server state so a re-run preserves prior swaps.
+    // Re-derive marks from server state so a re-run reproduces (and a
+    // refresh restores) the same swaps. Swaps covered by a bulk mark stay in
+    // the bulk sets only, so removing a chip + re-running reverts them.
+    const bulkP = new Set(s.bulk_marked_player_ids)
+    const bulkT = new Set(s.bulk_marked_teams)
     const marks = new Map<string, Set<number>>()
     for (const e of s.entries) {
       const pids = new Set<number>()
       for (const slot of e.slots) {
-        if (slot.swapped_in && slot.player?.player_id != null) pids.add(slot.player.player_id)
+        const p = slot.player
+        if (slot.swapped_in && p?.player_id != null
+            && !bulkP.has(p.player_id) && !(p.team && bulkT.has(p.team))) {
+          pids.add(p.player_id)
+        }
       }
       if (pids.size > 0) marks.set(e.entry_id, pids)
     }
     setEntryMarks(marks)
-    setBulkPids(new Set(s.bulk_marked_player_ids))
-    setBulkTeams(new Set(s.bulk_marked_teams))
+    setBulkPids(bulkP)
+    setBulkTeams(bulkT)
   }, [])
 
   useEffect(() => {
@@ -138,20 +164,16 @@ export default function LateSwapPanel({ platform }: Props) {
     [bulkPids, allPlayers],
   )
 
-  const isMarked = useCallback((entry: LateSwapEntry, slot: LateSwapSlot): boolean => {
-    if (slot.locked || !slot.player || slot.player.player_id == null) return false
-    const pid = slot.player.player_id
-    if (entryMarks.get(entry.entry_id)?.has(pid)) return true
-    if (bulkPids.has(pid)) return true
-    if (slot.player.team && bulkTeams.has(slot.player.team)) return true
-    return false
-  }, [entryMarks, bulkPids, bulkTeams])
-
   const isBulkMarked = useCallback((slot: LateSwapSlot): boolean => {
     const pid = slot.player?.player_id
     if (pid == null) return false
     return bulkPids.has(pid) || (!!slot.player?.team && bulkTeams.has(slot.player.team))
   }, [bulkPids, bulkTeams])
+
+  const isMarked = useCallback((entry: LateSwapEntry, slot: LateSwapSlot): boolean => {
+    if (slot.locked || slot.player?.player_id == null) return false
+    return isBulkMarked(slot) || !!entryMarks.get(entry.entry_id)?.has(slot.player.player_id)
+  }, [isBulkMarked, entryMarks])
 
   const visibleEntries = useMemo(() => {
     if (!state) return []
@@ -249,6 +271,7 @@ export default function LateSwapPanel({ platform }: Props) {
       setState(prev => prev ? {
         ...prev,
         written_files: resp.written_files,
+        last_run_at: resp.last_run_at ?? prev.last_run_at,
         entries: prev.entries.map(e => e.entry_id === entryId ? resp.entry : e),
       } : prev)
       setOpenDropdown(null)
@@ -395,7 +418,7 @@ export default function LateSwapPanel({ platform }: Props) {
       {state.written_files.length > 0 && (
         <div className="lateswap-banner">
           ✓ Swap files written: {state.written_files.map(f => f.split('/').pop()).join(', ')}
-          {state.last_run_at && <span className="lateswap-banner-time"> (run {state.last_run_at.replace('T', ' ')})</span>}
+          {state.last_run_at && <span className="lateswap-banner-time"> (updated {state.last_run_at.replace('T', ' ').slice(0, 19)})</span>}
         </div>
       )}
 
@@ -415,7 +438,7 @@ export default function LateSwapPanel({ platform }: Props) {
           const entryWarnings = entry.warnings.filter(w => w.slot_index === null)
           const slotWarnings = new Set(entry.warnings.filter(w => w.slot_index !== null).map(w => w.slot_index))
           return (
-            <div key={`${entry.source_file}:${entry.entry_id}`} className="lineup-card">
+            <div key={`${entry.source_file}:${entry.entry_id}`} className="lineup-card lateswap-card">
               <div className="lineup-card-header">
                 <span className="lineup-card-num">#{entry.entry_id}</span>
                 <span className="lineup-card-salary">${entrySalary(entry).toLocaleString()}</span>
@@ -424,7 +447,7 @@ export default function LateSwapPanel({ platform }: Props) {
                 </div>
               </div>
               <div className="lineup-card-entry-info">
-                {entry.source_file} · {entry.entry_fee} · {entry.contest_name}
+                {entryInfoText(entry)}
               </div>
               {entryWarnings.length > 0 && (
                 <div className="lateswap-card-warning">⚠ {entryWarnings.map(w => w.reason).join(', ')}</div>
@@ -451,9 +474,10 @@ export default function LateSwapPanel({ platform }: Props) {
                             className="lateswap-swapped-name"
                             onClick={() => !swapped.locked && openCandidates(entry.entry_id, slot.slot_index)}
                             disabled={swapped.locked}
-                            title={swapped.locked ? 'Game has started' : 'Choose a different replacement'}
+                            title={swapped.locked ? 'Game has started' : 'Change replacement or keep the original player'}
                           >
                             {swapped.name}
+                            {!swapped.locked && <span className="lateswap-swapped-caret">▾</span>}
                           </button>
                           {slot.swap_source === 'manual' && <span className="lateswap-manual-badge">manual</span>}
                           <span className="lateswap-was">was {slot.player ? slot.player.name : '(empty)'}</span>
@@ -461,6 +485,15 @@ export default function LateSwapPanel({ platform }: Props) {
                             <div className="swap-candidates-dropdown" ref={dropdownRef}>
                               {candidatesLoading && <div className="swap-candidates-empty">Loading…</div>}
                               {overrideError && <div className="swap-candidates-error">{overrideError}</div>}
+                              {!candidatesLoading && slot.player?.player_id != null && (
+                                <button
+                                  className="swap-candidate-btn swap-candidate-btn--revert"
+                                  onClick={() => handleOverride(entry.entry_id, slot.slot_index, slot.player!.player_id!)}
+                                >
+                                  <span className="swap-candidate-name">↩ Keep {slot.player.name}</span>
+                                  <span className="swap-candidate-meta">undo swap</span>
+                                </button>
+                              )}
                               {!candidatesLoading && !overrideError && candidates.length === 0 && (
                                 <div className="swap-candidates-empty">No eligible replacements</div>
                               )}
@@ -471,7 +504,10 @@ export default function LateSwapPanel({ platform }: Props) {
                                   disabled={c.player_id === swapped.player_id}
                                   onClick={() => handleOverride(entry.entry_id, slot.slot_index, c.player_id)}
                                 >
-                                  <span className="swap-candidate-name">{c.name}</span>
+                                  <span className="swap-candidate-name">
+                                    {c.name}
+                                    {c.newly_confirmed && <span className="lateswap-new-badge">new</span>}
+                                  </span>
                                   <span className="swap-candidate-meta">
                                     {c.position} · {c.team} · ${(c.salary / 1000).toFixed(1)}k{c.mean != null ? ` · ${c.mean.toFixed(1)} pts` : ''}
                                   </span>
@@ -507,8 +543,10 @@ export default function LateSwapPanel({ platform }: Props) {
                               slot.player == null
                                 ? 'Empty slot — filled automatically on swap'
                                 : bulkMarked
-                                  ? 'Marked by a bulk player/team action — unmark via the toolbar chips'
-                                  : marked ? 'Unmark' : 'Mark for swap'
+                                  ? 'Marked across all lineups — unmark via the toolbar chip'
+                                  : marked
+                                    ? `Unmark ${slot.player.name} (this lineup)`
+                                    : `Mark ${slot.player.name} for swap (this lineup only)`
                             }
                           >
                             ✗

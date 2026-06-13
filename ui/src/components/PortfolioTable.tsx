@@ -175,6 +175,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
   const [viewingRisk, setViewingRisk] = useState<number | null>(null)
   // Shared filter across all risk levels and both tabs
   const [filterPlayer, setFilterPlayer] = useState<PlayerRow | null>(null)
+  const [filterUnconfirmed, setFilterUnconfirmed] = useState(false)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const searchWrapRef = useRef<HTMLDivElement>(null)
@@ -228,15 +229,22 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
     .slice(0, 10)
 
   const sortedActiveLineups = sortByEntryRatio(activeLineups)
-  const filteredLineups = filterPlayer
+  const playerFilteredLineups = filterPlayer
     ? sortedActiveLineups.filter(l => l.players.some(p => p.player_id === filterPlayer.player_id))
     : sortedActiveLineups
+  const filterPlayerMissingFromRisk = filterPlayer !== null && playerFilteredLineups.length === 0
+
+  const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
+  const lineupHasUnconfirmed = (l: LineupResult) => l.players.some(p => unconfirmedSet.has(p.player_id))
+  // If every player gets confirmed while the filter is on, the filter stops
+  // applying (and its toggle disappears), so all lineups show again.
+  const showUnconfirmedOnly = filterUnconfirmed && playerFilteredLineups.some(lineupHasUnconfirmed)
+  const filteredLineups = showUnconfirmedOnly
+    ? playerFilteredLineups.filter(lineupHasUnconfirmed)
+    : playerFilteredLineups
   const visibleLineups = (contestNormalized.size > 0 && sortByActual)
     ? [...filteredLineups].sort((a, b) => calcLineupFpts(b, contestNormalized) - calcLineupFpts(a, contestNormalized))
     : filteredLineups
-  const filterPlayerMissingFromRisk = filterPlayer !== null && filteredLineups.length === 0
-
-  const unconfirmedSet = new Set(unconfirmedPlayerIds ?? [])
 
   const unconfirmedByPlayer = new Map<number, { name: string; count: number }>()
   for (const lineup of visibleLineups) {
@@ -304,7 +312,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
 
   const tabLabel = activeTab === 'optimal'
     ? `Optimal — ${filterPlayer ? `${visibleOptimalLineups.length} / ${optimalInPortfolio.length}` : optimalInPortfolio.length} Lineup${optimalInPortfolio.length !== 1 ? 's' : ''}`
-    : `Portfolio — ${filterPlayer ? `${visibleLineups.length} / ${activeLineups.length}` : activeLineups.length} Lineup${activeLineups.length !== 1 ? 's' : ''}`
+    : `Portfolio — ${(filterPlayer || showUnconfirmedOnly) ? `${visibleLineups.length} / ${activeLineups.length}` : activeLineups.length} Lineup${activeLineups.length !== 1 ? 's' : ''}`
 
   return (
     <div className="portfolio-table-wrap">
@@ -490,6 +498,15 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
           {totalUnconfirmed === 0
             ? '✓ All lineup slots confirmed'
             : `✕ ${totalUnconfirmed} unconfirmed lineup slot${totalUnconfirmed !== 1 ? 's' : ''} across portfolio${breakdown}`}
+          {totalUnconfirmed > 0 && (
+            <button
+              className={`portfolio-unconfirmed-filter-btn${showUnconfirmedOnly ? ' portfolio-unconfirmed-filter-btn--active' : ''}`}
+              onClick={() => setFilterUnconfirmed(f => !f)}
+              title={showUnconfirmedOnly ? 'Show all lineups' : 'Show only lineups with unconfirmed players'}
+            >
+              {showUnconfirmedOnly ? 'Show all' : 'Filter'}
+            </button>
+          )}
         </div>
         <div className="portfolio-contest-controls">
           <button
