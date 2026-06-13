@@ -115,7 +115,13 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         // scope — their projections are lower quality but they still model the field.
         // Pitchers with partial_mean have only the wins market missing; they receive a
         // +1.5 pt adjustment and remain in the candidate pool.
-        const pitcherIds = players.filter(p => p.is_pitcher && p.player_id && p.partial_mean == null).map(p => p.player_id as number)
+        // On a partial fetch the event carries the full merged pitcher list; only
+        // auto-exclude pitchers from the games that were actually just fetched.
+        const includedTeams: string[] = (event.included_teams as string[] | undefined) ?? []
+        const pitcherIds = players
+          .filter(p => p.is_pitcher && p.player_id && p.partial_mean == null &&
+            (includedTeams.length === 0 || includedTeams.includes(p.team)))
+          .map(p => p.player_id as number)
         if (pitcherIds.length > 0) {
           fetchSlatePlayers().then(slate => {
             const player_scopes: Record<string, ExclusionScope> = {}

@@ -1807,6 +1807,25 @@ async def projections_fetch(request: Request):
             ]
             return sorted(low, key=lambda x: x["total"])
 
+        def _confirmed_not_in_batter_ids(pool_df: "pd.DataFrame", itm: dict[int, str]) -> set[int]:
+            """Batter PIDs whose team has announced its official lineup but who are absent from it.
+            Detected by: team has ≥1 slot_confirmed=True batter, but this batter is not confirmed."""
+            if "slot_confirmed" not in pool_df.columns or "lineup_slot" not in pool_df.columns:
+                return set()
+            batters = pool_df[pool_df["lineup_slot"] != 10].copy()
+            if batters.empty:
+                return set()
+            batters["_t"] = batters["player_id"].astype(int).map(lambda p: itm.get(p, ""))
+            conf_teams: set[str] = set(
+                batters.loc[batters["slot_confirmed"].astype(bool), "_t"].tolist()
+            ) - {""}
+            if not conf_teams:
+                return set()
+            unconf = batters.loc[
+                ~batters["slot_confirmed"].astype(bool) & batters["_t"].isin(conf_teams)
+            ]
+            return set(unconf["player_id"].astype(int).tolist())
+
         # Helper: write final merged_df to proj_path, handling partial merge.
         def _write_proj(merged_df: "pd.DataFrame") -> "str | None":
             out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
@@ -2152,6 +2171,13 @@ async def projections_fetch(request: Request):
                         proj_written = True
                         _copy_proj_to_mo_archive()
 
+                        _conf_not_in = _confirmed_not_in_batter_ids(pool, _itm)
+                        if _conf_not_in:
+                            fallback_players = [
+                                p for p in fallback_players
+                                if p.get("is_pitcher") or p.get("player_id") not in _conf_not_in
+                            ]
+
                         # Build capped_players, missing_opt_players, and team_name_warnings from sidecars.
                         mo_cap_data = _read_mo_caps()
                         mo_missing_opt_data = _read_mo_missing_opt()
@@ -2173,7 +2199,7 @@ async def projections_fetch(request: Request):
                                         "markets": cap_mkts,
                                     })
                             for opt_pid, opt_mkts in mo_missing_opt_data.items():
-                                if opt_pid in pid_to_name:
+                                if opt_pid in pid_to_name and opt_pid not in _conf_not_in:
                                     missing_opt_players.append({
                                         "name": pid_to_name[opt_pid],
                                         "team": _itm.get(opt_pid, ""),
@@ -2217,7 +2243,7 @@ async def projections_fetch(request: Request):
                         })
 
                         if fallback_players or capped_players or low_team_projs or missing_opt_players or team_name_warnings or heuristic_players:
-                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'heuristic_players': heuristic_players, 'team_name_warnings': team_name_warnings, 'timestamp': int(time.time() * 1000)})}\n\n"
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'heuristic_players': heuristic_players, 'team_name_warnings': team_name_warnings, 'included_teams': sorted(included_teams), 'timestamp': int(time.time() * 1000)})}\n\n"
                         elif result_event is None:
                             result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
 
@@ -2411,6 +2437,13 @@ async def projections_fetch(request: Request):
                         yield _log(f"Warning: {_stale_warn}")
                     proj_written = True
 
+                    _conf_not_in2 = _confirmed_not_in_batter_ids(pool, _itm2)
+                    if _conf_not_in2:
+                        fallback_players2 = [
+                            p for p in fallback_players2
+                            if p.get("is_pitcher") or p.get("player_id") not in _conf_not_in2
+                        ]
+
                     low_team_projs2 = _low_team_projections(pool, _itm2)
                     _total_batters2: dict[str, int] = {}
                     if "lineup_slot" in pool.columns:
@@ -2439,7 +2472,7 @@ async def projections_fetch(request: Request):
                     })
 
                     if fallback_players2 or low_team_projs2 or heuristic_players2:
-                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'heuristic_players': heuristic_players2, 'timestamp': int(time.time() * 1000)})}\n\n"
+                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'heuristic_players': heuristic_players2, 'included_teams': sorted(included_teams), 'timestamp': int(time.time() * 1000)})}\n\n"
                     else:
                         result_event2 = _log(f"All player projections sourced from {preferred_label}.")
 
