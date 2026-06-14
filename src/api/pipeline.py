@@ -309,13 +309,6 @@ class PipelineRunner:
             logger.info("Using configured target: %.1f DK pts", target)
             self._cb("compute_target", {"target": target, "percentile": None})
 
-        # --- Reference score distribution for target/stats ---------------------
-        score_dist = self._best_lineup_score_distribution(
-            cand_players_df, sim_results, rules=roster_rules, slot_eligibility=slot_elig
-        )
-        fixed_ref_p90 = float(np.percentile(score_dist, 90))
-        fixed_ref_p99 = float(np.percentile(score_dist, 99))
-
         # --- Compute ownership vector -------------------------------------------
         from src.optimization.ownership import (
             apply_ownership_calibration,
@@ -380,22 +373,6 @@ class PipelineRunner:
         # Store simulation artifacts for post-run operations (lineup replacement).
         self._sim_results = sim_results
         self._players_df = cand_players_df
-        self._target = target
-        self._ownership_vector = ownership_vector
-        self._optimizer_kwargs_replace = dict(
-            n_chains=int(opt_cfg.get("n_chains", 250)),
-            temperature=float(opt_cfg.get("temperature", 0.1)),
-            n_steps=int(opt_cfg.get("n_steps", 100)),
-            niter_success=int(opt_cfg.get("niter_success", 25)),
-            n_workers=int(opt_cfg.get("n_workers", 1)),
-            rng_seed=opt_cfg.get("rng_seed"),
-            early_stopping_window=int(opt_cfg.get("early_stopping_window", 25)),
-            early_stopping_threshold=float(opt_cfg.get("early_stopping_threshold", 0.001)),
-            salary_floor=float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None,
-            ownership_vector=ownership_vector,
-            rules=roster_rules,
-            slot_eligibility=slot_elig,
-        )
 
         # --- Construct portfolio ----------------------------------------
         config_size = int(port_cfg.get("size", 20))
@@ -454,7 +431,7 @@ class PipelineRunner:
         # marginal-EV greedy selection.
         # ----------------------------------------------------------------
         from src.optimization.candidate_generator import CandidateGenerator
-        from src.optimization.gpp_portfolio import ContestScorer, EVPortfolioSelector
+        from src.optimization.gpp_portfolio import ContestScorer
 
         def _candidate_team_distribution(cands, players_df):
             """Return {team: count} of unambiguous 4/5-hitter primary stacks."""

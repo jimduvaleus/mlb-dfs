@@ -1,18 +1,9 @@
 """GPP portfolio construction via candidate scoring and simulation-coverage selection.
 
-Two-stage pipeline for the `leverage_surplus` objective:
-
-  ContestScorer   — scores each candidate against K simulated opponent fields,
-                    returning a robust_payout matrix (M × n_sims) that averages
-                    over field compositions to reduce overfitting.
-
-  MeanVariancePortfolioSelector — assembles a portfolio via simulated annealing
-                                   on the (M × n_sims) robust_payout matrix.
-                                   Objective: mean(sum_k payout_k) - alpha * std(sum_k payout_k)
-                                   where alpha = (10 - risk) / 10. Risk=0 (Shaidy default)
-                                   maximises diversity; risk=10 maximises concentration.
-
-  EVPortfolioSelector — legacy greedy coverage-based selector (preserved for reference).
+  ContestScorer                — scores each candidate against K simulated opponent fields,
+                                 returning a robust_payout matrix (M × n_sims).
+  DeterminantPortfolioSelector — greedy portfolio assembly via incremental determinant
+                                 maximisation, balancing EV and lineup diversity.
 
 Performance notes
 -----------------
@@ -181,7 +172,6 @@ class ContestScorer:
         self._preloaded_field = preloaded_field
         # Populated after score_candidates() for use by the coverage selector.
         self.last_field_sorted: Optional[np.ndarray] = None
-        self.last_col_lineups: Optional[np.ndarray] = None
         self.last_raw_field_list: Optional[list[np.ndarray]] = None
         # Per-sample sorted fields, retained so score_batch() can score
         # additional candidates against the exact same fields.
@@ -247,8 +237,7 @@ class ContestScorer:
 
         Side effects
         ------------
-        Sets self.last_field_sorted (n_sims × N_field float32, field sample 0)
-        and self.last_col_lineups (M × 10 int32) for use by EVPortfolioSelector.
+        Sets self.last_raw_field_list for field caching.
         """
         n_sims = self._sim_matrix.shape[0]
         _t_phase = time.perf_counter()
@@ -314,7 +303,6 @@ class ContestScorer:
         _t_col = time.perf_counter()
         M = len(candidates)
         col_lineups = self._build_col_lineups(candidates)  # (M, 10) int32
-        self.last_col_lineups = col_lineups
         logger.info("[TIMING] _build_col_lineups M=%d: %.3fs", M, time.perf_counter() - _t_col)
 
         _t_scoring = time.perf_counter()
@@ -339,8 +327,7 @@ class ContestScorer:
 
         Used by candidate-pool refinement: mutants must be scored against the
         exact same K field samples as the original pool so their robust_payout
-        rows are directly comparable. Appends the new candidates' column
-        lineups to last_col_lineups to keep coverage consumers consistent.
+        rows are directly comparable.
 
         Returns robust_payout of shape (len(candidates), n_sims) float32.
         """
@@ -348,12 +335,7 @@ class ContestScorer:
             raise RuntimeError("score_batch() requires a prior score_candidates() call.")
 
         col_lineups = self._build_col_lineups(candidates)
-        robust_payout = self._score_col_lineups(col_lineups, progress_cb, stop_check)
-        if self.last_col_lineups is not None:
-            self.last_col_lineups = np.concatenate(
-                [self.last_col_lineups, col_lineups], axis=0
-            )
-        return robust_payout
+        return self._score_col_lineups(col_lineups, progress_cb, stop_check)
 
     def _score_col_lineups(
         self,
@@ -445,228 +427,6 @@ class ContestScorer:
         return np.ascontiguousarray(np.sort(field_scores, axis=1))
 
 
-
-# ------------------------------------------------------------------ #
-#  EVPortfolioSelector                                                 #
-# ------------------------------------------------------------------ #
-
-class EVPortfolioSelector:
-    """Simulation-coverage portfolio selection from a pre-scored candidate pool.
-
-    Round 0: pick the candidate with the highest mean EV across all sims.
-    Round k: pick the candidate with the highest mean EV on sims not yet
-             "covered" by any prior lineup.
-
-    A sim is covered when the selected lineup beats ≥ coverage_percentile
-    fraction of the field in that sim, as reported by beat_rate_fn.
-
-    Parameters
-    ----------
-    robust_payout : (M, n_sims) float32 from ContestScorer.score_candidates()
-    candidates : list of M Lineup objects (same order as robust_payout rows)
-    portfolio_size : number of lineups to select
-    holdout_fraction : fraction of sims held out for OOS evaluation (0 = disabled)
-    rng_seed : used only to split train/holdout sims reproducibly
-    """
-
-    def __init__(
-        self,
-        robust_payout: np.ndarray,
-        candidates: list[Lineup],
-        portfolio_size: int = 10,
-        holdout_fraction: float = 0.0,
-        rng_seed: Optional[int] = None,
-    ) -> None:
-        self._M = len(candidates)
-        self._candidates = candidates
-        self._portfolio_size = min(portfolio_size, self._M)
-        self._robust_payout = np.ascontiguousarray(
-            robust_payout.astype(np.float32)
-        )  # (M, n_sims)
-
-        n_sims = robust_payout.shape[1]
-        if holdout_fraction > 0.0:
-            rng = np.random.default_rng(rng_seed)
-            perm = rng.permutation(n_sims)
-            n_holdout = max(1, int(n_sims * holdout_fraction))
-            self._train_idx = np.sort(perm[n_holdout:]).astype(np.int64)
-            self._holdout_idx = np.sort(perm[:n_holdout]).astype(np.int64)
-        else:
-            self._train_idx = np.arange(n_sims, dtype=np.int64)
-            self._holdout_idx = np.array([], dtype=np.int64)
-
-        self._selected_indices: list[int] = []
-        self._best_payout_train: Optional[np.ndarray] = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def select(
-        self,
-        progress_cb: Optional[Callable[[int, int, float, int, float], None]] = None,
-        stop_check: Optional[Callable[[], bool]] = None,
-        beat_rate_fn: Optional[Callable[[int], np.ndarray]] = None,
-        coverage_percentile: float = 0.5,
-    ) -> list[tuple[Lineup, float]]:
-        """Run simulation-coverage selection.
-
-        Parameters
-        ----------
-        progress_cb : optional callable(round_k, candidate_index, lineup_ev,
-                      n_covered, pct_covered)
-        beat_rate_fn : callable(candidate_idx) -> (n_sims,) float32 in [0, 1].
-                       Returns fraction of field lineups beaten per sim for the
-                       given candidate. Required for coverage tracking; if None,
-                       all sims remain active every round (first-lineup-only coverage).
-        coverage_percentile : sim is marked covered when beat_rate >= this value.
-
-        Returns
-        -------
-        list of (Lineup, lineup_ev) tuples in selection order, where lineup_ev
-        is the mean robust_payout on uncovered sims at the time of selection.
-        """
-        # Avoid a redundant copy of robust_payout when there is no holdout split.
-        # Fancy indexing with np.arange(n) always materialises a full copy; skip it
-        # when train_idx covers the whole matrix.
-        n_sims_total = self._robust_payout.shape[1]
-        if len(self._train_idx) == n_sims_total:
-            train_payout = self._robust_payout          # view — no copy
-        else:
-            train_payout = self._robust_payout[:, self._train_idx]  # (M, n_train)
-        n_train = train_payout.shape[1]
-        logger.info(
-            "[TIMING] EVPortfolioSelector.select() start — train_payout shape %s (%.1f MB)",
-            train_payout.shape, train_payout.nbytes / 1e6,
-        )
-
-        selected: list[tuple[Lineup, float]] = []
-        selected_pid_sets: list[frozenset] = []
-        remaining = np.arange(self._M, dtype=np.int32)
-
-        # active_mask tracks which train-split sims are not yet covered.
-        active_mask = np.ones(n_train, dtype=bool)
-        n_covered = 0
-
-        # Incremental EV: precompute the per-candidate sum over all train sims once,
-        # then subtract covered-sim contributions as coverage accrues.  Each round
-        # becomes O(M) instead of O(M × n_active), avoiding repeated 1800 MB copies.
-        _t_setup = time.perf_counter()
-        _ev_sum_all = train_payout.sum(axis=1).astype(np.float64)  # (M,) immutable baseline
-        _ev_sum = _ev_sum_all.copy()                                # (M,) mutable running sum
-        _n_active = float(n_train)
-        logger.info("[TIMING] ev_sum precompute: %.3fs", time.perf_counter() - _t_setup)
-
-        _t_select_start = time.perf_counter()
-        _t_ev_total = 0.0
-        _t_beat_total = 0.0
-
-        for k in range(self._portfolio_size):
-            if len(remaining) == 0:
-                break
-
-            # EV per round: O(M) — just index the running sum vector.
-            _t_ev = time.perf_counter()
-            n_active = int(_n_active)
-            if _n_active > 0:
-                ev = (_ev_sum[remaining] / _n_active).astype(np.float32)
-            else:
-                # All sims covered: fall back to global mean as tiebreaker.
-                ev = (_ev_sum_all[remaining] / float(n_train)).astype(np.float32)
-            _dt_ev = time.perf_counter() - _t_ev
-            _t_ev_total += _dt_ev
-
-            # Walk candidates in descending EV order, skipping duplicates.
-            order = np.argsort(ev)[::-1]
-            lineup = None
-            best_local = -1
-            best_global = -1
-            lineup_ev = 0.0
-            for rank_pos in order:
-                cand_local = int(rank_pos)
-                cand_global = int(remaining[cand_local])
-                cand = self._candidates[cand_global]
-                pid_set = frozenset(cand.player_ids)
-                if pid_set in selected_pid_sets:
-                    logger.warning(
-                        "Round %d: candidate %d is a duplicate; skipping.", k, cand_global
-                    )
-                    remaining = np.delete(remaining, cand_local)
-                    # Shift remaining order indices after deletion.
-                    order = order[order != rank_pos]
-                    order = np.where(order > cand_local, order - 1, order)
-                    continue
-                lineup = cand
-                best_local = cand_local
-                best_global = cand_global
-                lineup_ev = float(ev[rank_pos])
-                break
-
-            if lineup is None or len(remaining) == 0:
-                break
-
-            selected.append((lineup, lineup_ev))
-            selected_pid_sets.append(frozenset(lineup.player_ids))
-            self._selected_indices.append(best_global)
-            remaining = np.delete(remaining, best_local)
-
-            # Mark sims covered by this lineup and update running EV sum.
-            _t_beat = time.perf_counter()
-            if beat_rate_fn is not None:
-                beat_rates = beat_rate_fn(best_global)  # (n_sims,) float32
-                # beat_rates is over the full sim set; index into train split.
-                beat_rates_train = beat_rates[self._train_idx]
-                newly_covered = active_mask & (beat_rates_train >= coverage_percentile)
-                if newly_covered.any():
-                    # Subtract newly covered sims from running sum: O(M × n_newly_covered)
-                    # rather than recomputing the full O(M × n_active) slice next round.
-                    covered_idx = np.where(newly_covered)[0]
-                    _ev_sum -= train_payout[:, covered_idx].sum(axis=1).astype(np.float64)
-                    active_mask[newly_covered] = False
-                    _n_active = float(int(active_mask.sum()))
-                n_covered = int((~active_mask).sum())
-            _dt_beat = time.perf_counter() - _t_beat
-            _t_beat_total += _dt_beat
-
-            pct_covered = n_covered / n_train * 100
-            logger.info(
-                "  Round %d: lineup_ev=%.4f, covered=%d/%d (%.1f%%) | "
-                "ev_compute=%.3fs (n_active=%d), beat_rate=%.3fs",
-                k, lineup_ev, n_covered, n_train, pct_covered,
-                _dt_ev, n_active, _dt_beat,
-            )
-
-            if progress_cb is not None:
-                progress_cb(k, best_global, lineup_ev, n_covered, pct_covered)
-            if stop_check is not None and stop_check():
-                logger.info("EVPortfolioSelector: stop requested after round %d.", k)
-                break
-
-        _t_select_total = time.perf_counter() - _t_select_start
-        logger.info(
-            "[TIMING] EVPortfolioSelector.select() done — total=%.3fs, "
-            "ev_compute_total=%.3fs, beat_rate_total=%.3fs, other=%.3fs",
-            _t_select_total, _t_ev_total, _t_beat_total,
-            _t_select_total - _t_ev_total - _t_beat_total,
-        )
-
-        self._best_payout_train = np.zeros(n_train, dtype=np.float32)
-        return selected
-
-    def holdout_score(self) -> Optional[float]:
-        """Mean payout on held-out sims for the selected portfolio.
-
-        Returns None if holdout_fraction was 0 or select() has not been called.
-        """
-        if len(self._holdout_idx) == 0 or not self._selected_indices:
-            return None
-        holdout_payout = self._robust_payout[self._selected_indices[0], self._holdout_idx]
-        for idx in self._selected_indices[1:]:
-            holdout_payout = np.maximum(
-                holdout_payout,
-                self._robust_payout[idx, self._holdout_idx],
-            )
-        return float(holdout_payout.mean())
 
 
 # ------------------------------------------------------------------ #
