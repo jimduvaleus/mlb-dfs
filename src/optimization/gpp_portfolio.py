@@ -304,18 +304,11 @@ class ContestScorer:
 
         logger.info("[TIMING] Total field phase: %.3fs", time.perf_counter() - _t_phase)
 
-        # Combine all K field samples into one sorted pool for coverage computation.
-        # Beat rate = fraction of K×N field lineups beaten, consistent with how
-        # robust_payout averages payout across the same K samples.
-        _t_concat = time.perf_counter()
-        self.last_field_sorted = np.sort(
-            np.concatenate(field_sorted_list, axis=1), axis=1
-        )  # (n_sims, K * N_field)
-        logger.info(
-            "[TIMING] concat+sort field_sorted %s: %.3fs",
-            self.last_field_sorted.shape, time.perf_counter() - _t_concat,
-        )
-
+        # last_field_sorted (combined K-sample sorted pool) was used by the legacy
+        # EVPortfolioSelector which is no longer active. Skip the concat+sort to
+        # avoid a ~1.4 GB peak allocation (K*N_field float32) on top of the already
+        # large _field_sorted_list and robust_payout.
+        self.last_field_sorted = None
         self._field_sorted_list = field_sorted_list
 
         _t_col = time.perf_counter()

@@ -270,7 +270,10 @@ class PipelineRunner:
             quantile_grids=quantile_grids,
         )
         sim_results = engine.simulate(n_sims)
-        logger.info("Simulation complete — matrix: %s", sim_results.results_matrix.shape)
+        logger.info(
+            "Simulation complete — matrix: %s  RSS=%.0f MB",
+            sim_results.results_matrix.shape, _proc_rss_mb(),
+        )
 
         # --- PPD zeroing ------------------------------------------------
         if game_ppd_pcts:
@@ -793,6 +796,7 @@ class PipelineRunner:
                 cand_excluded_player_ids=_cand_excluded_pids,
                 preloaded_field=_cached_field,
             )
+            logger.info("Pre-scoring RSS: %.0f MB  (candidates=%d)", _proc_rss_mb(), len(candidates))
             _t_score = time.perf_counter()
             candidates, robust_payout = scorer.score_candidates(
                 candidates,
@@ -808,10 +812,10 @@ class PipelineRunner:
             )
             logger.info(
                 "[TIMING] score_candidates wall time: %.3fs  "
-                "robust_payout shape=%s (%.1f MB)  field_from_cache=%s",
+                "robust_payout shape=%s (%.1f MB)  field_from_cache=%s  RSS=%.0f MB",
                 time.perf_counter() - _t_score,
                 robust_payout.shape, robust_payout.nbytes / 1e6,
-                _cached_field is not None,
+                _cached_field is not None, _proc_rss_mb(),
             )
             if _cached_field is None and scorer.last_raw_field_list and _slate_fp:
                 save_field(_slate_fp, scorer.last_raw_field_list)
@@ -916,6 +920,11 @@ class PipelineRunner:
                 for _round in range(refine_rounds):
                     if _gpp_stopped and self._stop_check():
                         break
+                    logger.info(
+                        "Refine round %d/%d start  RSS=%.0f MB  pool=%d  robust_payout=%.0f MB",
+                        _round + 1, refine_rounds, _proc_rss_mb(),
+                        len(candidates), robust_payout.nbytes / 1e6,
+                    )
                     _ev_means_r, _ev_hold_r = _refine_ev_means(robust_payout)
                     _parents: list = []
                     _parent_idx: list[int] = []
@@ -942,8 +951,16 @@ class PipelineRunner:
                             _round + 1, refine_rounds,
                         )
                         break
+                    logger.info(
+                        "Refine round %d/%d pre-score_batch  RSS=%.0f MB  mutants=%d",
+                        _round + 1, refine_rounds, _proc_rss_mb(), len(_mutants),
+                    )
                     _payout_new = scorer.score_batch(
                         _mutants, stop_check=self._stop_check
+                    )
+                    logger.info(
+                        "Refine round %d/%d post-score_batch  RSS=%.0f MB  payout_new=%.0f MB",
+                        _round + 1, refine_rounds, _proc_rss_mb(), _payout_new.nbytes / 1e6,
                     )
 
                     # Round telemetry: what did mutation change, and does
@@ -970,8 +987,19 @@ class PipelineRunner:
                     )
 
                     candidates = candidates + _mutants
+                    logger.info(
+                        "Refine round %d/%d pre-concat  RSS=%.0f MB  "
+                        "robust_payout=%.0f MB  payout_new=%.0f MB",
+                        _round + 1, refine_rounds, _proc_rss_mb(),
+                        robust_payout.nbytes / 1e6, _payout_new.nbytes / 1e6,
+                    )
                     robust_payout = np.concatenate(
                         [robust_payout, _payout_new], axis=0
+                    )
+                    del _payout_new
+                    logger.info(
+                        "Refine round %d/%d post-concat  RSS=%.0f MB  robust_payout=%.0f MB",
+                        _round + 1, refine_rounds, _proc_rss_mb(), robust_payout.nbytes / 1e6,
                     )
                     _ev_means_after, _ev_hold_after = _refine_ev_means(robust_payout)
                     _best_ev = float(robust_payout.mean(axis=1).max())
@@ -1041,7 +1069,7 @@ class PipelineRunner:
                 # Phase 3: Det-EV portfolio selection
                 # Scorer is no longer needed; drop its large field arrays (~600-1200 MB)
                 # before the sweep allocates the M×M correlation matrix.
-                for _attr in ("_field_sorted_list", "last_field_sorted", "last_raw_field_list"):
+                for _attr in ("_field_sorted_list", "last_raw_field_list"):
                     try:
                         setattr(scorer, _attr, None)
                     except Exception:
