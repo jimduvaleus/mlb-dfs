@@ -337,6 +337,21 @@ def _load_persisted_optimal_lineups() -> None:
 
 
 @app.on_event("startup")
+def _reset_stale_twitter_lineups() -> None:
+    """Invalidate any locked lineups that belong to a different slate.
+
+    Runs eagerly on startup so a DKSalaries.csv swap takes effect immediately
+    rather than waiting for the first API request.
+    """
+    try:
+        fp = _slate_fingerprint()
+        if fp:
+            load_twitter_lineups(fp)  # triggers clear-and-save if fingerprint changed
+    except Exception:
+        pass
+
+
+@app.on_event("startup")
 def _start_dbus_monitor() -> None:
     _load_notifications()
     threading.Thread(target=_dbus_monitor_loop, daemon=True).start()
@@ -366,11 +381,17 @@ def get_notifications():
     with _notifications_lock:
         items = list(_notifications)
     items.sort(key=lambda n: n['captured_at'], reverse=True)
+    # A notification belongs to the current slate if it was captured after the slate
+    # file was last modified.  Notifications captured before the slate was replaced
+    # contain lineup assignments for a different day and must not auto-confirm.
+    slate_path = _get_slate_file_path()
+    slate_mtime: float = slate_path.stat().st_mtime if slate_path else 0.0
     return [
         {
             **n,
             'could_be_lineup': looks_like_lineup(n.get('body', '')),
             'lineup_team': extract_lineup_team(n.get('body', '')),
+            'is_current_slate': n.get('captured_at', 0) >= slate_mtime,
         }
         for n in items
     ]

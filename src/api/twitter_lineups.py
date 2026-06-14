@@ -214,7 +214,11 @@ def load_twitter_lineups(slate_fingerprint: str = "") -> list[dict]:
         lineups = raw.get("lineups", [])
         stored_fp = raw.get("slate_fingerprint", "")
 
-    if slate_fingerprint and stored_fp and slate_fingerprint != stored_fp:
+    # Reset whenever we have a current fingerprint and the stored one doesn't match.
+    # Treating stored_fp="" as a mismatch ensures lineups saved without a fingerprint
+    # (old format or empty slate path at save time) are always cleared on the next
+    # slate change, rather than silently surviving across slates.
+    if slate_fingerprint and slate_fingerprint != stored_fp:
         save_twitter_lineups([], slate_fingerprint=slate_fingerprint)
         return []
 

@@ -518,6 +518,7 @@ export interface TwitterNotification {
   captured_at: number
   could_be_lineup?: boolean
   lineup_team?: string | null
+  is_current_slate?: boolean
 }
 
 export interface PlayerMatch {

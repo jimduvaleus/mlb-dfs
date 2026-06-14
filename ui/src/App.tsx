@@ -162,6 +162,9 @@ export default function App() {
 
   // Attempt to auto-parse a notification silently. Dismisses it if successful.
   async function autoParseNotification(notif: TwitterNotification): Promise<boolean> {
+    // Notifications captured before the current DKSalaries.csv was placed contain
+    // lineup assignments for a different slate — never auto-confirm them.
+    if (notif.is_current_slate === false) return false
     try {
       const result = await parseTwitterLineup(notif.id, notif.body)
       if (!canAutoConfirm(result)) return false
