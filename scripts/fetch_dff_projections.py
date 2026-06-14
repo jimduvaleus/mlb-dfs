@@ -728,6 +728,11 @@ def _archive_dff_slate(
     try:
         archive_dir = PROJECT_ROOT / "archive" / _date_to_archive_dir(target_date)
         archive_dir.mkdir(parents=True, exist_ok=True)
+        _dk_src = PROJECT_ROOT / "data" / "raw" / "DKSalaries.csv"
+        _dk_dst = archive_dir / "DKSalaries.csv"
+        if _dk_src.exists() and not _dk_dst.exists():
+            import shutil as _shutil
+            _shutil.copy2(_dk_src, _dk_dst)
 
         # Archive the full player projection data including proj_score / game_ou.
         archive_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot",

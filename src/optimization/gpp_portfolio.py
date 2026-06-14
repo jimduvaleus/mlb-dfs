@@ -706,7 +706,7 @@ class DeterminantPortfolioSelector:
     robust_payout : (M, n_sims) float32 — net dollar payout per candidate per sim
     candidates    : list of M Lineup objects (same ordering as robust_payout rows)
     portfolio_size : number of lineups to select
-    risk          : 0 = maximise diversity (DEw=0.9), 10 = maximise EV (EVw=0.9)
+    risk          : 1 = diversity-heavy (EVw=0.05, DEw=0.95), 5 = EV-heavy (EVw=0.45, DEw=0.55)
     """
 
     def __init__(
@@ -720,8 +720,8 @@ class DeterminantPortfolioSelector:
         self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
         self._candidates = candidates
         self._portfolio_size = portfolio_size
-        # EVw = 0.05 at risk=1, 0.25 at risk=5
-        self._evw = float(np.clip(risk * 0.05, 0.0, 1.0))
+        # EVw = 0.05 at risk=1, 0.45 at risk=5  (step +0.10 per level)
+        self._evw = float(np.clip(0.05 + (risk - 1) * 0.1, 0.0, 1.0))
         self._dew = 1.0 - self._evw
 
     # ------------------------------------------------------------------
@@ -753,15 +753,20 @@ class DeterminantPortfolioSelector:
         pool_ev_vals = pool_ev[pool_idx].astype(np.float64)  # (M_pool,)
 
         # --- Precompute normalised payout matrix and full correlation matrix ---
+        # Memory budget: pool_payout (M×S×8) → norm_payout reuses the same buffer →
+        # matmul peak is norm_payout(M×S×8) + result(M×M×8). /= avoids a second M×M
+        # allocation. Old code called .astype(float64) twice on a float32 norm_payout,
+        # creating two extra M×S×8 temporaries simultaneously (≈1.2 GB wasted at peak).
         _t = time.perf_counter()
         pool_payout = self._robust_payout[pool_idx].astype(np.float64)  # (M_pool, n_sims)
         mu = pool_payout.mean(axis=1, keepdims=True)
         std = pool_payout.std(axis=1, keepdims=True)
         std = np.where(std < 1e-8, 1.0, std)
-        norm_payout = ((pool_payout - mu) / std).astype(np.float32)  # keep float32 for matmul speed
-        del pool_payout
+        norm_payout = (pool_payout - mu) / std  # float64; skip float32 round-trip
+        del pool_payout, mu, std
 
-        corr_matrix = (norm_payout.astype(np.float64) @ norm_payout.astype(np.float64).T) / n_sims
+        corr_matrix = norm_payout @ norm_payout.T  # single float64 copy during matmul
+        corr_matrix /= n_sims                       # in-place: no second M×M allocation
         corr_matrix = corr_matrix.astype(np.float32)
         del norm_payout
 

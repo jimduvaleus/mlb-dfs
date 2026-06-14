@@ -4,6 +4,7 @@ PipelineRunner — wraps the main.py pipeline with progress callbacks.
 Emits callback events at each pipeline stage so the API can forward them
 as SSE events to the browser.
 """
+import gc
 import json
 import logging
 import os
@@ -26,6 +27,18 @@ from src.simulation.engine import SimulationEngine
 from src.simulation.results import SimulationResults
 
 logger = logging.getLogger(__name__)
+
+
+def _proc_rss_mb() -> float:
+    """Return current process RSS in MB (Linux /proc; 0.0 on failure)."""
+    try:
+        with open("/proc/self/status") as _f:
+            for _line in _f:
+                if _line.startswith("VmRSS:"):
+                    return int(_line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
 
 
 def _extract_upload_tag(filename: str) -> str:
@@ -1026,6 +1039,16 @@ class PipelineRunner:
                 portfolio = []
             else:
                 # Phase 3: Det-EV portfolio selection
+                # Scorer is no longer needed; drop its large field arrays (~600-1200 MB)
+                # before the sweep allocates the M×M correlation matrix.
+                for _attr in ("_field_sorted_list", "last_field_sorted", "last_raw_field_list"):
+                    try:
+                        setattr(scorer, _attr, None)
+                    except Exception:
+                        pass
+                gc.collect()
+                logger.info("Pre-sweep RSS: %.0f MB", _proc_rss_mb())
+
                 _t_select = time.perf_counter()
                 _portfolio_sweep_raw: list[tuple[float, list]] = []  # [(risk, raw_portfolio)]
 
@@ -1042,11 +1065,12 @@ class PipelineRunner:
                 for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
                     if self._stop_check is not None and self._stop_check():
                         break
-                    _evw = _sweep_risk * 0.05
+                    _evw = 0.05 + (_sweep_risk - 1) * 0.1
+                    _rss_mb = _proc_rss_mb()
                     logger.info(
-                        "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)",
+                        "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)  RSS=%.0f MB",
                         _risk_idx + 1, len(_DET_SWEEP_RISKS),
-                        _sweep_risk, _evw, 1.0 - _evw,
+                        _sweep_risk, _evw, 1.0 - _evw, _rss_mb,
                     )
                     self._cb("gpp_det_risk_start", {
                         "risk": _sweep_risk,
@@ -1067,6 +1091,12 @@ class PipelineRunner:
                         ),
                     )
                     _portfolio_sweep_raw.append((_sweep_risk, _det_result))
+                    del _det_sel
+                    gc.collect()
+                    logger.info(
+                        "Det-EV risk %.0f done  RSS=%.0f MB",
+                        _sweep_risk, _proc_rss_mb(),
+                    )
 
                 # Reorder all sweep portfolios by entry-fee-weighted diversity now,
                 # so the ordering is final from the outset and never needs to be

@@ -2101,6 +2101,11 @@ def _archive_team_totals(slate_path: str, team_totals: dict[str, float]) -> None
             return
         archive_dir = PROJECT_ROOT / "archive" / _date_to_archive_dir(slate_date)
         archive_dir.mkdir(parents=True, exist_ok=True)
+        _dk_src = PROJECT_ROOT / "data" / "raw" / "DKSalaries.csv"
+        _dk_dst = archive_dir / "DKSalaries.csv"
+        if _dk_src.exists() and not _dk_dst.exists():
+            import shutil as _shutil
+            _shutil.copy2(_dk_src, _dk_dst)
         dest = archive_dir / "team_totals.csv"
         existing: dict[str, float] = {}
         if dest.exists():
@@ -2127,6 +2132,10 @@ def _archive_market_odds_slate(slate_path: str, proj_df: pd.DataFrame) -> None:
             return
         archive_dir = PROJECT_ROOT / "archive" / _date_to_archive_dir(slate_date)
         archive_dir.mkdir(parents=True, exist_ok=True)
+        _dk_src = PROJECT_ROOT / "data" / "raw" / "DKSalaries.csv"
+        _dk_dst = archive_dir / "DKSalaries.csv"
+        if _dk_src.exists() and not _dk_dst.exists():
+            shutil.copy2(_dk_src, _dk_dst)
         dest = archive_dir / "market_odds_projections.csv"
         proj_df.to_csv(dest, index=False)
         log.info("Archived market odds projections → %s", dest)
