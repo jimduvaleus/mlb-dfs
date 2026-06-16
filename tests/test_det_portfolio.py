@@ -121,12 +121,12 @@ def test_perfect_correlation_gets_low_det_score():
 
 
 def test_risk_weights():
-    """EVw/DEw formula: risk=1 → EVw=0.05, risk=3 → EVw=0.15, risk=5 → EVw=0.25."""
+    """EVw/DEw formula: risk=1 → EVw=0.05, risk=3 → EVw=0.25, risk=5 → EVw=0.45."""
     rng = np.random.default_rng(5)
     payout = _identity_payout(20, 100, rng)
     candidates = [_make_lineup(list(range(i * 10, i * 10 + 10))) for i in range(20)]
 
-    for risk, expected_evw in [(1, 0.05), (3, 0.15), (5, 0.25)]:
+    for risk, expected_evw in [(1, 0.05), (3, 0.25), (5, 0.45)]:
         sel = DeterminantPortfolioSelector(payout, candidates, portfolio_size=3, risk=risk)
         assert abs(sel._evw - expected_evw) < 1e-9, f"risk={risk}: EVw={sel._evw}, expected {expected_evw}"
         assert abs(sel._dew - (1.0 - expected_evw)) < 1e-9

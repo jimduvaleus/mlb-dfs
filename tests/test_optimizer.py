@@ -1,9 +1,5 @@
 """
-Tests for Phase 3: Basin-Hopping Optimizer.
-
-Covers Lineup constraint validation, score computation, and the full
-BasinHoppingOptimizer (random lineup generation, mutation, local search,
-and end-to-end optimize()).
+Tests for lineup validation, score computation, and player metadata helpers.
 """
 import numpy as np
 import pandas as pd
@@ -15,7 +11,7 @@ from src.optimization.lineup import (
     SALARY_CAP,
     MAX_HITTERS_PER_TEAM,
 )
-from src.optimization.optimizer import BasinHoppingOptimizer, _build_player_meta
+from src.optimization.optimizer import _build_player_meta
 from src.simulation.results import SimulationResults
 
 
@@ -139,58 +135,6 @@ def test_lineup_two_pitchers_same_team_invalid(player_meta):
     assert not Lineup(ids).is_valid(player_meta)
 
 
-def test_local_search_no_two_pitchers_same_team(players_df, sim_results):
-    """Local search fast path must not produce lineups with two pitchers from the same team.
-
-    The fast-path delta checker tracks constraints incrementally instead of calling
-    is_valid on every candidate.  This test verifies the same-team pitcher check is
-    enforced there by introducing a highly-valued same-team pitcher that would be
-    chosen greedily if the constraint were missing.
-    """
-    # Add an extra pitcher from team B (same as P1 and P3) with astronomically high
-    # simulated scores so that the local search is strongly tempted to swap it in.
-    # A valid starting lineup uses P20(A) + P21(C); swapping P21 → new B pitcher
-    # would violate the constraint (P20 is A, new pitcher is B — actually fine).
-    # Instead: start with P1(B) + P2(D); add extra P_B2(B) with huge scores so the
-    # local search wants to swap P2(D) → P_B2(B).  That would give two B pitchers.
-    extra_pid = 99  # second team-B pitcher
-    extra_row = pd.DataFrame([_make_player(extra_pid, 'P', 8000, 'B', 'A@B')])
-    extended_df = pd.concat([players_df, extra_row], ignore_index=True)
-
-    n_pids = len(extended_df)
-    rng_np = np.random.default_rng(0)
-    matrix = rng_np.uniform(0, 5, size=(sim_results.n_sims, n_pids)).astype(np.float64)
-    # extra_pid is the last column; give it an absurdly high score so local
-    # search always wants to include it.
-    matrix[:, -1] = 9999.0
-
-    extended_results = SimulationResults(
-        player_ids=extended_df['player_id'].tolist(),
-        results_matrix=matrix,
-    )
-    opt = BasinHoppingOptimizer(
-        sim_results=extended_results,
-        players_df=extended_df,
-        target=10000.0,  # unreachable → every marginal gain matters
-        n_chains=5,
-        n_steps=20,
-        rng_seed=3,
-        ownership_vector=np.ones(len(extended_results.player_ids)) / len(extended_results.player_ids),
-    )
-    runner = opt._runner
-    pm = _build_player_meta(extended_df)
-    rng = np.random.default_rng(3)
-    for _ in range(30):
-        lineup = runner._random_valid_lineup(rng)
-        cols = [opt.col_map[pid] for pid in lineup.player_ids]
-        totals = opt.sim_matrix[:, cols].sum(axis=1)
-        result, _ = runner._local_search(lineup, totals, rng)
-        pitcher_teams = [pm[pid]['team'] for pid in result.player_ids if pm[pid]['position'] == 'P']
-        assert len(set(pitcher_teams)) == 2, (
-            f"Two pitchers from same team {pitcher_teams} in lineup {result.player_ids}"
-        )
-
-
 def test_lineup_pitcher_opposing_constraint_skipped_without_opponent_info():
     # When opponent key is absent from meta the check is skipped (analogous to game check)
     positions = ['P', 'P', 'C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']
@@ -264,127 +208,6 @@ def test_lineup_score_fraction(sim_results):
 
 
 # ------------------------------------------------------------------ #
-#  BasinHoppingOptimizer internals                                     #
-# ------------------------------------------------------------------ #
-
-def make_optimizer(sim_results, players_df, target=100.0, n_chains=3, n_steps=10):
-    ownership_vector = np.ones(len(sim_results.player_ids)) / len(sim_results.player_ids)
-    return BasinHoppingOptimizer(
-        sim_results=sim_results,
-        players_df=players_df,
-        target=target,
-        n_chains=n_chains,
-        temperature=0.05,
-        n_steps=n_steps,
-        rng_seed=42,
-        ownership_vector=ownership_vector,
-    )
-
-
-def test_random_valid_lineup(sim_results, players_df, player_meta):
-    opt = make_optimizer(sim_results, players_df)
-    rng = np.random.default_rng(0)
-    for _ in range(10):
-        lineup = opt._runner._random_valid_lineup(rng)
-        assert isinstance(lineup, Lineup)
-        assert len(lineup.player_ids) == 10
-        assert lineup.is_valid(player_meta)
-
-
-def test_mutate_preserves_validity(sim_results, players_df, player_meta):
-    opt = make_optimizer(sim_results, players_df)
-    rng = np.random.default_rng(1)
-    lineup = opt._runner._random_valid_lineup(rng)
-    for _ in range(20):
-        mutated = opt._runner._mutate(lineup, rng)
-        assert mutated.is_valid(player_meta), f"Mutated lineup invalid: {mutated.player_ids}"
-
-
-def test_local_search_does_not_decrease_score(sim_results, players_df, player_meta):
-    opt = make_optimizer(sim_results, players_df, target=150.0)
-    rng = np.random.default_rng(2)
-    lineup = opt._runner._random_valid_lineup(rng)
-    cols = [opt.col_map[pid] for pid in lineup.player_ids]
-    totals = opt.sim_matrix[:, cols].sum(axis=1)
-    score_before = opt._runner._score_totals(totals, opt.target)
-
-    improved_lineup, improved_totals = opt._runner._local_search(lineup, totals, rng)
-    score_after = opt._runner._score_totals(improved_totals, opt.target)
-
-    assert score_after >= score_before - 1e-9
-    assert improved_lineup.is_valid(player_meta)
-
-
-# ------------------------------------------------------------------ #
-#  End-to-end optimize()                                               #
-# ------------------------------------------------------------------ #
-
-def test_optimize_returns_valid_lineup(sim_results, players_df, player_meta):
-    opt = make_optimizer(sim_results, players_df, target=150.0, n_chains=5, n_steps=20)
-    lineup, score = opt.optimize()
-
-    assert isinstance(lineup, Lineup)
-    assert lineup.is_valid(player_meta)
-    assert score >= 0.0
-
-
-def test_optimize_score_is_reproducible(sim_results, players_df):
-    """Same seed should produce the same result."""
-    opt1 = make_optimizer(sim_results, players_df, target=150.0, n_chains=3, n_steps=10)
-    opt2 = make_optimizer(sim_results, players_df, target=150.0, n_chains=3, n_steps=10)
-    lineup1, score1 = opt1.optimize()
-    lineup2, score2 = opt2.optimize()
-    assert score1 == pytest.approx(score2)
-    assert sorted(lineup1.player_ids) == sorted(lineup2.player_ids)
-
-
-def test_optimize_high_value_player_selected():
-    """
-    When one player has dramatically higher simulated scores the optimizer
-    should prefer them in the final lineup.
-    """
-    rng = np.random.default_rng(99)
-
-    # Two pitchers (P), one catcher, one 1B, one 2B, one 3B, one SS, three OF
-    # per game – two games to satisfy the multi-game constraint.
-    rows = [
-        # Pitchers from A and C oppose B and D respectively; no batters from B or D
-        # are in this slate, so the pitcher/opposing-batter constraint is satisfied.
-        _make_player(1,  'P',  8000, 'A', 'A@B'),
-        _make_player(2,  'P',  7000, 'C', 'C@D'),
-        _make_player(3,  'C',  4000, 'A', 'A@B'),
-        _make_player(4,  '1B', 4000, 'A', 'A@B'),
-        _make_player(5,  '2B', 4000, 'A', 'A@B'),
-        _make_player(6,  '3B', 4000, 'C', 'C@D'),
-        _make_player(7,  'SS', 4000, 'C', 'C@D'),
-        # OF – player 8 is the "stud", players 9-11 are average
-        _make_player(8,  'OF', 4000, 'C', 'C@D'),   # stud
-        _make_player(9,  'OF', 4000, 'A', 'A@B'),
-        _make_player(10, 'OF', 4000, 'A', 'A@B'),
-        _make_player(11, 'OF', 3500, 'C', 'C@D'),
-    ]
-    df = pd.DataFrame(rows)
-    pids = df['player_id'].tolist()
-    n_sims, n_players = 1000, len(pids)
-    matrix = rng.uniform(0, 10, size=(n_sims, n_players)).astype(np.float64)
-    # Make player 8 (index 7) score extremely high
-    matrix[:, 7] = 200.0
-
-    results = SimulationResults(player_ids=pids, results_matrix=matrix)
-    opt = BasinHoppingOptimizer(
-        sim_results=results,
-        players_df=df,
-        target=250.0,
-        n_chains=5,
-        n_steps=30,
-        rng_seed=0,
-        ownership_vector=np.ones(len(pids)) / len(pids),
-    )
-    lineup, _ = opt.optimize()
-    assert 8 in lineup.player_ids, "High-value player should be in the optimized lineup"
-
-
-# ------------------------------------------------------------------ #
 #  Salary floor                                                        #
 # ------------------------------------------------------------------ #
 
@@ -406,46 +229,8 @@ def test_lineup_floor_none_no_effect(player_meta):
     assert Lineup(VALID_IDS).is_valid(player_meta, salary_floor=None)
 
 
-def test_optimize_respects_salary_floor(sim_results, players_df, player_meta):
-    floor = 45_000.0
-    opt = BasinHoppingOptimizer(
-        sim_results=sim_results,
-        players_df=players_df,
-        target=150.0,
-        n_chains=5,
-        n_steps=20,
-        rng_seed=7,
-        salary_floor=floor,
-        ownership_vector=np.ones(len(sim_results.player_ids)) / len(sim_results.player_ids),
-    )
-    lineup, _ = opt.optimize()
-    total_salary = sum(player_meta[pid]['salary'] for pid in lineup.player_ids)
-    assert total_salary >= floor
-    assert lineup.is_valid(player_meta, salary_floor=floor)
-
-
-def test_optimize_floor_disabled_unchanged(sim_results, players_df):
-    # salary_floor=None must produce the same result as omitting the parameter
-    opt_default = make_optimizer(sim_results, players_df, target=150.0, n_chains=3, n_steps=10)
-    opt_none = BasinHoppingOptimizer(
-        sim_results=sim_results,
-        players_df=players_df,
-        target=150.0,
-        n_chains=3,
-        temperature=0.05,
-        n_steps=10,
-        rng_seed=42,
-        salary_floor=None,
-        ownership_vector=np.ones(len(sim_results.player_ids)) / len(sim_results.player_ids),
-    )
-    l1, s1 = opt_default.optimize()
-    l2, s2 = opt_none.optimize()
-    assert s1 == pytest.approx(s2)
-    assert sorted(l1.player_ids) == sorted(l2.player_ids)
-
-
 # ------------------------------------------------------------------ #
-#  Multi-position eligibility                                          #
+#  _build_player_meta                                                  #
 # ------------------------------------------------------------------ #
 
 def test_build_player_meta_stores_eligible_positions():
@@ -465,25 +250,9 @@ def test_build_player_meta_falls_back_without_column():
     assert meta[1]['eligible_positions'] == ['SS']
 
 
-def test_players_by_pos_multi_eligible(sim_results, players_df):
-    # Add a 3B/SS player to the slate and simulation results
-    extra_row = _make_player(99, '3B', 4000, 'A', 'A@B')
-    extra_df = pd.concat([players_df, pd.DataFrame([extra_row])], ignore_index=True)
-    extra_df['eligible_positions'] = extra_df['position'].apply(lambda p: [p])
-    # Give player 99 dual eligibility
-    extra_df.loc[extra_df['player_id'] == 99, 'eligible_positions'] = \
-        extra_df.loc[extra_df['player_id'] == 99, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
-
-    pids = extra_df['player_id'].tolist()
-    rng = np.random.default_rng(0)
-    matrix = rng.uniform(0, 40, size=(500, len(pids))).astype(np.float64)
-    results = SimulationResults(player_ids=pids, results_matrix=matrix)
-
-    opt = BasinHoppingOptimizer(sim_results=results, players_df=extra_df, target=100.0,
-                                ownership_vector=np.ones(len(results.player_ids)) / len(results.player_ids))
-    assert 99 in opt._players_by_pos['3B']
-    assert 99 in opt._players_by_pos['SS']
-
+# ------------------------------------------------------------------ #
+#  Multi-position eligibility                                          #
+# ------------------------------------------------------------------ #
 
 def test_is_valid_multipos_assignment_required():
     # Lineup with no pure SS: player 20 is 3B/SS and must fill SS for the
@@ -539,47 +308,6 @@ def test_is_valid_rejects_impossible_assignment():
     assert not Lineup(ids_10).is_valid(meta)
 
 
-def test_optimize_multi_pos_slate():
-    """Slate where the only valid lineup requires a 3B/SS player to fill SS."""
-    rng = np.random.default_rng(7)
-    rows = [
-        # Pitchers from A and C oppose B and D; no batters in this slate are from B or D.
-        _make_player(1,  'P',  8000, 'A', 'A@B'),
-        _make_player(2,  'P',  7500, 'C', 'C@D'),
-        _make_player(3,  'C',  4000, 'A', 'A@B'),
-        _make_player(4,  '1B', 4000, 'A', 'A@B'),
-        _make_player(5,  '2B', 4000, 'A', 'A@B'),
-        _make_player(6,  '3B', 4000, 'C', 'C@D'),
-        # No pure SS — player 7 is 3B/SS and must fill SS
-        _make_player(7,  '3B', 4000, 'A', 'A@B'),
-        _make_player(8,  'OF', 4000, 'A', 'A@B'),
-        _make_player(9,  'OF', 4000, 'C', 'C@D'),
-        _make_player(10, 'OF', 4000, 'C', 'C@D'),
-    ]
-    df = pd.DataFrame(rows)
-    df['eligible_positions'] = df['position'].apply(lambda p: [p])
-    df.loc[df['player_id'] == 7, 'eligible_positions'] = \
-        df.loc[df['player_id'] == 7, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
-
-    pids = df['player_id'].tolist()
-    matrix = rng.uniform(0, 40, size=(500, len(pids))).astype(np.float64)
-    results = SimulationResults(player_ids=pids, results_matrix=matrix)
-
-    opt = BasinHoppingOptimizer(
-        sim_results=results,
-        players_df=df,
-        target=100.0,
-        n_chains=5,
-        n_steps=20,
-        rng_seed=0,
-        ownership_vector=np.ones(len(results.player_ids)) / len(results.player_ids),
-    )
-    lineup, _ = opt.optimize()
-    meta = _build_player_meta(df)
-    assert lineup.is_valid(meta)
-    assert 7 in lineup.player_ids  # the 3B/SS player must be in the lineup
-
-
 # ------------------------------------------------------------------ #
 #  Pipeline _build_players_df multi-position passthrough               #
 # ------------------------------------------------------------------ #
@@ -626,111 +354,3 @@ def test_build_players_df_without_eligible_positions_omits_column():
     slate_df = pd.DataFrame(rows)
     players_df = runner._build_players_df(slate_df, proj_df=None)
     assert 'eligible_positions' not in players_df.columns
-
-
-def test_multipos_player_indexed_in_both_position_pools():
-    """A 3B/SS player must appear in both _players_by_pos['3B'] and ['SS']."""
-    from src.api.pipeline import PipelineRunner
-    runner = _make_pipeline_runner()
-    rows = [
-        _make_player(1,  'P',  8000, 'A', 'A@B'),
-        _make_player(2,  'P',  7500, 'C', 'C@D'),
-        _make_player(3,  'C',  4000, 'A', 'A@B'),
-        _make_player(4,  '1B', 4000, 'A', 'A@B'),
-        _make_player(5,  '2B', 4000, 'A', 'A@B'),
-        _make_player(6,  '3B', 4000, 'C', 'C@D'),
-        _make_player(7,  '3B', 4000, 'A', 'A@B'),  # will become 3B/SS
-        _make_player(8,  'OF', 4000, 'A', 'A@B'),
-        _make_player(9,  'OF', 4000, 'C', 'C@D'),
-        _make_player(10, 'OF', 4000, 'C', 'C@D'),
-    ]
-    slate_df = pd.DataFrame(rows)
-    slate_df['eligible_positions'] = slate_df['position'].apply(lambda p: [p])
-    slate_df.loc[slate_df['player_id'] == 7, 'eligible_positions'] = \
-        slate_df.loc[slate_df['player_id'] == 7, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
-
-    players_df = runner._build_players_df(slate_df, proj_df=None)
-
-    pids = players_df['player_id'].tolist()
-    rng = np.random.default_rng(0)
-    matrix = rng.uniform(0, 40, size=(200, len(pids))).astype(np.float64)
-    results = SimulationResults(player_ids=pids, results_matrix=matrix)
-
-    opt = BasinHoppingOptimizer(sim_results=results, players_df=players_df, target=100.0,
-                                ownership_vector=np.ones(len(results.player_ids)) / len(results.player_ids))
-    assert 7 in opt._players_by_pos['3B']
-    assert 7 in opt._players_by_pos['SS']
-
-
-def test_optimizer_can_place_multipos_player_at_alternate_slot():
-    """Optimizer must produce a valid lineup when the only way to fill SS is via a 3B/SS player,
-    with eligible_positions flowing through _build_players_df from a slate_df."""
-    from src.api.pipeline import PipelineRunner
-    runner = _make_pipeline_runner()
-    rows = [
-        _make_player(1,  'P',  8000, 'A', 'A@B'),
-        _make_player(2,  'P',  7500, 'C', 'C@D'),
-        _make_player(3,  'C',  4000, 'A', 'A@B'),
-        _make_player(4,  '1B', 4000, 'A', 'A@B'),
-        _make_player(5,  '2B', 4000, 'A', 'A@B'),
-        _make_player(6,  '3B', 4000, 'C', 'C@D'),
-        # Player 7: primary 3B, also eligible SS — only SS-eligible player
-        _make_player(7,  '3B', 4000, 'A', 'A@B'),
-        _make_player(8,  'OF', 4000, 'A', 'A@B'),
-        _make_player(9,  'OF', 4000, 'C', 'C@D'),
-        _make_player(10, 'OF', 4000, 'C', 'C@D'),
-    ]
-    slate_df = pd.DataFrame(rows)
-    slate_df['eligible_positions'] = slate_df['position'].apply(lambda p: [p])
-    slate_df.loc[slate_df['player_id'] == 7, 'eligible_positions'] = \
-        slate_df.loc[slate_df['player_id'] == 7, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
-
-    players_df = runner._build_players_df(slate_df, proj_df=None)
-
-    pids = players_df['player_id'].tolist()
-    rng = np.random.default_rng(3)
-    matrix = rng.uniform(0, 40, size=(300, len(pids))).astype(np.float64)
-    results = SimulationResults(player_ids=pids, results_matrix=matrix)
-
-    opt = BasinHoppingOptimizer(sim_results=results, players_df=players_df,
-                                target=100.0, n_chains=5, n_steps=20, rng_seed=0,
-                                ownership_vector=np.ones(len(results.player_ids)) / len(results.player_ids))
-    lineup, _ = opt.optimize()
-    meta = _build_player_meta(players_df)
-    assert lineup.is_valid(meta)
-    assert 7 in lineup.player_ids
-
-
-def test_multipos_player_appears_exactly_once_in_lineup():
-    """A multi-position eligible player must occupy exactly one slot (no duplicate IDs)."""
-    rows = [
-        _make_player(1,  'P',  8000, 'A', 'A@B'),
-        _make_player(2,  'P',  7500, 'C', 'C@D'),
-        _make_player(3,  'C',  4000, 'A', 'A@B'),
-        _make_player(4,  '1B', 4000, 'A', 'A@B'),
-        _make_player(5,  '2B', 4000, 'A', 'A@B'),
-        _make_player(6,  '3B', 4000, 'C', 'C@D'),
-        _make_player(7,  '3B', 4000, 'A', 'A@B'),  # 3B/SS
-        _make_player(8,  'OF', 4000, 'A', 'A@B'),
-        _make_player(9,  'OF', 4000, 'C', 'C@D'),
-        _make_player(10, 'OF', 4000, 'C', 'C@D'),
-    ]
-    df = pd.DataFrame(rows)
-    df['eligible_positions'] = df['position'].apply(lambda p: [p])
-    df.loc[df['player_id'] == 7, 'eligible_positions'] = \
-        df.loc[df['player_id'] == 7, 'eligible_positions'].apply(lambda _: ['3B', 'SS'])
-
-    pids = df['player_id'].tolist()
-    rng = np.random.default_rng(5)
-    matrix = rng.uniform(0, 40, size=(300, len(pids))).astype(np.float64)
-    results = SimulationResults(player_ids=pids, results_matrix=matrix)
-
-    opt = BasinHoppingOptimizer(sim_results=results, players_df=df,
-                                target=100.0, n_chains=5, n_steps=20, rng_seed=1,
-                                ownership_vector=np.ones(len(results.player_ids)) / len(results.player_ids))
-    lineup, _ = opt.optimize()
-
-    assert len(lineup.player_ids) == 10
-    assert len(set(lineup.player_ids)) == 10  # no duplicates
-    assert lineup.player_ids.count(7) == 1   # player 7 appears exactly once
-

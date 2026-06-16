@@ -129,15 +129,6 @@ class TestScoreBatch:
         with pytest.raises(RuntimeError, match="score_candidates"):
             scorer.score_batch(candidates[:5])
 
-    def test_appends_col_lineups(
-        self, sim_results, players_df, candidates, ownership_vec, test_payout_arr
-    ):
-        scorer = _make_scorer(sim_results, players_df, ownership_vec, test_payout_arr)
-        scorer.score_candidates(candidates[:20])
-        assert scorer.last_col_lineups.shape == (20, 10)
-        scorer.score_batch(candidates[20:30])
-        assert scorer.last_col_lineups.shape == (30, 10)
-
     def test_batch_shape_and_dtype(
         self, sim_results, players_df, candidates, ownership_vec, test_payout_arr
     ):

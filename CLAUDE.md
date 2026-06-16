@@ -63,10 +63,13 @@ Retrosheet EVN ──► process_historical.py  ──► historical_logs.parque
                               SimulationResults  (n_sims × n_players matrix)
                                         │
                                         ▼
-                            BasinHoppingOptimizer.optimize()  [per lineup]
+                   CandidateGenerator.generate()  [n_candidates stacked lineups]
                                         │
                                         ▼
-                   PortfolioConstructor  OR  BeamPortfolioConstructor
+                   ContestScorer.score_candidates()  [K simulated fields × M candidates]
+                                        │
+                                        ▼
+                   DeterminantPortfolioSelector.select()  [portfolio_size lineups]
                                         │
                                         ▼
                                Portfolio (n lineups)
@@ -91,30 +94,17 @@ Precedence per player (highest first):
 
 `scripts/compare_marginals.py` reports before/after moment and percentile shifts (synthetic archetypes, or per-player when a dist parquet is present).
 
-### Optimizer
-
-`BasinHoppingOptimizer` runs `n_chains` (default 250) independent chains. Each chain: random valid lineup → perturbation (3 position-preserving swaps) → greedy local search (delta-update avoids recomputing full sums) → Metropolis acceptance. The chains run in parallel via `ProcessPoolExecutor` (`n_workers > 1`).
-
-**Objective functions** (set via `optimizer.objective` in `config.yaml`):
-- `p_hit` — `P(lineup_total ≥ target)` estimated from the simulation matrix.
-- `expected_surplus` — expected score above target for lineups that hit.
-- `marginal_payout` — `E[P(max(best_scores, lineup_scores))]` where `P(s) = max(0, s - target)^beta`. Maximizes marginal expected payout improvement given prior portfolio lineups' best scores. Controlled by `optimizer.payout_beta` (default 2.5).
-
-**Additional constraints:**
-- `early_stopping_window` / `early_stopping_threshold` — cross-chain early stopping when improvement stalls.
-
-DraftKings Classic constraints enforced in `Lineup.is_valid()`: roster `{P×2, C, 1B, 2B, 3B, SS, OF×3}`, $50k salary cap, max 5 hitters from one team, min 2 different games.
-
 ### Portfolio construction
 
-Two implementations in `src/optimization/portfolio.py`:
+Three stages in `src/optimization/`:
 
-- **`PortfolioConstructor`** — Iterative greedy: each round optimizes a new lineup over remaining active simulation rows (rows where no prior lineup already hit target). Fast but can lock in on correlated first lineups. When objective is `marginal_payout`, switches to payout-weighted mode: tracks `best_scores` (per-sim best lineup score) instead of binary row consumption, and passes these to the optimizer so it maximizes marginal payout improvement.
-- **`BeamPortfolioConstructor`** — Beam search: maintains `beam_width` (default 3) candidate portfolio paths in parallel, pruning by coverage (fewest active rows remaining). Mitigates greedy lock-in at the cost of extra optimization rounds.
+- **`CandidateGenerator`** (`candidate_generator.py`) — generates a large pool of stacked candidate lineups (default 20k). Uses ownership-weighted sampling to produce correlated batter stacks with matching pitchers.
+- **`ContestScorer`** (`gpp_portfolio.py`) — scores each candidate against K simulated opponent fields (drawn from `ContestSimulator`), producing a `robust_payout` matrix (M candidates × n_sims). A Numba JIT kernel computes per-lineup payouts against the sorted field.
+- **`DeterminantPortfolioSelector`** (`gpp_portfolio.py`) — greedy portfolio assembly via incremental determinant maximization. Balances EV and lineup diversity by selecting each successive lineup to maximally expand the payout covariance structure.
 
 ### Payout functions
 
-`src/optimization/payout.py` provides a power-law payout function `P(s) = max(0, s - cash_line)^beta` used by the `marginal_payout` objective. A reference GPP payout structure is stored in `data/payout_structures/dk_classic_gpp.json`. The `calibrate_beta()` function can fit beta to an actual payout table given simulated score percentiles.
+`src/optimization/payout.py` provides `load_payout_structure()` and `payout_table_to_array()` for loading the reference GPP payout structure from `data/payout_structures/dk_classic_gpp.json`. Used by `ContestScorer` and `ContestSimulator` to compute per-rank net payouts.
 
 ### Entry file workflow
 
@@ -125,7 +115,7 @@ Two implementations in `src/optimization/portfolio.py`:
 
 ### Slate and player exclusions
 
-`src/api/slate_exclusions.py` manages persistent exclusions stored in `data/slate_exclusions.json`. Excluded games/teams and players are pruned from `players_df` before simulation. Server endpoints: `POST /api/slate/games` and `POST /api/slate/players`.
+`src/api/slate_exclusions.py` manages persistent exclusions stored in `data/slate_exclusions.json`. Excluded games/teams and players are pruned from `players_df` before simulation. Server endpoints: `POST /api/slate/exclusions` and `POST /api/slate/player-exclusions`.
 
 ### Key data contracts
 
@@ -151,17 +141,26 @@ Two implementations in `src/optimization/portfolio.py`:
 The web app is a React + TypeScript + Vite frontend (`ui/`) backed by a FastAPI server (`src/api/server.py`).
 
 **Key API endpoints:**
-- `GET /api/config` / `PUT /api/config` — read/write `config.yaml`
-- `POST /api/projections/fetch` — fetch RotoWire projections; `GET /api/projections/status` — freshness check
+- `GET /api/config` / `POST /api/config` — read/write `config.yaml`
+- `GET /api/projections/fetch` — stream projections fetch output (SSE); `GET /api/projections/status` — freshness check
+- `GET /api/projections/players` — current player projections; `GET /api/projections/team_totals`, `GET /api/projections/unconfirmed`, `GET /api/projections/merge_info`
 - `GET /api/run/stream` — SSE stream of pipeline progress events
 - `GET /api/run/status` / `POST /api/run/stop` — run state management
 - `GET /api/portfolio` — last completed portfolio (persisted across restarts)
-- `GET /api/slate/games` / `POST /api/slate/games` — game exclusions
-- `GET /api/slate/players` / `POST /api/slate/players` — player exclusions
+- `GET /api/portfolio/sweep` — risk-sweep results; `POST /api/portfolio/activate_risk` — select a risk tier; `POST /api/portfolio/replace/{lineup_index}` — swap one lineup
+- `GET /api/contest/analyze` — contest analysis / field simulation
+- `GET /api/slate/games` / `POST /api/slate/exclusions` — game exclusions
+- `GET /api/slate/players` / `POST /api/slate/player-exclusions` — player exclusions
+- `GET /api/slate/ownership-reductions` / `POST /api/slate/ownership-reductions` — per-player ownership fade
+- `GET /api/slate/projection-overrides` / `POST /api/slate/projection-overrides` — per-player mean/std overrides
+- `GET /api/notifications` / `DELETE /api/notifications/{id}` — in-app notification log
+- `GET /api/twitter-lineups` / `POST /api/twitter-lineups` / `DELETE /api/twitter-lineups/{team}` — confirmed opponent lineup tracking
+- `POST /api/lineups/{team}/lock` / `DELETE /api/lineups/{team}/lock` — lock/unlock a lineup
+- `GET /api/late-swap/state` / `POST /api/late-swap/run` / `POST /api/late-swap/override` / `POST /api/late-swap/reset` — late-swap workflow
 
-**Pipeline progress events** emitted via SSE: `slate_loaded`, `projections_loaded`, `simulation_complete`, `portfolio_complete`. Run tab shows live n_sims countdown during simulation.
+**Pipeline progress events** emitted via SSE: `load_slate`, `simulate`, `compute_target`, `gpp_generate_start/progress/done`, `gpp_score_start/done`, `gpp_optimal_start/progress/done`, `gpp_refine_start/progress/done`, `portfolio_stats`, `complete`.
 
-**UI components** (`ui/src/components/`): `ConfigForm`, `SlatePanel`, `ProjectionsPanel`, `ProgressPanel`, `PortfolioTable`, `MetricsPanel`, `TeamBadge`, `StopUploadDialog`.
+**UI components** (`ui/src/components/`): `ConfigForm`, `SlatePanel`, `ProjectionsPanel`, `ProjectionsTable`, `ProgressPanel`, `PortfolioTable`, `MetricsPanel`, `TeamBadge`, `StopUploadDialog`, `LateSwapPanel`, `LineupParserDialog`, `RunOptionsDialog`, `DeleteConfirmModal`.
 
 Team logos for all 30 MLB franchises are in `ui/public/team-logos/`.
 

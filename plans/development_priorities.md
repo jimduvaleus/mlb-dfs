@@ -1,4 +1,3 @@
-- check on basin hopping use/disuse
 - update MD
 - get w_resid explainer
 - gmail notifications (each way??)

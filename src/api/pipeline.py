@@ -1358,8 +1358,6 @@ class PipelineRunner:
         list[dict]
             Updated portfolio serialized in the same format as ``run()``.
         """
-        from src.optimization.optimizer import BasinHoppingOptimizer
-
         idx = lineup_index - 1
         deleted_lineup, _ = self._raw_portfolio[idx]
         remaining = self._raw_portfolio[:idx] + self._raw_portfolio[idx + 1:]
