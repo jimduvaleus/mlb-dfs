@@ -111,6 +111,12 @@ def build_swap_pools(
     exclusions (both "both" and "candidates" scopes — excluded players were
     kept out of optimization, so they must not enter via swap either).
 
+    Manual per-player projection overrides (`exclusions["player_projection_overrides"]`,
+    set via the Projections tab) take precedence over both the merged
+    projection and the salary heuristic, mirroring the override applied in
+    GET /api/projections/players — otherwise the swap heuristic scores a
+    manually-corrected player using a stale or heuristic mean.
+
     Confirmed lineups also scratch: batters on a confirmed team who are NOT
     in that team's lineup are dropped from the pool (same rule the pipeline
     applies via _apply_twitter_overrides). Confirmed players absent from the
@@ -145,6 +151,12 @@ def build_swap_pools(
     no_proj = lookup_df["mean"].isna()
     lookup_df.loc[no_proj, "mean"] = lookup_df.loc[no_proj, "salary"].map(_heuristic_mean)
     lookup_df["mean"] = lookup_df["mean"].astype(float)
+
+    raw_overrides = (exclusions or {}).get("player_projection_overrides", {}) or {}
+    overrides = {int(k): float(v) for k, v in raw_overrides.items()}
+    if overrides:
+        override_series = lookup_df["player_id"].map(overrides)
+        lookup_df["mean"] = override_series.combine_first(lookup_df["mean"])
 
     candidates_df = lookup_df
     if starters_pids is not None:

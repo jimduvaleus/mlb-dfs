@@ -312,6 +312,23 @@ class TestBuildSwapPools:
         assert 33 not in set(candidates_df["player_id"])
         assert not (candidates_df["game"] == "AAA@BBB").any()
 
+    def test_projection_override_takes_precedence(self, slate_df):
+        slate = slate_df.drop(columns=["mean"])
+        proj = pd.DataFrame({"player_id": [13, 17], "mean": [4.8, 11.1],
+                             "lineup_slot": [3.0, 5.0]})
+        exclusions = {"player_projection_overrides": {"13": 6.5}}
+        lookup_df, candidates_df = build_swap_pools(slate, proj, exclusions)
+        lk = lookup_df.set_index("player_id")
+        assert lk.loc[13, "mean"] == 6.5
+        assert lk.loc[17, "mean"] == 11.1
+        assert candidates_df.set_index("player_id").loc[13, "mean"] == 6.5
+
+    def test_projection_override_on_heuristic_fallback(self, slate_df):
+        slate = slate_df.drop(columns=["mean"])
+        exclusions = {"player_projection_overrides": {"20": 12.3}}
+        lookup_df, _ = build_swap_pools(slate, None, exclusions)
+        assert lookup_df.set_index("player_id").loc[20, "mean"] == 12.3
+
 
 # ---------------------------------------------------------------------------
 # eligible_candidates

@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -551,50 +552,135 @@ def get_twitter_lineups() -> list[TwitterLineupRecord]:
     return [TwitterLineupRecord(**l) for l in load_twitter_lineups(_slate_fingerprint())]
 
 
+def _emit_lineup_diff_notification(
+    team: str,
+    summary: str,
+    old_slots: list[dict],
+    new_slots: list[TwitterLineupSlot],
+) -> None:
+    """Post an In/Out notification for the batter diff between two slot lists."""
+    old_ids = {s["player_id"] for s in old_slots if s.get("player_id") is not None}
+    new_ids = {s.player_id for s in new_slots if s.player_id is not None}
+    added_ids = new_ids - old_ids
+    removed_ids = old_ids - new_ids
+    if not (added_ids or removed_ids):
+        return
+
+    name_map: dict[int, str] = {}
+    slate_df = _load_slate_df()
+    if slate_df is not None:
+        for pid in added_ids | removed_ids:
+            row = slate_df[slate_df["player_id"] == pid]
+            if not row.empty:
+                name_map[pid] = str(row.iloc[0]["name"])
+    for s in new_slots:
+        if s.player_id is not None and s.player_id not in name_map:
+            name_map[s.player_id] = s.name
+    for s in old_slots:
+        pid = s.get("player_id")
+        if pid is not None and pid not in name_map:
+            name_map[pid] = s.get("name", str(pid))
+
+    parts: list[str] = []
+    if added_ids:
+        parts.append("In: " + ", ".join(name_map.get(p, str(p)) for p in sorted(added_ids)))
+    if removed_ids:
+        parts.append("Out: " + ", ".join(name_map.get(p, str(p)) for p in sorted(removed_ids)))
+
+    diff_notif = {
+        "id": str(uuid.uuid4()),
+        "summary": summary,
+        "body": " | ".join(parts),
+        "app_name": "system",
+        "captured_at": time.time(),
+    }
+    with _notifications_lock:
+        _notifications.append(diff_notif)
+        _save_notifications()
+
+
+_LINEUP_DIFF_WINDOW = timedelta(minutes=10)
+
+
+def _slate_first_pitch_started() -> bool:
+    """True from 10 minutes before the slate's earliest game start onward.
+
+    The 10-minute lead-in covers lineups posted just ahead of lock, which are
+    just as noteworthy a diff against the best guess as ones posted after the
+    first game has actually begun.
+    """
+    starts = [t for t in _load_slate_games().values() if t]
+    if not starts:
+        return False
+    try:
+        earliest = min(datetime.fromisoformat(t) for t in starts)
+    except ValueError:
+        return False
+    return datetime.now() >= earliest - _LINEUP_DIFF_WINDOW
+
+
+def _best_guess_lineup_slots(team: str) -> list[dict] | None:
+    """Return the current best-guess (pre-confirmation) starting batters for a team.
+
+    Sourced from the projections CSV's `lineup_slot` column, which holds the
+    most recent RW/DFF-fetched lineup — this hasn't been overwritten yet when
+    a Twitter/Underdog notification is first being saved for the team, so it
+    reflects what the pipeline was using right up until this confirmation.
+    Returns None if there's no projections file or no slotted batters.
+    """
+    import pandas as pd
+    cfg = read_config()
+    proj_path = _resolve_proj_path(cfg)
+    if not proj_path.exists():
+        return None
+    try:
+        proj_df = pd.read_csv(proj_path)
+    except Exception:
+        return None
+    if "lineup_slot" not in proj_df.columns or "player_id" not in proj_df.columns:
+        return None
+
+    slate_df = _load_slate_df()
+    if slate_df is None:
+        return None
+    team_pids = set(
+        slate_df.loc[(slate_df["team"] == team) & (slate_df["position"] != "P"), "player_id"]
+    )
+    if not team_pids:
+        return None
+
+    starters = proj_df[
+        proj_df["player_id"].isin(team_pids)
+        & proj_df["lineup_slot"].notna()
+        & proj_df["lineup_slot"].between(1, 9)
+    ]
+    if starters.empty:
+        return None
+    return [
+        {"player_id": int(r["player_id"]), "name": str(r.get("name", ""))}
+        for _, r in starters.iterrows()
+    ]
+
+
 @app.post("/api/twitter-lineups")
 def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
     fp = _slate_fingerprint()
 
-    # When updating a locked lineup, inject a diff notification showing who's in/out
     existing_lineups = load_twitter_lineups(fp)
     existing = next((l for l in existing_lineups if l.get("team") == req.team), None)
     if existing and existing.get("locked"):
-        old_ids = {s["player_id"] for s in existing.get("slots", []) if s.get("player_id") is not None}
-        new_ids = {s.player_id for s in req.slots if s.player_id is not None}
-        added_ids = new_ids - old_ids
-        removed_ids = old_ids - new_ids
-        if added_ids or removed_ids:
-            name_map: dict[int, str] = {}
-            slate_df = _load_slate_df()
-            if slate_df is not None:
-                for pid in added_ids | removed_ids:
-                    row = slate_df[slate_df["player_id"] == pid]
-                    if not row.empty:
-                        name_map[pid] = str(row.iloc[0]["name"])
-            for s in req.slots:
-                if s.player_id is not None and s.player_id not in name_map:
-                    name_map[s.player_id] = s.name
-            for s in existing.get("slots", []):
-                pid = s.get("player_id")
-                if pid is not None and pid not in name_map:
-                    name_map[pid] = s.get("name", str(pid))
-
-            parts: list[str] = []
-            if added_ids:
-                parts.append("In: " + ", ".join(name_map.get(p, str(p)) for p in sorted(added_ids)))
-            if removed_ids:
-                parts.append("Out: " + ", ".join(name_map.get(p, str(p)) for p in sorted(removed_ids)))
-
-            diff_notif = {
-                "id": str(uuid.uuid4()),
-                "summary": f"{req.team} lineup update",
-                "body": " | ".join(parts),
-                "app_name": "system",
-                "captured_at": time.time(),
-            }
-            with _notifications_lock:
-                _notifications.append(diff_notif)
-                _save_notifications()
+        # Updating an already-locked lineup — diff against what was locked in.
+        _emit_lineup_diff_notification(
+            req.team, f"{req.team} lineup update", existing.get("slots", []), req.slots
+        )
+    elif _slate_first_pitch_started():
+        # First official confirmation for this team, arriving after the slate's
+        # first game began — diff against the best-guess lineup it's replacing.
+        best_guess = _best_guess_lineup_slots(req.team)
+        if best_guess is not None:
+            _emit_lineup_diff_notification(
+                req.team, f"{req.team} lineup confirmed", best_guess, req.slots
+            )
 
     slots = [s.model_dump() for s in req.slots]
     record = upsert_twitter_lineup(req.team, req.notification_id, slots, fp, locked=req.locked)
