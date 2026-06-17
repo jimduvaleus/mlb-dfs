@@ -96,6 +96,7 @@ export default function App() {
   const [configError, setConfigError] = useState<string | null>(null)
   const [projectionPlayers, setProjectionPlayers] = useState<ProjectionPlayerRow[]>([])
   const [teamTotals, setTeamTotals] = useState<Record<string, number>>({})
+  const [teamTotalsSource, setTeamTotalsSource] = useState<'fantasylabs' | 'cno' | 'dff' | null | undefined>(undefined)
   const [mergeInfo, setMergeInfo] = useState<MergeInfo | null>(null)
   // Games (as "AWAY@HOME" strings) to exclude from projection fetches.
   // Empty = fetch all games (default). Non-empty = partial fetch + merge.
@@ -134,7 +135,7 @@ export default function App() {
       .then(setProjectionPlayers)
       .catch(() => {})
     fetchTeamTotals()
-      .then(setTeamTotals)
+      .then(r => { setTeamTotals(r.totals); setTeamTotalsSource(r.source) })
       .catch(() => {})
   }
 
@@ -548,7 +549,7 @@ export default function App() {
           {configError && <p className="error">{configError}</p>}
           {state.config ? (
             <div className="config-layout">
-              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} refreshTrigger={projStatusTrigger} unlockedBatterCount={[...new Set(projectionPlayers.map(p => p.team))].filter(t => t && !state.twitterLineups.find(l => l.team === t && l.locked)).length * 9} />
+              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} refreshTrigger={projStatusTrigger} unlockedBatterCount={[...new Set(projectionPlayers.map(p => p.team))].filter(t => t && !state.twitterLineups.find(l => l.team === t && l.locked)).length * 9} teamTotalsSource={teamTotalsSource} />
               <ConfigForm
                 config={state.config}
                 onSaved={cfg => {

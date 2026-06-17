@@ -617,6 +617,18 @@ button { cursor: pointer; }
   margin-bottom: 4px;
 }
 
+.merge-info-team-totals-warn-callout {
+  background: #271e0f;
+  border-color: #b7791f;
+  border-left-color: #f6ad55;
+  border-left-width: 4px;
+  color: #fefcbf;
+}
+
+.merge-info-team-totals-warn-callout strong {
+  color: #f6ad55;
+}
+
 .merge-info-player-fallback-callout {
   margin-top: 10px;
   background: #271e0f;

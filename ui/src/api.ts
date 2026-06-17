@@ -50,9 +50,14 @@ export async function fetchOwnershipSync(): Promise<OwnershipSyncResult> {
   return res.json()
 }
 
-export async function fetchTeamTotals(): Promise<Record<string, number>> {
+export interface TeamTotalsResponse {
+  totals: Record<string, number>
+  source: 'fantasylabs' | 'cno' | 'dff' | null
+}
+
+export async function fetchTeamTotals(): Promise<TeamTotalsResponse> {
   const res = await fetch('/api/projections/team_totals')
-  if (!res.ok) return {}
+  if (!res.ok) return { totals: {}, source: null }
   return res.json()
 }
 

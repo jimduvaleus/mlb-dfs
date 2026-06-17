@@ -16,6 +16,7 @@ interface Props {
   onFetchingChange?: (fetching: boolean) => void
   refreshTrigger?: number
   unlockedBatterCount?: number
+  teamTotalsSource?: 'fantasylabs' | 'cno' | 'dff' | null
 }
 
 function formatET(unixSec: number): string {
@@ -29,7 +30,7 @@ function formatET(unixSec: number): string {
   }).format(new Date(unixSec * 1000))
 }
 
-export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange, refreshTrigger, unlockedBatterCount }: Props) {
+export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, projFetchExcluded = [], onFetchingChange, refreshTrigger, unlockedBatterCount, teamTotalsSource }: Props) {
   const [status, setStatus] = useState<ProjectionsStatus | null>(null)
   const [fetching, setFetching] = useState(false)
   const [log, setLog] = useState<string[]>([])
@@ -253,6 +254,21 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
             : ownershipSync.status === 'out_of_sync'
             ? `Ownership model out of sync — eval script and pipeline disagree (ρ = ${ownershipSync.spearman_r?.toFixed(3) ?? '?'}, n = ${ownershipSync.n_checked})`
             : `Ownership sync check failed${ownershipSync.reason ? ` — ${ownershipSync.reason}` : ''}`}
+        </div>
+      )}
+
+      {teamTotalsSource !== undefined && teamTotalsSource !== 'fantasylabs' && (
+        <div className="merge-info-callout merge-info-team-totals-warn-callout">
+          <strong>
+            {teamTotalsSource === null
+              ? '⚠ Team totals unavailable — ownership model running without implied run totals'
+              : `⚠ Team totals from legacy source (${teamTotalsSource.toUpperCase()}) — FantasyLabs Vegas totals not fetched`}
+          </strong>
+          {teamTotalsSource === null && (
+            <div style={{ marginTop: 4, fontSize: '0.8em', opacity: 0.85 }}>
+              Fetch projections to pull live Vegas implied totals. If the issue persists, the FL Vegas page may be returning no data.
+            </div>
+          )}
         </div>
       )}
 

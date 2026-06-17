@@ -1821,6 +1821,47 @@ class PipelineRunner:
         return None
 
     @staticmethod
+    def _get_team_totals_source(slate_path: str) -> Optional[str]:
+        """Return the source name for the team totals file used by _load_team_totals.
+
+        Returns "fantasylabs", "cno", "dff", or None (no file found).
+        """
+        import re as _re
+        from pathlib import Path as _Path
+        fname = _Path(slate_path).name if slate_path else ""
+        archive_dir = None
+        m = _re.search(r'(\d{1,2})[_\-](\d{1,2})[_\-](\d{4})', fname)
+        if m:
+            mm, dd, yyyy = m.group(1).zfill(2), m.group(2).zfill(2), m.group(3)
+            archive_dir = _Path(__file__).resolve().parents[2] / "archive" / f"{mm}{dd}{yyyy}"
+        if archive_dir is None or not archive_dir.exists():
+            slate_file = _Path(slate_path) if slate_path else None
+            if slate_file and slate_file.exists():
+                try:
+                    import csv as _csv
+                    with open(slate_file, newline="") as _f:
+                        for row in _csv.DictReader(_f):
+                            game_info = row.get("Game Info", "")
+                            dm = _re.search(r'(\d{2})/(\d{2})/(\d{4})', game_info)
+                            if dm:
+                                mm, dd, yyyy = dm.group(1), dm.group(2), dm.group(3)
+                                archive_dir = _Path(__file__).resolve().parents[2] / "archive" / f"{mm}{dd}{yyyy}"
+                                break
+                except Exception:
+                    pass
+        if archive_dir is None:
+            return None
+        _SOURCE_NAMES = {
+            "team_totals.csv": "fantasylabs",
+            "cno_team_totals.csv": "cno",
+            "dff_team_totals.csv": "dff",
+        }
+        for filename, source in _SOURCE_NAMES.items():
+            if (archive_dir / filename).exists():
+                return source
+        return None
+
+    @staticmethod
     def _load_hr_fair_odds(slate_path: str) -> dict[str, float]:
         """Load HR fair-implied-probability data from the archive for the slate date.
 

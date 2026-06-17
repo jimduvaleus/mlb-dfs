@@ -1528,14 +1528,19 @@ async def projections_ownership_sync():
 
 @app.get("/api/projections/team_totals")
 def projections_team_totals():
-    """Return implied run totals per team from team_totals.csv (FL), or {} if unavailable."""
+    """Return implied run totals and their source.
+
+    Response: {"totals": {team: float, ...}, "source": "fantasylabs"|"cno"|"dff"|null}
+    """
     try:
         from .pipeline import PipelineRunner
         slate_path = _get_slate_file_path()
-        totals = PipelineRunner._load_team_totals(str(slate_path) if slate_path else "")
-        return totals or {}
+        slate_str = str(slate_path) if slate_path else ""
+        totals = PipelineRunner._load_team_totals(slate_str)
+        source = PipelineRunner._get_team_totals_source(slate_str)
+        return {"totals": totals or {}, "source": source}
     except Exception:
-        return {}
+        return {"totals": {}, "source": None}
 
 
 @app.get("/api/projections/slates")
