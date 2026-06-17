@@ -47,6 +47,7 @@ _SLOT_LINE_RE = re.compile(
     r"^((?:[A-Z]\.\s+)?\S+(?:\s+\S+)*?)\s+(DH|1B|2B|3B|SS|LF|CF|RF|C|SP|RP|P)\s*$"
 )
 _NOTIF_META_RE = re.compile(r"^(@\w+|·|\d+[mhd]|Underdog\s+MLB)$", re.IGNORECASE)
+_HEADER_DATE_RE = re.compile(r"\s+(\d{1,2})/(\d{1,2})(?:/\d+)?\s*$")
 
 
 def looks_like_lineup(body: str) -> bool:
@@ -67,6 +68,25 @@ def extract_lineup_team(body: str) -> Optional[str]:
         candidate = re.sub(r"\s+\d+/\d+(?:/\d+)?\s*$", "", candidate).strip().lower()
         if candidate in TEAM_NAME_MAP:
             return TEAM_NAME_MAP[candidate]
+    return None
+
+
+def extract_lineup_header_date(body: str) -> Optional[tuple[int, int]]:
+    """Return (month, day) from the team header line if present, else None.
+
+    Handles 'Rays 6/16', 'Updated Rays 6/16', 'Rays 6/16/26', etc.
+    """
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or _NOTIF_META_RE.match(line):
+            continue
+        candidate_raw = re.sub(r"^Updated\s+", "", line, flags=re.IGNORECASE).strip()
+        date_m = _HEADER_DATE_RE.search(candidate_raw)
+        if date_m is None:
+            continue
+        candidate = re.sub(r"\s+\d+/\d+(?:/\d+)?\s*$", "", candidate_raw).strip().lower()
+        if candidate in TEAM_NAME_MAP:
+            return int(date_m.group(1)), int(date_m.group(2))
     return None
 
 

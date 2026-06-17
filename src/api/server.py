@@ -34,6 +34,7 @@ from .twitter_lineups import (
     get_twitter_overrides,
     load_twitter_lineups,
     extract_lineup_team,
+    extract_lineup_header_date,
     looks_like_lineup,
     match_player_name,
     parse_notification_body,
@@ -114,12 +115,57 @@ _TWITTER_RE = re.compile(
 _NOTIFY_HEADER_RE = re.compile(r'member=Notify\b')
 _STRING_START_RE = re.compile(r'^\s+string\s+"(.*)$')
 
+# Append-only forensic log of every dbus Notify call seen, regardless of the
+# app/content filter below. The live _notifications deque only retains undismissed
+# items, so it can't answer "did anything arrive around 7:12?" after the fact — this can.
+# Cleared whenever a new slate is detected — only useful for diagnosing the slate in progress.
+_RAW_NOTIF_LOG_PATH = PROJECT_ROOT / "data" / "notification_log.jsonl"
+_RAW_NOTIF_LOG_FP_PATH = PROJECT_ROOT / "data" / "notification_log.fingerprint"
+_raw_notif_log_lock = threading.Lock()
+
+
+def _clear_notification_log_if_new_slate(fp: str) -> None:
+    if not fp:
+        return
+    try:
+        stored = _RAW_NOTIF_LOG_FP_PATH.read_text().strip() if _RAW_NOTIF_LOG_FP_PATH.exists() else ""
+    except Exception:
+        stored = ""
+    if fp == stored:
+        return
+    try:
+        with _raw_notif_log_lock:
+            _RAW_NOTIF_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _RAW_NOTIF_LOG_PATH.write_text("")
+            _RAW_NOTIF_LOG_FP_PATH.write_text(fp)
+    except Exception:
+        pass
+
+
+def _log_raw_notification(app_name: str, summary: str, body: str, committed: bool) -> None:
+    entry = {
+        "logged_at": time.time(),
+        "app_name": app_name,
+        "summary": summary,
+        "body": body,
+        "committed": committed,
+    }
+    try:
+        with _raw_notif_log_lock:
+            _RAW_NOTIF_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _RAW_NOTIF_LOG_PATH.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
 
 def _maybe_commit_notification(str_args: list[str]) -> None:
     if len(str_args) < 4:
         return
     app_name, _icon, summary, body = str_args[0], str_args[1], str_args[2], str_args[3]
-    if app_name in _CHROME_APPS and _TWITTER_RE.search(summary + ' ' + body):
+    committed = app_name in _CHROME_APPS and bool(_TWITTER_RE.search(summary + ' ' + body))
+    _log_raw_notification(app_name, summary, body, committed)
+    if committed:
         notif = {
             'id': str(uuid.uuid4()),
             'summary': summary,
@@ -347,6 +393,7 @@ def _reset_stale_twitter_lineups() -> None:
         fp = _slate_fingerprint()
         if fp:
             load_twitter_lineups(fp)  # triggers clear-and-save if fingerprint changed
+            _clear_notification_log_if_new_slate(fp)
     except Exception:
         pass
 
@@ -386,12 +433,23 @@ def get_notifications():
     # contain lineup assignments for a different day and must not auto-confirm.
     slate_path = _get_slate_file_path()
     slate_mtime: float = slate_path.stat().st_mtime if slate_path else 0.0
+    from datetime import date as _date
+    today = _date.today()
+
+    def _is_current_slate(n: dict) -> bool:
+        if n.get('captured_at', 0) >= slate_mtime:
+            return True
+        # Fallback: if the lineup header explicitly carries today's date, treat as
+        # current-slate even if the notification arrived just before the slate was placed.
+        hd = extract_lineup_header_date(n.get('body', ''))
+        return hd is not None and hd == (today.month, today.day)
+
     return [
         {
             **n,
             'could_be_lineup': looks_like_lineup(n.get('body', '')),
             'lineup_team': extract_lineup_team(n.get('body', '')),
-            'is_current_slate': n.get('captured_at', 0) >= slate_mtime,
+            'is_current_slate': _is_current_slate(n),
         }
         for n in items
     ]
