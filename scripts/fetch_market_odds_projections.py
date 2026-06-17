@@ -209,6 +209,13 @@ _MARKET_DISPLAY: dict[str, str] = {
 # Tune down to 1-2 if the site starts returning empty tables or HTTP 429s.
 _MAX_CONCURRENT_GAMES = 4
 
+# Realistic browser UA sent with every Playwright request.  Without this,
+# headless Chromium hits Cloudflare's bot check on terminal.fantasylabs.com.
+_BROWSER_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 # Playwright selector IDs (verified from page inspection)
 SEL_MARKET = (
     "#ContentPlaceHolderMain_ContentPlaceHolderRight_DropDownListMarket"
@@ -1153,6 +1160,7 @@ async def _fetch_fantasylabs_team_totals(
         except Exception:
             pass  # networkidle can time out on long-polling pages; proceed anyway
         await page.wait_for_selector("table", timeout=30_000)
+        await asyncio.sleep(3)  # let React hydrate table rows after element appears
     except Exception as e:
         log.warning("FL totals: page did not load: %s", e)
         return {}, []
@@ -1903,7 +1911,11 @@ async def _run_playwright(
         # to every page opened in Phases 1-3.  browser.new_page() creates a
         # separate context per call — cookies don't carry over when that page
         # closes.  context.new_page() shares the cookie jar across all pages.
-        context = await browser.new_context()
+        context = await browser.new_context(
+            user_agent=_BROWSER_UA,
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+            locale="en-US",
+        )
 
         # Phase 0: set devig method cookie once — persists to all context pages.
         cookie_page = await context.new_page()
