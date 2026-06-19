@@ -1153,17 +1153,30 @@ async def _fetch_fantasylabs_team_totals(
 
     url = _FL_VEGAS_URL.format(date=date_param)
     log.info("Fetching FantasyLabs implied totals: %s", url)
-    try:
-        await page.goto(url, wait_until="load")
+    max_attempts = 2
+    for attempt in range(1, max_attempts + 1):
         try:
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-        except Exception:
-            pass  # networkidle can time out on long-polling pages; proceed anyway
-        await page.wait_for_selector("table", timeout=30_000)
-        await asyncio.sleep(3)  # let React hydrate table rows after element appears
-    except Exception as e:
-        log.warning("FL totals: page did not load: %s", e)
-        return {}, []
+            await page.goto(url, wait_until="load")
+            try:
+                await page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass  # networkidle can time out on long-polling pages; proceed anyway
+            await page.wait_for_selector("table", timeout=30_000)
+            await asyncio.sleep(3)  # let React hydrate table rows after element appears
+            break
+        except Exception as e:
+            title = ""
+            try:
+                title = await page.title()
+            except Exception:
+                pass
+            log.warning(
+                "FL totals: page did not load (attempt %d/%d, title=%r): %s",
+                attempt, max_attempts, title, e,
+            )
+            if attempt == max_attempts:
+                return {}, []
+            await asyncio.sleep(5)  # give a Cloudflare challenge time to clear before retrying
 
     try:
         rows: list[list[str]] = await page.evaluate("""
@@ -1786,14 +1799,16 @@ def _compute_pitcher_partial_no_win(
 # Playwright orchestration
 # ---------------------------------------------------------------------------
 
-def _install_rate_limit_handler(page, label: str) -> None:
+def _install_rate_limit_handler(
+    page, label: str, domain: str = "crazyninjaodds"
+) -> None:
     """
     Install a response listener on a Playwright page that logs HTTP status
-    codes indicative of rate-limiting or IP blocks from crazyninjaodds.com.
+    codes indicative of rate-limiting or IP blocks from the given domain.
     Call once per page immediately after creation.
     """
     async def _on_response(response) -> None:
-        if "crazyninjaodds" not in response.url:
+        if domain not in response.url:
             return
         status = response.status
         if status == 429:
@@ -2043,7 +2058,7 @@ async def _run_playwright(
         team_totals: dict[str, float] = {}
         all_team_name_warnings: list[dict] = []
         fl_page = await context.new_page()
-        _install_rate_limit_handler(fl_page, "fantasylabs-vegas")
+        _install_rate_limit_handler(fl_page, "fantasylabs-vegas", domain="fantasylabs")
         try:
             team_totals, all_team_name_warnings = await _fetch_fantasylabs_team_totals(
                 fl_page, slate_date,

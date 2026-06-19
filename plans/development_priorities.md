@@ -1,3 +1,1 @@
 - get w_resid explainer
-- gmail notifications (each way??)
-- internal notification for post-slate lineup diffs
