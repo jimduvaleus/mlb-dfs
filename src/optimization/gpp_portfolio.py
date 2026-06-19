@@ -490,17 +490,17 @@ class DeterminantPortfolioSelector:
         t0 = time.perf_counter()
         n_sims = self._robust_payout.shape[1]
 
-        # --- Phase 1 cull: keep +EV candidates ---
+        # --- Phase 1 cull: keep candidates with EV >= $0.20 ---
         pool_ev = self._robust_payout.mean(axis=1)  # (M,) float32
-        pool_mask = pool_ev > 0.0
+        pool_mask = pool_ev >= 0.20
         pool_idx = np.where(pool_mask)[0]  # indices into M
 
         logger.info(
-            "DeterminantSelector: %d / %d candidates are +EV",
+            "DeterminantSelector: %d / %d candidates have EV >= $0.20",
             len(pool_idx), len(self._candidates),
         )
         if len(pool_idx) == 0:
-            logger.warning("No +EV candidates; returning empty portfolio.")
+            logger.warning("No candidates with EV >= $0.20; returning empty portfolio.")
             return []
 
         pool_ev_vals = pool_ev[pool_idx].astype(np.float64)  # (M_pool,)
