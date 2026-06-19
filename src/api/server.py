@@ -115,6 +115,7 @@ _TWITTER_RE = re.compile(
 )
 _NOTIFY_HEADER_RE = re.compile(r'member=Notify\b')
 _STRING_START_RE = re.compile(r'^\s+string\s+"(.*)$')
+_SCRATCH_RE = re.compile(r'scratch(?:ed)?', re.IGNORECASE)
 
 # Append-only forensic log of every dbus Notify call seen, regardless of the
 # app/content filter below. The live _notifications deque only retains undismissed
@@ -177,6 +178,17 @@ def _maybe_commit_notification(str_args: list[str]) -> None:
         with _notifications_lock:
             _notifications.append(notif)
             _save_notifications()
+
+        # Scratch alerts are time-critical from 10 min before slate lock onward —
+        # email the full notification text in addition to the in-app entry above.
+        if _SCRATCH_RE.search(summary + ' ' + body) and _slate_first_pitch_started():
+            from .email_notify import send_notification_email
+            full_text = f"{summary}\n\n{body}" if body else summary
+            threading.Thread(
+                target=send_notification_email,
+                args=(f"Scratch alert: {summary}", full_text),
+                daemon=True,
+            ).start()
 
 
 def _dbus_monitor_loop() -> None:
@@ -597,6 +609,11 @@ def _emit_lineup_diff_notification(
     with _notifications_lock:
         _notifications.append(diff_notif)
         _save_notifications()
+
+    from .email_notify import send_notification_email
+    threading.Thread(
+        target=send_notification_email, args=(summary, diff_notif["body"]), daemon=True
+    ).start()
 
 
 _LINEUP_DIFF_WINDOW = timedelta(minutes=10)
