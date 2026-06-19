@@ -148,6 +148,21 @@ function parseFeeCents(entryFee: string | null | undefined): number {
   return Math.round(parseFloat(entryFee.replace(/[^0-9.]/g, '')) * 100)
 }
 
+// Average $EV across a portfolio's lineups, weighted by each lineup's entry fee,
+// then normalized by /4 since mean_ev is computed assuming a $4 entry fee.
+function calcWeightedAvgEv(lineups: LineupResult[]): number | null {
+  let weightedSum = 0
+  let totalFee = 0
+  for (const l of lineups) {
+    const fee = parseFeeCents(l.entry_fee) / 100
+    if (fee <= 0 || l.mean_ev == null) continue
+    weightedSum += fee * l.mean_ev
+    totalFee += fee
+  }
+  if (totalFee === 0) return null
+  return (weightedSum / totalFee) / 4
+}
+
 function entrySortKey(lineup: LineupResult): [number, number, number] {
   const ratio = lineup.entry_sort_order ?? Infinity
   const fee = parseFeeCents(lineup.entry_fee)
@@ -434,6 +449,12 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                   }}
                 >
                   {isActive && <span className="portfolio-risk-star">★ </span>}Risk {entry.risk}
+                  {(() => {
+                    const weightedAvgEv = calcWeightedAvgEv(entry.lineups)
+                    return weightedAvgEv != null && (
+                      <span className="portfolio-risk-btn-stats">${weightedAvgEv.toFixed(2)} avg $EV</span>
+                    )
+                  })()}
                   {contestNormalized.size > 0 && (() => {
                     const { max, avg } = calcSweepStats(entry.lineups, contestNormalized)
                     return <span className="portfolio-risk-btn-stats">{avg.toFixed(1)} avg · {max.toFixed(1)} max</span>
