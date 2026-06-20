@@ -271,7 +271,13 @@ export default function App() {
   // For each unambiguous lineup notification, attempt silent auto-parse before showing in panel.
   useEffect(() => {
     const poll = async () => {
-      const notifications = await fetchNotifications().catch(() => [] as typeof state.notifications)
+      const fetched = await fetchNotifications().catch(() => [] as typeof state.notifications)
+      // Notifications for teams not in the current slate are dismissed immediately and
+      // never enter state, so the unread count/title never flickers up before they're
+      // pruned (which previously only happened once the Slate tab mounted).
+      const outOfSlate = fetched.filter(n => n.lineup_team_in_slate === false)
+      const notifications = fetched.filter(n => n.lineup_team_in_slate !== false)
+      await Promise.all(outOfSlate.map(n => dismissNotification(n.id).catch(() => {})))
       let didAutoConfirm = false
       for (const notif of notifications) {
         if (notif.could_be_lineup && !seenNotifIdsRef.current.has(notif.id)) {
@@ -286,7 +292,7 @@ export default function App() {
         refreshProjectionPlayers()
         // Re-fetch to get the updated (dismissed) list
         const updated = await fetchNotifications().catch(() => notifications)
-        dispatch({ type: 'set_notifications', notifications: updated })
+        dispatch({ type: 'set_notifications', notifications: updated.filter(n => n.lineup_team_in_slate !== false) })
       } else {
         dispatch({ type: 'set_notifications', notifications })
       }

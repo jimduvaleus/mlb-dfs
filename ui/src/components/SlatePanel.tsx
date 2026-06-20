@@ -87,17 +87,6 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
       .catch(e => setError(String(e)))
   }, [platform])
 
-  // Auto-dismiss lineup notifications for teams not on the current slate
-  useEffect(() => {
-    if (!slate || !onDismissNotification) return
-    const teams = new Set(slate.games.flatMap(g => [g.away, g.home]))
-    for (const n of notifications) {
-      if (n.lineup_team && !teams.has(n.lineup_team)) {
-        onDismissNotification(n.id)
-      }
-    }
-  }, [notifications, slate])
-
   // Close search dropdowns when clicking outside
   useEffect(() => {
     function handleClick(e: MouseEvent) {

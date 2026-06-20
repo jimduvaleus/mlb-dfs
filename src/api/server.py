@@ -458,15 +458,22 @@ def get_notifications():
         hd = extract_lineup_header_date(n.get('body', ''))
         return hd is not None and hd == (today.month, today.day)
 
-    return [
-        {
+    # Teams playing in the currently-loaded slate, so out-of-slate lineup notifications
+    # can be excluded from the count returned to the client instead of being counted and
+    # then dismissed a moment later once the Slate tab mounts and re-derives this set.
+    slate_teams = {t for game in _load_slate_games() for t in game.split('@')}
+
+    result = []
+    for n in items:
+        lineup_team = extract_lineup_team(n.get('body', ''))
+        result.append({
             **n,
             'could_be_lineup': looks_like_lineup(n.get('body', '')),
-            'lineup_team': extract_lineup_team(n.get('body', '')),
+            'lineup_team': lineup_team,
             'is_current_slate': _is_current_slate(n),
-        }
-        for n in items
-    ]
+            'lineup_team_in_slate': not lineup_team or not slate_teams or lineup_team in slate_teams,
+        })
+    return result
 
 
 @app.delete("/api/notifications/{notification_id}")
