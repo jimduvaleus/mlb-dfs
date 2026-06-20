@@ -3029,8 +3029,12 @@ def _output_dir_path() -> Path:
 def _late_swap_context(apply_saved: bool = True) -> dict:
     """Parse entries + slate, build pools/lookup/states, apply persisted swaps.
 
-    Pass apply_saved=False to get pristine states (run_swap recomputes from
-    the original entry files, so a re-run must not start from prior swaps).
+    apply_saved=True (the default) carries forward previously committed
+    swaps onto the freshly parsed states — including into run_swap, so a
+    re-run extends prior swaps rather than recomputing from the untouched
+    original entry file. A slot whose original player has since locked
+    keeps its prior committed swap-in (run_swap won't re-vacate a locked
+    slot); a still-open slot remains fully re-computable on every run.
 
     Returns {"status": "ok", ...} or a terminal {"status": <reason>}.
     """
@@ -3132,7 +3136,7 @@ def run_late_swap(req: LateSwapRunRequest):
     if not _late_swap_lock.acquire(blocking=False):
         raise HTTPException(409, "A late swap run is already in progress")
     try:
-        ctx = _late_swap_context(apply_saved=False)
+        ctx = _late_swap_context()
         if ctx["status"] != "ok":
             raise HTTPException(400, f"Late swap unavailable: {ctx['status']}")
         bulk_pids = set(req.bulk_marked_player_ids)

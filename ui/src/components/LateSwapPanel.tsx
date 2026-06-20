@@ -73,6 +73,11 @@ export default function LateSwapPanel({ platform }: Props) {
 
   // Filter by player
   const [filterPlayer, setFilterPlayer] = useState<FilterPlayer | null>(null)
+  // Show only lineups with at least one marked or already-swapped slot.
+  // The all-locked auto-hide (n_swappable > 0) is applied first and takes
+  // precedence — this filter only narrows further, it never reveals a
+  // lineup the auto-hide already removed.
+  const [markedOnly, setMarkedOnly] = useState(false)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const searchWrapRef = useRef<HTMLDivElement>(null)
@@ -191,13 +196,17 @@ export default function LateSwapPanel({ platform }: Props) {
 
   const visibleEntries = useMemo(() => {
     if (!state) return []
+    // All-locked auto-hide first — it always wins, regardless of markedOnly.
     let entries = state.entries.filter(e => e.n_swappable > 0)
     if (filterPlayer) {
       entries = entries.filter(e =>
         e.slots.some(s => slotCurrentPlayerId(s) === filterPlayer.player_id || s.player?.player_id === filterPlayer.player_id))
     }
+    if (markedOnly) {
+      entries = entries.filter(e => e.slots.some(s => isMarked(e, s) || s.swapped_in))
+    }
     return entries
-  }, [state, filterPlayer])
+  }, [state, filterPlayer, markedOnly, isMarked])
 
   const markedCount = useMemo(() => {
     if (!state) return 0
@@ -390,6 +399,15 @@ export default function LateSwapPanel({ platform }: Props) {
           ))}
         </select>
 
+        <label className="lateswap-marked-filter">
+          <input
+            type="checkbox"
+            checked={markedOnly}
+            onChange={e => setMarkedOnly(e.target.checked)}
+          />
+          Marked/swapped only
+        </label>
+
         <span className="lateswap-summary">
           {visibleEntries.length} lineup{visibleEntries.length !== 1 ? 's' : ''} · {totalSwappable} swappable · {markedCount} marked
         </span>
@@ -443,7 +461,9 @@ export default function LateSwapPanel({ platform }: Props) {
         <p className="muted">
           {filterPlayer
             ? `No swappable lineups include ${filterPlayer.name}.`
-            : 'No entries with swappable players.'}
+            : markedOnly
+              ? 'No swappable lineups have a marked or swapped player.'
+              : 'No entries with swappable players.'}
         </p>
       )}
 

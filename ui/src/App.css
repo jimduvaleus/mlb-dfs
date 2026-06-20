@@ -2719,6 +2719,15 @@ button { cursor: pointer; }
   color: #a0aec0;
 }
 
+.lateswap-marked-filter {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  color: #a0aec0;
+  cursor: pointer;
+}
+
 .lateswap-bulk-chips {
   display: flex;
   align-items: center;

@@ -527,12 +527,14 @@ def run_swap(
 
     def slot_reserve(entry: EntrySwapState, slot_index: int) -> float:
         """Worst-case cost of a still-vacated slot: an unfillable slot keeps
-        its original player, so reserving the original's salary guarantees the
-        cap is never busted by later keeps. Empty cells reserve the cheapest
-        position-eligible candidate."""
+        its current occupant (the original player, or a prior committed swap
+        carried forward from an earlier run), so reserving that salary
+        guarantees the cap is never busted by later keeps. Empty cells
+        reserve the cheapest position-eligible candidate."""
         s = entry.slots[slot_index]
-        if s.original is not None and s.original.player_id is not None:
-            meta = lookup.get(s.original.player_id)
+        pid = s.current_player_id
+        if pid is not None:
+            meta = lookup.get(pid)
             if meta and meta.get("salary") is not None:
                 return meta["salary"]
         return pos_min_salary.get(s.slot_position, 0)
@@ -572,20 +574,22 @@ def run_swap(
             continue
         per_entry_excluded = set(entry_marks.get(entry.entry_id, set()))
 
+        snapshot = _snapshot_slots(entry, vacated)
         unfillable = fill_entry(entry, vacated, per_entry_excluded)
         if not entry.changed or _entry_is_valid(entry, lookup):
             continue
-        # An unfillable slot kept its original player, but earlier fills in
+        # An unfillable slot kept its prior occupant, but earlier fills in
         # this entry treated it as vacant and never checked constraints
-        # against that original (e.g. a new pitcher now opposes a kept
-        # batter). Revert and retry with the unfillable slots treated as
-        # kept from the start.
-        _revert_auto_swaps(entry, usage)
+        # against that occupant (e.g. a new pitcher now opposes a kept
+        # batter). Roll back to each slot's pre-this-run value (its original
+        # player, or a prior run's committed swap) and retry with the
+        # unfillable slots treated as kept from the start.
+        _revert_to_snapshot(entry, snapshot, usage)
         retry = vacated - unfillable
         if retry and retry != vacated:
             fill_entry(entry, retry, per_entry_excluded)
             if entry.changed and not _entry_is_valid(entry, lookup):
-                _revert_auto_swaps(entry, usage)
+                _revert_to_snapshot(entry, {i: snapshot[i] for i in retry}, usage)
                 entry.warnings.append({"slot_index": None, "reason": "validation_failed_reverted"})
         else:
             entry.warnings.append({"slot_index": None, "reason": "validation_failed_reverted"})
@@ -630,13 +634,28 @@ def _entry_is_valid(entry: EntrySwapState, lookup: Dict[int, dict]) -> bool:
     return Lineup(player_ids=list(final_ids)).is_valid(player_meta)
 
 
-def _revert_auto_swaps(entry: EntrySwapState, usage: Counter) -> None:
-    for s in entry.slots:
-        if s.swap_source == "auto":
-            if s.swapped_in_id is not None and usage.get(s.swapped_in_id, 0) > 0:
-                usage[s.swapped_in_id] -= 1
-            s.swapped_in_id = None
-            s.swap_source = None
+def _snapshot_slots(
+    entry: EntrySwapState, slot_indices: Set[int]
+) -> Dict[int, Tuple[Optional[int], Optional[str]]]:
+    """Capture each slot's (swapped_in_id, swap_source) before this run's
+    fill_entry touches it, so a failed attempt can roll back to whatever was
+    there beforehand — the original player, or a prior run's committed swap
+    carried forward — rather than always blanking to the original."""
+    return {i: (entry.slots[i].swapped_in_id, entry.slots[i].swap_source) for i in slot_indices}
+
+
+def _revert_to_snapshot(
+    entry: EntrySwapState,
+    snapshot: Dict[int, Tuple[Optional[int], Optional[str]]],
+    usage: Counter,
+) -> None:
+    for i, (prev_id, prev_source) in snapshot.items():
+        s = entry.slots[i]
+        if s.swapped_in_id == prev_id:
+            continue
+        if s.swapped_in_id is not None and usage.get(s.swapped_in_id, 0) > 0:
+            usage[s.swapped_in_id] -= 1
+        s.swapped_in_id, s.swap_source = prev_id, prev_source
 
 
 def apply_override(
