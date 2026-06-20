@@ -1610,6 +1610,17 @@ class PipelineRunner:
         slate_id = compute_slate_id(current_games)
         stored = read_exclusions(slate_id, fingerprint)
 
+        # Manual per-player projection overrides (Projections tab) take precedence
+        # over the merged/heuristic mean — apply before exclusion filtering so the
+        # simulation and candidate pool both score the overridden projection,
+        # mirroring the override applied in GET /api/projections/players.
+        raw_overrides = stored.get("player_projection_overrides", {}) or {}
+        overrides = {int(k): float(v) for k, v in raw_overrides.items()}
+        if overrides:
+            players_df = players_df.copy()
+            override_series = players_df["player_id"].map(overrides)
+            players_df["mean"] = override_series.combine_first(players_df["mean"])
+
         game_ppd_pcts: dict = {k: v for k, v in stored.get("game_ppd_pcts", {}).items() if v and v > 0}
 
         # "both" scope — excluded from everything

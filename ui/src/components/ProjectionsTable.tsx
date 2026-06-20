@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import type { ProjectionPlayerRow, PlatformType, TwitterLineupRecord } from '../types'
-import { fetchTeamOwnershipReductions, saveTeamOwnershipReductions, fetchPlayerProjectionOverrides, savePlayerProjectionOverrides } from '../api'
+import type { ProjectionPlayerRow, PlatformType, TwitterLineupRecord, TwitterLineupSlot } from '../types'
+import { fetchTeamOwnershipReductions, saveTeamOwnershipReductions, fetchPlayerProjectionOverrides, savePlayerProjectionOverrides, saveTwitterLineup } from '../api'
 import TeamBadge from './TeamBadge'
 
 interface Props {
@@ -101,6 +101,21 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
     } catch {}
     finally { setOverrideSaving(false) }
   }, [overrideSlateId, projOverrides, overrideSaving, onOwnershipSettingsChanged])
+
+  // Locking must snapshot whatever's currently visible on the card as the
+  // canonical lineup, not whatever was last parsed from a notification —
+  // those can drift out of sync (e.g. a newer RW confirmation merged in).
+  const handleLockTeam = useCallback(async (team: string, teamRecord: TwitterLineupRecord, batters: ProjectionPlayerRow[]) => {
+    const slots: TwitterLineupSlot[] = batters.map((p, i) => ({
+      slot: i + 1,
+      player_id: p.player_id,
+      name: p.name,
+    }))
+    try {
+      await saveTwitterLineup({ team, notification_id: teamRecord.notification_id, slots, locked: true })
+    } catch {}
+    onLockToggle?.(team, true)
+  }, [onLockToggle])
 
   const handleRefreshTeam = useCallback(async (team: string) => {
     setRefreshingTeam(team)
@@ -293,7 +308,7 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
                     <button
                       className={`btn-lock${isLocked ? ' btn-lock--locked' : ' btn-lock--unlocked'}`}
                       title={isLocked ? 'Lineup locked — click to unlock' : teamRecord ? 'Click to lock lineup' : 'No confirmed lineup to lock'}
-                      onClick={() => teamRecord && onLockToggle?.(team, !isLocked)}
+                      onClick={() => teamRecord && (isLocked ? onLockToggle?.(team, false) : handleLockTeam(team, teamRecord, batters))}
                       disabled={!teamRecord}
                       aria-label={isLocked ? `Unlock ${team} lineup` : `Lock ${team} lineup`}
                     >
