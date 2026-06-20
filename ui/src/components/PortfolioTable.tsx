@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import type { LineupResult, PlatformType, PlayerRow, PortfolioSweepEntry } from '../types'
 import { fetchContestAnalysis } from '../api'
-import { getStackNotation } from '../utils'
+import { getStackNotation, alphabetizeDuplicateGroups } from '../utils'
 import TeamBadge from './TeamBadge'
 
 interface Props {
@@ -116,7 +116,11 @@ function sortAndAssignPositions(
     }
   }
 
-  return result
+  // DK echoes duplicate-position roster slots (P,P and OF,OF,OF) back
+  // alphabetically by last name regardless of upload column order (confirmed
+  // empirically by diffing an uploaded vs. downloaded entries CSV) — mirror
+  // that convention here so cards match what DK itself will display.
+  return alphabetizeDuplicateGroups(result, r => r.displayPos, r => r.player.name)
 }
 
 function buildNormalizedFptsMap(fpts: Record<string, number>): Map<string, number> {

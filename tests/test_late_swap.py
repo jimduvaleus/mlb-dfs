@@ -634,15 +634,28 @@ class TestWriteSwapFiles:
         run_swap(states, {"100": {19}}, set(), set(), slate_df, lookup,
                  HeuristicScorer(), NOW)
         out_dir = tmp_path / "outputs"
-        written = write_swap_files(states, str(out_dir))
-        assert written == [str(out_dir / "swap_MEDKEntries.csv")]
+        written = write_swap_files(states, str(out_dir), lookup)
+        # The OF trio (7="O Seven", 17="O Seventeen", 18="O Eighteen" after the
+        # swap) reorders alphabetically by last name in the primary file
+        # ("Eighteen" < "Seven" < "Seventeen"), which differs from the
+        # original pinned columns -- so the swap_reversed_ hedge file is
+        # also written.
+        assert written == [
+            str(out_dir / "swap_MEDKEntries.csv"),
+            str(out_dir / "swap_reversed_MEDKEntries.csv"),
+        ]
         with open(out_dir / "swap_MEDKEntries.csv") as f:
             rows = list(csv.reader(f))
         assert rows[0] == UPLOAD_HEADER
         assert len(rows) == 2  # header + entry 100 only
-        # locked/kept players keep their columns; swapped slot has new id
-        expected = [str(p) for p in ENTRY1_PIDS[:9]] + ["18"]
+        expected = [str(p) for p in ENTRY1_PIDS[:7]] + ["18", "7", "17"]
         assert rows[1] == ["100", "MLB $5K Test", "111", "$4"] + expected
+
+        with open(out_dir / "swap_reversed_MEDKEntries.csv") as f:
+            reversed_rows = list(csv.reader(f))
+        # locked/kept players keep their original columns; swapped slot has new id
+        reversed_expected = [str(p) for p in ENTRY1_PIDS[:9]] + ["18"]
+        assert reversed_rows[1] == ["100", "MLB $5K Test", "111", "$4"] + reversed_expected
 
     def test_stale_swap_file_deleted(self, tmp_path, lookup):
         states = _states_for(tmp_path, lookup,
@@ -650,10 +663,13 @@ class TestWriteSwapFiles:
         out_dir = tmp_path / "outputs"
         out_dir.mkdir()
         stale = out_dir / "swap_MEDKEntries.csv"
+        stale_reversed = out_dir / "swap_reversed_MEDKEntries.csv"
         stale.write_text("stale")
-        written = write_swap_files(states, str(out_dir))  # nothing changed
+        stale_reversed.write_text("stale")
+        written = write_swap_files(states, str(out_dir), lookup)  # nothing changed
         assert written == []
         assert not stale.exists()
+        assert not stale_reversed.exists()
 
     def test_upload_prefix_stripped_from_swap_name(self, tmp_path, lookup, slate_df):
         states = _states_for(tmp_path, lookup,
@@ -661,8 +677,11 @@ class TestWriteSwapFiles:
         run_swap(states, {"100": {19}}, set(), set(), slate_df, lookup,
                  HeuristicScorer(), NOW)
         out_dir = tmp_path / "outputs"
-        written = write_swap_files(states, str(out_dir))
-        assert written == [str(out_dir / "swap_MEDKEntries.csv")]
+        written = write_swap_files(states, str(out_dir), lookup)
+        assert written == [
+            str(out_dir / "swap_MEDKEntries.csv"),
+            str(out_dir / "swap_reversed_MEDKEntries.csv"),
+        ]
 
 
 class TestScanSwapEntryFiles:

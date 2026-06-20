@@ -1,1 +1,2 @@
 - get w_resid explainer
+- swap ordering of SPs if pitchers are locked (might be ascending order?)

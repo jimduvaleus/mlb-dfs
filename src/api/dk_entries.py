@@ -23,6 +23,45 @@ logger = logging.getLogger(__name__)
 UPLOAD_HEADER = ["Entry ID", "Contest Name", "Contest ID", "Entry Fee",
                  "P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
 
+_NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
+
+
+def name_sort_key(name: str) -> tuple[str, str]:
+    """Sort key mirroring DK's own echo-back convention for duplicate-position
+    roster slots (P,P and OF,OF,OF): alphabetical by last name, first name as
+    tiebreak. Confirmed empirically by diffing an uploaded vs. downloaded
+    entries CSV — DK reorders these slots on its end regardless of upload
+    column order, so we match that order rather than fight it."""
+    parts = name.strip().split()
+    if not parts:
+        return ("", "")
+    last = parts[-1].rstrip(".").lower()
+    if last in _NAME_SUFFIXES and len(parts) > 1:
+        last = parts[-2].rstrip(".").lower()
+    first = parts[0].rstrip(".").lower()
+    return (last, first)
+
+
+def alphabetize_duplicate_slots(
+    ordered_ids: list[Optional[int]], id_to_name: dict[int, str]
+) -> list[Optional[int]]:
+    """Within each group of slots sharing the same SLOTS label (P,P and
+    OF,OF,OF), reorder the assigned players alphabetically by last name."""
+    groups: dict[str, list[int]] = {}
+    for j, pos in enumerate(SLOTS):
+        groups.setdefault(pos, []).append(j)
+    out = list(ordered_ids)
+    for idxs in groups.values():
+        if len(idxs) < 2:
+            continue
+        group_ids = sorted(
+            (ordered_ids[j] for j in idxs),
+            key=lambda pid: name_sort_key(str(id_to_name.get(pid, ""))),
+        )
+        for slot_j, pid in zip(idxs, group_ids):
+            out[slot_j] = pid
+    return out
+
 
 @dataclass
 class EntrySlotPlayer:
@@ -225,7 +264,9 @@ def assign_players_to_slots(
             f"Unmatched slots: {unmatched_slots}. Player IDs: {player_ids}"
         )
 
-    return [players[match_slot[j]] for j in range(n_slots)]
+    ordered_ids = [players[match_slot[j]] for j in range(n_slots)]
+    id_to_name = dict(zip(slate_df["player_id"], slate_df.get("name", slate_df["player_id"])))
+    return alphabetize_duplicate_slots(ordered_ids, id_to_name)
 
 
 def _sort_ratio(rec: EntryRecord) -> float:

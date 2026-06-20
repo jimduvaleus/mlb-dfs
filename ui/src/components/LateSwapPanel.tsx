@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { LateSwapCandidate, LateSwapEntry, LateSwapSlot, LateSwapState, PlatformType } from '../types'
 import { fetchLateSwapCandidates, fetchLateSwapState, overrideLateSwap, resetLateSwap, runLateSwap } from '../api'
+import { alphabetizeDuplicateGroups } from '../utils'
 import TeamBadge from './TeamBadge'
 
 interface Props {
@@ -17,6 +18,19 @@ interface FilterPlayer {
 function slotCurrentPlayerId(slot: LateSwapSlot): number | null {
   if (slot.swapped_in) return slot.swapped_in.player_id
   return slot.player?.player_id ?? null
+}
+
+function slotDisplayName(slot: LateSwapSlot): string {
+  return slot.swapped_in?.name ?? slot.player?.name ?? ''
+}
+
+// DK echoes duplicate-position roster slots (P,P and OF,OF,OF) back
+// alphabetically by last name regardless of upload column order (confirmed
+// empirically) — render cards in that order too, matching PortfolioTable.
+// Each slot keeps its own slot_index, so mark/override actions still target
+// the correct backend slot regardless of render position.
+function alphabetizedSlots(entry: LateSwapEntry): LateSwapSlot[] {
+  return alphabetizeDuplicateGroups(entry.slots, s => s.slot_position, slotDisplayName)
 }
 
 function entrySalary(entry: LateSwapEntry): number {
@@ -453,7 +467,7 @@ export default function LateSwapPanel({ platform }: Props) {
                 <div className="lateswap-card-warning">⚠ {entryWarnings.map(w => w.reason).join(', ')}</div>
               )}
               <div className="lineup-card-players">
-                {entry.slots.map(slot => {
+                {alphabetizedSlots(entry).map(slot => {
                   const marked = isMarked(entry, slot)
                   const bulkMarked = isBulkMarked(slot)
                   const swapped = slot.swapped_in

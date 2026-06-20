@@ -278,6 +278,7 @@ def _upload_order_players(players: list[dict]) -> list[dict]:
     try:
         sub = pd.DataFrame({
             "player_id": [p["player_id"] for p in players],
+            "name": [p.get("name", "") for p in players],
             "position": [str(p["position"]).split("/")[0] for p in players],
             "eligible_positions": [str(p["position"]).split("/") for p in players],
         })
@@ -3135,7 +3136,7 @@ def run_late_swap(req: LateSwapRunRequest):
             ctx["candidates_df"], ctx["lookup"], late_swap.HeuristicScorer(),
             ctx["now"],
         )
-        written = late_swap.write_swap_files(ctx["states"], ctx["output_dir"])
+        written = late_swap.write_swap_files(ctx["states"], ctx["output_dir"], ctx["lookup"])
         late_swap.save_state(
             ctx["output_dir"], ctx["fingerprint"], _now_eastern().isoformat(),
             bulk_pids, bulk_teams, ctx["states"], written,
@@ -3201,7 +3202,7 @@ def override_late_swap(req: LateSwapOverrideRequest):
         )
         if err:
             raise HTTPException(422, err)
-        written = late_swap.write_swap_files(ctx["states"], ctx["output_dir"])
+        written = late_swap.write_swap_files(ctx["states"], ctx["output_dir"], ctx["lookup"])
         # Stamp the write time so the UI banner reflects the latest file update.
         updated_at = _now_eastern().isoformat()
         late_swap.save_state(

@@ -10,13 +10,17 @@ players whose games have already started are untouched. This module:
     slate/player exclusions and non-starters)
   - Heuristically picks replacements for marked players (projection mean
     + same-team stack bonus - small cross-entry diversity penalty)
-  - Writes swap_<OriginalName>.csv upload files (changed entries only)
+  - Writes swap_<OriginalName>.csv upload files (changed entries only),
+    plus a swap_reversed_<OriginalName>.csv hedge file when a swap reorders
+    a duplicate-position group (see write_swap_files)
   - Persists swap results so the UI survives a server restart
 
 Slot semantics: entry CSV columns 4-13 are fixed slots P,P,C,1B,2B,3B,SS,
-OF,OF,OF. Locked and kept players stay in their column; a replacement must
-be eligible for the vacated column's slot (no bipartite re-shuffling —
-DK's late-swap rule is stricter than Lineup.is_valid's matching).
+OF,OF,OF. Locked and kept players stay in their column during matching; a
+replacement must be eligible for the vacated column's slot (no bipartite
+re-shuffling — DK's late-swap rule is stricter than Lineup.is_valid's
+matching). Column placement is only reshuffled afterward, at write time,
+within duplicate-position groups (see write_swap_files).
 
 All functions take `now` as a parameter; only the server layer reads the
 clock. Slate start times are naive Eastern-time ISO strings, so callers
@@ -40,7 +44,7 @@ from src.optimization.lineup import (
     SALARY_CAP,
     SLOTS,
 )
-from .dk_entries import EntryRecord, EntrySlotPlayer, UPLOAD_HEADER
+from .dk_entries import EntryRecord, EntrySlotPlayer, UPLOAD_HEADER, alphabetize_duplicate_slots
 
 logger = logging.getLogger(__name__)
 
@@ -57,13 +61,16 @@ def scan_swap_entry_files(output_dir: str) -> List[Path]:
     )
 
 
-def swap_file_name(source_file: str) -> str:
+def swap_file_name(source_file: str, reversed_order: bool = False) -> str:
     """swap_<OriginalName>.csv, with any upload_ prefix stripped
-    (upload_MEDKEntries.csv -> swap_MEDKEntries.csv)."""
+    (upload_MEDKEntries.csv -> swap_MEDKEntries.csv). reversed_order=True
+    gives the swap_reversed_<OriginalName>.csv hedge filename (see
+    write_swap_files)."""
     base = source_file
     if base.startswith("upload_"):
         base = base[len("upload_"):]
-    return f"swap_{base}"
+    prefix = "swap_reversed_" if reversed_order else "swap_"
+    return f"{prefix}{base}"
 
 
 # ---------------------------------------------------------------------------
@@ -729,10 +736,25 @@ def slot_max_salary(entry: EntrySwapState, slot_index: int,
 # CSV output
 # ---------------------------------------------------------------------------
 
-def write_swap_files(entry_states: List[EntrySwapState], output_dir: str) -> List[str]:
+def write_swap_files(
+    entry_states: List[EntrySwapState], output_dir: str, lookup: Dict[int, dict]
+) -> List[str]:
     """Write one swap_<OriginalName>.csv per source file, containing only the
     entries where at least one player changed. Sources with zero changed
-    entries get no file (and a stale swap_ file from a prior run is removed)."""
+    entries get no file (and stale swap_/swap_reversed_ files from a prior
+    run are removed).
+
+    swap_*.csv reorders duplicate-position slots (P,P and OF,OF,OF)
+    alphabetically by last name, mirroring DK's own echo-back convention
+    (confirmed by diffing an uploaded vs. downloaded entries CSV with both
+    slots still open). That evidence is about open slots, though — we have
+    no confirmed read on whether DK's *locked-slot* validation cares which
+    physical column a still-locked player occupies. As a hedge, when a swap
+    touches a duplicate-position group, we also write
+    swap_reversed_<OriginalName>.csv preserving each slot's original column
+    (the behavior before this change) as a fallback to try if swap_*.csv is
+    rejected.
+    """
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
     by_file: Dict[str, List[EntrySwapState]] = {}
@@ -742,24 +764,42 @@ def write_swap_files(entry_states: List[EntrySwapState], output_dir: str) -> Lis
     written: List[str] = []
     for source_file, entries in by_file.items():
         swap_path = out / swap_file_name(source_file)
+        reversed_path = out / swap_file_name(source_file, reversed_order=True)
         changed = [e for e in entries if e.changed]
         if not changed:
-            if swap_path.exists():
-                swap_path.unlink()
+            for p in (swap_path, reversed_path):
+                if p.exists():
+                    p.unlink()
             continue
-        rows = []
+
+        id_to_name = {pid: meta.get("name", "") for pid, meta in lookup.items()}
+        primary_rows, reversed_rows = [], []
+        any_reordered = False
         for e in changed:
             ids = [s.current_player_id for s in e.slots]
-            rows.append(
-                [e.entry_id, e.contest_name, e.contest_id, e.entry_fee_raw]
-                + ["" if pid is None else str(pid) for pid in ids]
-            )
+            alpha_ids = alphabetize_duplicate_slots(ids, id_to_name)
+            if alpha_ids != ids:
+                any_reordered = True
+            prefix = [e.entry_id, e.contest_name, e.contest_id, e.entry_fee_raw]
+            primary_rows.append(prefix + ["" if pid is None else str(pid) for pid in alpha_ids])
+            reversed_rows.append(prefix + ["" if pid is None else str(pid) for pid in ids])
+
         with open(swap_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(UPLOAD_HEADER)
-            writer.writerows(rows)
-        logger.info("Wrote %d swapped entries to %s", len(rows), swap_path)
+            writer.writerows(primary_rows)
+        logger.info("Wrote %d swapped entries to %s", len(primary_rows), swap_path)
         written.append(str(swap_path))
+
+        if any_reordered:
+            with open(reversed_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(UPLOAD_HEADER)
+                writer.writerows(reversed_rows)
+            logger.info("Wrote %d swapped entries to %s", len(reversed_rows), reversed_path)
+            written.append(str(reversed_path))
+        elif reversed_path.exists():
+            reversed_path.unlink()
     return written
 
 
