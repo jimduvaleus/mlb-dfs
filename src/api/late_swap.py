@@ -915,6 +915,26 @@ def apply_saved_state(entry_states: List[EntrySwapState], saved: dict) -> None:
                 entry.warnings.append(w)
 
 
+def recompute_locks(entry_states: List[EntrySwapState], lookup: Dict[int, dict],
+                    now: datetime) -> None:
+    """Recompute each slot's lock from its *current* occupant rather than
+    its original — once a swap commits, DK locks the slot based on whoever
+    is actually rostered there now, not the player it replaced. Call after
+    apply_saved_state so a slot whose original has since started keeps
+    reflecting its swapped-in player's (still-open) game.
+
+    Slots with no recoverable original (`missing_from_slate`) or no
+    original at all (an empty cell awaiting an auto-fill) are left as
+    built — there's no reliable per-player game time to recompute from.
+    """
+    for entry in entry_states:
+        for s in entry.slots:
+            if s.missing_from_slate or s.original is None:
+                continue
+            meta = lookup.get(s.current_player_id) if s.current_player_id is not None else None
+            s.locked = is_game_started(meta.get("game_start_time") if meta else None, now)
+
+
 # ---------------------------------------------------------------------------
 # API serialization
 # ---------------------------------------------------------------------------

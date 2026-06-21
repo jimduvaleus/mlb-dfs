@@ -43,6 +43,7 @@ from src.api.late_swap import (
     entry_to_dict,
     is_game_started,
     load_state,
+    recompute_locks,
     run_swap,
     save_state,
     scan_swap_entry_files,
@@ -740,6 +741,34 @@ class TestPersistence:
             "MEDKEntries.csv": [_entry("100", ENTRY1_PIDS[:9] + [20])]})
         apply_saved_state(changed, saved)
         assert changed[0].slots[9].swapped_in_id is None
+
+    def test_recompute_locks_uses_current_occupant(self, tmp_path, lookup, slate_df):
+        """A slot's lock must track whoever is actually rostered there now,
+        not the player a prior swap replaced — otherwise a still-open
+        swapped-in player gets stuck behind their (already-started)
+        predecessor's lock."""
+        states = _states_for(tmp_path, lookup,
+                             {"MEDKEntries.csv": [_entry("100", ENTRY1_PIDS)]})
+        # pid 19 (CCC/DDD game, T_OPEN1=21:05) swaps to an EEE/FFF OF
+        # (T_OPEN2=22:10) by excluding the other CCC/DDD OF candidates.
+        run_swap(states, {"100": {19}}, {18, 17, 24}, set(), slate_df, lookup,
+                 HeuristicScorer(), NOW)
+        repl = states[0].slots[9].swapped_in_id
+        assert lookup[repl]["game_start_time"] == "2026-06-11T22:10:00"
+        out_dir = str(tmp_path / "outputs")
+        save_state(out_dir, "fp1", "t", {18, 17, 24}, set(), states, [])
+        saved = load_state(out_dir, "fp1")
+
+        # 21:30: the original (19) has started; the swapped-in replacement
+        # hasn't.
+        later = datetime(2026, 6, 11, 21, 30)
+        path = tmp_path / "MEDKEntries.csv"
+        fresh = build_entry_states([(path, parse_entry_file(path))], lookup, {}, later)
+        assert fresh[0].slots[9].locked is True  # built fresh, pre-swap: original (19) has started
+        apply_saved_state(fresh, saved)
+        recompute_locks(fresh, lookup, later)
+        assert fresh[0].slots[9].locked is False
+        assert fresh[0].slots[9].swapped_in_id == repl
 
 
 # ---------------------------------------------------------------------------

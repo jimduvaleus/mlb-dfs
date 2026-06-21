@@ -3032,9 +3032,13 @@ def _late_swap_context(apply_saved: bool = True) -> dict:
     apply_saved=True (the default) carries forward previously committed
     swaps onto the freshly parsed states — including into run_swap, so a
     re-run extends prior swaps rather than recomputing from the untouched
-    original entry file. A slot whose original player has since locked
-    keeps its prior committed swap-in (run_swap won't re-vacate a locked
-    slot); a still-open slot remains fully re-computable on every run.
+    original entry file. Lock status is then recomputed from each slot's
+    current occupant (the swap-in, if any, else the original) via
+    recompute_locks: a slot only locks once whoever is actually rostered
+    there now has their game start, so a swapped-in player whose game
+    hasn't started keeps the slot open even though the player they
+    replaced has already started. A still-open slot remains fully
+    re-computable on every run.
 
     Returns {"status": "ok", ...} or a terminal {"status": <reason>}.
     """
@@ -3081,6 +3085,7 @@ def _late_swap_context(apply_saved: bool = True) -> dict:
     saved = late_swap.load_state(output_dir, fingerprint)
     if saved and apply_saved:
         late_swap.apply_saved_state(states, saved)
+        late_swap.recompute_locks(states, lookup, now)
 
     return {
         "status": "ok",
