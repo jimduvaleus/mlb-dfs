@@ -2833,6 +2833,11 @@ async def run_stream(
             portfolio = runner.run()
             _state["portfolio"] = portfolio
             _state["_runner_last"] = runner
+            # Re-sync the optimal-lineups cache with what this run just wrote to disk —
+            # it's otherwise never refreshed after the first load, so a later run (e.g.
+            # one that changed slate/player exclusions) would leave GET /api/portfolio/optimal
+            # serving a stale pre-exclusion snapshot indefinitely.
+            _state["optimal_lineups"] = _load_optimal_lineups_from_json(runner._platform.value)
             _state["status"] = "stopped" if _stop_event.is_set() else "complete"
         except Exception as exc:
             _state["status"] = "error"

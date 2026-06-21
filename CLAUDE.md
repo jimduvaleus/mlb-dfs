@@ -152,7 +152,7 @@ The web app is a React + TypeScript + Vite frontend (`ui/`) backed by a FastAPI 
 - `GET /api/slate/games` / `POST /api/slate/exclusions` — game exclusions
 - `GET /api/slate/players` / `POST /api/slate/player-exclusions` — player exclusions
 - `GET /api/slate/ownership-reductions` / `POST /api/slate/ownership-reductions` — per-player ownership fade
-- `GET /api/slate/projection-overrides` / `POST /api/slate/projection-overrides` — per-player mean/std overrides
+- `GET /api/slate/projection-overrides` / `POST /api/slate/projection-overrides` — per-player mean overrides (`dict[int, float]`; no std override exists). Applied to `players_df["mean"]` in `PipelineRunner._apply_exclusions()` before exclusion filtering, so both `sim_players_df` and `cand_players_df` (and therefore the optimal-lineup ILP solver) see the overridden mean.
 - `GET /api/notifications` / `DELETE /api/notifications/{id}` — in-app notification log
 - `GET /api/twitter-lineups` / `POST /api/twitter-lineups` / `DELETE /api/twitter-lineups/{team}` — confirmed opponent lineup tracking
 - `POST /api/lineups/{team}/lock` / `DELETE /api/lineups/{team}/lock` — lock/unlock a lineup
