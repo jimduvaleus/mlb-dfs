@@ -1070,7 +1070,7 @@ class PipelineRunner:
                 for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
                     if self._stop_check is not None and self._stop_check():
                         break
-                    _evw = 0.05 + (_sweep_risk - 1) * 0.1
+                    _evw = DeterminantPortfolioSelector.evw_for_risk(_sweep_risk)
                     _rss_mb = _proc_rss_mb()
                     logger.info(
                         "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)  RSS=%.0f MB",

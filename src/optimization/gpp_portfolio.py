@@ -459,7 +459,7 @@ class DeterminantPortfolioSelector:
     robust_payout : (M, n_sims) float32 — net dollar payout per candidate per sim
     candidates    : list of M Lineup objects (same ordering as robust_payout rows)
     portfolio_size : number of lineups to select
-    risk          : 1 = diversity-heavy (EVw=0.05, DEw=0.95), 5 = EV-heavy (EVw=0.45, DEw=0.55)
+    risk          : 1 = diversity-heavy (EVw=0.15, DEw=0.85), 5 = EV-heavy (EVw=0.55, DEw=0.45)
     """
 
     def __init__(
@@ -473,9 +473,18 @@ class DeterminantPortfolioSelector:
         self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
         self._candidates = candidates
         self._portfolio_size = portfolio_size
-        # EVw = 0.05 at risk=1, 0.45 at risk=5  (step +0.10 per level)
-        self._evw = float(np.clip(0.05 + (risk - 1) * 0.1, 0.0, 1.0))
+        self._evw = self.evw_for_risk(risk)
         self._dew = 1.0 - self._evw
+
+    @staticmethod
+    def evw_for_risk(risk: float) -> float:
+        """EVw = 0.15 at risk=1, 0.55 at risk=5 (step +0.10 per level).
+
+        Single source of truth for the EVw/DEw split — also used by callers
+        (e.g. PipelineRunner's risk-sweep logging) that need the weight
+        without constructing a selector.
+        """
+        return float(np.clip(0.15 + (risk - 1) * 0.1, 0.0, 1.0))
 
     # ------------------------------------------------------------------
     # Public API
