@@ -24,6 +24,13 @@ function slotDisplayName(slot: LateSwapSlot): string {
   return slot.swapped_in?.name ?? slot.player?.name ?? ''
 }
 
+// "Heriberto Hernandez" -> "H. Hernandez", for the compact "was ___" label.
+function shortName(name: string): string {
+  const parts = name.trim().split(/\s+/)
+  if (parts.length < 2) return name
+  return `${parts[0][0]}. ${parts[parts.length - 1]}`
+}
+
 // DK echoes duplicate-position roster slots (P,P and OF,OF,OF) back
 // alphabetically by last name regardless of upload column order (confirmed
 // empirically) — render cards in that order too, matching PortfolioTable.
@@ -514,7 +521,7 @@ export default function LateSwapPanel({ platform }: Props) {
                             {!swapped.locked && <span className="lateswap-swapped-caret">▾</span>}
                           </button>
                           {slot.swap_source === 'manual' && <span className="lateswap-manual-badge">manual</span>}
-                          <span className="lateswap-was">was {slot.player ? slot.player.name : '(empty)'}</span>
+                          <span className="lateswap-was">was {slot.player ? shortName(slot.player.name) : '(empty)'}</span>
                           {isOpen && (
                             <div className="swap-candidates-dropdown" ref={dropdownRef}>
                               {candidatesLoading && <div className="swap-candidates-empty">Loading…</div>}
