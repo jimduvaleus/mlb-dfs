@@ -632,6 +632,8 @@ export default function App() {
             onDeleteLineup={state.runStatus === 'complete' ? handleDeleteLineup : undefined}
             replacingLineupIndex={replacingIndex}
             platform={state.config?.platform}
+            evwBase={state.config?.gpp.evw_base}
+            evwMax={state.config?.gpp.evw_max}
           />
         )}
         {replaceError && state.activeTab === 'portfolio' && (

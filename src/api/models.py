@@ -57,6 +57,9 @@ class GppConfig(BaseModel):
     refine_top: int = 150
     refine_mutants: int = 8
     refine_holdout_fraction: float = 0.3
+    evw_base: float = 0.10
+    evw_max: float = 0.40
+    ev_floor: float = 0.20
 
 
 class AppConfig(BaseModel):

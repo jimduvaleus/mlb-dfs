@@ -1061,16 +1061,19 @@ class PipelineRunner:
                 # Always sweep risk values 1-5; ignore gpp.risk config for det_ev.
                 _DET_SWEEP_RISKS = [1.0, 2.0, 3.0, 4.0, 5.0]
                 _portfolio_sweep_raw: list[tuple[float, list]] = []
+                _evw_base = float(gpp_cfg.get("evw_base", 0.10))
+                _evw_max = float(gpp_cfg.get("evw_max", 0.40))
+                _ev_floor = float(gpp_cfg.get("ev_floor", 0.20))
 
                 logger.info(
-                    "Det-EV sweep — portfolio_size=%d, risks=%s",
-                    portfolio_size, _DET_SWEEP_RISKS,
+                    "Det-EV sweep — portfolio_size=%d, risks=%s, evw_base=%.3f, evw_max=%.3f, ev_floor=%.2f",
+                    portfolio_size, _DET_SWEEP_RISKS, _evw_base, _evw_max, _ev_floor,
                 )
 
                 for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
                     if self._stop_check is not None and self._stop_check():
                         break
-                    _evw = DeterminantPortfolioSelector.evw_for_risk(_sweep_risk)
+                    _evw = DeterminantPortfolioSelector.evw_for_risk(_sweep_risk, _evw_base, _evw_max)
                     _rss_mb = _proc_rss_mb()
                     logger.info(
                         "Det-EV risk %d/%d (risk=%.0f, EVw=%.2f, DEw=%.2f)  RSS=%.0f MB",
@@ -1087,6 +1090,9 @@ class PipelineRunner:
                         candidates=candidates,
                         portfolio_size=portfolio_size,
                         risk=_sweep_risk,
+                        evw_base=_evw_base,
+                        evw_max=_evw_max,
+                        ev_floor=_ev_floor,
                     )
                     _det_result = _det_sel.select(
                         progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(

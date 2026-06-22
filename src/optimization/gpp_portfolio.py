@@ -459,7 +459,12 @@ class DeterminantPortfolioSelector:
     robust_payout : (M, n_sims) float32 — net dollar payout per candidate per sim
     candidates    : list of M Lineup objects (same ordering as robust_payout rows)
     portfolio_size : number of lineups to select
-    risk          : 1 = diversity-heavy (EVw=0.15, DEw=0.85), 5 = EV-heavy (EVw=0.55, DEw=0.45)
+    risk          : 1..5; EVw is linearly interpolated between evw_base (risk=1) and
+                    evw_max (risk=5)
+    evw_base      : EVw at risk=1 (most diversity-heavy)
+    evw_max       : EVw at risk=5 (most EV-heavy)
+    ev_floor      : candidates with mean robust_payout below this $ amount are
+                    culled from the pool before selection begins
     """
 
     def __init__(
@@ -468,23 +473,28 @@ class DeterminantPortfolioSelector:
         candidates: list[Lineup],
         portfolio_size: int,
         risk: float = 5.0,
+        evw_base: float = 0.10,
+        evw_max: float = 0.40,
+        ev_floor: float = 0.20,
         rng_seed: Optional[int] = None,  # unused; kept for API consistency
     ) -> None:
         self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
         self._candidates = candidates
         self._portfolio_size = portfolio_size
-        self._evw = self.evw_for_risk(risk)
+        self._evw = self.evw_for_risk(risk, evw_base, evw_max)
         self._dew = 1.0 - self._evw
+        self._ev_floor = ev_floor
 
     @staticmethod
-    def evw_for_risk(risk: float) -> float:
-        """EVw = 0.15 at risk=1, 0.55 at risk=5 (step +0.10 per level).
+    def evw_for_risk(risk: float, evw_base: float = 0.10, evw_max: float = 0.40) -> float:
+        """EVw = evw_base at risk=1, evw_max at risk=5; linear in between.
 
         Single source of truth for the EVw/DEw split — also used by callers
         (e.g. PipelineRunner's risk-sweep logging) that need the weight
         without constructing a selector.
         """
-        return float(np.clip(0.15 + (risk - 1) * 0.1, 0.0, 1.0))
+        t = (risk - 1) / 4.0
+        return float(np.clip(evw_base + t * (evw_max - evw_base), 0.0, 1.0))
 
     # ------------------------------------------------------------------
     # Public API
@@ -499,17 +509,17 @@ class DeterminantPortfolioSelector:
         t0 = time.perf_counter()
         n_sims = self._robust_payout.shape[1]
 
-        # --- Phase 1 cull: keep candidates with EV >= $0.20 ---
+        # --- Phase 1 cull: keep candidates with EV >= ev_floor ---
         pool_ev = self._robust_payout.mean(axis=1)  # (M,) float32
-        pool_mask = pool_ev >= 0.20
+        pool_mask = pool_ev >= self._ev_floor
         pool_idx = np.where(pool_mask)[0]  # indices into M
 
         logger.info(
-            "DeterminantSelector: %d / %d candidates have EV >= $0.20",
-            len(pool_idx), len(self._candidates),
+            "DeterminantSelector: %d / %d candidates have EV >= $%.2f",
+            len(pool_idx), len(self._candidates), self._ev_floor,
         )
         if len(pool_idx) == 0:
-            logger.warning("No candidates with EV >= $0.20; returning empty portfolio.")
+            logger.warning("No candidates with EV >= $%.2f; returning empty portfolio.", self._ev_floor)
             return []
 
         pool_ev_vals = pool_ev[pool_idx].astype(np.float64)  # (M_pool,)

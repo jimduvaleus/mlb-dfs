@@ -52,6 +52,9 @@ export interface GppConfig {
   refine_top: number
   refine_mutants: number
   refine_holdout_fraction: number
+  evw_base: number
+  evw_max: number
+  ev_floor: number
 }
 
 export interface AppConfig {

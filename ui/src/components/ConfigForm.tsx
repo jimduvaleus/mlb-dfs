@@ -200,13 +200,17 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
               <input type="number" step={1} min={1} max={50} value={draft.gpp.refine_mutants ?? 8}
                 onChange={e => setGpp('refine_mutants', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
-            <FieldRow label="Refine holdout fraction (0 = off)">
-              <input type="number" step={0.05} min={0} max={0.5} value={draft.gpp.refine_holdout_fraction ?? 0.3}
-                onChange={e => setGpp('refine_holdout_fraction', Number(e.target.value))} disabled={disabled} />
+            <FieldRow label="Base EVw (risk 1)">
+              <input type="number" step={0.01} min={0} max={1} value={draft.gpp.evw_base ?? 0.10}
+                onChange={e => setGpp('evw_base', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
-            <FieldRow label="Dump candidate pool">
-              <input type="checkbox" checked={!!draft.gpp.dump_candidate_pool}
-                onChange={e => setGpp('dump_candidate_pool', e.target.checked)} disabled={disabled} />
+            <FieldRow label="Max EVw (risk 5)">
+              <input type="number" step={0.01} min={0} max={1} value={draft.gpp.evw_max ?? 0.40}
+                onChange={e => setGpp('evw_max', Number(e.target.value))} disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="EV floor ($)">
+              <input type="number" step={0.01} min={0} value={draft.gpp.ev_floor ?? 0.20}
+                onChange={e => setGpp('ev_floor', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
           </section>
         </div>

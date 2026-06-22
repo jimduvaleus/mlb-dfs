@@ -121,15 +121,57 @@ def test_perfect_correlation_gets_low_det_score():
 
 
 def test_risk_weights():
-    """EVw/DEw formula: risk=1 → EVw=0.15, risk=3 → EVw=0.35, risk=5 → EVw=0.55."""
+    """EVw/DEw formula: risk=1 → EVw=0.10, risk=3 → EVw=0.25, risk=5 → EVw=0.40."""
     rng = np.random.default_rng(5)
     payout = _identity_payout(20, 100, rng)
     candidates = [_make_lineup(list(range(i * 10, i * 10 + 10))) for i in range(20)]
 
-    for risk, expected_evw in [(1, 0.15), (3, 0.35), (5, 0.55)]:
+    for risk, expected_evw in [(1, 0.1), (3, 0.25), (5, 0.4)]:
         sel = DeterminantPortfolioSelector(payout, candidates, portfolio_size=3, risk=risk)
         assert abs(sel._evw - expected_evw) < 1e-9, f"risk={risk}: EVw={sel._evw}, expected {expected_evw}"
         assert abs(sel._dew - (1.0 - expected_evw)) < 1e-9
+
+
+def test_risk_weights_custom_base_max():
+    """Custom evw_base/evw_max are linearly interpolated across risk 1-5."""
+    rng = np.random.default_rng(5)
+    payout = _identity_payout(20, 100, rng)
+    candidates = [_make_lineup(list(range(i * 10, i * 10 + 10))) for i in range(20)]
+
+    for risk, expected_evw in [(1, 0.2), (3, 0.5), (5, 0.8)]:
+        sel = DeterminantPortfolioSelector(
+            payout, candidates, portfolio_size=3, risk=risk, evw_base=0.2, evw_max=0.8,
+        )
+        assert abs(sel._evw - expected_evw) < 1e-9, f"risk={risk}: EVw={sel._evw}, expected {expected_evw}"
+
+
+def test_ev_floor_default_is_point_two():
+    """Default ev_floor of $0.20 culls candidates below that EV, matching the old hardcoded value."""
+    rng = np.random.default_rng(8)
+    n_sims = 200
+    above = rng.standard_normal((3, n_sims)).astype(np.float32) + 5.0  # EV ~5.0
+    below = rng.standard_normal((3, n_sims)).astype(np.float32) * 0.01 + 0.1  # EV ~0.1, below floor
+    payout = np.vstack([above, below])
+    candidates = [_make_lineup(list(range(i * 10, i * 10 + 10))) for i in range(len(payout))]
+    sel = _make_selector(payout, candidates, portfolio_size=10)
+    result = sel.select()
+    selected_idx = {candidates.index(lu) for lu, _ in result}
+    assert selected_idx == {0, 1, 2}
+
+
+def test_ev_floor_custom_value():
+    """A lower ev_floor admits candidates the default $0.20 floor would have culled."""
+    rng = np.random.default_rng(8)
+    n_sims = 200
+    above = rng.standard_normal((3, n_sims)).astype(np.float32) + 5.0
+    below = rng.standard_normal((3, n_sims)).astype(np.float32) * 0.01 + 0.1
+    payout = np.vstack([above, below])
+    candidates = [_make_lineup(list(range(i * 10, i * 10 + 10))) for i in range(len(payout))]
+    sel = DeterminantPortfolioSelector(
+        payout, candidates, portfolio_size=10, ev_floor=0.05,
+    )
+    result = sel.select()
+    assert len(result) == 6
 
 
 def test_progress_callback_called():

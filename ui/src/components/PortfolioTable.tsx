@@ -14,6 +14,8 @@ interface Props {
   onDeleteLineup?: (lineupIndex: number) => void
   replacingLineupIndex?: number | null
   platform?: PlatformType
+  evwBase?: number
+  evwMax?: number
 }
 
 function formatFdEntryInfo(entryFee?: string | null, contestName?: string | null): string {
@@ -188,7 +190,14 @@ function playerKey(players: PlayerRow[]): string {
   return [...players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
 }
 
-export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = [], activeRisk = 1, onActivateRisk, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform }: Props) {
+// Mirrors DeterminantPortfolioSelector.evw_for_risk in gpp_portfolio.py:
+// EVw = evwBase at risk=1, evwMax at risk=5; linear in between.
+function evwForRisk(risk: number, evwBase: number, evwMax: number): number {
+  const t = (risk - 1) / 4
+  return Math.min(Math.max(evwBase + t * (evwMax - evwBase), 0), 1)
+}
+
+export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = [], activeRisk = 1, onActivateRisk, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform, evwBase = 0.10, evwMax = 0.40 }: Props) {
   const [activeTab, setActiveTab] = useState<'portfolio' | 'optimal'>('portfolio')
   // viewingRisk: which risk the user is currently browsing (null = showing active)
   const [viewingRisk, setViewingRisk] = useState<number | null>(null)
@@ -453,6 +462,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                   }}
                 >
                   {isActive && <span className="portfolio-risk-star">★ </span>}Risk {entry.risk}
+                  <span className="portfolio-risk-btn-stats">EVw {evwForRisk(entry.risk, evwBase, evwMax).toFixed(3)}</span>
                   {(() => {
                     const weightedAvgEv = calcWeightedAvgEv(entry.lineups)
                     return weightedAvgEv != null && (
