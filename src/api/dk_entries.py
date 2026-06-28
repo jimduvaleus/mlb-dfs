@@ -99,6 +99,12 @@ def _parse_fee_cents(fee_str: str) -> int:
 
 _PRIZE_POOL_RE = re.compile(r"\$(\d+(?:\.\d+)?)(K|M)?", re.IGNORECASE)
 
+# DK runs ~180 parallel "Qualifier" contests feeding a single $100K final; the
+# advertised prize pool is the *final's* pool, not the qualifier's. Approximate
+# the qualifier's own pool by dividing it out until DK exposes a real number.
+_QUALIFIER_RE = re.compile(r"qualifier", re.IGNORECASE)
+_QUALIFIER_DIVISOR = 180
+
 _PLAYER_CELL_RE = re.compile(r"^\s*(.*?)\s*\((\d+)\)\s*$")
 _BARE_ID_RE = re.compile(r"^\s*(\d+)\s*$")
 
@@ -138,6 +144,12 @@ def _parse_prize_pool_cents(contest_name: str) -> Optional[int]:
       "MLB $1.5K Pickoff"                  -> 150_000_00 (= $1,500 * 100)
       "MLB $20K Four-Seamer"               -> 2_000_000_00 (= $20,000 * 100)
 
+    If "Qualifier" appears in the contest name, the parsed amount is the
+    pool of the $100K final the qualifier feeds into, not the qualifier's
+    own pool, so it's divided by `_QUALIFIER_DIVISOR` (~180 parallel
+    qualifiers per final), e.g.:
+      "MLB $100K Baseball Pocket Cup Qualifier #144" -> 555_55 (= $100,000 / 180 * 100)
+
     Returns None if no such token is found.
     """
     m = _PRIZE_POOL_RE.search(contest_name)
@@ -149,6 +161,8 @@ def _parse_prize_pool_cents(contest_name: str) -> Optional[int]:
         amount *= 1_000
     elif suffix == "M":
         amount *= 1_000_000
+    if _QUALIFIER_RE.search(contest_name):
+        amount /= _QUALIFIER_DIVISOR
     return round(amount * 100)
 
 
