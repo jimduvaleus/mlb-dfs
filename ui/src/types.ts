@@ -562,6 +562,7 @@ export interface TwitterLineupRecord {
   confirmed_at: number
   slots: TwitterLineupSlot[]
   locked: boolean
+  needs_game_confirmation: boolean
 }
 
 export interface TwitterLineupSaveRequest {
@@ -569,6 +570,12 @@ export interface TwitterLineupSaveRequest {
   notification_id: string
   slots: TwitterLineupSlot[]
   locked: boolean
+}
+
+export interface DoubleheaderStatusResponse {
+  date: string
+  doubleheader_teams: string[]
+  is_fresh: boolean
 }
 
 export interface ContestAnalysisResponse {

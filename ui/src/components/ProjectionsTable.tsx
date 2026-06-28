@@ -298,16 +298,26 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
                 )
               })
 
+          const needsGameConfirmation = !isLocked && (teamRecord?.needs_game_confirmation ?? false)
+
           return (
             <div key={team} className={`lineup-card${hasReduction ? ' lineup-card--own-red' : ''}${isLocked ? ' lineup-card--locked' : ''}`}>
               <div className="lineup-card-header">
                 <TeamBadge team={team} />
+                {needsGameConfirmation && (
+                  <span
+                    className="doubleheader-badge"
+                    title={`${team} is playing a doubleheader today — this confirmed lineup may be for the wrong game. Auto-lock was skipped; verify it's for tonight's slate game before locking.`}
+                  >
+                    ⚠ DH
+                  </span>
+                )}
                 <div className="lineup-card-header-right">
                   <span className="projections-team-total">{hitterProj.toFixed(1)} pts</span>
                   <div className="lineup-lock-controls">
                     <button
                       className={`btn-lock${isLocked ? ' btn-lock--locked' : ' btn-lock--unlocked'}`}
-                      title={isLocked ? 'Lineup locked — click to unlock' : teamRecord ? 'Click to lock lineup' : 'No confirmed lineup to lock'}
+                      title={isLocked ? 'Lineup locked — click to unlock' : needsGameConfirmation ? 'Doubleheader — verify this lineup is for tonight\'s game, then click to lock anyway' : teamRecord ? 'Click to lock lineup' : 'No confirmed lineup to lock'}
                       onClick={() => teamRecord && (isLocked ? onLockToggle?.(team, false) : handleLockTeam(team, teamRecord, batters))}
                       disabled={!teamRecord}
                       aria-label={isLocked ? `Unlock ${team} lineup` : `Lock ${team} lineup`}

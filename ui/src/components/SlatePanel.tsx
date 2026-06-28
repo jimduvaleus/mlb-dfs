@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ExclusionScope, ExclusionsUpdate, GameStatus, PlayerExclusionStatus, PlayerExclusionsUpdate, PlatformType, SlateGamesResponse, SlatePlayersResponse, TwitterLineupRecord, TwitterNotification } from '../types'
-import { fetchSlateGames, fetchSlatePlayers, savePlayerExclusions, saveSlateExclusions } from '../api'
+import { fetchDoubleheaders, fetchSlateGames, fetchSlatePlayers, savePlayerExclusions, saveSlateExclusions } from '../api'
 
 interface Props {
   disabled?: boolean
@@ -50,6 +50,15 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
   const [searchFullOpen, setSearchFullOpen] = useState(false)
   const searchFullRef = useRef<HTMLDivElement>(null)
   const [ppdPcts, setPpdPcts] = useState<Record<string, string>>({})
+  const [doubleheaderTeams, setDoubleheaderTeams] = useState<string[]>([])
+  const [doubleheaderCheckFailed, setDoubleheaderCheckFailed] = useState(false)
+
+  useEffect(() => {
+    fetchDoubleheaders().then(res => {
+      setDoubleheaderTeams(res.doubleheader_teams)
+      setDoubleheaderCheckFailed(!res.is_fresh)
+    })
+  }, [])
 
   const syncPpdFromSlate = useCallback((data: SlateGamesResponse) => {
     const pcts: Record<string, string> = {}
@@ -580,15 +589,45 @@ export function SlatePanel({ disabled, projFetchExcluded = [], onProjFetchFilter
         </div>
       </div>
 
+      {(() => {
+        const slateTeams = new Set(slate?.games.flatMap(g => [g.away, g.home]) ?? [])
+        const relevantDH = doubleheaderTeams.filter(t => slateTeams.size === 0 || slateTeams.has(t))
+        if (relevantDH.length === 0 && !doubleheaderCheckFailed) return null
+        return (
+          <div className="doubleheader-warning">
+            {relevantDH.length > 0
+              ? `⚠ ${relevantDH.join(' / ')} ${relevantDH.length > 1 ? 'are' : 'is'} playing a doubleheader today — confirmed-lineup auto-lock is disabled for ${relevantDH.length > 1 ? 'these teams' : 'this team'} until you verify the lineup is for tonight's slate game.`
+              : '⚠ Doubleheader schedule check unavailable — verify confirmed lineups manually.'}
+          </div>
+        )
+      })()}
+
       {/* Compact locked-lineup summary — no dismiss button; manage locks via Projections tab */}
-      {twitterLineups.length > 0 && (
-        <div className="locked-lineups-summary">
-          <span className="locked-lineups-label">🔒 {twitterLineups.length} locked lineup{twitterLineups.length !== 1 ? 's' : ''}:</span>
-          {twitterLineups.map(tl => (
-            <span key={tl.team} className="locked-lineup-chip">{tl.team}</span>
-          ))}
-        </div>
-      )}
+      {(() => {
+        const locked = twitterLineups.filter(tl => tl.locked)
+        const needsConfirm = twitterLineups.filter(tl => !tl.locked && tl.needs_game_confirmation)
+        if (locked.length === 0 && needsConfirm.length === 0) return null
+        return (
+          <div className="locked-lineups-summary">
+            {locked.length > 0 && (
+              <>
+                <span className="locked-lineups-label">🔒 {locked.length} locked lineup{locked.length !== 1 ? 's' : ''}:</span>
+                {locked.map(tl => (
+                  <span key={tl.team} className="locked-lineup-chip">{tl.team}</span>
+                ))}
+              </>
+            )}
+            {needsConfirm.length > 0 && (
+              <>
+                <span className="locked-lineups-label">⚠ {needsConfirm.length} unconfirmed (doubleheader):</span>
+                {needsConfirm.map(tl => (
+                  <span key={tl.team} className="locked-lineup-chip locked-lineup-chip--warning">{tl.team}</span>
+                ))}
+              </>
+            )}
+          </div>
+        )
+      })()}
 
       {/* Only show notifications that haven't already been auto-confirmed */}
       {(() => {

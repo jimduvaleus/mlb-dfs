@@ -2550,6 +2550,35 @@ button { cursor: pointer; }
   letter-spacing: 0.03em;
 }
 
+.locked-lineup-chip--warning {
+  background: #5a3a1a;
+  color: #fbd38d;
+}
+
+.doubleheader-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: #5a3a1a;
+  color: #fbd38d;
+  letter-spacing: 0.03em;
+  cursor: help;
+}
+
+.doubleheader-warning {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  margin-top: 12px;
+  background: #5a3a1a;
+  color: #fbd38d;
+  border-radius: 6px;
+  border: 1px solid #9c6a1f;
+  font-size: 0.82rem;
+}
+
 /* ── Lineup Parser Dialog ── */
 
 .dialog--wide {

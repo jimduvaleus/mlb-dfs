@@ -20,7 +20,7 @@ import threading
 import time
 import uuid
 from collections import deque
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
@@ -28,7 +28,8 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config_io import read_config, write_config
-from .models import AppConfig, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
+from .models import AppConfig, DoubleheaderStatusResponse, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
+from .mlb_schedule import get_doubleheader_teams_cached
 from .twitter_lineups import (
     delete_twitter_lineup,
     get_confirmed_team_lineups,
@@ -569,7 +570,12 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
 
 @app.get("/api/twitter-lineups")
 def get_twitter_lineups() -> list[TwitterLineupRecord]:
-    return [TwitterLineupRecord(**l) for l in load_twitter_lineups(_slate_fingerprint())]
+    doubleheader_teams, _ = get_doubleheader_teams_cached(date.today().isoformat())
+    records = []
+    for l in load_twitter_lineups(_slate_fingerprint()):
+        l = {**l, "needs_game_confirmation": l.get("team") in doubleheader_teams}
+        records.append(TwitterLineupRecord(**l))
+    return records
 
 
 def _emit_lineup_diff_notification(
@@ -707,8 +713,16 @@ def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
                 req.team, f"{req.team} lineup confirmed", best_guess, req.slots
             )
 
+    # Teams playing a doubleheader today can't be auto-trusted: Twitter/RotoWire/DFF
+    # carry no game-time data, so a confirmed lineup might belong to the wrong game.
+    # Save it, but veto the lock and flag it for manual confirmation.
+    doubleheader_teams, _ = get_doubleheader_teams_cached(date.today().isoformat())
+    needs_game_confirmation = req.team in doubleheader_teams
+    locked = False if needs_game_confirmation else req.locked
+
     slots = [s.model_dump() for s in req.slots]
-    record = upsert_twitter_lineup(req.team, req.notification_id, slots, fp, locked=req.locked)
+    record = upsert_twitter_lineup(req.team, req.notification_id, slots, fp, locked=locked)
+    record["needs_game_confirmation"] = needs_game_confirmation
     return TwitterLineupRecord(**record)
 
 
@@ -1038,6 +1052,19 @@ def _load_slate_games() -> dict[str, str]:
             continue
         result[game] = str(row["game_start_time"]) if has_time and row["game_start_time"] else ""
     return result
+
+
+@app.get("/api/schedule/doubleheaders")
+def get_schedule_doubleheaders() -> DoubleheaderStatusResponse:
+    """Doubleheader teams for today, per the real MLB schedule (not the slate file).
+
+    Used to veto auto-lock for Twitter/RotoWire/DFF confirmed lineups, since
+    those feeds carry no game-time data and can't tell which of a team's
+    games a confirmed lineup belongs to.
+    """
+    today = date.today().isoformat()
+    teams, is_fresh = get_doubleheader_teams_cached(today)
+    return DoubleheaderStatusResponse(date=today, doubleheader_teams=sorted(teams), is_fresh=is_fresh)
 
 
 @app.get("/api/slate/games")

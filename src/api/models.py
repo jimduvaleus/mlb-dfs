@@ -239,6 +239,7 @@ class TwitterLineupRecord(BaseModel):
     confirmed_at: float
     slots: list[TwitterLineupSlot]
     locked: bool = True  # old records without the key are treated as locked
+    needs_game_confirmation: bool = False  # team plays a doubleheader today; auto-lock was vetoed
 
 
 class TwitterLineupSaveRequest(BaseModel):
@@ -246,3 +247,9 @@ class TwitterLineupSaveRequest(BaseModel):
     notification_id: str
     slots: list[TwitterLineupSlot]
     locked: bool = True  # old clients that omit the field get locked=True
+
+
+class DoubleheaderStatusResponse(BaseModel):
+    date: str
+    doubleheader_teams: list[str] = []
+    is_fresh: bool = True

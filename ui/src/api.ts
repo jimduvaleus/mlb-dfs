@@ -1,4 +1,4 @@
-import type { AppConfig, CacheStatus, ContestAnalysisResponse, ExclusionsUpdate, LateSwapCandidatesResponse, LateSwapOverrideResponse, LateSwapRunRequest, LateSwapState, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
+import type { AppConfig, CacheStatus, ContestAnalysisResponse, DoubleheaderStatusResponse, ExclusionsUpdate, LateSwapCandidatesResponse, LateSwapOverrideResponse, LateSwapRunRequest, LateSwapState, OwnershipSyncResult, PlayerExclusionsUpdate, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, ProjectionPlayerRow, ProjectionsStatus, LineupResult, SlateGamesResponse, SlateListResponse, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
 
 export async function fetchConfig(): Promise<AppConfig> {
   const res = await fetch('/api/config')
@@ -173,6 +173,12 @@ export async function parseTwitterLineup(notificationId: string, body: string): 
     body: JSON.stringify({ notification_id: notificationId, body }),
   })
   if (!res.ok) throw new Error(`Failed to parse lineup: ${res.statusText}`)
+  return res.json()
+}
+
+export async function fetchDoubleheaders(): Promise<DoubleheaderStatusResponse> {
+  const res = await fetch('/api/schedule/doubleheaders')
+  if (!res.ok) return { date: '', doubleheader_teams: [], is_fresh: false }
   return res.json()
 }
 
