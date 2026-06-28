@@ -1705,6 +1705,32 @@ async def projections_ownership_sync():
         live_df["ownership_frac"] = live_df["ownership_pct"] / 100.0
 
         merged = dry_df.merge(live_df[["player_id", "ownership_frac"]], on="player_id", how="inner")
+
+        # Players whose whole game is excluded from the live slate (e.g. a postponed
+        # game) are correctly zeroed out by projections_players(), but the dry-run
+        # archive predates that exclusion and still assigns them nonzero
+        # pred_E_production. Comparing those rows is a spurious mismatch, not a real
+        # model disagreement, so drop them from the sync check.
+        both_excl_pids: set = set()
+        slate_df = _load_slate_df()
+        if slate_df is not None and "game" in slate_df.columns:
+            try:
+                from .slate_exclusions import compute_slate_id
+                games = [str(g) for g in slate_df["game"].dropna().unique()]
+                sid = compute_slate_id(games)
+                fp = compute_file_fingerprint(_get_slate_file_path())
+                excl = read_exclusions(sid, fp)
+                both_games = set(excl.get("excluded_games", []))
+                if both_games:
+                    slate_df["player_id"] = pd.to_numeric(slate_df["player_id"], errors="coerce")
+                    both_excl_pids = set(
+                        slate_df.loc[slate_df["game"].isin(both_games), "player_id"].dropna().astype(int)
+                    )
+            except Exception:
+                pass
+        if both_excl_pids:
+            merged = merged[~merged["player_id"].isin(both_excl_pids)]
+
         if len(merged) < 5:
             return {"status": "unavailable", "reason": "too_few_matched_players"}
 
