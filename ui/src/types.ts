@@ -578,8 +578,23 @@ export interface DoubleheaderStatusResponse {
   is_fresh: boolean
 }
 
+export interface ContestNameCollisionCandidate {
+  player_id: number
+  team: string
+  salary: number
+  fpts: number
+  drafted: number
+  suggested: boolean
+}
+
+export interface ContestNameCollision {
+  name: string
+  candidates: ContestNameCollisionCandidate[]
+}
+
 export interface ContestAnalysisResponse {
   player_fpts: Record<string, number>
+  collisions: ContestNameCollision[]
 }
 
 // ---------------------------------------------------------------------------

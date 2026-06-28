@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
-import type { LineupResult, PlatformType, PlayerRow, PortfolioSweepEntry } from '../types'
+import type { ContestNameCollision, LineupResult, PlatformType, PlayerRow, PortfolioSweepEntry } from '../types'
 import { fetchContestAnalysis } from '../api'
 import { getStackNotation, alphabetizeDuplicateGroups } from '../utils'
 import TeamBadge from './TeamBadge'
@@ -133,20 +133,43 @@ function buildNormalizedFptsMap(fpts: Record<string, number>): Map<string, numbe
   return m
 }
 
-function lookupFpts(name: string, normalized: Map<string, number>): number {
-  return normalized.get(name.toLowerCase()) ?? 0
+// `overrides` resolves players caught in a contest name collision (e.g. two real
+// players both named "Max Muncy") to their correct FPTS by player_id, since the
+// plain name map can only hold one value per name. See buildFptsOverrides.
+function lookupFpts(player: PlayerRow, normalized: Map<string, number>, overrides: Map<number, number>): number {
+  const override = overrides.get(player.player_id)
+  if (override != null) return override
+  return normalized.get(player.name.toLowerCase()) ?? 0
 }
 
-function calcLineupFpts(lineup: LineupResult, normalized: Map<string, number>): number {
-  return lineup.players.reduce((sum, p) => sum + lookupFpts(p.name, normalized), 0)
+function calcLineupFpts(lineup: LineupResult, normalized: Map<string, number>, overrides: Map<number, number>): number {
+  return lineup.players.reduce((sum, p) => sum + lookupFpts(p, normalized, overrides), 0)
 }
 
-function calcSweepStats(lineups: LineupResult[], norm: Map<string, number>) {
-  const scores = lineups.map(l => calcLineupFpts(l, norm))
+function calcSweepStats(lineups: LineupResult[], norm: Map<string, number>, overrides: Map<number, number>) {
+  const scores = lineups.map(l => calcLineupFpts(l, norm, overrides))
   return {
     max: Math.max(...scores),
     avg: scores.reduce((a, b) => a + b, 0) / scores.length,
   }
+}
+
+// Builds a player_id → FPTS map for players caught in a contest name collision.
+// The contest export has no team/ID for its FPTS sidebar table, so the server can only
+// suggest which candidate maps to which value; `swapped` holds names the user has
+// flipped away from that suggestion (2-candidate collisions only).
+function buildFptsOverrides(collisions: ContestNameCollision[], swapped: Set<string>): Map<number, number> {
+  const overrides = new Map<number, number>()
+  for (const collision of collisions) {
+    const candidates = swapped.has(collision.name) && collision.candidates.length === 2
+      ? [collision.candidates[1], collision.candidates[0]]
+      : collision.candidates
+    collision.candidates.forEach((cand, i) => {
+      const fpts = candidates[i].fpts
+      if (fpts != null) overrides.set(cand.player_id, fpts)
+    })
+  }
+  return overrides
 }
 
 function parseFeeCents(entryFee: string | null | undefined): number {
@@ -209,6 +232,8 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
   const searchWrapRef = useRef<HTMLDivElement>(null)
   // Contest analysis state
   const [contestNormalized, setContestNormalized] = useState<Map<string, number>>(new Map())
+  const [contestCollisions, setContestCollisions] = useState<ContestNameCollision[]>([])
+  const [swappedCollisions, setSwappedCollisions] = useState<Set<string>>(new Set())
   const [contestError, setContestError] = useState<string | null>(null)
   const [contestLoading, setContestLoading] = useState(false)
   const [sortByActual, setSortByActual] = useState(false)
@@ -229,6 +254,8 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
     try {
       const result = await fetchContestAnalysis()
       setContestNormalized(buildNormalizedFptsMap(result.player_fpts))
+      setContestCollisions(result.collisions)
+      setSwappedCollisions(new Set())
     } catch (e) {
       setContestError(e instanceof Error ? e.message : String(e))
     } finally {
@@ -237,6 +264,8 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
   }
 
   if (lineups.length === 0) return null
+
+  const fptsOverrides = buildFptsOverrides(contestCollisions, swappedCollisions)
 
   // Derive displayed lineups. viewingRisk=null shows the active portfolio (state.portfolio).
   const hasSweep = portfolioSweep.length > 0
@@ -271,7 +300,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
     ? playerFilteredLineups.filter(lineupHasUnconfirmed)
     : playerFilteredLineups
   const visibleLineups = (contestNormalized.size > 0 && sortByActual)
-    ? [...filteredLineups].sort((a, b) => calcLineupFpts(b, contestNormalized) - calcLineupFpts(a, contestNormalized))
+    ? [...filteredLineups].sort((a, b) => calcLineupFpts(b, contestNormalized, fptsOverrides) - calcLineupFpts(a, contestNormalized, fptsOverrides))
     : filteredLineups
 
   const unconfirmedByPlayer = new Map<number, { name: string; count: number }>()
@@ -470,7 +499,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                     )
                   })()}
                   {contestNormalized.size > 0 && (() => {
-                    const { max, avg } = calcSweepStats(entry.lineups, contestNormalized)
+                    const { max, avg } = calcSweepStats(entry.lineups, contestNormalized, fptsOverrides)
                     return <span className="portfolio-risk-btn-stats">{avg.toFixed(1)} avg · {max.toFixed(1)} max</span>
                   })()}
                 </button>
@@ -566,6 +595,40 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
           )}
         </div>
       </div>
+      {contestCollisions.length > 0 && (
+        <div className="portfolio-collision-banner">
+          {contestCollisions.map(collision => {
+            const swapped = swappedCollisions.has(collision.name)
+            const ordered = swapped && collision.candidates.length === 2
+              ? [collision.candidates[1], collision.candidates[0]]
+              : collision.candidates
+            return (
+              <div key={collision.name} className="portfolio-collision-row">
+                <span className="portfolio-collision-name">⚠ {collision.name} is ambiguous —</span>
+                {collision.candidates.map((cand, i) => (
+                  <span key={cand.player_id} className="portfolio-collision-candidate">
+                    {cand.team} ${(cand.salary / 1000).toFixed(1)}k → {ordered[i].fpts ?? '?'} FPTS
+                  </span>
+                ))}
+                {collision.candidates.length === 2 && (
+                  <button
+                    className="portfolio-collision-swap-btn"
+                    onClick={() => setSwappedCollisions(prev => {
+                      const next = new Set(prev)
+                      if (next.has(collision.name)) next.delete(collision.name)
+                      else next.add(collision.name)
+                      return next
+                    })}
+                    title="The contest export doesn't say which player each value belongs to — swap if this guess looks wrong"
+                  >
+                    Swap
+                  </button>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
       <div className="portfolio-cards">
         {visibleLineups.map(lineup => {
           const sorted = sortAndAssignPositions(lineup.players, platform)
@@ -610,7 +673,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
               )}
               {contestNormalized.size > 0 && (
                 <div className="lineup-card-actual-score">
-                  {calcLineupFpts(lineup, contestNormalized).toFixed(2)} FPTS
+                  {calcLineupFpts(lineup, contestNormalized, fptsOverrides).toFixed(2)} FPTS
                 </div>
               )}
               <div className="lineup-card-players">

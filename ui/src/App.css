@@ -993,6 +993,49 @@ button { cursor: pointer; }
 
 .portfolio-unconfirmed-filter-btn--active:hover { background: #ed8936; border-color: #ed8936; }
 
+.portfolio-collision-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 10px;
+}
+
+.portfolio-collision-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: rgba(246, 173, 85, 0.15);
+  border: 1px solid rgba(246, 173, 85, 0.4);
+  border-radius: 6px;
+  color: #f6ad55;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.portfolio-collision-name { white-space: nowrap; }
+
+.portfolio-collision-candidate {
+  color: #e2e8f0;
+  font-weight: 400;
+  white-space: nowrap;
+}
+
+.portfolio-collision-swap-btn {
+  margin-left: auto;
+  padding: 1px 8px;
+  border: 1px solid rgba(246, 173, 85, 0.5);
+  background: transparent;
+  color: #f6ad55;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.portfolio-collision-swap-btn:hover { background: rgba(246, 173, 85, 0.2); }
+
 .ownership-sync-banner {
   margin-top: 10px;
   padding: 6px 12px;

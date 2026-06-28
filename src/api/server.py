@@ -1008,19 +1008,76 @@ def get_contest_analysis():
         if not rows:
             raise HTTPException(status_code=500, detail="Contest standings CSV is empty")
         header = rows[0]
-        player_col = header.index("Player")
-        fpts_col   = header.index("FPTS")
-        player_fpts: dict[str, float] = {}
+        player_col   = header.index("Player")
+        fpts_col     = header.index("FPTS")
+        drafted_col  = header.index("%Drafted")
+
+        # name -> distinct (fpts, drafted) pairs seen for that name in the contest export.
+        # DK's contest export keys this sidebar table by name only, so when two real
+        # players share a name (e.g. two different "Max Muncy"s), their rows collide here.
+        name_pairs: dict[str, list[tuple[float, float]]] = {}
         for row in rows[1:]:
             if len(row) > player_col and row[player_col].strip():
                 name = row[player_col].strip()
                 raw  = row[fpts_col].strip() if len(row) > fpts_col else ""
-                if raw:
-                    try:
-                        player_fpts[name] = float(raw)
-                    except ValueError:
-                        pass
-        return {"player_fpts": player_fpts}
+                if not raw:
+                    continue
+                try:
+                    fpts = float(raw)
+                except ValueError:
+                    continue
+                drafted_raw = row[drafted_col].strip().rstrip("%") if len(row) > drafted_col else ""
+                try:
+                    drafted = float(drafted_raw) if drafted_raw else 0.0
+                except ValueError:
+                    drafted = 0.0
+                pairs = name_pairs.setdefault(name, [])
+                if (fpts, drafted) not in pairs:
+                    pairs.append((fpts, drafted))
+
+        # name -> candidate players from the slate pool, used to tell a genuine name
+        # collision (two distinct player_ids) apart from duplicate rows for one player.
+        candidates_by_name: dict[str, list[dict]] = {}
+        slate_df = _load_slate_df()
+        if slate_df is not None and not slate_df.empty:
+            for _, r in slate_df.drop_duplicates("player_id").iterrows():
+                candidates_by_name.setdefault(str(r["name"]).strip(), []).append({
+                    "player_id": int(r["player_id"]),
+                    "team": str(r["team"]),
+                    "salary": int(r["salary"]),
+                })
+
+        player_fpts: dict[str, float] = {}
+        collisions: list[dict] = []
+        for name, pairs in name_pairs.items():
+            slate_candidates = candidates_by_name.get(name, [])
+            distinct_fpts = {p[0] for p in pairs}
+            # Multiple rows for a name only matter if they actually disagree on FPTS —
+            # if both real players happened to score the same, there's nothing to resolve.
+            if len(distinct_fpts) > 1 and len(slate_candidates) > 1:
+                # Genuine collision: the contest file has no team/ID for this table, so we
+                # can only suggest a pairing — rank both lists by their best ownership proxy
+                # (salary for slate candidates, %Drafted for contest rows) and zip them.
+                # The user picks the actual mapping in the UI; this is just the default.
+                sorted_pairs = sorted(pairs, key=lambda p: -p[1])
+                sorted_candidates = sorted(slate_candidates, key=lambda c: -c["salary"])
+                entries = [
+                    {
+                        **cand,
+                        "fpts": sorted_pairs[i][0] if i < len(sorted_pairs) else None,
+                        "drafted": sorted_pairs[i][1] if i < len(sorted_pairs) else None,
+                        "suggested": i == 0,
+                    }
+                    for i, cand in enumerate(sorted_candidates)
+                ]
+                collisions.append({"name": name, "candidates": entries})
+                player_fpts[name] = entries[0]["fpts"] if entries[0]["fpts"] is not None else max(pairs, key=lambda p: p[1])[0]
+            else:
+                # No collision (or nothing to disambiguate against) — keep the
+                # highest-%Drafted value, same as before.
+                player_fpts[name] = max(pairs, key=lambda p: p[1])[0]
+
+        return {"player_fpts": player_fpts, "collisions": collisions}
     except HTTPException:
         raise
     except Exception as exc:
