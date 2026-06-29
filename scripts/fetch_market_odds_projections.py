@@ -59,9 +59,11 @@ import os
 import re
 import sys
 import unicodedata
+from datetime import date
 from datetime import datetime
 from datetime import time as dtime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -78,6 +80,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_NAME_MAP_PATH = PROJECT_ROOT / "data" / "name_map.json"
 GAME_ID_CACHE_PATH    = PROJECT_ROOT / "data" / "processed" / "market_odds_game_ids.json"
 FAIR_ODDS_CACHE_PATH  = PROJECT_ROOT / "data" / "processed" / "market_odds_fair_odds.json"
+
+# DK Game Info times are labeled "ET"; CrazyNinjaOdds renders game times in
+# whatever timezone the browser/host machine is set to. Convert ET → local
+# before comparing the two, otherwise matching breaks for any host not on ET.
+_ET = ZoneInfo("America/New_York")
 
 GAMES_URL       = "https://crazyninjaodds.com/site/browse/games.aspx"
 GAME_URL        = "https://crazyninjaodds.com/site/browse/game.aspx?game_id={}"
@@ -1289,6 +1296,17 @@ async def _find_game_ids(
     slate_date_obj = datetime.strptime(slate_date, "%Y-%m-%d").date()
     today = datetime.now().date()
 
+    # Convert each slate game's ET date+time to the local-equivalent
+    # date+time, since CrazyNinjaOdds' "Today"/"Tomorrow at H:MM" cells are
+    # rendered in the local (host machine) timezone, not ET.
+    slate_local: dict[tuple[str, str], tuple[date, dtime | None]] = {}
+    for key, slate_time in slate_games.items():
+        if slate_time is None:
+            slate_local[key] = (slate_date_obj, None)
+        else:
+            local_dt = datetime.combine(slate_date_obj, slate_time, tzinfo=_ET).astimezone()
+            slate_local[key] = (local_dt.date(), local_dt.time())
+
     game_id_map: dict[tuple[str, str], int] = {}
 
     for row_data in rows:
@@ -1333,7 +1351,7 @@ async def _find_game_ids(
             game_time = dtime(h, mn)
             break
 
-        if resolved_date != slate_date_obj or game_time is None:
+        if resolved_date is None or game_time is None:
             continue
 
         # Identify team abbreviations from cell text.
@@ -1366,20 +1384,25 @@ async def _find_game_ids(
 
         game_away, game_home = found_abbrs[0], found_abbrs[1]
 
-        # Match to slate game by team pair + optional time tolerance ±30 min.
+        # Match to slate game by team pair + date + optional time tolerance
+        # ±30 min, all expressed in local time (see slate_local above).
         # When slate_time is None (e.g. FD CSV has no game time), match on
-        # team pairs only — any CrazyNinjaOdds game on the correct date with
-        # the same two teams is accepted.
-        for (slate_away, slate_home), slate_time in slate_games.items():
+        # team pairs + date only — any CrazyNinjaOdds game on the correct
+        # date with the same two teams is accepted.
+        for slate_key in slate_games:
+            slate_away, slate_home = slate_key
             if {game_away, game_home} == {slate_away, slate_home}:
-                if slate_time is not None:
+                local_date, local_time = slate_local[slate_key]
+                if resolved_date != local_date:
+                    continue
+                if local_time is not None:
                     delta = abs(
                         (game_time.hour * 60 + game_time.minute)
-                        - (slate_time.hour * 60 + slate_time.minute)
+                        - (local_time.hour * 60 + local_time.minute)
                     )
                     if delta > 30:
                         continue
-                game_id_map[(slate_away, slate_home)] = game_id
+                game_id_map[slate_key] = game_id
                 log.info(
                     "Matched %s@%s → game_id=%d", slate_away, slate_home, game_id
                 )
