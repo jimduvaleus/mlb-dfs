@@ -1556,7 +1556,11 @@ def projections_players():
 
         # Compute heuristic ownership — Model D if team totals available, else C.
         try:
-            from src.optimization.ownership import compute_heuristic_ownership
+            from src.optimization.ownership import (
+                apply_ownership_calibration,
+                compute_heuristic_ownership,
+                load_ownership_calibrator,
+            )
             from .pipeline import PipelineRunner
             slate_path = _get_slate_file_path()
             team_totals = PipelineRunner._load_team_totals(str(slate_path) if slate_path else "")
@@ -1577,6 +1581,15 @@ def projections_players():
                     non_excl, team_totals,
                     team_ownership_reductions=_team_ownership_reductions or None,
                 )
+                # Apply the same isotonic calibration (W_resid) the live pipeline
+                # uses, so the UI shows the same magnitude-corrected ownership the
+                # optimizer actually runs on. Loader returns None when the
+                # artifact is missing or stale against current model constants.
+                _calibrator = load_ownership_calibrator()
+                if _calibrator is not None:
+                    ow_sub = apply_ownership_calibration(
+                        ow_sub, non_excl["position"].values, _calibrator
+                    )
                 ow_pct = [0.0] * len(merged)
                 sub_i = 0
                 for i, is_excl in enumerate(excl_mask):

@@ -333,6 +333,15 @@ class PipelineRunner:
                 cand_players_df[name_col].apply(lambda n: hr_odds.get(_norm(str(n))))
                 if name_col else np.nan
             )
+            # Field ownership must see the same HR-probability boost as our own
+            # candidate pool's ownership — otherwise the simulated opponent field
+            # would be missing a signal that's baked into the calibrated vector.
+            sim_players_df = sim_players_df.copy()
+            sim_name_col = "name" if "name" in sim_players_df.columns else None
+            sim_players_df["hr_prob"] = (
+                sim_players_df[sim_name_col].apply(lambda n: hr_odds.get(_norm(str(n))))
+                if sim_name_col else np.nan
+            )
         # Load per-team ownership reductions from persisted exclusions.
         _team_ownership_reductions: dict = {}
         try:
@@ -743,6 +752,20 @@ class PipelineRunner:
                 "n_field_samples": n_k,
             })
             team_totals_gpp = self._load_team_totals(slate_path)
+            # Field lineups must reflect the same calibrated ownership as our own
+            # candidate pool — compute fresh from sim_players_df (the full,
+            # candidate-exclusion-unfiltered universe), apply the same per-team
+            # manual reductions, then the same isotonic calibrator, so the
+            # simulated opponent field isn't biased toward E_production's known
+            # magnitude error or stale to a manual fade the user just set.
+            field_ownership_vector = compute_heuristic_ownership(
+                sim_players_df, team_totals_gpp,
+                team_ownership_reductions=_team_ownership_reductions or None,
+            )
+            if _calibrator is not None:
+                field_ownership_vector = apply_ownership_calibration(
+                    field_ownership_vector, sim_players_df["position"].values, _calibrator
+                )
             from src.optimization.payout import load_payout_structure, payout_table_to_array
             _gpp_structure = load_payout_structure("dk_classic_gpp_5001")
             _gpp_payout_arr = payout_table_to_array(_gpp_structure).astype(np.float32)
@@ -767,6 +790,7 @@ class PipelineRunner:
                 payout_arr=_gpp_payout_arr,
                 field_rng_seed=int(opt_cfg.get("rng_seed") or 42),
                 ownership_vec=ownership_vector,
+                field_ownership_vec=field_ownership_vector,
                 team_totals=team_totals_gpp,
                 candidate_batch_size=cand_batch,
                 portfolio_size=portfolio_size,

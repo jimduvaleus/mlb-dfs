@@ -138,6 +138,12 @@ class ContestScorer:
                  If None, loaded from data/payout_structures/dk_classic_gpp.json.
     field_rng_seed : base seed; sample k uses seed field_rng_seed + k
     ownership_vec : if None, computed from players_df via compute_heuristic_ownership
+    field_ownership_vec : ownership for field_players_df (drives generate_field()).
+                 If None, computed from field_players_df via compute_heuristic_ownership
+                 (uncalibrated). Callers that have a fitted isotonic calibrator
+                 (data/processed/ownership_calibrator.json) should pass the
+                 calibrated vector here so the simulated opponent field reflects
+                 the same magnitude-corrected ownership used elsewhere.
     team_totals : optional {team: implied_total} for Model D ownership
     candidate_batch_size : BATCH — candidates processed simultaneously (memory control)
     portfolio_size : unused, kept for API compatibility
@@ -153,6 +159,7 @@ class ContestScorer:
         payout_arr: Optional[np.ndarray] = None,
         field_rng_seed: int = 42,
         ownership_vec: Optional[np.ndarray] = None,
+        field_ownership_vec: Optional[np.ndarray] = None,
         team_totals: Optional[dict] = None,
         candidate_batch_size: int = 500,
         portfolio_size: int = 0,
@@ -205,10 +212,15 @@ class ContestScorer:
         # the players we chose to include in our own candidate pool.
         if field_players_df is not None:
             self._field_players_df = field_players_df
-            self._field_ownership_vec = compute_heuristic_ownership(field_players_df, team_totals)
+            self._field_ownership_vec = (
+                field_ownership_vec if field_ownership_vec is not None
+                else compute_heuristic_ownership(field_players_df, team_totals)
+            )
         else:
             self._field_players_df = players_df
-            self._field_ownership_vec = self._ownership_vec
+            self._field_ownership_vec = (
+                field_ownership_vec if field_ownership_vec is not None else self._ownership_vec
+            )
 
         self._cs = ContestSimulator()
 
