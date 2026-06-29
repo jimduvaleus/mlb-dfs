@@ -718,30 +718,6 @@ class PipelineRunner:
             _preloaded_cands is not None,
         )
 
-        if gpp_cfg.get("dump_candidate_pool", False) and candidates:
-            _dump_path = os.path.join(output_dir, "candidate_pool_debug.csv")
-            _pid_meta = {
-                int(r["player_id"]): r
-                for r in cand_players_df.to_dict("records")
-            }
-            import csv as _csv
-            with open(_dump_path, "w", newline="") as _f:
-                _w = _csv.writer(_f)
-                _w.writerow(["lineup_index", "player_id", "name", "position", "team", "salary", "mean"])
-                for _li, _lu in enumerate(candidates):
-                    for _pid in _lu.player_ids:
-                        _m = _pid_meta.get(int(_pid), {})
-                        _w.writerow([
-                            _li,
-                            int(_pid),
-                            _m.get("name", ""),
-                            _m.get("position", ""),
-                            _m.get("team", ""),
-                            _m.get("salary", ""),
-                            round(float(_m.get("mean", 0)), 3),
-                        ])
-            logger.info("Candidate pool written to %s", _dump_path)
-
         if not candidates or (_gpp_stopped and self._stop_check()):
             portfolio = []
         else:
@@ -1178,6 +1154,61 @@ class PipelineRunner:
                     logger.warning("Failed to save sweep cache: %s", _sc_e)
 
                 portfolio = gpp_result
+
+                if gpp_cfg.get("dump_candidate_pool", False) and candidates:
+                    _dump_path = os.path.join(output_dir, "candidate_pool_debug.csv")
+                    _pid_meta = {
+                        int(r["player_id"]): r
+                        for r in cand_players_df.to_dict("records")
+                    }
+                    # Use field_ownership_vector (computed over sim_players_df, the
+                    # full candidate-exclusion-unfiltered universe) rather than our
+                    # own candidate pool's ownership_vector — the latter is
+                    # renormalized over a narrower per-position population (value
+                    # cutoffs / candidate-only exclusions), so it diverges from the
+                    # model's actual real-field ownership estimate (verified: 0/219
+                    # shared players matched exactly on a live slate, up to ~8pp
+                    # off). For retrospective comparison against DK's real
+                    # %Drafted, we want the real-field estimate, not the
+                    # candidate-pool-internal sampling weight.
+                    _pid_ownership = dict(zip(
+                        sim_players_df["player_id"].astype(int), field_ownership_vector
+                    ))
+                    _ev_means_final = robust_payout.mean(axis=1)
+                    _cand_keys = [frozenset(int(p) for p in _lu.player_ids) for _lu in candidates]
+                    _risk_membership: dict[int, list[str]] = {}
+                    for _risk, _port in _portfolio_sweep_raw:
+                        _selected_keys = {
+                            frozenset(int(p) for p in _lu.player_ids) for _lu, _ in _port
+                        }
+                        for _li, _key in enumerate(_cand_keys):
+                            if _key in _selected_keys:
+                                _risk_membership.setdefault(_li, []).append(str(int(_risk)))
+                    import csv as _csv
+                    with open(_dump_path, "w", newline="") as _f:
+                        _w = _csv.writer(_f)
+                        _w.writerow([
+                            "lineup_index", "player_id", "name", "position", "team",
+                            "salary", "mean", "ownership", "mean_ev", "selected_risks",
+                        ])
+                        for _li, _lu in enumerate(candidates):
+                            _selected_risks = ",".join(_risk_membership.get(_li, []))
+                            _mean_ev = round(float(_ev_means_final[_li]), 4)
+                            for _pid in _lu.player_ids:
+                                _m = _pid_meta.get(int(_pid), {})
+                                _w.writerow([
+                                    _li,
+                                    int(_pid),
+                                    _m.get("name", ""),
+                                    _m.get("position", ""),
+                                    _m.get("team", ""),
+                                    _m.get("salary", ""),
+                                    round(float(_m.get("mean", 0)), 3),
+                                    round(float(_pid_ownership.get(int(_pid), 0.0)), 5),
+                                    _mean_ev,
+                                    _selected_risks,
+                                ])
+                    logger.info("Candidate pool written to %s", _dump_path)
 
                 # Compute best_scores for portfolio_stats event.
                 col_map_ps = {pid: i for i, pid in enumerate(sim_results.player_ids)}

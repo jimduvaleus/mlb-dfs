@@ -981,6 +981,50 @@ def _get_archive_dir(create: bool = False) -> Path | None:
         return None
 
 
+def _archive_contest_artifacts(archive_dir: Path, player_fpts_by_id: dict, zip_name: str) -> None:
+    """Snapshot pipeline-run artifacts into the contest archive dir, once per
+    "Analyze Contest" click. Best-effort: each artifact's failure is logged
+    and skipped so the endpoint's primary by-name response is never blocked
+    by an archival problem (missing file, disk full, permissions, etc.).
+    """
+    import shutil as _shutil
+    log = _logging.getLogger(__name__)
+    out_dir = _output_dir_path()
+    cfg = read_config()
+    from src.platforms.base import Platform
+    platform = cfg.platform if hasattr(cfg, 'platform') else Platform.DRAFTKINGS
+
+    try:
+        src = out_dir / "candidate_pool_debug.csv"
+        if src.exists():
+            _shutil.copy2(str(src), str(archive_dir / "candidate_pool_debug.csv"))
+        else:
+            log.info("Analyze Contest: no candidate_pool_debug.csv to archive.")
+    except Exception as exc:
+        log.warning("Analyze Contest: failed to archive candidate pool dump: %s", exc)
+
+    try:
+        sweep_name = f"portfolio_sweep_{platform.value}.json"
+        src = out_dir / sweep_name
+        if src.exists():
+            _shutil.copy2(str(src), str(archive_dir / sweep_name))
+        else:
+            log.info("Analyze Contest: no %s to archive.", sweep_name)
+    except Exception as exc:
+        log.warning("Analyze Contest: failed to archive portfolio sweep: %s", exc)
+
+    try:
+        payload = {
+            "generated_at": datetime.now().isoformat(),
+            "zip_source": zip_name,
+            "player_fpts": {str(pid): fpts for pid, fpts in player_fpts_by_id.items()},
+        }
+        with open(archive_dir / "contest_player_fpts.json", "w") as f:
+            json.dump(payload, f, indent=2)
+    except Exception as exc:
+        log.warning("Analyze Contest: failed to write contest_player_fpts.json: %s", exc)
+
+
 @app.get("/api/contest/analyze")
 def get_contest_analysis():
     """Return a player-name → FPTS map parsed from the contest standings zip in the archive dir."""
@@ -1076,6 +1120,26 @@ def get_contest_analysis():
                 # No collision (or nothing to disambiguate against) — keep the
                 # highest-%Drafted value, same as before.
                 player_fpts[name] = max(pairs, key=lambda p: p[1])[0]
+
+        # Resolved player_id -> FPTS map (unambiguous names + heuristic-guessed
+        # collisions) — an additional, durable artifact for retrospective
+        # candidate-pool analysis; the by-name response below is unchanged.
+        player_fpts_by_id: dict[int, float] = {}
+        collided_names = {c["name"] for c in collisions}
+        for name in name_pairs:
+            if name in collided_names:
+                continue
+            for cand in candidates_by_name.get(name, []):
+                player_fpts_by_id[cand["player_id"]] = player_fpts[name]
+        for collision in collisions:
+            for cand in collision["candidates"]:
+                if cand["fpts"] is not None:
+                    player_fpts_by_id[cand["player_id"]] = cand["fpts"]
+
+        try:
+            _archive_contest_artifacts(archive_dir, player_fpts_by_id, zip_path.name)
+        except Exception as exc:
+            _logging.getLogger(__name__).warning("Analyze Contest: artifact archiving failed: %s", exc)
 
         return {"player_fpts": player_fpts, "collisions": collisions}
     except HTTPException:

@@ -1962,7 +1962,10 @@ def _append_summary(combined: pd.DataFrame, summary_path: Path) -> None:
 
     if summary_path.exists():
         try:
-            old = pd.read_csv(summary_path)
+            # dtype=str on "slate" avoids pandas inferring an all-numeric-looking
+            # column (e.g. "06262026") as int64 and silently stripping the
+            # leading zero on the next write.
+            old = pd.read_csv(summary_path, dtype={"slate": str})
             combined = pd.concat([old, combined], ignore_index=True)
         except Exception as exc:
             print(f"Warning: could not read existing {summary_path} ({exc}) — overwriting.")
