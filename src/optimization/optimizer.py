@@ -56,7 +56,9 @@ def _compute_slot_assignment(
     pidx_to_slot: List[int] = [-1] * n
 
     def _elig(pidx: int) -> List[int]:
-        meta = player_meta[ids[pidx]]
+        meta = player_meta.get(ids[pidx])
+        if meta is None:
+            return []
         ep = meta.get('eligible_positions') or [meta['position']]
         ep_set = set(ep)
         return [j for j, s in enumerate(_slots) if ep_set & _se.get(s, {s})]

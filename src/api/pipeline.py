@@ -469,6 +469,20 @@ class PipelineRunner:
         cand_batch = int(gpp_cfg.get("candidate_batch_size", 500))
         max_attempts_mult = int(gpp_cfg.get("max_attempts_multiplier", 50))
         candidate_floor_relief = int(gpp_cfg.get("candidate_floor_relief", 2500))
+        _field_source = str(gpp_cfg.get("field_source", "simulated"))
+        _hist_n_slates = int(gpp_cfg.get("historical_n_slates", 10))
+        # Derive current slate's archive folder name (MMDDYYYY) from the slate
+        # filename so the historical loader can exclude the current slate.
+        _exclude_slate_date: str | None = None
+        try:
+            import re as _re
+            _slate_fname = _Path(slate_path).name if slate_path else ""
+            _m = _re.search(r'(\d{1,2})[_\-](\d{1,2})[_\-](\d{4})', _slate_fname)
+            if _m:
+                _mm, _dd, _yyyy = _m.group(1).zfill(2), _m.group(2).zfill(2), _m.group(3)
+                _exclude_slate_date = f"{_mm}{_dd}{_yyyy}"
+        except Exception:
+            pass
         salary_floor_gpp = (
             float(opt_cfg["salary_floor"]) if opt_cfg.get("salary_floor") is not None else None
         )
@@ -772,6 +786,10 @@ class PipelineRunner:
                 portfolio_size=portfolio_size,
                 cand_excluded_player_ids=_cand_excluded_pids,
                 preloaded_field=_cached_field,
+                field_source=_field_source,
+                historical_archive_root=_Path(__file__).resolve().parents[2] / "archive",
+                historical_n_slates=_hist_n_slates,
+                exclude_slate_date=_exclude_slate_date,
             )
             logger.info("Pre-scoring RSS: %.0f MB  (candidates=%d)", _proc_rss_mb(), len(candidates))
             _t_score = time.perf_counter()

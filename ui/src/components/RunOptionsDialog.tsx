@@ -5,11 +5,13 @@ interface Props {
   cacheStatus: CacheStatus
   onStart: (useCandidates: boolean, useField: boolean, seedOptimal: boolean) => void
   onDismiss: () => void
+  fieldSource?: string
 }
 
-export function RunOptionsDialog({ cacheStatus, onStart, onDismiss }: Props) {
+export function RunOptionsDialog({ cacheStatus, onStart, onDismiss, fieldSource }: Props) {
+  const isHistorical = fieldSource === 'historical'
   const [useCandidates, setUseCandidates] = useState(cacheStatus.candidates !== null)
-  const [useField, setUseField] = useState(cacheStatus.field_k !== null)
+  const [useField, setUseField] = useState(!isHistorical && cacheStatus.field_k !== null)
   const [seedOptimal, setSeedOptimal] = useState(false)
 
   const candAvailable = cacheStatus.candidates !== null
@@ -50,17 +52,19 @@ export function RunOptionsDialog({ cacheStatus, onStart, onDismiss }: Props) {
               )}
             </span>
           </label>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: fieldAvailable ? 'pointer' : 'default', opacity: fieldAvailable ? 1 : 0.45 }}>
-            <input
-              type="checkbox"
-              checked={useField && fieldAvailable}
-              disabled={!fieldAvailable}
-              onChange={e => setUseField(e.target.checked)}
-            />
-            <span>
-              <strong>Field lineups</strong> — {fieldLabel}
-            </span>
-          </label>
+          {!isHistorical && (
+            <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: fieldAvailable ? 'pointer' : 'default', opacity: fieldAvailable ? 1 : 0.45 }}>
+              <input
+                type="checkbox"
+                checked={useField && fieldAvailable}
+                disabled={!fieldAvailable}
+                onChange={e => setUseField(e.target.checked)}
+              />
+              <span>
+                <strong>Field lineups</strong> — {fieldLabel}
+              </span>
+            </label>
+          )}
           <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: seedOptimalDisabled ? 'default' : 'pointer', opacity: seedOptimalDisabled ? 0.45 : 1 }}>
             <input
               type="checkbox"

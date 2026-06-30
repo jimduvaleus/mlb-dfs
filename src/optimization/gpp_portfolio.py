@@ -165,6 +165,10 @@ class ContestScorer:
         portfolio_size: int = 0,
         cand_excluded_player_ids: Optional[set] = None,
         preloaded_field: Optional[list[np.ndarray]] = None,
+        field_source: str = "simulated",
+        historical_archive_root: Optional["Path"] = None,
+        historical_n_slates: int = 10,
+        exclude_slate_date: Optional[str] = None,
     ) -> None:
         self._sim_results = sim_results
         self._players_df = players_df
@@ -224,6 +228,37 @@ class ContestScorer:
 
         self._cs = ContestSimulator()
 
+        # Historical field mode ----------------------------------------
+        self._field_source = field_source
+        self._hist_distributions: list = []
+        if field_source == "historical":
+            if historical_archive_root is None:
+                logger.warning(
+                    "ContestScorer: field_source='historical' but no archive root "
+                    "provided — falling back to simulated."
+                )
+                self._field_source = "simulated"
+            else:
+                from pathlib import Path as _Path
+                from src.optimization.historical_field import load_historical_distributions
+                self._hist_distributions = load_historical_distributions(
+                    _Path(historical_archive_root),
+                    n_slates=historical_n_slates,
+                    exclude_date=exclude_slate_date,
+                )
+                if not self._hist_distributions:
+                    logger.warning(
+                        "ContestScorer: no historical distributions found in %s "
+                        "(n_slates=%d, exclude=%s) — falling back to simulated.",
+                        historical_archive_root, historical_n_slates, exclude_slate_date,
+                    )
+                    self._field_source = "simulated"
+                else:
+                    logger.info(
+                        "ContestScorer: historical field mode — %d distributions loaded.",
+                        len(self._hist_distributions),
+                    )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -256,6 +291,12 @@ class ContestScorer:
 
         # --- Generate (or inject cached) field samples ---
         field_sorted_list: list[np.ndarray] = []
+        if self._preloaded_field is not None and self._field_source == "historical":
+            logger.warning(
+                "ContestScorer: ignoring cached field lineups — field_source='historical' "
+                "requires real score distributions, not model-generated lineup arrays."
+            )
+            self._preloaded_field = None
         if self._preloaded_field is not None:
             logger.info(
                 "Using %d preloaded field samples from cache.", len(self._preloaded_field)
@@ -269,6 +310,42 @@ class ContestScorer:
                 )
             self._n_k = len(self._preloaded_field)
             self._n_field = self._preloaded_field[0].shape[0] if self._preloaded_field else self._n_field
+        elif self._field_source == "historical":
+            from src.optimization.historical_field import (
+                estimate_current_slate_ref,
+                build_historical_field_samples,
+            )
+            logger.info(
+                "Generating %d historical field samples (N=%d each, "
+                "%d source distributions)...",
+                self._n_k, self._n_field, len(self._hist_distributions),
+            )
+            _t_ref = time.perf_counter()
+            current_ref = estimate_current_slate_ref(
+                self._sim_matrix, self._field_ownership_vec,
+            )
+            logger.info(
+                "  [TIMING] estimate_current_slate_ref: %.3fs  ref=%.2f",
+                time.perf_counter() - _t_ref, current_ref,
+            )
+            rng_hist = np.random.default_rng(self._field_seed)
+            _t_build = time.perf_counter()
+            field_sorted_list = build_historical_field_samples(
+                self._hist_distributions,
+                n_field=self._n_field,
+                n_sims=n_sims,
+                current_ref=current_ref,
+                rng=rng_hist,
+                K=self._n_k,
+            )
+            logger.info(
+                "  [TIMING] build_historical_field_samples: %.3fs",
+                time.perf_counter() - _t_build,
+            )
+            # No raw lineup arrays in historical mode — field caching is inapplicable.
+            self.last_raw_field_list = None
+            if field_progress_cb is not None:
+                field_progress_cb(self._n_k * self._n_field, self._n_k * self._n_field)
         else:
             logger.info(
                 "Generating %d field samples (N=%d each)...",

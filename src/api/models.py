@@ -60,6 +60,8 @@ class GppConfig(BaseModel):
     evw_base: float = 0.10
     evw_max: float = 0.40
     ev_floor: float = 0.20
+    field_source: str = "simulated"
+    historical_n_slates: int = 10
 
 
 class AppConfig(BaseModel):

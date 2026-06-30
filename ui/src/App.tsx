@@ -678,6 +678,7 @@ export default function App() {
           cacheStatus={pendingCacheStatus}
           onStart={(useCandidates, useField, seedOptimal) => _doStartRun(useCandidates, useField, seedOptimal)}
           onDismiss={() => { setShowRunOptionsDialog(false); setPendingCacheStatus(null) }}
+          fieldSource={state.config?.gpp?.field_source}
         />
       )}
 

@@ -55,6 +55,8 @@ export interface GppConfig {
   evw_base: number
   evw_max: number
   ev_floor: number
+  field_source: 'simulated' | 'historical'
+  historical_n_slates: number
 }
 
 export interface AppConfig {

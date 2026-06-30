@@ -212,6 +212,21 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
               <input type="number" step={0.01} min={0} value={draft.gpp.ev_floor ?? 0.20}
                 onChange={e => setGpp('ev_floor', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
+            <FieldRow label="Field source">
+              <select value={draft.gpp.field_source ?? 'simulated'}
+                onChange={e => setGpp('field_source', e.target.value)} disabled={disabled}>
+                <option value="simulated">Simulated</option>
+                <option value="historical">Historical</option>
+              </select>
+            </FieldRow>
+            {(draft.gpp.field_source ?? 'simulated') === 'historical' && (
+              <FieldRow label="Historical slates (N)">
+                <input type="number" step={1} min={1} max={50}
+                  value={draft.gpp.historical_n_slates ?? 10}
+                  onChange={e => setGpp('historical_n_slates', Number(e.target.value))}
+                  disabled={disabled} />
+              </FieldRow>
+            )}
           </section>
         </div>
       </div>
