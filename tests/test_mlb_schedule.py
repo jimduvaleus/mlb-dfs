@@ -133,7 +133,13 @@ class TestTwitterLineupLockGate:
             slots=[TwitterLineupSlot(slot=1, player_id=1, name="Test Player")],
             locked=True,
         )
-        return server.save_twitter_lineup(req)
+        # Without this, the "no existing locked lineup" branch in save_twitter_lineup
+        # falls through to _slate_first_pitch_started() / _best_guess_lineup_slots(),
+        # which read the live slate/projections and can fire a real notification
+        # email (lineup diff against this test's fake player) if today's slate has
+        # already started.
+        with patch("src.api.server._slate_first_pitch_started", return_value=False):
+            return server.save_twitter_lineup(req)
 
     def test_doubleheader_team_save_is_not_locked(self, tmp_path, monkeypatch):
         monkeypatch.setattr(twitter_lineups, "_DATA_PATH", tmp_path / "twitter_lineups.json")
