@@ -164,6 +164,8 @@ The web app is a React + TypeScript + Vite frontend (`ui/`) backed by a FastAPI 
 
 Team logos for all 30 MLB franchises are in `ui/public/team-logos/`.
 
+**Adding new config fields:** any field exposed in the UI (`ConfigForm.tsx` / `ui/src/types.ts` `GppConfig`) must also be declared in `src/api/models.py` `GppConfig`. Pydantic silently drops unknown fields on `POST /api/config`, so omitting a field there means Save Config is a no-op for that field. The three places that must stay in sync: `config.yaml` (default value), `src/api/models.py` `GppConfig` (Pydantic model + default), `ui/src/types.ts` `GppConfig` (TypeScript type).
+
 ## DK Classic GPP payout structure
 
 `data/payout_structures/dk_classic_gpp.json` models a typical DK $4 Classic GPP: 14,863 entries, 3,855 paying positions (~26% cash rate). The cash cutoff is finishing in roughly the **top 26%**, which requires beating ~74% of the field. `ContestSimulator.eval_portfolio()` reads this file via `PipelineRunner._load_cash_threshold()` to derive the `cash_threshold` used in `cash_rate` computation — do not use `> 0.5` (beats half the field) as a cash proxy.
