@@ -209,7 +209,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 onChange={e => setGpp('evw_max', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
             <FieldRow label="EV floor ($)">
-              <input type="number" step={0.01} min={0} value={draft.gpp.ev_floor ?? 0.20}
+              <input type="number" step={0.01} value={draft.gpp.ev_floor ?? 0.20}
                 onChange={e => setGpp('ev_floor', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
             <FieldRow label="Field source">

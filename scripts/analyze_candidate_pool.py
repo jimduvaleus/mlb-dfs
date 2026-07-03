@@ -215,15 +215,19 @@ def sweep_floor_table(lineup_df: pd.DataFrame, n_field: int, start: float, end: 
     for fl in floors:
         fl = round(float(fl), 6)
         m = compute_floor_metrics(lineup_df, fl, n_field)
+        n_above = m["n_at_or_above_floor"]
+        n_below = m["n_below_floor"]
         rows.append({
             "floor": fl,
-            "n_below": m["n_below_floor"],
-            "n_above": m["n_at_or_above_floor"],
-            "pct_above": m["n_at_or_above_floor"] / n_total if n_total else float("nan"),
+            "n_below": n_below,
+            "n_above": n_above,
+            "pct_above": n_above / n_total if n_total else float("nan"),
             "cash_below": m["cash_rate_below_floor"],
             "cash_above": m["cash_rate_at_or_above_floor"],
             "top_pct_below": m["top_pct_rate_below_floor"],
+            "n_top_below": (int(round(n_below * m["top_pct_rate_below_floor"])) if not np.isnan(m["top_pct_rate_below_floor"]) else 0),
             "top_pct_above": m["top_pct_rate_at_or_above_floor"],
+            "n_top_above": (int(round(n_above * m["top_pct_rate_at_or_above_floor"])) if not np.isnan(m["top_pct_rate_at_or_above_floor"]) else 0),
             "real_pct_below": m["real_percentile_below_floor"],
             "real_pct_above": m["real_percentile_at_or_above_floor"],
         })

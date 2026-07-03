@@ -681,10 +681,15 @@ class DeterminantPortfolioSelector:
             partial_var = 1.0 - (temp * R).sum(axis=1)   # (M_rem,)
             partial_var = np.clip(partial_var, 0.0, 1.0)
 
-            # Normalised EV (relative to current remaining pool)
+            # Normalised EV (relative to current remaining pool).
+            # Shift up by |min_ev| when negatives are present so EVn stays in
+            # [0, 1]; shift is normalization-only and does not affect stored EVs.
             ev_rem = pool_ev_vals[remaining_pool_idx]
-            max_ev = ev_rem.max()
-            EVn = ev_rem / max_ev if max_ev > 1e-12 else np.ones(M_rem)
+            min_ev = ev_rem.min()
+            shift = -min_ev if min_ev < 0.0 else 0.0
+            ev_shifted = ev_rem + shift
+            max_ev_shifted = ev_shifted.max()
+            EVn = ev_shifted / max_ev_shifted if max_ev_shifted > 1e-12 else np.ones(M_rem)
 
             # Normalised determinant contribution
             max_pv = partial_var.max()
