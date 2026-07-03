@@ -1641,6 +1641,20 @@ _ER_EXPOSURE_CLIP = (0.25, 1.75)  # bounds on the inverse-exposure ER scale
 _BLOWUP_PROB = 0.15
 _BLOWUP_MEAN_OUTS = 9.0
 
+# Latent run-environment factor for the batter Monte Carlo. The market fits
+# give per-event means, but drawing every event independently understates a
+# batter's score variance: all counting stats co-move through plate
+# appearances and the game's run environment (a blowout inflates singles,
+# walks, runs and RBI together). Each draw scales every event rate by a
+# shared mean-one lognormal factor z ~ LogNormal(-σ²/2, σ), which preserves
+# every event mean exactly (E[Poisson(λz)] = λ) while fattening the right
+# tail of the score distribution — the region GPP equity lives in.
+# σ = 0.30 corresponds to a ±30%-ish 1-sigma swing in the per-game offensive
+# environment and induces a mild positive correlation between a player's
+# counting stats, consistent with historical box-score co-movement.
+# Set to 0 (or --env-sigma 0) to disable and recover independent draws.
+_ENV_SIGMA = 0.30
+
 # Percentile points for the stored quantile grid. Endpoints are pulled in
 # from the raw sample min/max (P0/P100) to P0.05/P99.95 so a single extreme
 # Monte Carlo draw cannot distort interpolated means in the tail buckets.
@@ -1659,32 +1673,42 @@ def _simulate_batter_distribution(
     platform: str = "draftkings",
     n_draws: int = _DIST_N_DRAWS,
     seed: int = 0,
+    env_sigma: float | None = None,
 ) -> tuple[np.ndarray, float]:
     """Monte Carlo DK/FD score distribution for a batter.
 
     Structural coupling: R >= HR and RBI >= HR (a homer scores the batter
     and drives him in), with the excess drawn so E[R] and E[RBI] match the
-    fitted market means. All other events are independent Poisson draws.
+    fitted market means. A shared mean-one lognormal environment factor
+    (see _ENV_SIGMA) scales every event rate per draw so counting stats
+    co-move as they do in real box scores; conditional on the factor,
+    events are independent Poisson draws.
 
     Returns (percentile grid P0..P100, score std_dev).
     """
     c = _FD_BATTER if platform == "fanduel" else _DK_BATTER
     rng = np.random.default_rng(seed)
 
-    hr = rng.poisson(rates["home_run"], n_draws)
-    s = rng.poisson(rates["single"], n_draws)
-    d = rng.poisson(rates["double"], n_draws)
-    t = rng.poisson(rates["triple"], n_draws)
-    bb = rng.poisson(rates["walk"], n_draws)
-    sb = rng.poisson(rates["sb"], n_draws)
-    hbp = rng.poisson(rates["hbp"], n_draws)
+    sigma = _ENV_SIGMA if env_sigma is None else float(env_sigma)
+    if sigma > 0:
+        z = rng.lognormal(mean=-0.5 * sigma * sigma, sigma=sigma, size=n_draws)
+    else:
+        z = np.ones(n_draws)
+
+    hr = rng.poisson(rates["home_run"] * z)
+    s = rng.poisson(rates["single"] * z)
+    d = rng.poisson(rates["double"] * z)
+    t = rng.poisson(rates["triple"] * z)
+    bb = rng.poisson(rates["walk"] * z)
+    sb = rng.poisson(rates["sb"] * z)
+    hbp = rng.poisson(rates["hbp"] * z)
 
     # R = HR + independent Poisson excess (mean-preserving when e_r >= e_hr).
-    r = hr + rng.poisson(max(rates["run"] - rates["home_run"], 0.0), n_draws)
+    r = hr + rng.poisson(max(rates["run"] - rates["home_run"], 0.0) * z)
     # RBI = HR + NB(r=1) excess, keeping the market's overdispersion.
     m_excess = max(rates["rbi"] - rates["home_run"], 0.0)
     if m_excess > 0:
-        rbi = hr + rng.negative_binomial(1, 1.0 / (1.0 + m_excess), n_draws)
+        rbi = hr + rng.negative_binomial(1, 1.0 / (1.0 + m_excess * z))
     else:
         rbi = hr.copy()
 
@@ -2514,6 +2538,7 @@ def build_projections_csv(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _ENV_SIGMA
     parser = argparse.ArgumentParser(
         description=(
             "Fetch CrazyNinjaOdds market odds and produce DK projections CSV."
@@ -2590,6 +2615,18 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--env-sigma",
+        type=float,
+        default=None,
+        metavar="SIGMA",
+        help=(
+            "Lognormal sigma of the shared run-environment factor in the batter "
+            f"Monte Carlo (default: {_ENV_SIGMA}). Couples a batter's counting "
+            "stats per draw, fattening the right tail of the score grid. "
+            "0 disables (independent event draws)."
+        ),
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging (prints raw table rows and per-market data counts)",
@@ -2598,6 +2635,10 @@ def main() -> None:
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.env_sigma is not None:
+        _ENV_SIGMA = max(float(args.env_sigma), 0.0)
+        log.info("Batter MC run-environment sigma set to %.3f", _ENV_SIGMA)
 
     games_filter: set[tuple[str, str]] | None = None
     if args.games:
