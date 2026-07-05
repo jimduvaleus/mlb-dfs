@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
+import numpy as np
 import pandas as pd
 
 from src.optimization.lineup import Lineup
@@ -13,6 +14,98 @@ from src.optimization.lineup import Lineup
 POS_REQUIREMENTS: dict[str, int] = {
     "P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3,
 }
+
+
+def stratified_sim_sample(
+    sim_matrix: np.ndarray, n_sample: int, rng: np.random.Generator,
+) -> list[tuple[int, int]]:
+    """Sample n_sample sim indices stratified across slate-total deciles, so
+    quiet and explosive run environments are both represented.
+
+    Returns [(sim_index, decile 1-10), ...], at most n_sample entries.
+    """
+    n_sims = sim_matrix.shape[0]
+    n_sample = min(int(n_sample), n_sims)
+    order = np.argsort(sim_matrix.sum(axis=1))
+    sampled: list[tuple[int, int]] = []
+    per_decile = max(1, int(np.ceil(n_sample / 10)))
+    for dec_idx, dec in enumerate(np.array_split(order, 10)):
+        take = min(per_decile, len(dec))
+        sampled.extend(
+            (int(s), dec_idx + 1) for s in rng.choice(dec, size=take, replace=False)
+        )
+    return sampled[:n_sample]
+
+
+def generate_sim_optimal_lineups(
+    df: pd.DataFrame,
+    sim_matrix: np.ndarray,
+    sim_player_ids: list[int],
+    sim_indices: list[int],
+    min_stack: int = 4,
+    salary_floor: Optional[float] = None,
+    seen: Optional[set] = None,
+    progress_cb: Optional[Callable[[int], None]] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+) -> list[Lineup]:
+    """Per-sim optimal lineups: for each sim index, solve the roster ILP with
+    that sim's *realized* player scores as the objective — the lineup that
+    wins that particular simulated world.
+
+    Unlike the projected-mean ILP seeding (one deterministic answer per team
+    stack), these seeds are ceiling lineups by construction: each is a
+    99.9th-percentile outcome in at least one world the simulator produced,
+    capturing the correlation/variance structure a mean objective ignores.
+    Sample sim_indices with stratified_sim_sample so the seeds span run
+    environments.
+
+    df is the candidate player pool (same contract as generate_optimal_lineups;
+    the "mean" column is ignored and replaced per sim). Players missing from
+    sim_player_ids score 0 and are never preferred. Duplicate solutions
+    (across sims, and against `seen`) are dropped.
+
+    Runs solves in a thread pool — CBC releases the GIL. Returns unique
+    lineups in sim_indices order.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    col_map = {int(pid): i for i, pid in enumerate(sim_player_ids)}
+    pid_list = df["player_id"].astype(int).tolist()
+    col_idx = np.array([col_map.get(p, -1) for p in pid_list], dtype=np.int64)
+
+    def _solve(sim_idx: int) -> Optional[Lineup]:
+        if stop_check is not None and stop_check():
+            return None
+        row = sim_matrix[sim_idx].astype(np.float64)
+        scores = np.where(col_idx >= 0, row[np.clip(col_idx, 0, None)], 0.0)
+        d = df.copy()
+        d["mean"] = scores
+        lineups = generate_optimal_lineups(
+            d, n=1, min_uniques=1, min_stack=min_stack, salary_floor=salary_floor,
+        )
+        return lineups[0] if lineups else None
+
+    results: list[Optional[Lineup]] = [None] * len(sim_indices)
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(_solve, s): i for i, s in enumerate(sim_indices)}
+        n_done = 0
+        for fut in as_completed(futures):
+            results[futures[fut]] = fut.result()
+            n_done += 1
+            if progress_cb is not None:
+                progress_cb(n_done)
+
+    seen_keys: set = set(seen or ())
+    unique: list[Lineup] = []
+    for lu in results:
+        if lu is None:
+            continue
+        key = frozenset(int(p) for p in lu.player_ids)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique.append(lu)
+    return unique
 
 
 def generate_optimal_lineups(

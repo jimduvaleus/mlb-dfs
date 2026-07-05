@@ -51,17 +51,47 @@ class GppConfig(BaseModel):
     candidate_batch_size: int = 500
     max_attempts_multiplier: int = 50
     seed_optimal_lineups: bool = False
+    # Seed the pool with per-sim optimal lineups: the roster ILP solved
+    # against individual simulation draws' realized scores (each seed wins at
+    # least one simulated world). n_sim_optimals = how many sims to solve,
+    # stratified across slate-total deciles; duplicates are dropped.
+    seed_sim_optimal_lineups: bool = False
+    n_sim_optimals: int = 300
     dump_candidate_pool: bool = False
+    # Diagnostic: N > 0 samples N sims post-run and solves the per-sim optimal
+    # lineup ILP to measure how much of the model's own ceiling the candidate
+    # pool captures (writes pool_ceiling_sim.csv). 0 disables (no overhead).
+    measure_sim_ceiling: int = 0
     candidate_floor_relief: int = 2500
     refine_rounds: int = 2
     refine_top: int = 150
     refine_mutants: int = 8
     refine_holdout_fraction: float = 0.3
+    final_n_field_samples: int = 5
+    # Tail bypass: admit the top N below-ev_floor candidates by per-candidate
+    # sim-p99 (a ceiling statistic mean EV undervalues) into the fresh
+    # re-score; they must keep fresh EV >= tail_bypass_ev_floor to reach the
+    # selector. 0 disables.
+    tail_bypass_n: int = 2000
+    tail_bypass_ev_floor: float = -1.0
+    # Safety cap on the fresh-rescore slice. The slice itself is defined by
+    # ev_floor (rescore everything at/above it, then drop what falls below on
+    # fresh EVs); this cap only bounds memory/time on pathological slates.
+    final_rescore_top: int = 20000
     evw_base: float = 0.10
     evw_max: float = 0.40
     ev_floor: float = 0.20
     field_source: str = "simulated"
     historical_n_slates: int = 10
+    dupe_penalty: bool = False
+    # Coefficients fitted by scripts/fit_dupe_model.py on the contest-standings
+    # archive (32 contests, 2026-07-04); intercept is calibrated to the
+    # reference 14,863-entry DK Classic GPP.
+    dupe_intercept: float = 3.698
+    dupe_log_own_coef: float = 0.212
+    dupe_salary_coef: float = 0.089
+    dupe_stack_coef: float = 0.024
+    dupe_min_gross_payout: float = 15.0
 
 
 class AppConfig(BaseModel):

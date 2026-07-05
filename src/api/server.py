@@ -2958,6 +2958,7 @@ async def run_stream(
     use_candidates: bool = False,
     use_field: bool = False,
     seed_optimal: bool = False,
+    seed_sim_optimal: bool = False,
 ):
     if _state["status"] in ("running", "replacing"):
         raise HTTPException(409, "A run is already in progress")
@@ -2998,10 +2999,13 @@ async def run_stream(
             from .pipeline import PipelineRunner
             import yaml as _yaml
             _cfg_path = str(PROJECT_ROOT / "config.yaml")
-            if seed_optimal:
+            if seed_optimal or seed_sim_optimal:
                 with open(_cfg_path) as _f:
                     _cfg = _yaml.safe_load(_f) or {}
-                _cfg.setdefault("gpp", {})["seed_optimal_lineups"] = True
+                if seed_optimal:
+                    _cfg.setdefault("gpp", {})["seed_optimal_lineups"] = True
+                if seed_sim_optimal:
+                    _cfg.setdefault("gpp", {})["seed_sim_optimal_lineups"] = True
                 import tempfile, os as _os
                 _tmp = tempfile.NamedTemporaryFile(
                     mode="w", suffix=".yaml", delete=False,
@@ -3032,7 +3036,7 @@ async def run_stream(
             err_payload = {"stage": "error", "message": str(exc), "timestamp": int(time.time() * 1000)}
             asyncio.run_coroutine_threadsafe(queue.put(err_payload), loop)
         finally:
-            if seed_optimal and _cfg_path != str(PROJECT_ROOT / "config.yaml"):
+            if (seed_optimal or seed_sim_optimal) and _cfg_path != str(PROJECT_ROOT / "config.yaml"):
                 import os as _os
                 try:
                     _os.unlink(_cfg_path)

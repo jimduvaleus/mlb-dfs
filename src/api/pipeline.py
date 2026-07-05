@@ -60,6 +60,143 @@ def _shorten_contest_name(name: str) -> str:
     return name.strip()
 
 
+def _candidate_sim_tail_scores(
+    pool: list,
+    sim_results: "SimulationResults",
+    percentile: float = 99.0,
+    chunk: int = 2048,
+) -> np.ndarray:
+    """Per-candidate tail score: the given percentile of each candidate's own
+    per-sim score distribution. This is a *ceiling* statistic — computed from
+    the sim matrix only, independent of field draws — used to admit
+    high-ceiling candidates that mean-dollar EV undervalues (real-p99 hit
+    rate peaks in the mid-EV deciles; see memory/pool-ceiling findings).
+
+    Candidates referencing players absent from the sim universe get -inf so
+    they are never tail-selected. Chunked to bound memory
+    (n_sims × chunk float64 accumulator).
+    """
+    col_map = {int(pid): i for i, pid in enumerate(sim_results.player_ids)}
+    mat = sim_results.results_matrix
+    n = len(pool)
+    cols = np.full((n, 10), -1, dtype=np.int64)
+    valid = np.zeros(n, dtype=bool)
+    for i, lu in enumerate(pool):
+        c = [col_map.get(int(p), -1) for p in lu.player_ids]
+        if len(c) == 10 and -1 not in c:
+            cols[i] = c
+            valid[i] = True
+
+    out = np.full(n, -np.inf, dtype=np.float64)
+    for a in range(0, n, chunk):
+        b = min(a + chunk, n)
+        sub = cols[a:b]
+        sub_valid = valid[a:b]
+        if not sub_valid.any():
+            continue
+        scores = np.zeros((mat.shape[0], b - a), dtype=np.float64)
+        for j in range(10):
+            scores += mat[:, np.clip(sub[:, j], 0, None)]
+        pct = np.percentile(scores, percentile, axis=0)
+        out[a:b] = np.where(sub_valid, pct, -np.inf)
+    return out
+
+
+def _measure_sim_ceiling(
+    n_sample: int,
+    pool: list,
+    sim_results: "SimulationResults",
+    cand_players_df: pd.DataFrame,
+    salary_floor: Optional[float],
+    rng_seed: int,
+    output_dir: str,
+) -> None:
+    """Diagnostic (gpp.measure_sim_ceiling): how much of the model's own
+    ceiling does the candidate pool capture?
+
+    For n_sample sims (stratified across slate-total deciles so quiet and
+    explosive worlds are both represented), solve the per-sim optimal lineup
+    ILP — generate_optimal_lineups with mean = that sim's realized scores,
+    under the same stack/salary-floor constraints generation ran under — and
+    compare it to the pool's best lineup in that same sim. The per-sim
+    capture ratio (pool best / ILP optimal) isolates the *generation* gap:
+    ceiling worlds the simulator produced but the pool never covered,
+    independent of whether the sim tails match reality (that half is
+    measured retrospectively by scripts/measure_pool_ceiling.py).
+
+    Writes pool_ceiling_sim.csv to output_dir and logs a summary.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from src.optimization.optimal_lineups import generate_optimal_lineups
+
+    sim_mat = sim_results.results_matrix
+    n_sims = sim_mat.shape[0]
+    n_sample = min(int(n_sample), n_sims)
+    col_map = {int(pid): i for i, pid in enumerate(sim_results.player_ids)}
+
+    # Pool membership as column indices (skip lineups touching a player
+    # absent from the sim universe — shouldn't happen, but stay defensive).
+    member_rows = [
+        cols for lu in pool
+        if len(cols := [col_map[int(p)] for p in lu.player_ids if int(p) in col_map]) == 10
+    ]
+    if not member_rows:
+        logger.warning("Sim-ceiling diagnostic: no pool lineups map onto the sim matrix.")
+        return
+    member = np.asarray(member_rows, dtype=np.int64)
+
+    from src.optimization.optimal_lineups import stratified_sim_sample
+    rng = np.random.default_rng(rng_seed + 7919)
+    sampled = stratified_sim_sample(sim_mat, n_sample, rng)
+
+    cand_pids = cand_players_df["player_id"].astype(int)
+
+    def _solve(sim_idx: int) -> tuple[float, float]:
+        row = sim_mat[sim_idx].astype(np.float64)
+        pool_best = float(row[member].sum(axis=1).max())
+        df = cand_players_df.copy()
+        df["mean"] = [float(row[col_map[p]]) if p in col_map else 0.0 for p in cand_pids]
+        lineups = generate_optimal_lineups(
+            df, n=1, min_uniques=1, min_stack=4, salary_floor=salary_floor,
+        )
+        if not lineups:
+            return pool_best, float("nan")
+        optimal = float(sum(
+            row[col_map[int(p)]] for p in lineups[0].player_ids if int(p) in col_map
+        ))
+        return pool_best, optimal
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor() as executor:
+        results = list(executor.map(_solve, [s for s, _ in sampled]))
+
+    rows = []
+    for (sim_idx, dec), (pool_best, optimal) in zip(sampled, results):
+        rows.append({
+            "sim_index": sim_idx,
+            "slate_total_decile": dec,
+            "pool_best": round(pool_best, 3),
+            "sim_optimal": round(optimal, 3),
+            "capture_ratio": round(pool_best / optimal, 4) if optimal and not np.isnan(optimal) else float("nan"),
+        })
+    out_df = pd.DataFrame(rows).sort_values(["slate_total_decile", "sim_index"])
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, "pool_ceiling_sim.csv")
+    out_df.to_csv(out_path, index=False)
+
+    ratios = out_df["capture_ratio"].dropna()
+    if len(ratios):
+        logger.info(
+            "Sim-ceiling diagnostic: %d sims in %.1fs — pool captures "
+            "mean=%.3f median=%.3f p10=%.3f min=%.3f of the per-sim ILP "
+            "optimal (written to %s)",
+            len(ratios), time.perf_counter() - t0,
+            float(ratios.mean()), float(ratios.median()),
+            float(np.percentile(ratios, 10)), float(ratios.min()),
+            out_path,
+        )
+
+
 class PipelineRunner:
     """
     Runs the full DFS portfolio pipeline with progress callbacks.
@@ -604,6 +741,11 @@ class PipelineRunner:
                 _n_optimal_target = len(batter_teams) * sum(_batches_per_stack.values())
 
                 self._cb("gpp_optimal_start", {"n_optimal": _n_optimal_target})
+                _t_optimal = time.perf_counter()
+                logger.info(
+                    "Optimal (mean-ILP) seeding: %d lineups across %d teams...",
+                    _n_optimal_target, len(batter_teams),
+                )
 
                 from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
 
@@ -702,12 +844,73 @@ class PipelineRunner:
                     key=lambda lu: sum(_mean_map.get(pid, 0.0) for pid in lu.player_ids),
                     reverse=True,
                 )
+                logger.info(
+                    "[TIMING] Optimal (mean-ILP) seeding: %d lineups in %.1fs",
+                    len(_optimal_lineups), time.perf_counter() - _t_optimal,
+                )
                 self._cb("gpp_optimal_done", {"n_generated": len(_optimal_lineups)})
 
-            n_random = max(0, n_candidates - len(_optimal_lineups))
+            # Optionally seed per-sim optimal lineups: the ILP solved against
+            # individual simulation draws' realized scores (stratified across
+            # run environments). Each seed wins at least one simulated world,
+            # so the pool always contains ceiling candidates the ownership
+            # sampler is unlikely to produce; the fresh-field rescore keeps
+            # sim-noise mining from surviving into selection.
+            _sim_optimal_lineups: list = []
+            seed_sim_optimal = bool(gpp_cfg.get("seed_sim_optimal_lineups", False))
+            n_sim_optimals = int(gpp_cfg.get("n_sim_optimals", 300))
+            if (
+                seed_sim_optimal and n_sim_optimals > 0
+                and not (_gpp_stopped and self._stop_check())
+            ):
+                from src.optimization.optimal_lineups import (
+                    generate_sim_optimal_lineups, stratified_sim_sample,
+                )
+                self._cb("gpp_sim_optimal_start", {"n_sim_optimals": n_sim_optimals})
+                _t_simopt = time.perf_counter()
+                try:
+                    _so_rng = np.random.default_rng(
+                        int(opt_cfg.get("rng_seed") or 42) + 104729
+                    )
+                    _so_sampled = stratified_sim_sample(
+                        sim_results.results_matrix, n_sim_optimals, _so_rng,
+                    )
+                    _sim_optimal_lineups = generate_sim_optimal_lineups(
+                        cand_players_df,
+                        sim_results.results_matrix,
+                        sim_results.player_ids,
+                        [s for s, _ in _so_sampled],
+                        min_stack=4,
+                        salary_floor=salary_floor_gpp,
+                        seen={
+                            frozenset(int(p) for p in lu.player_ids)
+                            for lu in _optimal_lineups
+                        },
+                        progress_cb=lambda n: self._cb(
+                            "gpp_sim_optimal_progress",
+                            {"n": n, "total": n_sim_optimals},
+                        ),
+                        stop_check=self._stop_check,
+                    )
+                    logger.info(
+                        "[TIMING] Sim-optimal seeding: %d unique lineups from "
+                        "%d sims in %.1fs",
+                        len(_sim_optimal_lineups), len(_so_sampled),
+                        time.perf_counter() - _t_simopt,
+                    )
+                except Exception as _so_e:
+                    logger.warning("Sim-optimal seeding failed: %s", _so_e)
+                    _sim_optimal_lineups = []
+                self._cb("gpp_sim_optimal_done", {
+                    "n_generated": len(_sim_optimal_lineups),
+                })
+
+            _n_seeded = len(_optimal_lineups) + len(_sim_optimal_lineups)
+            n_random = max(0, n_candidates - _n_seeded)
             self._cb("gpp_generate_start", {
-                "n_candidates": n_random + len(_optimal_lineups),
+                "n_candidates": n_random + _n_seeded,
                 **({"n_from_optimal": len(_optimal_lineups)} if _optimal_lineups else {}),
+                **({"n_from_sim_optimal": len(_sim_optimal_lineups)} if _sim_optimal_lineups else {}),
             })
             random_cands = gen.generate(
                 n_candidates=n_random,
@@ -716,7 +919,7 @@ class PipelineRunner:
                 stop_check=self._stop_check,
                 progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
             )
-            candidates = _optimal_lineups + random_cands
+            candidates = _optimal_lineups + _sim_optimal_lineups + random_cands
             self._cb("gpp_generate_done", {
                 "n_generated": len(candidates),
                 "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
@@ -790,6 +993,13 @@ class PipelineRunner:
                 historical_archive_root=_Path(__file__).resolve().parents[2] / "archive",
                 historical_n_slates=_hist_n_slates,
                 exclude_slate_date=_exclude_slate_date,
+                dupe_penalty=bool(gpp_cfg.get("dupe_penalty", False)),
+                dupe_intercept=float(gpp_cfg.get("dupe_intercept", 3.698)),
+                dupe_log_own_coef=float(gpp_cfg.get("dupe_log_own_coef", 0.212)),
+                dupe_salary_coef=float(gpp_cfg.get("dupe_salary_coef", 0.089)),
+                dupe_stack_coef=float(gpp_cfg.get("dupe_stack_coef", 0.024)),
+                dupe_min_gross_payout=float(gpp_cfg.get("dupe_min_gross_payout", 15.0)),
+                salary_cap=float(roster_rules.salary_cap),
             )
             logger.info("Pre-scoring RSS: %.0f MB  (candidates=%d)", _proc_rss_mb(), len(candidates))
             _t_score = time.perf_counter()
@@ -1058,6 +1268,190 @@ class PipelineRunner:
                     "best_ev_before": _ev_before,
                 })
 
+            # Phase 2c: two-stage scoring — kill the EV winner's curse.
+            # Pool mining (generation + refinement) ranked candidates on the
+            # same K field draws it optimized against, so the top of the pool
+            # is selected partly for luck against those particular fields.
+            # Re-score every candidate at/above the EV floor against fresh
+            # field draws, then re-apply the floor on the fresh EVs — a
+            # lineup must clear the floor twice to reach the selector. The
+            # floor (not an EV-rank cutoff) defines the selection pool, so
+            # the low-EV/high-diversity band above the floor stays available
+            # to the diversity-weighted selector. final_rescore_top acts only
+            # as a safety cap on the rescore slice (memory/time guard).
+            final_k = int(gpp_cfg.get("final_n_field_samples", 5))
+            rescore_cap = int(gpp_cfg.get("final_rescore_top", 2000))
+            _floor = float(gpp_cfg.get("ev_floor", 0.20))
+            # Tail bypass: mined-dollar EV predicts *mean* finish but
+            # undervalues ceiling (real-p99 hit rate peaks in the mid-EV
+            # deciles and the 07/04 contest-winning pool lineup sat at
+            # -$0.31 mined EV). Admit the top tail_bypass_n below-floor
+            # candidates by per-candidate sim-p99 into the rescore set, and
+            # hold them to their own fresh floor (tail_bypass_ev_floor) so
+            # the winner's-curse protection extends to them too.
+            _tail_bypass_n = int(gpp_cfg.get("tail_bypass_n", 2000))
+            _tail_bypass_floor = float(gpp_cfg.get("tail_bypass_ev_floor", -1.0))
+            _tail_bypass_keys: set = set()
+            _n_bypass_survivors = 0
+            # Full mined pool retained for the candidate-pool debug dump:
+            # post-contest eval (scripts/analyze_candidate_pool.py) needs the
+            # whole pool, not just the fresh-scored slice Phase 3 consumes.
+            _dump_pool_candidates: Optional[list] = None
+            _dump_pool_mined_ev: Optional[np.ndarray] = None
+            if (
+                final_k > 0 and rescore_cap > 0
+                and not (_gpp_stopped and self._stop_check())
+            ):
+                _t_rescore = time.perf_counter()
+                _mined_ev = robust_payout.mean(axis=1)
+                _dump_pool_candidates = candidates
+                _dump_pool_mined_ev = _mined_ev
+                _keep_idx = np.where(_mined_ev >= _floor)[0]
+                # Tiny-pool fallback: always rescore enough to fill a
+                # portfolio even when the floor culls nearly everything.
+                _min_keep = min(max(2 * portfolio_size, 200), len(candidates))
+                if len(_keep_idx) < _min_keep:
+                    logger.warning(
+                        "Fresh re-score: only %d candidates at/above the $%.2f "
+                        "floor; topping up to %d by mined EV.",
+                        len(_keep_idx), _floor, _min_keep,
+                    )
+                    _keep_idx = np.argsort(_mined_ev)[::-1][:_min_keep]
+                if len(_keep_idx) > rescore_cap:
+                    logger.warning(
+                        "Fresh re-score: %d candidates at/above the $%.2f floor "
+                        "exceed the final_rescore_top cap (%d); keeping the top "
+                        "%d by mined EV — raise the cap to honor the floor fully.",
+                        len(_keep_idx), _floor, rescore_cap, rescore_cap,
+                    )
+                    _keep_idx = _keep_idx[np.argsort(_mined_ev[_keep_idx])[::-1][:rescore_cap]]
+
+                _bypass_idx = np.array([], dtype=np.int64)
+                if _tail_bypass_n > 0:
+                    try:
+                        _tail_scores = _candidate_sim_tail_scores(candidates, sim_results)
+                        _in_keep = np.zeros(len(candidates), dtype=bool)
+                        _in_keep[_keep_idx] = True
+                        _below = np.where(~_in_keep & np.isfinite(_tail_scores))[0]
+                        _bypass_cap = min(
+                            _tail_bypass_n, max(0, rescore_cap - len(_keep_idx)),
+                        )
+                        if _bypass_cap < _tail_bypass_n:
+                            logger.warning(
+                                "Tail bypass truncated to %d by the "
+                                "final_rescore_top cap (%d).",
+                                _bypass_cap, rescore_cap,
+                            )
+                        if _bypass_cap > 0 and len(_below):
+                            _order = np.argsort(_tail_scores[_below])[::-1][:_bypass_cap]
+                            _bypass_idx = _below[_order]
+                            _tail_bypass_keys = {
+                                frozenset(int(p) for p in candidates[int(i)].player_ids)
+                                for i in _bypass_idx
+                            }
+                            logger.info(
+                                "Tail bypass: admitting %d below-floor candidates "
+                                "by sim-p99 (range %.1f-%.1f) to the fresh "
+                                "re-score; fresh floor $%.2f.",
+                                len(_bypass_idx),
+                                float(_tail_scores[_bypass_idx].min()),
+                                float(_tail_scores[_bypass_idx].max()),
+                                _tail_bypass_floor,
+                            )
+                    except Exception as _tb_e:
+                        logger.warning("Tail bypass failed (skipping): %s", _tb_e)
+                        _bypass_idx = np.array([], dtype=np.int64)
+
+                _is_bypass = np.zeros(len(candidates), dtype=bool)
+                _is_bypass[_bypass_idx] = True
+                _keep_idx = np.concatenate([_keep_idx, _bypass_idx])
+                if len(_keep_idx) < len(candidates):
+                    # Sort indices so surviving candidates keep relative order.
+                    _keep = np.sort(_keep_idx)
+                    candidates = [candidates[int(i)] for i in _keep]
+                    _mined_ev = _mined_ev[_keep]
+                    _is_bypass = _is_bypass[_keep]
+                self._cb("gpp_rescore_start", {
+                    "n_candidates": len(candidates),
+                    "n_field_samples": final_k,
+                })
+                # Free the mined full-pool payout matrix (~2 GB at production
+                # scale) before the fresh fields are allocated; _mined_ev
+                # already holds everything the telemetry needs.
+                robust_payout = None
+                gc.collect()
+                robust_payout = scorer.rescore_fresh_fields(
+                    candidates, n_samples=final_k,
+                    stop_check=self._stop_check,
+                    progress_cb=lambda done, total: self._cb(
+                        "gpp_score_progress",
+                        {"batches_done": done, "batches_total": total},
+                    ),
+                    field_progress_cb=lambda n_done, n_total: self._cb(
+                        "gpp_field_progress",
+                        {"n_done": n_done, "n_total": n_total},
+                    ),
+                )
+                _fresh_ev = robust_payout.mean(axis=1)
+                # Winner's-curse telemetry: how much of the mined top-EV was
+                # overfit to the first-stage fields?
+                _wc_k = min(50, len(candidates))
+                _mined_top_idx = np.argsort(_mined_ev)[::-1][:_wc_k]
+                _mined_top = float(_mined_ev[_mined_top_idx].mean())
+                _fresh_of_mined_top = float(_fresh_ev[_mined_top_idx].mean())
+
+                # Second floor pass: discard candidates whose fresh EV fell
+                # below the floor — their mined EV was favorable noise. Tail
+                # bypass candidates are held to their own (lower) fresh floor:
+                # they were admitted for ceiling, not mean EV, but a fresh EV
+                # below tail_bypass_ev_floor means even the ceiling bet is
+                # overpaying.
+                _surv = np.where(
+                    _is_bypass,
+                    _fresh_ev >= _tail_bypass_floor,
+                    _fresh_ev >= _floor,
+                )
+                _n_min = min(max(portfolio_size, 1), len(candidates))
+                if int(_surv.sum()) < _n_min:
+                    logger.warning(
+                        "Fresh re-score: only %d candidates kept fresh EV >= "
+                        "$%.2f; relaxing to top %d by fresh EV to fill the "
+                        "portfolio.",
+                        int(_surv.sum()), _floor, _n_min,
+                    )
+                    _surv = np.zeros(len(candidates), dtype=bool)
+                    _surv[np.argsort(_fresh_ev)[::-1][:_n_min]] = True
+                _n_dropped = int(len(candidates) - _surv.sum())
+                _n_rescored = len(_surv)
+                if _n_dropped:
+                    candidates = [c for c, s in zip(candidates, _surv) if s]
+                    robust_payout = robust_payout[_surv]
+                    _fresh_ev = _fresh_ev[_surv]
+                    _is_bypass = _is_bypass[_surv]
+                _n_bypass_survivors = int(_is_bypass.sum())
+
+                logger.info(
+                    "[TIMING] Fresh re-score wall time: %.3fs  rescored=%d  K=%d  "
+                    "dropped-below-floor=%d  pool=%d  tail-bypass=%d/%d  "
+                    "top-%d EV mined $%.3f → fresh $%.3f (curse $%.3f)",
+                    time.perf_counter() - _t_rescore, _n_rescored, final_k,
+                    _n_dropped, len(candidates),
+                    _n_bypass_survivors, len(_tail_bypass_keys),
+                    _wc_k, _mined_top, _fresh_of_mined_top,
+                    _mined_top - _fresh_of_mined_top,
+                )
+                self._cb("gpp_rescore_done", {
+                    "pool_size": len(candidates),
+                    "n_dropped_below_floor": _n_dropped,
+                    "n_tail_bypass_admitted": len(_tail_bypass_keys),
+                    "n_tail_bypass_survived": _n_bypass_survivors,
+                    "n_field_samples": final_k,
+                    "topk": _wc_k,
+                    "topk_ev_mined": _mined_top,
+                    "topk_ev_fresh": _fresh_of_mined_top,
+                    "best_ev": float(_fresh_ev.max()),
+                })
+
             if _gpp_stopped and self._stop_check():
                 portfolio = []
             else:
@@ -1082,12 +1476,26 @@ class PipelineRunner:
                 _evw_base = float(gpp_cfg.get("evw_base", 0.10))
                 _evw_max = float(gpp_cfg.get("evw_max", 0.40))
                 _ev_floor = float(gpp_cfg.get("ev_floor", 0.20))
+                if _n_bypass_survivors > 0:
+                    # Phase 2c already enforced the per-set floors (main set:
+                    # ev_floor twice; bypass set: tail_bypass_ev_floor on the
+                    # fresh pass), so lower the selector's backstop cull to the
+                    # bypass floor — otherwise it would silently re-cull every
+                    # tail-bypass survivor.
+                    _ev_floor = min(_ev_floor, _tail_bypass_floor)
 
                 logger.info(
                     "Det-EV sweep — portfolio_size=%d, risks=%s, evw_base=%.3f, evw_max=%.3f, ev_floor=%.2f",
                     portfolio_size, _DET_SWEEP_RISKS, _evw_base, _evw_max, _ev_floor,
                 )
 
+                # Floor cull + correlation matrix are identical for every risk
+                # (risk only changes the EVw/DEw blend) — compute once and
+                # share across the sweep instead of repeating the M×M matmul
+                # per risk (~23s each at pool=11k).
+                _det_pre = DeterminantPortfolioSelector.precompute_pool(
+                    robust_payout, _ev_floor,
+                )
                 for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
                     if self._stop_check is not None and self._stop_check():
                         break
@@ -1111,6 +1519,7 @@ class PipelineRunner:
                         evw_base=_evw_base,
                         evw_max=_evw_max,
                         ev_floor=_ev_floor,
+                        precomputed=_det_pre,
                     )
                     _det_result = _det_sel.select(
                         progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
@@ -1126,6 +1535,9 @@ class PipelineRunner:
                         "Det-EV risk %.0f done  RSS=%.0f MB",
                         _sweep_risk, _proc_rss_mb(),
                     )
+                # Free the shared corr matrix (~500 MB at pool=11k).
+                del _det_pre
+                gc.collect()
 
                 # Reorder all sweep portfolios by entry-fee-weighted diversity now,
                 # so the ordering is final from the outset and never needs to be
@@ -1174,6 +1586,24 @@ class PipelineRunner:
                 portfolio = gpp_result
 
                 if gpp_cfg.get("dump_candidate_pool", False) and candidates:
+                    # When the fresh re-score ran, dump the FULL mined pool
+                    # (mean_ev = first-stage EV, comparable across all rows)
+                    # and record the fresh-scored EV of the surviving top
+                    # pool in a separate fresh_ev column. Post-contest eval
+                    # sweeps the whole pool; Phase 3 only ever saw the slice.
+                    if _dump_pool_candidates is not None:
+                        _dump_cands = _dump_pool_candidates
+                        _dump_ev = _dump_pool_mined_ev
+                        _fresh_ev_map = {
+                            frozenset(int(p) for p in _lu.player_ids): float(_v)
+                            for _lu, _v in zip(
+                                candidates, robust_payout.mean(axis=1)
+                            )
+                        }
+                    else:
+                        _dump_cands = candidates
+                        _dump_ev = robust_payout.mean(axis=1)
+                        _fresh_ev_map = {}
                     _dump_path = os.path.join(output_dir, "candidate_pool_debug.csv")
                     _pid_meta = {
                         int(r["player_id"]): r
@@ -1192,8 +1622,7 @@ class PipelineRunner:
                     _pid_ownership = dict(zip(
                         sim_players_df["player_id"].astype(int), field_ownership_vector
                     ))
-                    _ev_means_final = robust_payout.mean(axis=1)
-                    _cand_keys = [frozenset(int(p) for p in _lu.player_ids) for _lu in candidates]
+                    _cand_keys = [frozenset(int(p) for p in _lu.player_ids) for _lu in _dump_cands]
                     _risk_membership: dict[int, list[str]] = {}
                     for _risk, _port in _portfolio_sweep_raw:
                         _selected_keys = {
@@ -1208,10 +1637,14 @@ class PipelineRunner:
                         _w.writerow([
                             "lineup_index", "player_id", "name", "position", "team",
                             "salary", "mean", "ownership", "mean_ev", "selected_risks",
+                            "fresh_ev", "tail_bypass",
                         ])
-                        for _li, _lu in enumerate(candidates):
+                        for _li, _lu in enumerate(_dump_cands):
                             _selected_risks = ",".join(_risk_membership.get(_li, []))
-                            _mean_ev = round(float(_ev_means_final[_li]), 4)
+                            _mean_ev = round(float(_dump_ev[_li]), 4)
+                            _fresh = _fresh_ev_map.get(_cand_keys[_li])
+                            _fresh_ev = round(_fresh, 4) if _fresh is not None else ""
+                            _tb = 1 if _cand_keys[_li] in _tail_bypass_keys else 0
                             for _pid in _lu.player_ids:
                                 _m = _pid_meta.get(int(_pid), {})
                                 _w.writerow([
@@ -1225,8 +1658,31 @@ class PipelineRunner:
                                     round(float(_pid_ownership.get(int(_pid), 0.0)), 5),
                                     _mean_ev,
                                     _selected_risks,
+                                    _fresh_ev,
+                                    _tb,
                                 ])
-                    logger.info("Candidate pool written to %s", _dump_path)
+                    logger.info(
+                        "Candidate pool written to %s (%d lineups%s)",
+                        _dump_path, len(_dump_cands),
+                        f", {len(_fresh_ev_map)} fresh-scored" if _fresh_ev_map else "",
+                    )
+
+                # Diagnostic: pool ceiling capture vs the model's own worlds
+                # (per-sim optimal ILP over sampled sims). Gated, default off.
+                _n_ceiling_sims = int(gpp_cfg.get("measure_sim_ceiling", 0))
+                if _n_ceiling_sims > 0 and candidates and not (_gpp_stopped and self._stop_check()):
+                    try:
+                        _measure_sim_ceiling(
+                            n_sample=_n_ceiling_sims,
+                            pool=(_dump_pool_candidates if _dump_pool_candidates is not None else candidates),
+                            sim_results=sim_results,
+                            cand_players_df=cand_players_df,
+                            salary_floor=salary_floor_gpp,
+                            rng_seed=int(opt_cfg.get("rng_seed") or 42),
+                            output_dir=output_dir,
+                        )
+                    except Exception as _mc_e:
+                        logger.warning("Sim-ceiling diagnostic failed: %s", _mc_e)
 
                 # Compute best_scores for portfolio_stats event.
                 col_map_ps = {pid: i for i, pid in enumerate(sim_results.player_ids)}

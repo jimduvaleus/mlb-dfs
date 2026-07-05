@@ -26,35 +26,26 @@ from src.simulation.results import SimulationResults
 
 logger = logging.getLogger(__name__)
 
+# Seed offset for the second-stage fresh field draws (rescore_fresh_fields).
+# Must exceed any plausible n_field_samples so the fresh seeds never collide
+# with the first-stage seeds field_rng_seed + 0..K-1.
+_FRESH_FIELD_SEED_OFFSET = 100_003
+
 
 # ------------------------------------------------------------------ #
 #  Numba kernels (module-level, compiled once per process)            #
 # ------------------------------------------------------------------ #
 
-def _build_payout_lookup(gross_payout_arr: np.ndarray, N: int, entry_fee: float = 4.0) -> np.ndarray:
-    """Precompute a net payout lookup of size N+1 from the real gross payout array.
+def _band_average(gross_payout_arr: np.ndarray, N: int) -> np.ndarray:
+    """Band-average a per-rank gross payout array onto N+1 lookup slots.
 
-    Each entry lookup[lo] is the average GROSS payout over the fractionally-weighted
-    band of real ranks corresponding to beating lo of N simulated field lineups,
-    minus the entry fee.
+    Each entry lookup[lo] is the average payout over the fractionally-weighted
+    band of real ranks corresponding to beating lo of N simulated field lineups.
 
     The prize pool scales naturally with the simulated field size: a 5,001-entry
     simulated contest drawn from a 14,863-entry real structure gets a prize pool of
     $50,000 × (5001/14863) ≈ $16,820 — the same economics as if DK ran that
     smaller contest with the same payout shape.
-
-    Example (N=5_000, T=5_001, prize_pool=$16_800, entry_fee=$4):
-      - Each bin covers exactly 1 real rank (T == N+1)
-      - lookup[5000] (beat all)  = $2,000 - $4 = +$1,996 net
-      - lookup[4100] (min cash)  = $8    - $4 = +$4.00 net
-      - lookup[4099] (no cash)   = $0    - $4 = -$4.00 net
-      - lookup[0]    (beat none) = $0    - $4 = -$4.00 net
-
-    Parameters
-    ----------
-    gross_payout_arr : (T,) array — GROSS prize per rank (entry fee NOT subtracted)
-    N : number of simulated field lineups; lookup will have N+1 entries (lo=0..N)
-    entry_fee : $4 for a standard DK GPP; subtracted from each slot after scaling
     """
     T = len(gross_payout_arr)
     ga = gross_payout_arr.astype(np.float64)
@@ -77,33 +68,97 @@ def _build_payout_lookup(gross_payout_arr: np.ndarray, N: int, entry_fee: float 
 
         gross_lookup[lo] = (cum[i1] + f1 * ga[i1] - cum[i0] - f0 * ga[i0]) / band
 
-    return (gross_lookup - entry_fee).astype(np.float32)
+    return gross_lookup
+
+
+def _build_payout_lookup(gross_payout_arr: np.ndarray, N: int, entry_fee: float = 4.0) -> np.ndarray:
+    """Precompute a net payout lookup of size N+1 from the real gross payout array.
+
+    Example (N=5_000, T=5_001, prize_pool=$16_800, entry_fee=$4):
+      - Each bin covers exactly 1 real rank (T == N+1)
+      - lookup[5000] (beat all)  = $2,000 - $4 = +$1,996 net
+      - lookup[4100] (min cash)  = $8    - $4 = +$4.00 net
+      - lookup[4099] (no cash)   = $0    - $4 = -$4.00 net
+      - lookup[0]    (beat none) = $0    - $4 = -$4.00 net
+
+    Parameters
+    ----------
+    gross_payout_arr : (T,) array — GROSS prize per rank (entry fee NOT subtracted)
+    N : number of simulated field lineups; lookup will have N+1 entries (lo=0..N)
+    entry_fee : $4 for a standard DK GPP; subtracted from each slot after scaling
+    """
+    return (_band_average(gross_payout_arr, N) - entry_fee).astype(np.float32)
+
+
+def _build_dilutable_lookup(
+    gross_payout_arr: np.ndarray, N: int, min_gross_payout: float
+) -> np.ndarray:
+    """Band-average only the ranks whose gross prize is >= min_gross_payout.
+
+    This is the portion of the payout the duplicate penalty dilutes: near the
+    min-cash plateau the payout curve is flat, so tying with a duplicate barely
+    changes the prize; at the steep top of the curve splitting is real money.
+    The threshold is applied per REAL rank before banding so a lookup band that
+    straddles the threshold is diluted only for its qualifying fraction.
+    """
+    dilutable = np.where(
+        gross_payout_arr.astype(np.float64) >= float(min_gross_payout),
+        gross_payout_arr.astype(np.float64), 0.0,
+    )
+    return _band_average(dilutable, N)
+
+
+def _payout_cumsum(lookup: np.ndarray) -> np.ndarray:
+    """(N+2,) float64 prefix sum of a (N+1,) lookup, cs[i] = sum(lookup[:i]).
+
+    Lets the kernel average any contiguous slot range lo..hi in O(1):
+    mean = (cs[hi+1] - cs[lo]) / (hi - lo + 1). float64 so 25k-entry sums do
+    not lose cents to float32 cancellation.
+    """
+    cs = np.zeros(len(lookup) + 1, dtype=np.float64)
+    np.cumsum(lookup.astype(np.float64), out=cs[1:])
+    return cs
 
 
 @njit(parallel=True, cache=True)
 def _compute_payout_from_sorted_field(
     cand_scores_batch: np.ndarray,  # (BATCH, n_sims) float32, C-contiguous
     field_sorted: np.ndarray,       # (n_sims, N) float32, sorted along axis=1
-    payout_lookup: np.ndarray,      # (N+1,) float32 — precomputed by _build_payout_lookup
+    payout_cumsum: np.ndarray,      # (N+2,) float64 — _payout_cumsum(net lookup)
+    dilute_cumsum: np.ndarray,      # (N+2,) float64 — _payout_cumsum(dilutable lookup)
+    dupe_scale: np.ndarray,         # (BATCH,) float32 — 1/(1+E[dupes]); 1.0 = no penalty
 ) -> np.ndarray:                    # (BATCH, n_sims) float32
-    """Compute dollar payout for each (candidate, sim) pair via precomputed lookup.
+    """Compute dollar payout for each (candidate, sim) pair with exact tie splitting.
 
-    For each candidate b and simulation s:
-      lo      = number of simulated field lineups beaten (binary search, O(log N))
-      payout  = payout_lookup[lo]   (O(1) table lookup)
+    For each candidate b and simulation s two binary searches bound the tie group:
+      lo = number of field lineups strictly below the candidate's score
+      hi = number of field lineups at or below it
+    The candidate finishes anywhere in the (hi - lo + 1)-slot tie band with equal
+    probability, so its payout is the band mean — an O(1) prefix-sum difference.
+    With no ties (hi == lo) this reduces exactly to the old single-lookup path.
 
-    The lookup is indexed directly by lo so there is no floating-point arithmetic
-    in the inner loop.  Aggregate preservation and edge cases are handled entirely
-    in _build_payout_lookup at construction time.
+    The duplicate penalty subtracts (1 - dupe_scale[b]) of the dilutable (top-band
+    gross) portion of the same slot range, i.e. top payouts scale by 1/(1+E[dupes]).
     """
     BATCH = cand_scores_batch.shape[0]
     n_sims = cand_scores_batch.shape[1]
     N = field_sorted.shape[1]
     out = np.zeros((BATCH, n_sims), dtype=np.float32)
     for b in prange(BATCH):
+        dilution = 1.0 - np.float64(dupe_scale[b])
         for s in range(n_sims):
             score = cand_scores_batch[b, s]
+            # lower bound: count of field scores strictly < score
             lo = 0
+            hi = N
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                if field_sorted[s, mid] < score:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            lo_idx = lo
+            # upper bound: count of field scores <= score
             hi = N
             while lo < hi:
                 mid = (lo + hi) >> 1
@@ -111,7 +166,11 @@ def _compute_payout_from_sorted_field(
                     lo = mid + 1
                 else:
                     hi = mid
-            out[b, s] = payout_lookup[lo]
+            hi_idx = lo
+            total = payout_cumsum[hi_idx + 1] - payout_cumsum[lo_idx]
+            if dilution > 0.0:
+                total -= dilution * (dilute_cumsum[hi_idx + 1] - dilute_cumsum[lo_idx])
+            out[b, s] = total / (hi_idx - lo_idx + 1)
     return out
 
 
@@ -147,6 +206,20 @@ class ContestScorer:
     team_totals : optional {team: implied_total} for Model D ownership
     candidate_batch_size : BATCH — candidates processed simultaneously (memory control)
     portfolio_size : unused, kept for API compatibility
+    dupe_penalty : when True, each candidate's top-band payouts are diluted by
+                 1/(1+E[dupes]) where E[dupes] comes from a log-linear model:
+                 log E[dupes] = dupe_intercept
+                                + dupe_log_own_coef * Σ log(ownership_i)
+                                - dupe_salary_coef  * (unused salary / $100)
+                                + dupe_stack_coef   * (primary stack size - 4)
+                 Default coefficients were fitted by scripts/fit_dupe_model.py
+                 (zero-truncated Poisson GLM on 32 archived DK contest
+                 standings, 2026-07-04); the intercept is calibrated to the
+                 reference 14,863-entry contest. Re-run the fit as the archive
+                 grows. Dilution applies only to lookup bands whose gross prize
+                 is >= dupe_min_gross_payout (flat near-min-cash bands are
+                 unaffected by splitting).
+    salary_cap : platform salary cap used for the unused-salary dupe feature
     """
 
     def __init__(
@@ -169,6 +242,13 @@ class ContestScorer:
         historical_archive_root: Optional["Path"] = None,
         historical_n_slates: int = 10,
         exclude_slate_date: Optional[str] = None,
+        dupe_penalty: bool = False,
+        dupe_intercept: float = 3.698,
+        dupe_log_own_coef: float = 0.212,
+        dupe_salary_coef: float = 0.089,
+        dupe_stack_coef: float = 0.024,
+        dupe_min_gross_payout: float = 15.0,
+        salary_cap: float = 50_000.0,
     ) -> None:
         self._sim_results = sim_results
         self._players_df = players_df
@@ -201,6 +281,22 @@ class ContestScorer:
         self._payout_lookup = _build_payout_lookup(
             self._payout_arr, N=n_field_lineups, entry_fee=self._entry_fee
         )
+        self._payout_cumsum = _payout_cumsum(self._payout_lookup)
+
+        self._dupe_penalty = bool(dupe_penalty)
+        self._dupe_intercept = float(dupe_intercept)
+        self._dupe_log_own_coef = float(dupe_log_own_coef)
+        self._dupe_salary_coef = float(dupe_salary_coef)
+        self._dupe_stack_coef = float(dupe_stack_coef)
+        self._salary_cap = float(salary_cap)
+        if self._dupe_penalty:
+            self._dilute_cumsum = _payout_cumsum(_build_dilutable_lookup(
+                self._payout_arr, N=n_field_lineups,
+                min_gross_payout=dupe_min_gross_payout,
+            ))
+        else:
+            # All-zero dilutable portion: the kernel's dilution term vanishes.
+            self._dilute_cumsum = np.zeros_like(self._payout_cumsum)
 
         self._sim_matrix = sim_results.results_matrix.astype(np.float32)
         self._col_map: dict[int, int] = {
@@ -395,7 +491,8 @@ class ContestScorer:
         logger.info("[TIMING] _build_col_lineups M=%d: %.3fs", M, time.perf_counter() - _t_col)
 
         _t_scoring = time.perf_counter()
-        robust_payout = self._score_col_lineups(col_lineups, progress_cb, stop_check)
+        dupe_scale = self._compute_dupe_scale(candidates)
+        robust_payout = self._score_col_lineups(col_lineups, dupe_scale, progress_cb, stop_check)
         logger.info("[TIMING] Numba scoring loop total: %.3fs", time.perf_counter() - _t_scoring)
 
         logger.info(
@@ -424,11 +521,90 @@ class ContestScorer:
             raise RuntimeError("score_batch() requires a prior score_candidates() call.")
 
         col_lineups = self._build_col_lineups(candidates)
-        return self._score_col_lineups(col_lineups, progress_cb, stop_check)
+        dupe_scale = self._compute_dupe_scale(candidates)
+        return self._score_col_lineups(col_lineups, dupe_scale, progress_cb, stop_check)
+
+    def rescore_fresh_fields(
+        self,
+        candidates: list[Lineup],
+        n_samples: int,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+        field_progress_cb: Optional[Callable[[int, int], None]] = None,
+    ) -> np.ndarray:
+        """Re-score candidates against n_samples freshly drawn opponent fields.
+
+        Second scoring stage against fields never seen during pool mining
+        (generation + refinement), so a candidate whose first-stage EV was
+        luck against the particular K field draws regresses back to its true
+        EV here (winner's-curse control). Fresh draws use a seed range
+        disjoint from the first-stage seeds.
+
+        Side effect: the fresh fields replace the cached first-stage fields,
+        so any later score_batch() call scores against the same fresh fields
+        the selector consumed.
+        """
+        n_sims = self._sim_matrix.shape[0]
+        _t0 = time.perf_counter()
+        fresh_seed = self._field_seed + _FRESH_FIELD_SEED_OFFSET
+        # Release the stage-1 fields up front: at production scale each sorted
+        # field is ~n_sims × N_field × 4 bytes, so holding both generations
+        # simultaneously would roughly double the field memory peak.
+        self._field_sorted_list = None
+        field_sorted_list: list[np.ndarray] = []
+        if self._field_source == "historical":
+            from src.optimization.historical_field import (
+                estimate_current_slate_ref,
+                build_historical_field_samples,
+            )
+            current_ref = estimate_current_slate_ref(
+                self._sim_matrix, self._field_ownership_vec,
+            )
+            field_sorted_list = build_historical_field_samples(
+                self._hist_distributions,
+                n_field=self._n_field,
+                n_sims=n_sims,
+                current_ref=current_ref,
+                rng=np.random.default_rng(fresh_seed),
+                K=n_samples,
+            )
+            if field_progress_cb is not None:
+                field_progress_cb(n_samples * self._n_field, n_samples * self._n_field)
+        else:
+            logger.info(
+                "Generating %d fresh field samples (N=%d each) for re-scoring...",
+                n_samples, self._n_field,
+            )
+            n_total_field = n_samples * self._n_field
+            for k in range(n_samples):
+                offset = k * self._n_field
+                def _field_cb(n_done: int, _n: int, _offset: int = offset) -> None:
+                    if field_progress_cb is not None:
+                        field_progress_cb(_offset + n_done, n_total_field)
+                raw = self._cs.generate_field(
+                    self._field_players_df, self._field_ownership_vec,
+                    n_lineups=self._n_field, rng_seed=fresh_seed + k,
+                    progress_cb=_field_cb if field_progress_cb is not None else None,
+                )
+                field_sorted_list.append(self._build_field_sorted(raw))
+                if field_progress_cb is not None:
+                    field_progress_cb(offset + len(raw), n_total_field)
+
+        self._field_sorted_list = field_sorted_list
+        self._n_k = len(field_sorted_list)
+        logger.info(
+            "[TIMING] Fresh field phase (K=%d): %.3fs",
+            self._n_k, time.perf_counter() - _t0,
+        )
+
+        col_lineups = self._build_col_lineups(candidates)
+        dupe_scale = self._compute_dupe_scale(candidates)
+        return self._score_col_lineups(col_lineups, dupe_scale, progress_cb, stop_check)
 
     def _score_col_lineups(
         self,
         col_lineups: np.ndarray,
+        dupe_scale: np.ndarray,
         progress_cb: Optional[Callable[[int, int], None]] = None,
         stop_check: Optional[Callable[[], bool]] = None,
     ) -> np.ndarray:
@@ -454,9 +630,11 @@ class ContestScorer:
 
             # Accumulate payout over K field samples
             batch_payout = np.zeros((end - start, n_sims), dtype=np.float32)
+            batch_dupe_scale = np.ascontiguousarray(dupe_scale[start:end])
             for field_sorted in field_sorted_list:
                 payout_k = _compute_payout_from_sorted_field(
-                    cand_scores_batch, field_sorted, self._payout_lookup,
+                    cand_scores_batch, field_sorted,
+                    self._payout_cumsum, self._dilute_cumsum, batch_dupe_scale,
                 )
                 batch_payout += payout_k
 
@@ -486,6 +664,61 @@ class ContestScorer:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _compute_dupe_scale(self, candidates: list[Lineup]) -> np.ndarray:
+        """(M,) float32 top-band payout multipliers 1/(1+E[dupes]) per candidate.
+
+        E[dupes] is the log-linear model documented on the class. Ownership
+        comes from the field vector (the real-universe %drafted estimate that
+        drives opponent field generation), not the candidate pool's internal
+        sampling weights. Returns all ones when the penalty is disabled.
+        """
+        M = len(candidates)
+        if not self._dupe_penalty:
+            return np.ones(M, dtype=np.float32)
+
+        fdf = self._field_players_df
+        pids = fdf["player_id"].astype(int).to_numpy()
+        own_map = dict(zip(pids, np.asarray(self._field_ownership_vec, dtype=np.float64)))
+        sal_map = dict(zip(pids, fdf["salary"].astype(float).to_numpy()))
+        team_map = dict(zip(pids, fdf["team"]))
+        pos_map = dict(zip(pids, fdf["position"]))
+
+        scale = np.ones(M, dtype=np.float32)
+        e_dupes_all = np.zeros(M, dtype=np.float64)
+        for i, lu in enumerate(candidates):
+            sum_log_own = 0.0
+            salary_used = 0.0
+            team_counts: dict[str, int] = {}
+            for pid in lu.player_ids:
+                pid = int(pid)
+                own = float(np.clip(own_map.get(pid, 0.01), 1e-4, 0.95))
+                sum_log_own += np.log(own)
+                salary_used += sal_map.get(pid, 0.0)
+                if pos_map.get(pid, "") != "P":
+                    t = team_map.get(pid, "")
+                    if t:
+                        team_counts[t] = team_counts.get(t, 0) + 1
+            primary_stack = max(team_counts.values()) if team_counts else 0
+            unused_hundreds = max(self._salary_cap - salary_used, 0.0) / 100.0
+            log_dupes = (
+                self._dupe_intercept
+                + self._dupe_log_own_coef * sum_log_own
+                - self._dupe_salary_coef * unused_hundreds
+                + self._dupe_stack_coef * (primary_stack - 4)
+            )
+            e_dupes = float(np.exp(np.clip(log_dupes, -20.0, 10.0)))
+            e_dupes_all[i] = e_dupes
+            scale[i] = np.float32(1.0 / (1.0 + e_dupes))
+
+        logger.info(
+            "Dupe penalty: E[dupes] min=%.3f  p50=%.3f  p90=%.3f  max=%.1f  "
+            "(top-band payout scale p50=%.3f)",
+            float(e_dupes_all.min()), float(np.percentile(e_dupes_all, 50)),
+            float(np.percentile(e_dupes_all, 90)), float(e_dupes_all.max()),
+            float(np.percentile(scale, 50)),
+        )
+        return scale
 
     def _build_col_lineups(self, candidates: list[Lineup]) -> np.ndarray:
         """Convert candidate player_ids to sim_matrix column indices.
@@ -566,6 +799,7 @@ class DeterminantPortfolioSelector:
         evw_max: float = 0.40,
         ev_floor: float = 0.20,
         rng_seed: Optional[int] = None,  # unused; kept for API consistency
+        precomputed: Optional[tuple] = None,
     ) -> None:
         self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
         self._candidates = candidates
@@ -573,6 +807,11 @@ class DeterminantPortfolioSelector:
         self._evw = self.evw_for_risk(risk, evw_base, evw_max)
         self._dew = 1.0 - self._evw
         self._ev_floor = ev_floor
+        # Optional shared precompute from precompute_pool() — must have been
+        # built from the same robust_payout/ev_floor. The risk sweep passes
+        # one precompute to all five selectors instead of repeating the
+        # M×M correlation matmul per risk.
+        self._precomputed = precomputed
 
     @staticmethod
     def evw_for_risk(risk: float, evw_base: float = 0.10, evw_max: float = 0.40) -> float:
@@ -585,41 +824,32 @@ class DeterminantPortfolioSelector:
         t = (risk - 1) / 4.0
         return float(np.clip(evw_base + t * (evw_max - evw_base), 0.0, 1.0))
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    @staticmethod
+    def precompute_pool(
+        robust_payout: np.ndarray, ev_floor: float,
+    ) -> Optional[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Floor cull + payout correlation matrix — the risk-independent part
+        of select(). A risk sweep over the same robust_payout/ev_floor should
+        compute this once and hand it to every selector: the M×M matmul is
+        the dominant selection cost (~23s at pool=11k) and is identical for
+        every risk, since risk only changes the EVw/DEw blend.
 
-    def select(
-        self,
-        stop_check: Optional[Callable[[], bool]] = None,
-        progress_cb: Optional[Callable[[dict], None]] = None,
-    ) -> list[tuple[Lineup, float]]:
-        """Run greedy Det-EV selection and return (lineup, mean_ev) pairs."""
-        t0 = time.perf_counter()
-        n_sims = self._robust_payout.shape[1]
-
-        # --- Phase 1 cull: keep candidates with EV >= ev_floor ---
-        pool_ev = self._robust_payout.mean(axis=1)  # (M,) float32
-        pool_mask = pool_ev >= self._ev_floor
-        pool_idx = np.where(pool_mask)[0]  # indices into M
-
-        logger.info(
-            "DeterminantSelector: %d / %d candidates have EV >= $%.2f",
-            len(pool_idx), len(self._candidates), self._ev_floor,
-        )
+        Returns (pool_idx, pool_ev_vals float64, corr_matrix float32), or
+        None when no candidate clears the floor.
+        """
+        robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        n_sims = robust_payout.shape[1]
+        pool_ev = robust_payout.mean(axis=1)
+        pool_idx = np.where(pool_ev >= ev_floor)[0]
         if len(pool_idx) == 0:
-            logger.warning("No candidates with EV >= $%.2f; returning empty portfolio.", self._ev_floor)
-            return []
+            return None
+        pool_ev_vals = pool_ev[pool_idx].astype(np.float64)
 
-        pool_ev_vals = pool_ev[pool_idx].astype(np.float64)  # (M_pool,)
-
-        # --- Precompute normalised payout matrix and full correlation matrix ---
-        # Memory budget: pool_payout (M×S×8) → norm_payout reuses the same buffer →
-        # matmul peak is norm_payout(M×S×8) + result(M×M×8). /= avoids a second M×M
-        # allocation. Old code called .astype(float64) twice on a float32 norm_payout,
-        # creating two extra M×S×8 temporaries simultaneously (≈1.2 GB wasted at peak).
+        # Memory budget: pool_payout (M×S×8) → norm_payout reuses the same
+        # buffer → matmul peak is norm_payout(M×S×8) + result(M×M×8). /=
+        # avoids a second M×M allocation.
         _t = time.perf_counter()
-        pool_payout = self._robust_payout[pool_idx].astype(np.float64)  # (M_pool, n_sims)
+        pool_payout = robust_payout[pool_idx].astype(np.float64)  # (M_pool, n_sims)
         mu = pool_payout.mean(axis=1, keepdims=True)
         std = pool_payout.std(axis=1, keepdims=True)
         std = np.where(std < 1e-8, 1.0, std)
@@ -634,6 +864,34 @@ class DeterminantPortfolioSelector:
         logger.info(
             "[TIMING] DeterminantSelector precompute: %.2fs  corr_matrix %s (%.1f MB)",
             time.perf_counter() - _t, corr_matrix.shape, corr_matrix.nbytes / 1e6,
+        )
+        return pool_idx, pool_ev_vals, corr_matrix
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def select(
+        self,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> list[tuple[Lineup, float]]:
+        """Run greedy Det-EV selection and return (lineup, mean_ev) pairs."""
+        t0 = time.perf_counter()
+
+        # --- Floor cull + correlation precompute (shared across a risk sweep
+        # when the caller passed precompute_pool() output) ---
+        pre = self._precomputed
+        if pre is None:
+            pre = self.precompute_pool(self._robust_payout, self._ev_floor)
+        if pre is None:
+            logger.warning("No candidates with EV >= $%.2f; returning empty portfolio.", self._ev_floor)
+            return []
+        pool_idx, pool_ev_vals, corr_matrix = pre
+
+        logger.info(
+            "DeterminantSelector: %d / %d candidates have EV >= $%.2f",
+            len(pool_idx), len(self._candidates), self._ev_floor,
         )
 
         M_pool = len(pool_idx)
