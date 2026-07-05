@@ -1649,11 +1649,16 @@ _BLOWUP_MEAN_OUTS = 9.0
 # shared mean-one lognormal factor z ~ LogNormal(-σ²/2, σ), which preserves
 # every event mean exactly (E[Poisson(λz)] = λ) while fattening the right
 # tail of the score distribution — the region GPP equity lives in.
-# σ = 0.30 corresponds to a ±30%-ish 1-sigma swing in the per-game offensive
-# environment and induces a mild positive correlation between a player's
-# counting stats, consistent with historical box-score co-movement.
+# σ = 0.46 was calibrated by scripts/calibrate_env_sigma.py (2026-07-04)
+# against 2022-2025 Retrosheet cwdaily box scores: it minimises the squared
+# error between the MC's within-player stat-pair correlations and the pooled
+# within-player (demeaned) historical correlations across all pairs of
+# {single, double, HR, walk, run, RBI}. A single shared factor cannot match
+# every pair (same-inning causation makes e.g. single-run +0.22 while PA
+# competition makes single-walk slightly negative); 0.46 is the least-squares
+# balance. Re-run the calibration after refreshing Retrosheet data.
 # Set to 0 (or --env-sigma 0) to disable and recover independent draws.
-_ENV_SIGMA = 0.30
+_ENV_SIGMA = 0.46
 
 # Percentile points for the stored quantile grid. Endpoints are pulled in
 # from the raw sample min/max (P0/P100) to P0.05/P99.95 so a single extreme
