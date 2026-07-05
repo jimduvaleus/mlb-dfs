@@ -30,12 +30,16 @@ const STAGE_LABELS: Record<string, string> = {
   optimize_lineup: 'Optimize lineups',
   gpp_optimal_start: 'Optimal seeding',
   gpp_optimal_done: 'Optimal seeding',
+  gpp_sim_optimal_start: 'Sim-optimal seeding',
+  gpp_sim_optimal_done: 'Sim-optimal seeding',
   gpp_generate_start: 'Generate candidates',
   gpp_generate_done: 'Generate candidates',
   gpp_score_start: 'Score candidates',
   gpp_score_done: 'Score candidates',
   gpp_refine_start: 'Refine pool',
   gpp_refine_done: 'Refine pool',
+  gpp_rescore_start: 'Fresh re-score',
+  gpp_rescore_done: 'Fresh re-score',
   gpp_field_inject: 'Field lineups',
   gpp_holdout: 'Holdout evaluation',
   complete: 'Complete',
@@ -44,7 +48,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target'])
-const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_refine_progress', 'gpp_select_progress', 'gpp_optimal_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_refine_progress', 'gpp_select_progress', 'gpp_optimal_progress', 'gpp_sim_optimal_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
@@ -72,6 +76,9 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_optimal_start' ||
       last?.stage === 'gpp_optimal_progress' ||
       last?.stage === 'gpp_optimal_done' ||
+      last?.stage === 'gpp_sim_optimal_start' ||
+      last?.stage === 'gpp_sim_optimal_progress' ||
+      last?.stage === 'gpp_sim_optimal_done' ||
       last?.stage === 'gpp_generate_start' ||
       last?.stage === 'gpp_generate_progress' ||
       last?.stage === 'gpp_generate_done' ||
@@ -117,6 +124,7 @@ export function ProgressPanel({ events, running }: Props) {
 
   const isGpp = events.some(e =>
     e.stage === 'gpp_optimal_start' || e.stage === 'gpp_optimal_done' ||
+    e.stage === 'gpp_sim_optimal_start' || e.stage === 'gpp_sim_optimal_done' ||
     e.stage === 'gpp_generate_start' || e.stage === 'gpp_generate_done' ||
     e.stage === 'gpp_score_start' || e.stage === 'gpp_field_inject' ||
     e.stage === 'gpp_select_progress' || e.stage === 'gpp_mv_select_progress' ||
@@ -130,6 +138,12 @@ export function ProgressPanel({ events, running }: Props) {
   const latestOptimalProgress = optimalProgressEvents[optimalProgressEvents.length - 1]
   const optimalDone = events.some(e => e.stage === 'gpp_optimal_done')
 
+  // --- Sim-optimal lineup seeding progress ---
+  const simOptimalStartEvent = events.find(e => e.stage === 'gpp_sim_optimal_start') as unknown as { n_sim_optimals: number } | undefined
+  const simOptimalProgressEvents = events.filter(e => e.stage === 'gpp_sim_optimal_progress') as unknown as GppOptimalProgressEvent[]
+  const latestSimOptimalProgress = simOptimalProgressEvents[simOptimalProgressEvents.length - 1]
+  const simOptimalDone = events.some(e => e.stage === 'gpp_sim_optimal_done')
+
   // --- Non-GPP lineup progress ---
   const latestLineup = [...events]
     .reverse()
@@ -142,7 +156,7 @@ export function ProgressPanel({ events, running }: Props) {
   const lineupEvents = events.filter(e => e.stage === 'optimize_lineup') as OptimizeLineupEvent[]
 
   // --- GPP progress ---
-  const generateStartEvent = events.find(e => e.stage === 'gpp_generate_start') as unknown as { n_candidates: number; n_from_optimal?: number } | undefined
+  const generateStartEvent = events.find(e => e.stage === 'gpp_generate_start') as unknown as { n_candidates: number; n_from_optimal?: number; n_from_sim_optimal?: number } | undefined
   const generateProgressEvents = events.filter(e => e.stage === 'gpp_generate_progress') as unknown as GppGenerateProgressEvent[]
   const latestGenerateProgress = generateProgressEvents[generateProgressEvents.length - 1]
   const generateDone = events.some(e => e.stage === 'gpp_generate_done')
@@ -216,12 +230,21 @@ export function ProgressPanel({ events, running }: Props) {
       gppPct = 100
       gppLabel = 'Candidates generated'
     } else if (latestGenerateProgress && generateStartEvent) {
-      const nToGenerate = generateStartEvent.n_candidates - (generateStartEvent.n_from_optimal ?? 0)
+      const nToGenerate = generateStartEvent.n_candidates - (generateStartEvent.n_from_optimal ?? 0) - (generateStartEvent.n_from_sim_optimal ?? 0)
       gppPct = Math.round((latestGenerateProgress.n / nToGenerate) * 100)
       gppLabel = `Generating candidates: ${latestGenerateProgress.n.toLocaleString()} / ${nToGenerate.toLocaleString()}`
     } else if (generateStartEvent) {
       gppPct = 0
       gppLabel = 'Generating candidates…'
+    } else if (simOptimalDone) {
+      gppPct = 100
+      gppLabel = 'Sim-optimal seeding complete'
+    } else if (latestSimOptimalProgress && simOptimalStartEvent) {
+      gppPct = Math.round((latestSimOptimalProgress.n / latestSimOptimalProgress.total) * 100)
+      gppLabel = `Seeding sim-optimal: ${latestSimOptimalProgress.n} / ${latestSimOptimalProgress.total}`
+    } else if (simOptimalStartEvent) {
+      gppPct = 0
+      gppLabel = `Seeding sim-optimal: 0 / ${simOptimalStartEvent.n_sim_optimals}`
     } else if (optimalDone) {
       gppPct = 100
       gppLabel = 'Optimal seeding complete'
@@ -249,7 +272,7 @@ export function ProgressPanel({ events, running }: Props) {
       if (recent.length >= 2) {
         const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
         const avgPerChunk = recentElapsed / (recent.length - 1)
-        const nToGenerate = generateStartEvent.n_candidates - (generateStartEvent.n_from_optimal ?? 0)
+        const nToGenerate = generateStartEvent.n_candidates - (generateStartEvent.n_from_optimal ?? 0) - (generateStartEvent.n_from_sim_optimal ?? 0)
         const remainingChunks = (nToGenerate - latestGenerateProgress.n) / 500
         if (remainingChunks > 0) etaMs = avgPerChunk * remainingChunks
       }
@@ -507,9 +530,11 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
     if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress') continue
     // Skip start event once done event is present (collapse into one row)
     if (e.stage === 'gpp_optimal_start' && hasEvent('gpp_optimal_done')) continue
+    if (e.stage === 'gpp_sim_optimal_start' && hasEvent('gpp_sim_optimal_done')) continue
     if (e.stage === 'gpp_generate_start' && hasEvent('gpp_generate_done')) continue
     if (e.stage === 'gpp_score_start' && hasEvent('gpp_score_done')) continue
     if (e.stage === 'gpp_refine_start' && hasEvent('gpp_refine_done')) continue
+    if (e.stage === 'gpp_rescore_start' && hasEvent('gpp_rescore_done')) continue
     // field_inject is a one-shot cache notification; skip once score is done
     if (e.stage === 'gpp_field_inject' && hasEvent('gpp_score_done')) continue
     if (CONFIG_STAGES.has(e.stage)) {
@@ -578,13 +603,25 @@ function renderDetail(e: SSEEvent): string {
       const ev = e as unknown as { n_generated: number }
       return `${ev.n_generated} optimal candidates seeded`
     }
+    case 'gpp_sim_optimal_start': {
+      const ev = e as unknown as { n_sim_optimals: number }
+      return `Solving ${ev.n_sim_optimals} per-sim optimal lineups…`
+    }
+    case 'gpp_sim_optimal_done': {
+      const ev = e as unknown as { n_generated: number }
+      return `${ev.n_generated} sim-optimal candidates seeded`
+    }
     case 'gpp_generate_start': {
-      const ev = e as unknown as { n_candidates: number; n_from_cache?: number; n_from_optimal?: number }
+      const ev = e as unknown as { n_candidates: number; n_from_cache?: number; n_from_optimal?: number; n_from_sim_optimal?: number }
       if (ev.n_from_cache != null && ev.n_from_cache > 0) {
         return `Generating ${ev.n_candidates.toLocaleString()} + ${ev.n_from_cache.toLocaleString()} from cache…`
       }
-      if (ev.n_from_optimal != null && ev.n_from_optimal > 0) {
-        return `Generating ${(ev.n_candidates - ev.n_from_optimal).toLocaleString()} random + ${ev.n_from_optimal} optimal candidates…`
+      const nSeeded = (ev.n_from_optimal ?? 0) + (ev.n_from_sim_optimal ?? 0)
+      if (nSeeded > 0) {
+        const parts = []
+        if (ev.n_from_optimal) parts.push(`${ev.n_from_optimal} optimal`)
+        if (ev.n_from_sim_optimal) parts.push(`${ev.n_from_sim_optimal} sim-optimal`)
+        return `Generating ${(ev.n_candidates - nSeeded).toLocaleString()} random + ${parts.join(' + ')} candidates…`
       }
       return `Generating ${ev.n_candidates.toLocaleString()} candidates…`
     }
@@ -611,6 +648,15 @@ function renderDetail(e: SSEEvent): string {
       const ev = e as unknown as { pool_size: number; n_added: number; best_ev: number; best_ev_before: number }
       const uplift = ev.best_ev - ev.best_ev_before
       return `+${ev.n_added.toLocaleString()} mutants (pool ${ev.pool_size.toLocaleString()}) · best EV $${ev.best_ev_before.toFixed(2)} → $${ev.best_ev.toFixed(2)}${uplift > 0 ? ` (+$${uplift.toFixed(2)})` : ''}`
+    }
+    case 'gpp_rescore_start': {
+      const ev = e as unknown as { n_candidates: number; n_field_samples: number }
+      return `Re-scoring top ${ev.n_candidates.toLocaleString()} candidates × ${ev.n_field_samples} fresh field samples…`
+    }
+    case 'gpp_rescore_done': {
+      const ev = e as unknown as { pool_size: number; n_field_samples: number; topk: number; topk_ev_mined: number; topk_ev_fresh: number }
+      const curse = ev.topk_ev_mined - ev.topk_ev_fresh
+      return `${ev.pool_size.toLocaleString()} candidates × ${ev.n_field_samples} fresh fields · top-${ev.topk} EV $${ev.topk_ev_mined.toFixed(2)} → $${ev.topk_ev_fresh.toFixed(2)} (curse $${curse.toFixed(2)})`
     }
     case 'gpp_holdout': {
       const ev = e as unknown as { holdout_mean_payout: number }

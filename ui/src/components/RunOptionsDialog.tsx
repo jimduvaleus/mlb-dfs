@@ -3,7 +3,7 @@ import type { CacheStatus } from '../types'
 
 interface Props {
   cacheStatus: CacheStatus
-  onStart: (useCandidates: boolean, useField: boolean, seedOptimal: boolean) => void
+  onStart: (useCandidates: boolean, useField: boolean, seedOptimal: boolean, seedSimOptimal: boolean) => void
   onDismiss: () => void
   fieldSource?: string
 }
@@ -13,6 +13,7 @@ export function RunOptionsDialog({ cacheStatus, onStart, onDismiss, fieldSource 
   const [useCandidates, setUseCandidates] = useState(cacheStatus.candidates !== null)
   const [useField, setUseField] = useState(!isHistorical && cacheStatus.field_k !== null)
   const [seedOptimal, setSeedOptimal] = useState(false)
+  const [seedSimOptimal, setSeedSimOptimal] = useState(false)
 
   const candAvailable = cacheStatus.candidates !== null
   const fieldAvailable = cacheStatus.field_k !== null
@@ -81,9 +82,25 @@ export function RunOptionsDialog({ cacheStatus, onStart, onDismiss, fieldSource 
               )}
             </span>
           </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: seedOptimalDisabled ? 'default' : 'pointer', opacity: seedOptimalDisabled ? 0.45 : 1 }}>
+            <input
+              type="checkbox"
+              checked={seedSimOptimal && !seedOptimalDisabled}
+              disabled={seedOptimalDisabled}
+              onChange={e => setSeedSimOptimal(e.target.checked)}
+            />
+            <span>
+              <strong>Seed with sim-optimal lineups</strong> — per-sim ILP winners across sampled simulated worlds (ceiling candidates by construction)
+              {seedOptimalDisabled && (
+                <span style={{ color: 'var(--color-text-muted)', fontSize: '0.85em' }}>
+                  {' '}(unavailable when using cached candidates)
+                </span>
+              )}
+            </span>
+          </label>
         </div>
         <div className="dialog-actions">
-          <button className="btn-run" onClick={() => onStart(useCandidates && candAvailable, useField && fieldAvailable, seedOptimal && !seedOptimalDisabled)}>
+          <button className="btn-run" onClick={() => onStart(useCandidates && candAvailable, useField && fieldAvailable, seedOptimal && !seedOptimalDisabled, seedSimOptimal && !seedOptimalDisabled)}>
             Start Run
           </button>
           <button className="btn-secondary" onClick={onDismiss}>

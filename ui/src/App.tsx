@@ -345,7 +345,7 @@ export default function App() {
     }
   }, [events])
 
-  const _doStartRun = (useCandidates: boolean, useField: boolean, seedOptimal: boolean = false) => {
+  const _doStartRun = (useCandidates: boolean, useField: boolean, seedOptimal: boolean = false, seedSimOptimal: boolean = false) => {
     setShowRunOptionsDialog(false)
     setPendingCacheStatus(null)
     resetSSE()
@@ -358,6 +358,7 @@ export default function App() {
     if (useCandidates) params.use_candidates = 'true'
     if (useField) params.use_field = 'true'
     if (seedOptimal) params.seed_optimal = 'true'
+    if (seedSimOptimal) params.seed_sim_optimal = 'true'
     startSSE(Object.keys(params).length ? params : undefined)
   }
 
@@ -676,7 +677,7 @@ export default function App() {
       {showRunOptionsDialog && pendingCacheStatus && (
         <RunOptionsDialog
           cacheStatus={pendingCacheStatus}
-          onStart={(useCandidates, useField, seedOptimal) => _doStartRun(useCandidates, useField, seedOptimal)}
+          onStart={(useCandidates, useField, seedOptimal, seedSimOptimal) => _doStartRun(useCandidates, useField, seedOptimal, seedSimOptimal)}
           onDismiss={() => { setShowRunOptionsDialog(false); setPendingCacheStatus(null) }}
           fieldSource={state.config?.gpp?.field_source}
         />

@@ -46,17 +46,30 @@ export interface GppConfig {
   candidate_batch_size: number
   max_attempts_multiplier: number
   seed_optimal_lineups: boolean
+  seed_sim_optimal_lineups: boolean
+  n_sim_optimals: number
   dump_candidate_pool: boolean
+  measure_sim_ceiling: number
   candidate_floor_relief: number
   refine_rounds: number
   refine_top: number
   refine_mutants: number
   refine_holdout_fraction: number
+  final_n_field_samples: number
+  final_rescore_top: number
+  tail_bypass_n: number
+  tail_bypass_ev_floor: number
   evw_base: number
   evw_max: number
   ev_floor: number
   field_source: 'simulated' | 'historical'
   historical_n_slates: number
+  dupe_penalty: boolean
+  dupe_intercept: number
+  dupe_log_own_coef: number
+  dupe_salary_coef: number
+  dupe_stack_coef: number
+  dupe_min_gross_payout: number
 }
 
 export interface AppConfig {
@@ -142,6 +155,9 @@ export type SSEStage =
   | 'gpp_optimal_start'
   | 'gpp_optimal_progress'
   | 'gpp_optimal_done'
+  | 'gpp_sim_optimal_start'
+  | 'gpp_sim_optimal_progress'
+  | 'gpp_sim_optimal_done'
   | 'gpp_generate_start'
   | 'gpp_generate_progress'
   | 'gpp_generate_done'
@@ -152,6 +168,8 @@ export type SSEStage =
   | 'gpp_refine_start'
   | 'gpp_refine_progress'
   | 'gpp_refine_done'
+  | 'gpp_rescore_start'
+  | 'gpp_rescore_done'
   | 'gpp_field_inject'
   | 'gpp_select_progress'
   | 'gpp_mv_select_progress'
