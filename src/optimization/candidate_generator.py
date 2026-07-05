@@ -39,6 +39,16 @@ logger = logging.getLogger(__name__)
 _BATTER_POSITIONS = ("C", "1B", "2B", "3B", "SS", "OF")
 _MAX_HITTERS_PER_TEAM = 5
 
+# Secondary stacks from the opposite side of the primary stack's game share
+# its run environment (park, weather, umpire — the copula's latent env factor),
+# so they correlate positively with the primary and get a slight selection
+# boost. Different-game secondaries carry no such coupling.
+# _PROB overrides the round-robin secondary hint with the primary's opponent
+# (the path that assigns most secondaries); _BOOST applies the same preference
+# in the weighted fallback used when the hint is infeasible.
+_SAME_GAME_SECONDARY_PROB = 0.10
+_SAME_GAME_SECONDARY_BOOST = 1.25
+
 
 def _gumbel_choice(rng: np.random.Generator, n: int, size: int, weights: np.ndarray) -> np.ndarray:
     """Weighted sampling without replacement via Efraimidis-Spirakis (O(n))."""
@@ -47,21 +57,66 @@ def _gumbel_choice(rng: np.random.Generator, n: int, size: int, weights: np.ndar
     return np.argpartition(keys, -size)[-size:]
 
 
+def _capped_gumbel_choice(
+    rng: np.random.Generator,
+    pool: list,
+    size: int,
+    weights: np.ndarray,
+    pos_of: dict,
+    room: dict,
+) -> Optional[list[int]]:
+    """Weighted sampling without replacement (Efraimidis-Spirakis) that skips
+    players whose primary position has no remaining roster room.
+
+    Position-blind stack draws are the dominant candidate-attrition source:
+    an 8-batter (5,3)/(4,4) two-team stack sampled without position caps fits
+    the C/1B/2B/3B/SS/OF×3 slots only ~4% of the time, so big-secondary
+    patterns die at the fill/roster stage ~99% of the time and the realized
+    pool skews to (5,0)/(5,2) regardless of pattern draw weights. Capping by
+    position keeps every draw roster-feasible.
+
+    Mutates `room` (position → remaining slots) for the chosen players.
+    Returns the chosen player ids, or None when the pool cannot supply
+    `size` players within the caps (room is left unchanged in that case).
+    """
+    log_u = np.log(rng.random(len(pool)))
+    keys = np.where(weights > 0, log_u / weights, -np.inf)
+    chosen: list[int] = []
+    for i in np.argsort(keys)[::-1]:
+        if keys[int(i)] == -np.inf:
+            break
+        pid = int(pool[int(i)])
+        p = pos_of[pid]["position"]
+        if room.get(p, 0) > 0:
+            room[p] -= 1
+            chosen.append(pid)
+            if len(chosen) == size:
+                return chosen
+    for pid in chosen:
+        room[pos_of[pid]["position"]] += 1
+    return None
+
+
 class CandidateGenerator:
     """Generate M valid DK Classic stacked lineups.
 
-    Stack patterns by primary hitter count:
-      5-group: (5,0), (5,2), (5,3)
-      4-group: (4,4), (4,3), (4,2)
+    Stack patterns by primary hitter count (repeated entries = higher draw
+    weight; patterns are drawn uniformly from each group's list):
+      5-group: (5,3)×2, (5,2), (5,0)
+      4-group: (4,3)×2, (4,4), (4,2)
       3-group: (3,3)
+    The x-3 patterns are overweighted because real top-1% GPP lineups carry a
+    2-3 batter secondary stack far more often than uniform pattern draws
+    produce after sampling attrition (measured 83% vs 54%; see
+    scripts/measure_pool_ceiling.py composition tables).
 
     Each lineup satisfies the GPP stacking requirement:
       top team ≥ 5 hitters  OR  top-2 combined ≥ 6 with second ≥ 2.
     """
 
     STACK_GROUPS: dict[int, list[tuple[int, int]]] = {
-        5: [(5, 0), (5, 2), (5, 3)],
-        4: [(4, 4), (4, 3), (4, 2)],
+        5: [(5, 3), (5, 3), (5, 2), (5, 0)],
+        4: [(4, 3), (4, 3), (4, 4), (4, 2)],
         3: [(3, 3)],
     }
     # Target fraction of generated lineups per stack-size group.
@@ -69,8 +124,10 @@ class CandidateGenerator:
 
     @property
     def STACK_PATTERNS(self) -> list[tuple[int, int]]:
-        """Flat list of all patterns (backward-compat property)."""
-        return [p for pats in self.STACK_GROUPS.values() for p in pats]
+        """Flat list of distinct patterns (backward-compat property)."""
+        return list(dict.fromkeys(
+            p for pats in self.STACK_GROUPS.values() for p in pats
+        ))
 
     def __init__(
         self,
@@ -80,6 +137,7 @@ class CandidateGenerator:
         salary_floor: Optional[float] = None,
         team_weight_power: float = 0.5,
         fill_weight_power: float = 0.0,
+        fill_salary_tilt: float = 2.0,
     ) -> None:
         self._players_df = players_df
         self._ownership_vec = ownership_vec
@@ -87,6 +145,11 @@ class CandidateGenerator:
         self._salary_floor = salary_floor
         self._team_weight_power = float(team_weight_power)
         self._fill_weight_power = float(fill_weight_power)
+        # Tilt fill-slot sampling toward the expensive end of each slot's
+        # feasible salary window: weight ∝ (salary/window_max)^tilt. Uniform
+        # fills systematically underspend relative to real top-1% lineups
+        # (pool salary mean ~49.0k / 14% at-cap vs 49.7k / 28%). 0 = uniform.
+        self._fill_salary_tilt = float(fill_salary_tilt)
 
         self._pmeta = _player_meta_from_df(players_df)
         self._pos_pools = _build_pos_pools(players_df, ownership_vec)
@@ -152,13 +215,20 @@ class CandidateGenerator:
             )
             self._team_top_k_salary[t] = {k: sum(sals[:k]) for k in range(1, len(sals) + 1)}
 
-        # Precomputed team→game.
+        # Precomputed team→game and team→opponent.
         self._team_game: dict[str, str] = {}
         for t, pids in self._team_batters.items():
             for pid in pids:
                 g = self._pmeta[pid].get("game", "")
                 if g:
                     self._team_game[t] = g
+                    break
+        self._team_opponent: dict[str, str] = {}
+        for t, pids in self._team_batters.items():
+            for pid in pids:
+                opp = self._pmeta[pid].get("opponent", "")
+                if opp:
+                    self._team_opponent[t] = opp
                     break
 
         # Per-team effective salary floor.
@@ -170,14 +240,7 @@ class CandidateGenerator:
         # can produce a proportional share of lineups for them.
         self._team_salary_floor: dict[str, float] = {}
         if self._salary_floor is not None:
-            # Derive team→opponent from any batter in that team.
-            _team_to_opp: dict[str, str] = {}
-            for pid, meta in self._pmeta.items():
-                t = meta["team"]
-                if t in self._team_batters and t not in _team_to_opp:
-                    opp = meta.get("opponent", "")
-                    if opp:
-                        _team_to_opp[t] = opp
+            _team_to_opp = self._team_opponent
 
             # Top-2 pitcher salary sum available for each primary team
             # (pitchers from the opponent's team are excluded).
@@ -670,10 +733,16 @@ class CandidateGenerator:
         if len(primary_pool) < primary_size:
             return None, '', ''
 
+        # Batter-slot room shared by primary and secondary draws so the
+        # stack is always roster-feasible (see _capped_gumbel_choice).
+        slot_room = {p: n for p, n in ROSTER_REQUIREMENTS.items() if p != "P"}
+
         sw = np.array([pid_to_ow[pid] for pid in primary_pool], dtype=np.float64)
         sw /= sw.sum()
-        chosen_idx = _gumbel_choice(rng, len(primary_pool), primary_size, sw)
-        primary_ids = {int(primary_pool[i]) for i in chosen_idx}
+        picked = _capped_gumbel_choice(rng, primary_pool, primary_size, sw, pmeta, slot_room)
+        if picked is None:
+            return None, '', ''
+        primary_ids = set(picked)
         used: set[int] = set(primary_ids)
         current_salary: int = sum(pid_salary[pid] for pid in primary_ids)
 
@@ -706,6 +775,19 @@ class CandidateGenerator:
             if not other_teams:
                 return None, '', ''
 
+            # Slight same-game preference: with small probability override the
+            # round-robin hint with the primary's opponent when it is feasible
+            # (see _SAME_GAME_SECONDARY_PROB). The round-robin cursor assigns
+            # most secondaries, so the preference must act here, not just in
+            # the weighted fallback below.
+            opp_team = self._team_opponent.get(primary_team, "")
+            if (
+                opp_team
+                and opp_team in other_teams
+                and rng.random() < _SAME_GAME_SECONDARY_PROB
+            ):
+                hint_secondary = opp_team
+
             # Try hint_secondary first (round-robin cursor from generate()).
             hint_pool = []
             if hint_secondary and hint_secondary in other_teams:
@@ -723,7 +805,7 @@ class CandidateGenerator:
                     [
                         (self._team_weights.get(t, 0.0) ** self._team_weight_power
                          if self._team_weights.get(t, 0.0) > 0 else 0.0)
-                        * (2.0 if team_game.get(t, "") not in primary_games else 1.0)
+                        * (_SAME_GAME_SECONDARY_BOOST if team_game.get(t, "") in primary_games else 1.0)
                         for t in other_teams
                     ],
                     dtype=np.float64,
@@ -743,8 +825,12 @@ class CandidateGenerator:
 
             sec_sw = np.array([pid_to_ow[pid] for pid in sec_pool], dtype=np.float64)
             sec_sw /= sec_sw.sum()
-            sec_idx = _gumbel_choice(rng, len(sec_pool), secondary_size, sec_sw)
-            secondary_ids = {int(sec_pool[i]) for i in sec_idx}
+            picked = _capped_gumbel_choice(
+                rng, sec_pool, secondary_size, sec_sw, pmeta, slot_room,
+            )
+            if picked is None:
+                return None, '', ''
+            secondary_ids = set(picked)
             used |= secondary_ids
             current_salary += sum(pid_salary[pid] for pid in secondary_ids)
 
@@ -843,18 +929,28 @@ class CandidateGenerator:
             if not cands:
                 return None, '', ''
 
-            if self._fill_weight_power == 0.0:
+            if self._fill_weight_power == 0.0 and self._fill_salary_tilt == 0.0:
                 chosen_pid = int(cands[int(rng.integers(len(cands)))])
             else:
-                cw_dict = dict(zip(p_ids_pos, p_w_pos))
-                raw_cw = np.array(
-                    [cw_dict.get(pid, 1.0 / len(cands)) for pid in cands],
-                    dtype=np.float64,
-                )
-                if self._fill_weight_power != 1.0:
-                    raw_cw = np.power(raw_cw, self._fill_weight_power)
-                raw_cw /= raw_cw.sum()
-                chosen_pid = int(cands[int(rng.choice(len(cands), p=raw_cw))])
+                if self._fill_weight_power != 0.0:
+                    cw_dict = dict(zip(p_ids_pos, p_w_pos))
+                    raw_cw = np.array(
+                        [cw_dict.get(pid, 1.0 / len(cands)) for pid in cands],
+                        dtype=np.float64,
+                    )
+                    if self._fill_weight_power != 1.0:
+                        raw_cw = np.power(raw_cw, self._fill_weight_power)
+                else:
+                    raw_cw = np.ones(len(cands), dtype=np.float64)
+                if self._fill_salary_tilt != 0.0:
+                    sal_arr = np.array([pid_salary[pid] for pid in cands], dtype=np.float64)
+                    raw_cw = raw_cw * np.power(sal_arr / sal_arr.max(), self._fill_salary_tilt)
+                cw_sum = raw_cw.sum()
+                if cw_sum <= 0:
+                    chosen_pid = int(cands[int(rng.integers(len(cands)))])
+                else:
+                    raw_cw /= cw_sum
+                    chosen_pid = int(cands[int(rng.choice(len(cands), p=raw_cw))])
 
             t = pid_team[chosen_pid]
             hitter_team_count[t] = hitter_team_count.get(t, 0) + 1

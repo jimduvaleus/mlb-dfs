@@ -325,7 +325,11 @@ def test_salary_floor_enforced_when_full_stack_leaves_no_fill():
     salary_floor = 44_000.0
     gen = CandidateGenerator(df, ow, rng_seed=0, salary_floor=salary_floor,
                               team_weight_power=0.5, fill_weight_power=0.0)
-    results = gen.generate(n_candidates=40, max_attempts_multiplier=500)
+    # floor_relief=0: dynamic relief may legitimately lower a struggling team's
+    # floor below salary_floor; disable it so the assertion isolates the
+    # no-fill floor guard this regression test is about.
+    results = gen.generate(n_candidates=40, max_attempts_multiplier=500,
+                           floor_relief=0)
 
     assert len(results) > 0, "Generator produced no lineups — check fixture salaries"
     for lu in results:
@@ -337,11 +341,18 @@ def test_salary_floor_enforced_when_full_stack_leaves_no_fill():
             if pid_pos[pid] != "P":
                 t = pid_team[pid]
                 team_h[t] = team_h.get(t, 0) + 1
-        primary = max(team_h, key=team_h.get) if team_h else None
-        effective_floor = gen._team_salary_floor.get(primary, salary_floor) if primary else salary_floor
+        # A (4,4) lineup has an ambiguous primary — the generator may have
+        # built it from either side — so hold it to the laxer of the tied
+        # teams' per-team floors.
+        top = max(team_h.values()) if team_h else 0
+        tied = [t for t, c in team_h.items() if c == top]
+        effective_floor = min(
+            (gen._team_salary_floor.get(t, salary_floor) for t in tied),
+            default=salary_floor,
+        )
         assert total >= effective_floor, (
             f"Lineup below effective floor: total={total}, floor={effective_floor}, "
-            f"primary_team={primary}, player_ids={lu.player_ids}"
+            f"primary_teams={tied}, player_ids={lu.player_ids}"
         )
 
 
