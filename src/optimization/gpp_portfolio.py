@@ -303,6 +303,10 @@ class ContestScorer:
             pid: i for i, pid in enumerate(sim_results.player_ids)
         }
 
+        # NOTE: these None-fallbacks compute ownership from players_df means
+        # as-is. The production pipeline always passes both vectors (computed
+        # on restore_fitted_mean_scale'd means — see projection_calibration);
+        # the fallbacks exist for tests/ad-hoc use with synthetic means.
         if ownership_vec is None:
             ownership_vec = compute_heuristic_ownership(players_df, team_totals)
         self._ownership_vec = ownership_vec

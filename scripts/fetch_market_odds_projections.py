@@ -1674,8 +1674,12 @@ _ENV_SIGMA = 0.46
 # measured bias). Set both to 1.0 to disable; re-fit as the archive grows
 # (post-2026-07-06 archives contain calibrated means — measure raw bias
 # against pre-calibration archives or divide these factors back out).
-_MEAN_CALIB_BATTER = 0.867
-_MEAN_CALIB_PITCHER = 0.946
+# Values live in src/models/projection_calibration.py (shared with the
+# pipeline, which divides them back out for ownership prediction).
+from src.models.projection_calibration import (  # noqa: E402
+    MEAN_CALIB_BATTER as _MEAN_CALIB_BATTER,
+    MEAN_CALIB_PITCHER as _MEAN_CALIB_PITCHER,
+)
 
 # Percentile points for the stored quantile grid. Endpoints are pulled in
 # from the raw sample min/max (P0/P100) to P0.05/P99.95 so a single extreme

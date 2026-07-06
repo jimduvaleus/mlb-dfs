@@ -495,8 +495,12 @@ class PipelineRunner:
                 )
         except Exception:
             pass
+        # Ownership constants + isotonic calibrator were fitted on
+        # pre-calibration (hot) means; restore that input scale so predicted
+        # ownership (and the dupe model's Σlog-own input) doesn't flatten.
+        from src.models.projection_calibration import restore_fitted_mean_scale
         ownership_vector = compute_heuristic_ownership(
-            cand_players_df, team_totals,
+            restore_fitted_mean_scale(cand_players_df), team_totals,
             team_ownership_reductions=_team_ownership_reductions or None,
         )
         # Post-hoc isotonic calibration (data/processed/ownership_calibrator.json,
@@ -952,7 +956,7 @@ class PipelineRunner:
             # simulated opponent field isn't biased toward E_production's known
             # magnitude error or stale to a manual fade the user just set.
             field_ownership_vector = compute_heuristic_ownership(
-                sim_players_df, team_totals_gpp,
+                restore_fitted_mean_scale(sim_players_df), team_totals_gpp,
                 team_ownership_reductions=_team_ownership_reductions or None,
             )
             if _calibrator is not None:

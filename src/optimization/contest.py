@@ -581,7 +581,10 @@ class ContestSimulator:
         col_map = {pid: i for i, pid in enumerate(sim_results.player_ids)}
         n_sims = sim_matrix.shape[0]
 
-        ownership_vec = compute_heuristic_ownership(players_df, team_totals)
+        from src.models.projection_calibration import restore_fitted_mean_scale
+        ownership_vec = compute_heuristic_ownership(
+            restore_fitted_mean_scale(players_df), team_totals
+        )
 
         logger.info("Generating field A (%d lineups, seed=%d)...", n_field_lineups, field_seed)
         field_a = self.generate_field(

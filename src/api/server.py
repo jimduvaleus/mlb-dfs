@@ -1641,8 +1641,9 @@ def projections_players():
                         return _re.sub(r"[^a-z ]", "", nfkd.encode("ascii", "ignore").decode("ascii").lower()).strip()
                     non_excl = non_excl.copy()
                     non_excl["hr_prob"] = non_excl["name"].apply(lambda n: hr_odds.get(_norm_hr(str(n))))
+                from src.models.projection_calibration import restore_fitted_mean_scale
                 ow_sub = compute_heuristic_ownership(
-                    non_excl, team_totals,
+                    restore_fitted_mean_scale(non_excl), team_totals,
                     team_ownership_reductions=_team_ownership_reductions or None,
                 )
                 # Apply the same isotonic calibration (W_resid) the live pipeline
