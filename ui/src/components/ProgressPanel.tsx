@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppRescoreFieldProgressEvent, GppRescoreScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -48,7 +48,7 @@ const STAGE_LABELS: Record<string, string> = {
 }
 
 const CONFIG_STAGES = new Set(['simulate', 'compute_target'])
-const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_refine_progress', 'gpp_select_progress', 'gpp_optimal_progress', 'gpp_sim_optimal_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
+const GPP_PROGRESS_STAGES = new Set(['gpp_generate_progress', 'gpp_score_progress', 'gpp_rescore_score_progress', 'gpp_refine_progress', 'gpp_select_progress', 'gpp_optimal_progress', 'gpp_sim_optimal_progress', 'gpp_det_select_progress', 'gpp_det_risk_start'])
 
 export function ProgressPanel({ events, running }: Props) {
   const [now, setNow] = useState(() => Date.now())
@@ -89,6 +89,10 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_refine_start' ||
       last?.stage === 'gpp_refine_progress' ||
       last?.stage === 'gpp_refine_done' ||
+      last?.stage === 'gpp_rescore_start' ||
+      last?.stage === 'gpp_rescore_field_progress' ||
+      last?.stage === 'gpp_rescore_score_progress' ||
+      last?.stage === 'gpp_rescore_done' ||
       last?.stage === 'gpp_field_inject' ||
       last?.stage === 'gpp_select_progress' ||
       last?.stage === 'gpp_mv_select_progress' ||
@@ -127,6 +131,7 @@ export function ProgressPanel({ events, running }: Props) {
     e.stage === 'gpp_sim_optimal_start' || e.stage === 'gpp_sim_optimal_done' ||
     e.stage === 'gpp_generate_start' || e.stage === 'gpp_generate_done' ||
     e.stage === 'gpp_score_start' || e.stage === 'gpp_field_inject' ||
+    e.stage === 'gpp_rescore_start' || e.stage === 'gpp_rescore_done' ||
     e.stage === 'gpp_select_progress' || e.stage === 'gpp_mv_select_progress' ||
     e.stage === 'gpp_hybrid_select_progress' || e.stage === 'gpp_det_select_progress' ||
     e.stage === 'gpp_det_risk_start'
@@ -175,6 +180,16 @@ export function ProgressPanel({ events, running }: Props) {
   const latestRefineProgress = refineProgressEvents[refineProgressEvents.length - 1]
   const refineDone = events.some(e => e.stage === 'gpp_refine_done')
 
+  // --- Fresh re-score progress (Phase 2c) — distinct event names from the
+  // first-stage scoring above so this phase gets its own live readout
+  // instead of showing a stale "Scoring batch"/"Generating field" label.
+  const rescoreStartEvent = events.find(e => e.stage === 'gpp_rescore_start') as unknown as { n_candidates: number; n_field_samples: number } | undefined
+  const rescoreFieldProgressEvents = events.filter(e => e.stage === 'gpp_rescore_field_progress') as unknown as GppRescoreFieldProgressEvent[]
+  const latestRescoreFieldProgress = rescoreFieldProgressEvents[rescoreFieldProgressEvents.length - 1]
+  const rescoreScoreProgressEvents = events.filter(e => e.stage === 'gpp_rescore_score_progress') as unknown as GppRescoreScoreProgressEvent[]
+  const latestRescoreScoreProgress = rescoreScoreProgressEvents[rescoreScoreProgressEvents.length - 1]
+  const rescoreDone = events.some(e => e.stage === 'gpp_rescore_done')
+
   // Det-EV hoisted variables (used in both gppLabel, detSegments, and ETA)
   const isDetEv = detRiskStartEvents.length > 0 || detProgressEvents.length > 0
   const latestDetStep = detProgressEvents[detProgressEvents.length - 1]
@@ -206,6 +221,18 @@ export function ProgressPanel({ events, running }: Props) {
       const lastSel = selectProgressEvents[selectProgressEvents.length - 1]
       gppPct = 100
       gppLabel = `Portfolio selection: round ${lastSel.round + 1} — ${lastSel.pct_covered.toFixed(1)}% covered`
+    } else if (rescoreDone) {
+      gppPct = 100
+      gppLabel = 'Fresh re-score complete'
+    } else if (latestRescoreScoreProgress) {
+      gppPct = Math.round((latestRescoreScoreProgress.batches_done / latestRescoreScoreProgress.batches_total) * 100)
+      gppLabel = `Fresh re-score: scoring batch ${latestRescoreScoreProgress.batches_done} / ${latestRescoreScoreProgress.batches_total}`
+    } else if (latestRescoreFieldProgress) {
+      gppPct = Math.round((latestRescoreFieldProgress.n_done / latestRescoreFieldProgress.n_total) * 100)
+      gppLabel = `Fresh re-score: generating field ${latestRescoreFieldProgress.n_done.toLocaleString()} / ${latestRescoreFieldProgress.n_total.toLocaleString()} lineups`
+    } else if (rescoreStartEvent) {
+      gppPct = 0
+      gppLabel = `Fresh re-score: ${rescoreStartEvent.n_candidates.toLocaleString()} candidates × K=${rescoreStartEvent.n_field_samples} fresh fields…`
     } else if (refineStartEvent && !refineDone) {
       gppPct = latestRefineProgress
         ? Math.round((latestRefineProgress.round / latestRefineProgress.rounds) * 100)
@@ -290,6 +317,22 @@ export function ProgressPanel({ events, running }: Props) {
         const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
         const avgPerBatch = recentElapsed / (recent.length - 1)
         const remaining = latestScoreProgress.batches_total - latestScoreProgress.batches_done
+        if (remaining > 0) etaMs = avgPerBatch * remaining
+      }
+    } else if (running && latestRescoreFieldProgress && !rescoreDone && latestRescoreScoreProgress === undefined) {
+      const remaining = latestRescoreFieldProgress.n_total - latestRescoreFieldProgress.n_done
+      if (remaining > 0 && rescoreFieldProgressEvents.length >= 2) {
+        const recent = rescoreFieldProgressEvents.slice(-4)
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const recentLineups = recent[recent.length - 1].n_done - recent[0].n_done
+        if (recentLineups > 0) etaMs = (recentElapsed / recentLineups) * remaining
+      }
+    } else if (running && latestRescoreScoreProgress && !rescoreDone) {
+      const recent = rescoreScoreProgressEvents.slice(-4)
+      if (recent.length >= 2) {
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const avgPerBatch = recentElapsed / (recent.length - 1)
+        const remaining = latestRescoreScoreProgress.batches_total - latestRescoreScoreProgress.batches_done
         if (remaining > 0) etaMs = avgPerBatch * remaining
       }
     } else if (running && isDetEv) {
@@ -527,7 +570,7 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
 
   for (const e of events) {
     if (e.stage === 'optimize_lineup' || e.stage === 'upload_files') continue
-    if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress') continue
+    if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress' || e.stage === 'gpp_rescore_field_progress') continue
     // Skip start event once done event is present (collapse into one row)
     if (e.stage === 'gpp_optimal_start' && hasEvent('gpp_optimal_done')) continue
     if (e.stage === 'gpp_sim_optimal_start' && hasEvent('gpp_sim_optimal_done')) continue

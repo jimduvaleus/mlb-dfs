@@ -161,7 +161,7 @@ The web app is a React + TypeScript + Vite frontend (`ui/`) backed by a FastAPI 
 - `POST /api/lineups/{team}/lock` / `DELETE /api/lineups/{team}/lock` — lock/unlock a lineup
 - `GET /api/late-swap/state` / `POST /api/late-swap/run` / `POST /api/late-swap/override` / `POST /api/late-swap/reset` — late-swap workflow
 
-**Pipeline progress events** emitted via SSE: `load_slate`, `simulate`, `compute_target`, `gpp_generate_start/progress/done`, `gpp_score_start/done`, `gpp_optimal_start/progress/done`, `gpp_sim_optimal_start/progress/done`, `gpp_refine_start/progress/done`, `gpp_rescore_start/done`, `portfolio_stats`, `complete`.
+**Pipeline progress events** emitted via SSE: `load_slate`, `simulate`, `compute_target`, `gpp_generate_start/progress/done`, `gpp_score_start/done`, `gpp_optimal_start/progress/done`, `gpp_sim_optimal_start/progress/done`, `gpp_refine_start/progress/done`, `gpp_rescore_start/field_progress/score_progress/done`, `portfolio_stats`, `complete`. The rescore field/score progress events are named distinctly from the first-stage `gpp_field_progress`/`gpp_score_progress` (same payload shape, different stage string) so the UI can show a live Fresh re-score readout instead of a stale first-stage label held over in `ProgressPanel.tsx`.
 
 **UI components** (`ui/src/components/`): `ConfigForm`, `SlatePanel`, `ProjectionsPanel`, `ProjectionsTable`, `ProgressPanel`, `PortfolioTable`, `MetricsPanel`, `TeamBadge`, `StopUploadDialog`, `LateSwapPanel`, `LineupParserDialog`, `RunOptionsDialog`, `DeleteConfirmModal`.
 

@@ -1387,12 +1387,17 @@ class PipelineRunner:
                 robust_payout = scorer.rescore_fresh_fields(
                     candidates, n_samples=final_k,
                     stop_check=self._stop_check,
+                    # Distinct event names from the first-stage scoring
+                    # callbacks below — sharing "gpp_score_progress" /
+                    # "gpp_field_progress" here made the UI show a stale
+                    # "Scoring batch"/"Generating field" label held over from
+                    # the first stage instead of a live Fresh re-score readout.
                     progress_cb=lambda done, total: self._cb(
-                        "gpp_score_progress",
+                        "gpp_rescore_score_progress",
                         {"batches_done": done, "batches_total": total},
                     ),
                     field_progress_cb=lambda n_done, n_total: self._cb(
-                        "gpp_field_progress",
+                        "gpp_rescore_field_progress",
                         {"n_done": n_done, "n_total": n_total},
                     ),
                 )

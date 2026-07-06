@@ -169,6 +169,8 @@ export type SSEStage =
   | 'gpp_refine_progress'
   | 'gpp_refine_done'
   | 'gpp_rescore_start'
+  | 'gpp_rescore_field_progress'
+  | 'gpp_rescore_score_progress'
   | 'gpp_rescore_done'
   | 'gpp_field_inject'
   | 'gpp_select_progress'
@@ -288,6 +290,18 @@ export interface GppFieldProgressEvent extends SSEEvent {
 
 export interface GppScoreProgressEvent extends SSEEvent {
   stage: 'gpp_score_progress'
+  batches_done: number
+  batches_total: number
+}
+
+export interface GppRescoreFieldProgressEvent extends SSEEvent {
+  stage: 'gpp_rescore_field_progress'
+  n_done: number
+  n_total: number
+}
+
+export interface GppRescoreScoreProgressEvent extends SSEEvent {
+  stage: 'gpp_rescore_score_progress'
   batches_done: number
   batches_total: number
 }
