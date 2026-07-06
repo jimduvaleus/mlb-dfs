@@ -8,9 +8,9 @@ Generates M valid DraftKings Classic lineups via a two-phase approach:
     sampling, skipping teams that already hit quota.
 
 Stack-size distribution targets (configurable via GROUP_FRACTIONS):
-  5-hitter primary (5, 5-2, 5-3): 50 %
-  4-hitter primary (4-4, 4-3, 4-2): 40 %
-  3-hitter primary (3-3):           10 %
+  5-hitter primary (5, 5-2, 5-3): 62 %
+  4-hitter primary (4-4, 4-3, 4-2): 31 %
+  3-hitter primary (3-3):            7 %
 
 Diversity parameters:
   team_weight_power : float, default 0.5
@@ -120,7 +120,9 @@ class CandidateGenerator:
         3: [(3, 3)],
     }
     # Target fraction of generated lineups per stack-size group.
-    GROUP_FRACTIONS: dict[int, float] = {5: 0.50, 4: 0.40, 3: 0.10}
+    # Tuned 2026-07-06 against real top-1% composition (prim5 ~55-68% across
+    # slates; realized pool prim5 ≈ 60% at these fractions).
+    GROUP_FRACTIONS: dict[int, float] = {5: 0.62, 4: 0.31, 3: 0.07}
 
     @property
     def STACK_PATTERNS(self) -> list[tuple[int, int]]:
@@ -138,6 +140,8 @@ class CandidateGenerator:
         team_weight_power: float = 0.5,
         fill_weight_power: float = 0.0,
         fill_salary_tilt: float = 2.0,
+        stack_salary_tilt: float = 1.0,
+        spend_up_prob: float = 0.30,
     ) -> None:
         self._players_df = players_df
         self._ownership_vec = ownership_vec
@@ -150,6 +154,20 @@ class CandidateGenerator:
         # fills systematically underspend relative to real top-1% lineups
         # (pool salary mean ~49.0k / 14% at-cap vs 49.7k / 28%). 0 = uniform.
         self._fill_salary_tilt = float(fill_salary_tilt)
+        # Same idea for the stack batter draws (weight ∝ ownership ×
+        # (salary/team_max)^tilt). With big secondaries most lineups have 0-1
+        # fill slots, so total spend is set by the stack picks — fill tilt
+        # alone cannot close the at-cap gap (pool 10-17% vs real top-1% ~29%).
+        # Expensive studs are also the high-owned ones, so a mild tilt keeps
+        # ownership realism. 0 = pure ownership weights.
+        self._stack_salary_tilt = float(stack_salary_tilt)
+        # Probability that a completed lineup gets a greedy spend-up pass
+        # (same-team same-position upgrades until the leftover budget is
+        # spent). Salary tilts alone cannot reproduce the real field's at-cap
+        # rate (~24-30% of entries land on exactly $50,000): hitting the cap
+        # is a budget-exhausting *construction* behavior, not a marginal
+        # preference. 0 = disabled.
+        self._spend_up_prob = float(spend_up_prob)
 
         self._pmeta = _player_meta_from_df(players_df)
         self._pos_pools = _build_pos_pools(players_df, ownership_vec)
@@ -181,6 +199,16 @@ class CandidateGenerator:
         self._pid_opponent: dict[int, str] = {
             pid: meta.get("opponent", "") for pid, meta in self._pmeta.items()
         }
+
+        # (team, primary position) -> player ids, for the spend-up pass.
+        # Same-team same-position swaps preserve every structural property of
+        # a lineup (stack counts, roster multiset, pitcher-opponent rules), so
+        # spend-up only ever changes total salary.
+        self._team_pos_players: dict[tuple[str, str], list[int]] = {}
+        for pid, meta in self._pmeta.items():
+            self._team_pos_players.setdefault(
+                (meta["team"], meta["position"]), []
+            ).append(pid)
 
         # Salary look-ahead: sorted batter salaries descending for fill estimation.
         batter_salaries = [self._pid_salary[pid] for pid in self._pid_to_ow]
@@ -738,6 +766,9 @@ class CandidateGenerator:
         slot_room = {p: n for p, n in ROSTER_REQUIREMENTS.items() if p != "P"}
 
         sw = np.array([pid_to_ow[pid] for pid in primary_pool], dtype=np.float64)
+        if self._stack_salary_tilt != 0.0:
+            _sal = np.array([pid_salary[pid] for pid in primary_pool], dtype=np.float64)
+            sw = sw * np.power(_sal / _sal.max(), self._stack_salary_tilt)
         sw /= sw.sum()
         picked = _capped_gumbel_choice(rng, primary_pool, primary_size, sw, pmeta, slot_room)
         if picked is None:
@@ -824,6 +855,9 @@ class CandidateGenerator:
                 return None, '', ''
 
             sec_sw = np.array([pid_to_ow[pid] for pid in sec_pool], dtype=np.float64)
+            if self._stack_salary_tilt != 0.0:
+                _ssal = np.array([pid_salary[pid] for pid in sec_pool], dtype=np.float64)
+                sec_sw = sec_sw * np.power(_ssal / _ssal.max(), self._stack_salary_tilt)
             sec_sw /= sec_sw.sum()
             picked = _capped_gumbel_choice(
                 rng, sec_pool, secondary_size, sec_sw, pmeta, slot_room,
@@ -962,13 +996,92 @@ class CandidateGenerator:
         all_ids = pitcher_ids + list(stack_ids) + remaining
         if len(set(all_ids)) != 10 or len(all_ids) != 10:
             return None, '', ''
+        if self._spend_up_prob > 0.0 and rng.random() < self._spend_up_prob:
+            all_ids = self._spend_up(all_ids)
         # Full-stack floor guard (fill_slots empty when primary+secondary cover all 8 slots).
         # Use the team's computed effective floor (may be lower than configured for cheap
         # teams). Do NOT use salary_floor_val — dynamic floor relief can lower it further
         # and must not override this hard minimum.
         _hard_floor = self._team_salary_floor.get(primary_team, self._salary_floor)
-        if _hard_floor is not None and current_salary < _hard_floor:
+        if _hard_floor is not None and sum(pid_salary[p] for p in all_ids) < _hard_floor:
             return None, '', ''
         if not _is_valid_field_lineup(all_ids, pmeta):
             return None, '', ''
         return all_ids, primary_team, secondary_team
+
+    def _spend_up(self, ids: list[int]) -> list[int]:
+        """Greedy budget-exhausting pass: repeatedly replace a player with the
+        costliest alternative that fits the leftover budget, preferring an
+        exact leftover match so the lineup lands on the cap.
+
+        Two swap tiers:
+          1. same-team same-position — structure-preserving for any player
+             (stack counts, roster multiset, pitcher rules all unchanged);
+          2. any-team same-position, but only for *singleton* batters (their
+             team has exactly one rostered hitter, i.e. fill slots) — carries
+             no stack structure; team cap and pitcher-conflict re-checked.
+        """
+        pid_salary = self._pid_salary
+        pid_team = self._pid_team
+        pmeta = self._pmeta
+        leftover = int(SALARY_CAP) - sum(pid_salary[p] for p in ids)
+        if leftover <= 0:
+            return ids
+        ids = list(ids)
+        used = set(ids)
+        hitter_counts: dict[str, int] = {}
+        pitcher_opps: set[str] = set()
+        for pid in ids:
+            if pmeta[pid]["position"] == "P":
+                opp = self._pid_opponent.get(pid, "")
+                if opp:
+                    pitcher_opps.add(opp)
+            else:
+                t = pid_team[pid]
+                hitter_counts[t] = hitter_counts.get(t, 0) + 1
+
+        while leftover > 0:
+            best = None  # (is_exact, gain, idx, new_pid)
+
+            def _consider(i: int, cand: int) -> None:
+                nonlocal best
+                gain = pid_salary[cand] - pid_salary[ids[i]]
+                if gain <= 0 or gain > leftover or cand in used:
+                    return
+                key = (gain == leftover, gain)
+                if best is None or key > (best[0], best[1]):
+                    best = (gain == leftover, gain, i, cand)
+
+            for i, pid in enumerate(ids):
+                m = pmeta[pid]
+                pos = m["position"]
+                # Tier 1: same team, same position (always safe).
+                for cand in self._team_pos_players.get((m["team"], pos), ()):
+                    _consider(i, cand)
+                # Tier 2: singleton batters may swap across teams.
+                if pos != "P" and hitter_counts.get(pid_team[pid], 0) == 1:
+                    cand_ids, _ = self._pos_pools.get(pos, ([], None))
+                    for cand in cand_ids:
+                        ct = pid_team[cand]
+                        if ct == pid_team[pid]:
+                            continue  # tier 1 covered same-team
+                        if ct in pitcher_opps:
+                            continue
+                        if hitter_counts.get(ct, 0) + 1 > _MAX_HITTERS_PER_TEAM:
+                            continue
+                        _consider(i, cand)
+
+            if best is None:
+                break
+            _, gain, i, cand = best
+            old = ids[i]
+            if pmeta[old]["position"] != "P":
+                ot, nt = pid_team[old], pid_team[cand]
+                if ot != nt:
+                    hitter_counts[ot] -= 1
+                    hitter_counts[nt] = hitter_counts.get(nt, 0) + 1
+            used.discard(old)
+            used.add(cand)
+            ids[i] = cand
+            leftover -= gain
+        return ids
