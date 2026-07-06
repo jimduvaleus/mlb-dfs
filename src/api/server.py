@@ -647,7 +647,7 @@ def _slate_first_pitch_started() -> bool:
         earliest = min(datetime.fromisoformat(t) for t in starts)
     except ValueError:
         return False
-    return datetime.now() >= earliest - _LINEUP_DIFF_WINDOW
+    return _now_eastern() >= earliest - _LINEUP_DIFF_WINDOW
 
 
 def _best_guess_lineup_slots(team: str) -> list[dict] | None:
