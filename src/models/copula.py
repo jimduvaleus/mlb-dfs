@@ -2,9 +2,40 @@ import logging
 
 import pandas as pd
 import numpy as np
+from scipy.stats import norm
 from typing import Optional, Dict
 
 logger = logging.getLogger(__name__)
+
+# Sim-time dependence overlay (calibrated 2026-07-06 by
+# scripts/diagnose_sim_tails.py against 30 archived slates, 507 confirmed
+# team-games, PIT rank dependence — marginal-robust):
+#
+#   realized residual batter-batter Spearman     +0.190
+#   copula rows (unconditional, 2022-25)         +0.131
+#   realized residual batter-vs-opp-pitcher      -0.182
+#   copula rows                                  -0.335
+#
+# The copula's historical rank rows mix *identity/matchup* dependence with
+# *in-game residual* dependence, but the sim's marginals are already
+# matchup-conditioned (projections price the opposing pitcher), so raw rows
+# double-count identity for the pitcher (too anti-correlated) and understate
+# the residual same-game co-movement of teammates (weather, bullpen, shared
+# offensive environment, correlated projection error). The overlay rotates
+# each sampled row's Gaussianized ranks toward a shared latent unit factor g:
+#
+#   z_b' = (z_b + GAMMA*g) / sqrt(1+GAMMA^2)   (batter slots 1-9)
+#   z_p' = (z_p + DELTA*g) / sqrt(1+DELTA^2)   (opposing-pitcher slot 10)
+#
+# which preserves uniform marginals exactly and maps the pairwise
+# correlations (rho + GAMMA^2)/(1+GAMMA^2) etc. onto the realized targets.
+# g is drawn independently per unit row (the two rows of a game do NOT share
+# g — historical cross-team rank correlation is ~-0.05 ≈ 0 and must stay so).
+# Set both to 0 to disable. Re-fit with diagnose_sim_tails.py as the archive
+# grows.
+_ENV_OVERLAY_GAMMA = 0.271
+_ENV_OVERLAY_DELTA = 0.467
+_U_EPS = 1e-6
 
 
 class EmpiricalCopula:
@@ -20,16 +51,42 @@ class EmpiricalCopula:
     in the opposite row), and the shared game-level run environment.
     """
 
-    def __init__(self, copula_path: str):
+    def __init__(
+        self,
+        copula_path: str,
+        env_overlay_gamma: float = _ENV_OVERLAY_GAMMA,
+        env_overlay_delta: float = _ENV_OVERLAY_DELTA,
+    ):
         """
         Initialize the copula by loading historical quantile data.
 
         Args:
             copula_path (str): Path to the empirical_copula.parquet file.
+            env_overlay_gamma: batter loading of the sim-time dependence
+                overlay (see module docstring above). 0 disables.
+            env_overlay_delta: opposing-pitcher loading of the overlay.
         """
         self.copula_data = pd.read_parquet(copula_path)
         self.n_observations = len(self.copula_data)
         self._paired_games = self._build_paired_games()
+        self._gamma = float(env_overlay_gamma)
+        self._delta = float(env_overlay_delta)
+
+    def _apply_env_overlay(self, rows: np.ndarray) -> np.ndarray:
+        """Rotate sampled rank rows toward a shared per-row latent factor.
+
+        rows: (..., 10) rank-quantile rows (last axis = slots 1-9 batters,
+        slot 10 opposing pitcher). One independent g per row (all leading
+        axes), shared across that row's 10 slots. Marginals stay uniform.
+        """
+        if self._gamma == 0.0 and self._delta == 0.0:
+            return rows
+        z = norm.ppf(np.clip(rows, _U_EPS, 1.0 - _U_EPS))
+        g = np.random.standard_normal(rows.shape[:-1])[..., None]
+        loading = np.full(rows.shape[-1], self._gamma)
+        loading[-1] = self._delta
+        z = (z + loading * g) / np.sqrt(1.0 + loading ** 2)
+        return norm.cdf(z)
 
     def _build_paired_games(self) -> Optional[np.ndarray]:
         """
@@ -89,7 +146,7 @@ class EmpiricalCopula:
         indices = np.random.choice(len(target_df), size=n_sims, replace=True)
 
         # Return as a NumPy array for vectorized processing in the simulation engine
-        return target_df.iloc[indices].values
+        return self._apply_env_overlay(target_df.iloc[indices].values)
 
     def sample_games(self, n_sims: int) -> np.ndarray:
         """
@@ -113,4 +170,6 @@ class EmpiricalCopula:
         pairs = self._paired_games[indices]  # fancy indexing copies, safe to mutate
         flip = np.random.random(n_sims) < 0.5
         pairs[flip] = pairs[flip][:, ::-1, :]
-        return pairs
+        # Overlay draws one independent g per row (leading axes (n_sims, 2)),
+        # so the two units of a game get separate environment factors.
+        return self._apply_env_overlay(pairs)

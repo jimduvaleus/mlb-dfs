@@ -84,6 +84,8 @@ Retrosheet EVN ──► process_historical.py  ──► historical_logs.parque
 
 Players are grouped by `(team, opponent)` into 10-player "units": the 9 batters of one team plus their opposing pitcher. The empirical copula is a `G × 10` matrix of historical rank-quantiles (one row per historical game-team observation). Simulation samples at the **game level**: `EmpiricalCopula.sample_games()` bootstraps whole historical games and assigns the two paired rows to the game's two opposing units, preserving the correlation between a team's batters and its own pitcher (~+0.10 at the quantile level) and the shared run environment. Units without a partner on the slate (or copulas lacking a `(game_id, team_id)` index) fall back to independent row sampling via `sample()`.
 
+Sampled rows then pass through a **sim-time dependence overlay** (`_apply_env_overlay` in `src/models/copula.py`): a shared per-unit Gaussian factor with calibrated loadings (`_ENV_OVERLAY_GAMMA` for batters, `_ENV_OVERLAY_DELTA` for the opposing pitcher) rotates the Gaussianized ranks so the joint dependence matches *realized residual* dependence rather than the rows' unconditional historical dependence — the raw rows double-count identity/matchup effects that the matchup-conditioned marginals already price (batter-batter +0.13 → target +0.19; batter-vs-opp-pitcher −0.335 → target −0.18). Marginals stay exactly uniform; the two rows of a game get independent factors (cross-team corr ≈ 0 is preserved). Calibrated by `scripts/diagnose_sim_tails.py` (PIT calibration of replayed sims against realized FPTS across the contest archive) — re-fit as the archive grows.
+
 ### Marginal distributions
 
 Precedence per player (highest first):

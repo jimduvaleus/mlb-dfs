@@ -43,7 +43,8 @@ def paired_copula_path(tmp_path):
 
 class TestSampleGames:
     def test_rows_come_from_same_game(self, paired_copula_path):
-        copula = EmpiricalCopula(paired_copula_path)
+        # Overlay off: this test asserts exact row equality to verify pairing.
+        copula = EmpiricalCopula(paired_copula_path, env_overlay_gamma=0.0, env_overlay_delta=0.0)
         pairs = copula.sample_games(n_sims=500)
         assert pairs.shape == (500, 2, 10)
         # Both rows of a draw carry the same per-game constant.
@@ -61,7 +62,7 @@ class TestSampleGames:
             rows=[0.2, 0.8],
             index_tuples=[("G1", "AAA"), ("G1", "BBB")],
         )
-        copula = EmpiricalCopula(path)
+        copula = EmpiricalCopula(path, env_overlay_gamma=0.0, env_overlay_delta=0.0)
         pairs = copula.sample_games(n_sims=2000)
         # Pairing intact regardless of orientation...
         assert np.array_equal(np.sort(pairs[:, :, 0], axis=1),
@@ -94,7 +95,8 @@ class TestEngineGameLevelSampling:
         ])
 
     def test_opposing_units_share_game_draw(self, paired_copula_path):
-        copula = EmpiricalCopula(paired_copula_path)
+        # Overlay off: exact-equality assertion checks the shared game draw.
+        copula = EmpiricalCopula(paired_copula_path, env_overlay_gamma=0.0, env_overlay_delta=0.0)
         engine = SimulationEngine(copula, self._players())
         results = engine.simulate(n_sims=300)
         col = {pid: i for i, pid in enumerate(results.player_ids)}
@@ -119,3 +121,47 @@ class TestEngineGameLevelSampling:
         engine = SimulationEngine(_Stub(), self._players())
         results = engine.simulate(n_sims=50)
         assert results.results_matrix.shape == (50, 3)
+
+
+class TestEnvOverlay:
+    """The sim-time dependence overlay must hit its correlation targets while
+    leaving marginals unchanged (uniform on the rank scale)."""
+
+    def test_overlay_preserves_uniform_marginals(self, tmp_path):
+        rng = np.random.default_rng(1)
+        df = pd.DataFrame(rng.random((4000, 10)), columns=range(1, 11))
+        path = tmp_path / "flat.parquet"
+        df.to_parquet(path)
+        copula = EmpiricalCopula(str(path))
+        rows = copula.sample(50_000)
+        for c in (0, 4, 9):
+            q = np.percentile(rows[:, c], [5, 50, 95])
+            assert abs(q[0] - 0.05) < 0.02
+            assert abs(q[1] - 0.50) < 0.02
+            assert abs(q[2] - 0.95) < 0.02
+
+    def test_overlay_raises_batter_dependence(self, tmp_path):
+        rng = np.random.default_rng(2)
+        df = pd.DataFrame(rng.random((4000, 10)), columns=range(1, 11))
+        path = tmp_path / "flat.parquet"
+        df.to_parquet(path)
+        copula = EmpiricalCopula(str(path))  # source rows independent
+        rows = copula.sample(50_000)
+        u = rows[:, :9]
+        cm = np.corrcoef(u.T)
+        bb = cm[np.triu_indices(9, k=1)].mean()
+        # gamma=0.271 over independent rows -> gamma^2/(1+gamma^2) ~ 0.068
+        assert 0.04 < bb < 0.10
+        bp = np.mean([np.corrcoef(u[:, i], rows[:, 9])[0, 1] for i in range(9)])
+        # positive batter and pitcher loadings -> positive cross term
+        assert bp > 0.05
+
+    def test_overlay_disabled_is_identity(self, tmp_path):
+        rng = np.random.default_rng(3)
+        df = pd.DataFrame(rng.random((50, 10)), columns=range(1, 11))
+        path = tmp_path / "flat.parquet"
+        df.to_parquet(path)
+        copula = EmpiricalCopula(str(path), env_overlay_gamma=0.0, env_overlay_delta=0.0)
+        rows = copula.sample(200)
+        src = df.values
+        assert all(any(np.allclose(r, s) for s in src) for r in rows[:20])
