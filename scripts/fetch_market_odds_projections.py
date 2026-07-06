@@ -1660,6 +1660,23 @@ _BLOWUP_MEAN_OUTS = 9.0
 # Set to 0 (or --env-sigma 0) to disable and recover independent draws.
 _ENV_SIGMA = 0.46
 
+# Empirical mean calibration (fitted 2026-07-06 against 30 archived slates:
+# 4,791 confirmed batter-games / 597 pitcher-games, PPD-zeroed team-games
+# excluded — see scripts/diagnose_sim_tails.py and the pool-ceiling memory
+# notes). Realized DK points run below the market-implied means by a stable,
+# roughly level factor: batters actual/proj = 0.867 (flat 0.82-0.88 across
+# projection quintiles), pitchers 0.946 — most plausibly residual
+# favourite-longshot/vig in the prop-implied rates that per-market fair-odds
+# devigging does not remove. Applied multiplicatively to the mean, std_dev
+# AND the full quantile grid so the marginal scales coherently and the
+# grid-vs-mean consistency guard (src/models/quantile_grids.py, ±0.5) keeps
+# matching. RotoWire-fallback players are NOT scaled (different source, no
+# measured bias). Set both to 1.0 to disable; re-fit as the archive grows
+# (post-2026-07-06 archives contain calibrated means — measure raw bias
+# against pre-calibration archives or divide these factors back out).
+_MEAN_CALIB_BATTER = 0.867
+_MEAN_CALIB_PITCHER = 0.946
+
 # Percentile points for the stored quantile grid. Endpoints are pulled in
 # from the raw sample min/max (P0/P100) to P0.05/P99.95 so a single extreme
 # Monte Carlo draw cannot distort interpolated means in the tail buckets.
@@ -2328,8 +2345,8 @@ def build_projections_csv(
                 partial = _compute_pitcher_partial_no_win(player_markets, platform=platform)
                 if partial is not None:
                     pitcher_partial_projections[pid] = {
-                        "mean": round(partial[0], 2),
-                        "std_dev": round(partial[1], 2),
+                        "mean": round(partial[0] * _MEAN_CALIB_PITCHER, 2),
+                        "std_dev": round(partial[1] * _MEAN_CALIB_PITCHER, 2),
                     }
                 log.info(
                     "No projection for pitcher %s (pid=%d) — markets present: %s",
@@ -2366,6 +2383,14 @@ def build_projections_csv(
                     player_name, pid, display,
                 )
                 cap_warnings[pid] = capped_markets
+            # Empirical mean calibration, applied at the RATE level: every
+            # batter event carries non-negative points, so deflating all
+            # rates by _MEAN_CALIB_BATTER scales the analytic mean exactly
+            # linearly while the Monte Carlo produces the correct (Poisson-
+            # style, ~sqrt-shrunken) spread and keeps the structural
+            # couplings intact. See _MEAN_CALIB_* above.
+            b_rates = {k: v * _MEAN_CALIB_BATTER for k, v in b_rates.items()}
+            mean = mean * _MEAN_CALIB_BATTER
             quantile_grid, std_dev = _simulate_batter_distribution(
                 b_rates, platform=platform, seed=(_DIST_SEED_BASE + pid) % 2**32
             )
@@ -2373,6 +2398,13 @@ def build_projections_csv(
         # mean stays analytic (exact); std_dev comes from the Monte Carlo,
         # which captures the HR→R/RBI covariance (batters) and the
         # outs/K/ER/win couplings (pitchers) the closed forms ignore.
+        # Pitcher calibration is post-hoc on the whole marginal (score is not
+        # monotone in any one rate — Ks positive, ER negative, 5-IP win rule
+        # nonlinear — so rate-level deflation is ill-defined there).
+        if is_pitcher:
+            mean = mean * _MEAN_CALIB_PITCHER
+            std_dev = std_dev * _MEAN_CALIB_PITCHER
+            quantile_grid = np.asarray(quantile_grid) * _MEAN_CALIB_PITCHER
         matched.append({
             "player_id": pid,
             "name": player_name,
