@@ -1,0 +1,70 @@
+# Snapshot of known-good config.yaml values (config.yaml itself is
+# gitignored — per-machine). Copy to config.yaml to bootstrap a setup.
+# Refresh periodically when the live values are worth preserving:
+#   cp config.yaml config.example.yaml   (keep this header)
+# gpp.dupe_* coefficients are fitted by scripts/fit_dupe_model.py — this
+# snapshot's values were fitted 2026-07-10 on 37 archived contests.
+# Snapshot taken: 2026-07-10
+platform: draftkings
+paths:
+  dk_slate: data/raw/DKSalaries.csv
+  fd_slate: data/raw/FanDuel-MLB-2026-04-18-129137-entries-upload-template.csv
+  copula: data/processed/empirical_copula.parquet
+  output_dir: outputs
+  projections: data/processed/projections.csv
+  fd_projections: ''
+  batter_pca_model: data/processed/batter_pca_model.npz
+  batter_score_grid: data/processed/batter_score_grid.npy
+  batter_pca_model_fd: ''
+  batter_score_grid_fd: ''
+  projections_source: market_odds
+simulation:
+  n_sims: 25000
+optimizer:
+  n_chains: 200
+  temperature: 0.05
+  n_steps: 100
+  niter_success: 30
+  n_workers: 8
+  early_stopping_window: 15
+  early_stopping_threshold: 0.0005
+  salary_floor: 48500.0
+  rng_seed: null
+  min_pitcher_value: null
+  min_batter_value: null
+portfolio:
+  size: 10
+  target_percentile: 99
+  target_score: null
+gpp:
+  n_candidates: 20000
+  n_field_lineups: 5000
+  n_field_samples: 2
+  holdout_fraction: 0.0
+  candidate_batch_size: 500
+  max_attempts_multiplier: 55
+  seed_optimal_lineups: false
+  seed_sim_optimal_lineups: false
+  n_sim_optimals: 1000
+  dump_candidate_pool: true
+  measure_sim_ceiling: 200
+  candidate_floor_relief: 3000
+  refine_rounds: 4
+  refine_top: 250
+  refine_mutants: 8
+  refine_holdout_fraction: 0.3
+  final_n_field_samples: 3
+  tail_bypass_n: 0
+  tail_bypass_ev_floor: -1.0
+  final_rescore_top: 20000
+  evw_base: 0.15
+  evw_max: 0.45
+  ev_floor: 0.25
+  field_source: simulated
+  historical_n_slates: 10
+  dupe_penalty: true
+  dupe_intercept: 3.573
+  dupe_log_own_coef: 0.223
+  dupe_salary_coef: 0.095
+  dupe_stack_coef: -0.102
+  dupe_min_gross_payout: 15.0
