@@ -208,37 +208,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
               <input type="number" step={100} min={100} value={draft.gpp.final_rescore_top ?? 2000}
                 onChange={e => setGpp('final_rescore_top', Number(e.target.value))} disabled={disabled} />
             </FieldRow>
-            <FieldRow label="Dupe penalty">
-              <select value={(draft.gpp.dupe_penalty ?? false) ? 'on' : 'off'}
-                onChange={e => setGpp('dupe_penalty', e.target.value === 'on')} disabled={disabled}>
-                <option value="off">Off</option>
-                <option value="on">On</option>
-              </select>
-            </FieldRow>
-            {(draft.gpp.dupe_penalty ?? false) && (
-              <>
-                <FieldRow label="Dupe intercept">
-                  <input type="number" step={0.1} value={draft.gpp.dupe_intercept ?? 3.698}
-                    onChange={e => setGpp('dupe_intercept', Number(e.target.value))} disabled={disabled} />
-                </FieldRow>
-                <FieldRow label="Dupe Σlog(own) coef">
-                  <input type="number" step={0.01} min={0} value={draft.gpp.dupe_log_own_coef ?? 0.212}
-                    onChange={e => setGpp('dupe_log_own_coef', Number(e.target.value))} disabled={disabled} />
-                </FieldRow>
-                <FieldRow label="Dupe salary coef (per $100 unused)">
-                  <input type="number" step={0.01} min={0} value={draft.gpp.dupe_salary_coef ?? 0.089}
-                    onChange={e => setGpp('dupe_salary_coef', Number(e.target.value))} disabled={disabled} />
-                </FieldRow>
-                <FieldRow label="Dupe stack coef">
-                  <input type="number" step={0.05} value={draft.gpp.dupe_stack_coef ?? 0.024}
-                    onChange={e => setGpp('dupe_stack_coef', Number(e.target.value))} disabled={disabled} />
-                </FieldRow>
-                <FieldRow label="Dupe min gross payout ($)">
-                  <input type="number" step={1} min={0} value={draft.gpp.dupe_min_gross_payout ?? 15}
-                    onChange={e => setGpp('dupe_min_gross_payout', Number(e.target.value))} disabled={disabled} />
-                </FieldRow>
-              </>
-            )}
             <FieldRow label="Base EVw (risk 1)">
               <input type="number" step={0.01} min={0} max={1} value={draft.gpp.evw_base ?? 0.10}
                 onChange={e => setGpp('evw_base', Number(e.target.value))} disabled={disabled} />
