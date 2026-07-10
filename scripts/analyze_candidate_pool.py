@@ -271,26 +271,93 @@ def run_floor_sweep(
 
 def build_lineup_table(pool_df: pd.DataFrame, fpts_map: dict[int, float]) -> pd.DataFrame:
     """Collapse the per-player-per-lineup pool rows to one row per candidate
-    lineup: projected_score (sum mean), projected_ev (mean_ev, constant per
-    lineup), avg_ownership (mean of its players' ownership), actual_score
-    (sum of each player's real FPTS — NaN if any of its players is missing
-    from fpts_map, so partial-coverage lineups don't silently understate).
+    lineup: projected_score (sum mean), projected_ev (mean_ev, the first-
+    stage "mined" EV, constant per lineup), fresh_ev (the post winner's-
+    curse-correction EV from CLAUDE.md's "Fresh re-score" step — NaN for
+    candidates outside the rescore survivor slice — this is what the
+    portfolio-panel UI displays and what actually drove selection),
+    avg_ownership (mean of its players' ownership), total_salary (sum of
+    its players' salary), actual_score (sum of each player's real FPTS —
+    NaN if any of its players is missing from fpts_map, so partial-coverage
+    lineups don't silently understate). seed_source (constant per lineup:
+    "optimal" / "sim_optimal" / "random") and tail_bypass (1 if the
+    candidate was admitted to the fresh re-score as a below-floor sim-p99
+    ceiling pick rather than by clearing the mined-EV floor normally — see
+    CLAUDE.md's "Tail bypass") are carried through when the dump has them;
+    archives from before those columns were added get "not_tracked" / 0.
     """
     df = pool_df.copy()
     df["actual_fpts"] = df["player_id"].map(fpts_map)
+    if "seed_source" not in df.columns:
+        df["seed_source"] = "not_tracked"
+    if "fresh_ev" not in df.columns:
+        df["fresh_ev"] = np.nan
+    if "tail_bypass" not in df.columns:
+        df["tail_bypass"] = 0
 
     grouped = df.groupby("lineup_index")
     out = grouped.agg(
         projected_score=("mean", "sum"),
         projected_ev=("mean_ev", "first"),
+        fresh_ev=("fresh_ev", "first"),
         avg_ownership=("ownership", "mean"),
+        total_salary=("salary", "sum"),
         selected_risks=("selected_risks", "first"),
+        seed_source=("seed_source", "first"),
+        tail_bypass=("tail_bypass", "first"),
         n_players=("player_id", "count"),
         n_missing=("actual_fpts", lambda s: s.isna().sum()),
         actual_score=("actual_fpts", "sum"),
     ).reset_index()
     out.loc[out["n_missing"] > 0, "actual_score"] = np.nan
     return out
+
+
+def top_candidates_table(lineup_df: pd.DataFrame, top_n: int) -> pd.DataFrame:
+    """Top `top_n` candidates by actual_score, descending. Candidates with
+    incomplete actual-score coverage (a player missing from the resolved
+    contest fpts map) are excluded — their actual_score is NaN, not low.
+
+    Reports both mined_ev (first-stage) and fresh_ev (post re-score, NaN if
+    the candidate fell outside the rescore slice) — the portfolio-panel UI
+    displays fresh_ev, not mined_ev, so use that column to cross-check
+    against what's shown there. tail_bypass=1 flags a candidate admitted to
+    the fresh re-score by sim-p99 ceiling despite a below-floor mined EV.
+    """
+    df = lineup_df.dropna(subset=["actual_score"]).sort_values(
+        "actual_score", ascending=False
+    ).head(top_n)
+    return df[[
+        "lineup_index", "actual_score", "total_salary", "projected_score",
+        "avg_ownership", "projected_ev", "fresh_ev", "seed_source", "tail_bypass",
+    ]].rename(columns={
+        "total_salary": "salary", "projected_score": "mean", "avg_ownership": "ownership",
+        "projected_ev": "mined_ev",
+    }).reset_index(drop=True)
+
+
+def run_top_candidates(archive_dirs: list[Path], top_n: int) -> None:
+    for d in archive_dirs:
+        try:
+            pool_df = load_candidate_pool(d)
+            fpts_map = load_contest_player_fpts(d)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Skipping {d.name}: {exc}")
+            continue
+
+        lineup_df = build_lineup_table(pool_df, fpts_map)
+        table = top_candidates_table(lineup_df, top_n)
+
+        if (table["seed_source"] == "not_tracked").all():
+            seed_note = " (seed_source not tracked for this archive — re-run the pipeline to capture it)"
+        else:
+            seed_note = ""
+        print(f"\n=== {d.name} === top {len(table)} candidates by actual_score{seed_note}")
+        print(table.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+        out_path = d / "top_candidates.csv"
+        table.to_csv(out_path, index=False)
+        print(f"Top candidates written -> {out_path}")
 
 
 def _decile_table(lineup_df: pd.DataFrame, by: str, value_col: str = "actual_score", n_bins: int = 10) -> pd.DataFrame:
@@ -572,6 +639,13 @@ def main() -> None:
         help="Increment between --sweep grid points (default: $0.30).",
     )
     parser.add_argument(
+        "--top", type=int, default=0, metavar="N",
+        help="Instead of the standard report, print (and write "
+             "archive/MMDDYYYY/top_candidates.csv) the top N candidates by actual "
+             "fantasy score, descending, with lineup_index/salary/mean/ownership/"
+             "projected_ev/seed_source. Mutually exclusive with --sweep.",
+    )
+    parser.add_argument(
         "--top-percentile", type=float, default=0.95, metavar="FRACTION",
         help="Real-field percentile above which a lineup counts toward the 'top percentile' "
              "readout (default: 0.95) — where the real money in a top-heavy GPP payout curve "
@@ -581,6 +655,8 @@ def main() -> None:
 
     if args.recent and args.archive_dirs:
         parser.error("--recent and positional ARCHIVE_DIR arguments are mutually exclusive.")
+    if args.top and args.sweep:
+        parser.error("--top and --sweep are mutually exclusive.")
 
     if args.recent:
         dirs = _find_recent_pool_slates(args.recent)
@@ -604,7 +680,9 @@ def main() -> None:
             sys.exit(1)
 
     cash_threshold = args.cash_threshold if args.cash_threshold is not None else default_cash_threshold()
-    if args.sweep:
+    if args.top:
+        run_top_candidates(dirs, top_n=args.top)
+    elif args.sweep:
         run_floor_sweep(
             dirs, start=args.ev_floor, end=args.sweep_end, step=args.sweep_step,
             cash_threshold=cash_threshold, top_percentile=args.top_percentile,
