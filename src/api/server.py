@@ -2918,7 +2918,7 @@ def run_cache_status():
     slate_path = cfg.paths.dk_slate or ""
     abs_slate = (PROJECT_ROOT / slate_path) if slate_path else None
     is_gpp = True
-    status = get_cache_status(abs_slate or "")
+    status = get_cache_status(abs_slate or "", salary_floor=cfg.optimizer.salary_floor)
 
     n_batter_teams = 0
     try:

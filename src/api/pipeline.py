@@ -636,6 +636,7 @@ class PipelineRunner:
 
         _gpp_stopped = self._stop_check is not None and self._stop_check
         self._optimal_lineups: list = []  # populated only on fresh (non-cached) runs
+        self._sim_optimal_lineups: list = []  # populated only on fresh (non-cached) runs
 
         # Compute slate fingerprint for lineup cache (mtime_ns:size)
         from pathlib import Path as _Path
@@ -656,7 +657,8 @@ class PipelineRunner:
 
         _t_gpp_start = time.perf_counter()
         _preloaded_cands = (
-            load_candidates(_slate_fp) if (self._use_cached_candidates and _slate_fp) else None
+            load_candidates(_slate_fp, salary_floor=salary_floor_gpp)
+            if (self._use_cached_candidates and _slate_fp) else None
         )
         if _preloaded_cands is not None:
             # Validate cached candidates against the current eligible player pool.
@@ -710,7 +712,7 @@ class PipelineRunner:
                     "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
                 })
                 if _slate_fp and not (_gpp_stopped and self._stop_check()):
-                    save_candidates(_slate_fp, candidates)
+                    save_candidates(_slate_fp, candidates, salary_floor=salary_floor_gpp)
 
             # Restore optimal lineups from persisted JSON if fingerprints match.
             try:
@@ -929,8 +931,9 @@ class PipelineRunner:
                 "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
             })
             if _slate_fp and candidates and not (_gpp_stopped and self._stop_check()):
-                save_candidates(_slate_fp, candidates)
+                save_candidates(_slate_fp, candidates, salary_floor=salary_floor_gpp)
             self._optimal_lineups = _optimal_lineups
+            self._sim_optimal_lineups = _sim_optimal_lineups
 
         logger.info("Candidate pool: %d lineups.", len(candidates))
         logger.info(
@@ -1632,6 +1635,17 @@ class PipelineRunner:
                         sim_players_df["player_id"].astype(int), field_ownership_vector
                     ))
                     _cand_keys = [frozenset(int(p) for p in _lu.player_ids) for _lu in _dump_cands]
+                    # Seed provenance: matched by player-id-set rather than by
+                    # position in `candidates`, since that ordering convention
+                    # (optimal + sim_optimal + random) doesn't hold on a
+                    # partial-cache run. self._optimal_lineups/_sim_optimal_lineups
+                    # are set on both the fresh-generation and cache-restore paths.
+                    _optimal_keys = {
+                        frozenset(int(p) for p in _lu.player_ids) for _lu in self._optimal_lineups
+                    }
+                    _sim_optimal_keys = {
+                        frozenset(int(p) for p in _lu.player_ids) for _lu in self._sim_optimal_lineups
+                    }
                     _risk_membership: dict[int, list[str]] = {}
                     for _risk, _port in _portfolio_sweep_raw:
                         _selected_keys = {
@@ -1646,7 +1660,7 @@ class PipelineRunner:
                         _w.writerow([
                             "lineup_index", "player_id", "name", "position", "team",
                             "salary", "mean", "ownership", "mean_ev", "selected_risks",
-                            "fresh_ev", "tail_bypass",
+                            "fresh_ev", "tail_bypass", "seed_source",
                         ])
                         for _li, _lu in enumerate(_dump_cands):
                             _selected_risks = ",".join(_risk_membership.get(_li, []))
@@ -1654,6 +1668,12 @@ class PipelineRunner:
                             _fresh = _fresh_ev_map.get(_cand_keys[_li])
                             _fresh_ev = round(_fresh, 4) if _fresh is not None else ""
                             _tb = 1 if _cand_keys[_li] in _tail_bypass_keys else 0
+                            if _cand_keys[_li] in _optimal_keys:
+                                _seed_source = "optimal"
+                            elif _cand_keys[_li] in _sim_optimal_keys:
+                                _seed_source = "sim_optimal"
+                            else:
+                                _seed_source = "random"
                             for _pid in _lu.player_ids:
                                 _m = _pid_meta.get(int(_pid), {})
                                 _w.writerow([
@@ -1669,6 +1689,7 @@ class PipelineRunner:
                                     _selected_risks,
                                     _fresh_ev,
                                     _tb,
+                                    _seed_source,
                                 ])
                     logger.info(
                         "Candidate pool written to %s (%d lineups%s)",

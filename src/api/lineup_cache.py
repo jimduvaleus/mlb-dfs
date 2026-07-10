@@ -26,14 +26,31 @@ def _safe_fp(fingerprint: str) -> str:
     return fingerprint.replace(":", "_")
 
 
-def get_cache_status(slate_path: str | Path) -> dict:
+def _floor_matches(stored: np.ndarray | None, expected: float | None) -> bool:
+    """Compare a stored salary_floor scalar (NaN sentinel = None) to expected."""
+    stored_val = None if stored is None or bool(np.isnan(stored)) else float(stored)
+    if stored_val is None and expected is None:
+        return True
+    if stored_val is None or expected is None:
+        return False
+    return abs(stored_val - float(expected)) < 1e-6
+
+
+def get_cache_status(slate_path: str | Path, salary_floor: float | None = None) -> dict:
     """Return cache availability for the given slate file.
+
+    ``salary_floor`` should be the currently configured optimizer salary
+    floor. Candidate caches were generated under a specific floor (baked
+    into the pool via CandidateGenerator); if the configured floor has
+    since changed, the cache is reported as unavailable so the pipeline
+    (and the UI's cache-reuse checkbox) doesn't silently reuse a pool that
+    no longer reflects the current floor.
 
     Returns
     -------
     dict with keys:
         fingerprint : str  (empty if slate_path missing)
-        candidates  : int | None  (None = no cache)
+        candidates  : int | None  (None = no cache, or floor mismatch)
         field_k     : int | None  (None = no cache)
     """
     from src.api.slate_exclusions import compute_file_fingerprint
@@ -52,7 +69,11 @@ def get_cache_status(slate_path: str | Path) -> dict:
         try:
             with np.load(cand_path) as npz:
                 arr = npz["arr"]
-                if arr.ndim == 2 and arr.shape[1] == 10:
+                stored_floor = npz["salary_floor"] if "salary_floor" in npz.files else None
+                if (
+                    arr.ndim == 2 and arr.shape[1] == 10
+                    and _floor_matches(stored_floor, salary_floor)
+                ):
                     result["candidates"] = int(arr.shape[0])
         except Exception:
             pass
@@ -72,8 +93,12 @@ def get_cache_status(slate_path: str | Path) -> dict:
     return result
 
 
-def load_candidates(fingerprint: str) -> list[Lineup] | None:
-    """Load cached candidates. Returns None on miss or corruption."""
+def load_candidates(
+    fingerprint: str, salary_floor: float | None = None,
+) -> list[Lineup] | None:
+    """Load cached candidates. Returns None on miss, corruption, or if the
+    cache was generated under a different ``salary_floor`` than requested
+    (the floor is baked into which lineups made it into the pool)."""
     from src.optimization.lineup import Lineup
 
     safe = _safe_fp(fingerprint)
@@ -86,6 +111,14 @@ def load_candidates(fingerprint: str) -> list[Lineup] | None:
             if arr.ndim != 2 or arr.shape[1] != 10:
                 logger.warning("lineup_cache: candidates shape mismatch %s", arr.shape)
                 return None
+            stored_floor = npz["salary_floor"] if "salary_floor" in npz.files else None
+            if not _floor_matches(stored_floor, salary_floor):
+                logger.info(
+                    "lineup_cache: candidate cache salary_floor mismatch "
+                    "(cached=%s, configured=%s) — treating as miss.",
+                    stored_floor, salary_floor,
+                )
+                return None
             candidates = [Lineup(player_ids=row.tolist()) for row in arr]
         logger.info("lineup_cache: loaded %d candidates from cache", len(candidates))
         return candidates
@@ -94,13 +127,16 @@ def load_candidates(fingerprint: str) -> list[Lineup] | None:
         return None
 
 
-def save_candidates(fingerprint: str, candidates: list[Lineup]) -> None:
+def save_candidates(
+    fingerprint: str, candidates: list[Lineup], salary_floor: float | None = None,
+) -> None:
     """Serialize candidates to disk. Overwrites existing file then prunes stale files."""
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     arr = np.array([lu.player_ids for lu in candidates], dtype=np.int64)
+    floor_arr = np.array(np.nan if salary_floor is None else float(salary_floor))
     safe = _safe_fp(fingerprint)
     path = CACHE_DIR / f"candidates_{safe}.npz"
-    np.savez_compressed(path, arr=arr)
+    np.savez_compressed(path, arr=arr, salary_floor=floor_arr)
     logger.info("lineup_cache: saved %d candidates to %s", len(candidates), path.name)
     prune_stale_cache(fingerprint)
 

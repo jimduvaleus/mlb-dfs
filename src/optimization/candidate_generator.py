@@ -355,18 +355,28 @@ class CandidateGenerator:
                     _typical_achievable_min if _typical_achievable_min < float("inf") else 0.0
                 )
 
-                # Floor = min(configured, typical_achievable). Using the minimum
-                # typical achievable across all patterns ensures cheap-roster teams
-                # get a realistic floor; secondary-heavy patterns (5-3, 4-4) push
-                # the typical high, so we track the minimum so the hardest pattern
-                # (no-secondary) also has a feasible window with typical resources.
-                _floor = min(self._salary_floor, _typical_achievable)
+                # Floor = min(configured, max_achievable). max_achievable is the
+                # best-case salary (top pitchers + top fill) a team can build with
+                # the *hardest* stack pattern — i.e. whether the configured floor
+                # is even reachable at all for this team. Using typical_achievable
+                # (median-case pitchers/fill) here instead would relax the floor
+                # for any team whose *typical* construction undershoots, which in
+                # practice is nearly every team (median-case is a pessimistic bar,
+                # not an infeasibility signal) — verified against a live 16-team
+                # slate: max_achievable was $50,000 (cap) for every team, yet the
+                # old typical-based floor still got lowered for 15/16 of them,
+                # silently exempting ~42% of the candidate pool from the
+                # configured floor even though every team could clear it.
+                # Teams that are genuinely hard (but not infeasible) to hit at the
+                # configured floor are still covered by the bounded, runtime
+                # dynamic relief below (capped at floor_relief per generate()).
+                _floor = min(self._salary_floor, _max_achievable)
                 self._team_salary_floor[_team] = _floor
                 if _floor < self._salary_floor:
                     logger.info(
                         "CandidateGenerator: %s salary floor lowered to %.0f "
-                        "(typical achievable %.0f, max achievable %.0f, configured %.0f)",
-                        _team, _floor, _typical_achievable, _max_achievable,
+                        "(max achievable %.0f, typical achievable %.0f, configured %.0f)",
+                        _team, _floor, _max_achievable, _typical_achievable,
                         self._salary_floor,
                     )
 
