@@ -70,7 +70,26 @@ from scipy.stats import spearmanr
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src.models.projection_calibration import restore_fitted_mean_scale  # noqa: E402
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Archives fetched on/after this date contain calibrated (deflated) means —
+# the fetcher's empirical mean calibration landed 2026-07-06 (d8cf405). The
+# ownership constants and isotonic calibrator were fitted on pre-calibration
+# (hot) means, and the live pipeline divides the factors back out via
+# restore_fitted_mean_scale() before compute_heuristic_ownership, so the
+# player pool must do the same for these archives to keep fit/eval inputs
+# consistent with runtime.
+_CALIBRATED_MEANS_SINCE = datetime(2026, 7, 6)
+
+
+def _archive_has_calibrated_means(archive_dir: Path) -> bool:
+    m = re.match(r"^(\d{2})(\d{2})(\d{4})", archive_dir.name)
+    if not m:
+        return False
+    month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    return datetime(year, month, day) >= _CALIBRATED_MEANS_SINCE
 
 # DK position tags that appear in lineup strings
 _LINEUP_POSITIONS = {"P", "C", "1B", "2B", "3B", "SS", "OF"}
@@ -281,6 +300,12 @@ def _build_player_pool(
 
     merged = sal_df.merge(dff_df[dff_cols], on="player_id", how="left")
     merged = merged.dropna(subset=["mean"])  # only projected starters
+
+    if _archive_has_calibrated_means(archive_dir):
+        # Mirrors the live pipeline: all players are rescaled, including
+        # DFF/RW-fallback ones that were never deflated at source.
+        merged = restore_fitted_mean_scale(merged)
+        print("  Restored fitted (hot) mean scale — post-2026-07-06 calibrated archive")
 
     merged["salary_value"] = merged["mean"] / merged["salary"] * 1000
 

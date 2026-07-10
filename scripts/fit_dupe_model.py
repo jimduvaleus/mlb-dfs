@@ -116,8 +116,16 @@ def load_salaries(slate_dir: Path) -> tuple[dict[str, float], dict[str, str]]:
 def build_design(archive_root: Path, min_entries: int) -> pd.DataFrame:
     """One row per unique lineup per contest: count, features, offset."""
     frames = []
+    seen_contest_ids: set[str] = set()
     for zp in sorted(glob.glob(str(archive_root / "*" / "contest-standings-*.zip"))):
         slate_dir = Path(zp).parent
+        # Re-run archives (e.g. 07042026r) hold a copy of the base slate's
+        # standings zip — count each contest once.
+        contest_id = Path(zp).stem.rsplit("-", 1)[-1]
+        if contest_id in seen_contest_ids:
+            print(f"  {slate_dir.name}: contest {contest_id} already counted — skipped")
+            continue
+        seen_contest_ids.add(contest_id)
         loaded = load_contest(zp)
         if loaded is None:
             print(f"  {slate_dir.name}: unparseable standings — skipped")
