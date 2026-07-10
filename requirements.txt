@@ -6,6 +6,9 @@ requests
 pytest
 pytest-cov
 pyarrow
-pyyamlplaywright
+pyyaml
+playwright
 ortools
 python-dotenv
+fastapi
+uvicorn
