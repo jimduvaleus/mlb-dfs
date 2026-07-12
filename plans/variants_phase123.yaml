@@ -1,0 +1,34 @@
+# Pre-registered variant matrix — ceiling-first redesign Phases 1-3.
+# Registered 2026-07-12 BEFORE the batch run, per the anti-overfit protocol.
+# Production profile, 11 replay slates (--recent 11), sequential.
+#
+# Judgment criteria (Phase 4):
+#   - seed blocks: sim_winner / sim_optimal block hit99 vs the random block,
+#     pooled + per-slate sign consistency
+#   - funnel: fresh_surv + rank-column hit99/hit99.9 vs baseline
+#   - portfolios: risk_all hit99 pooled (binomial CI) + mean_net_$ / cash_rate
+#     (tail-first must not crater the cash band)
+
+baseline: {}
+
+simopt1000:
+  gpp.seed_sim_optimal_lineups: true
+
+simwin8k:
+  gpp.seed_sim_winners: true
+
+tailfirst_tailev:
+  gpp.funnel_mode: tail_first
+  gpp.tail_metric: tail_ev
+  gpp.selector_score: tail
+
+tailfirst_simp99:
+  gpp.funnel_mode: tail_first
+  gpp.tail_metric: sim_p99
+  gpp.selector_score: tail
+
+ceiling_stack:
+  gpp.seed_sim_winners: true
+  gpp.funnel_mode: tail_first
+  gpp.tail_metric: sim_p99
+  gpp.selector_score: tail
