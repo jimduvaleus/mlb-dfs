@@ -1,0 +1,39 @@
+# Round-2 pre-registered matrix — ceiling-first redesign.
+# Registered 2026-07-13 BEFORE the batch, after round-1 (variants_phase123)
+# results. Each variant targets one measured round-1 gap:
+#
+#   round-1 facts: no pool variant >1% (0.87-0.91%); sim_winner block 0.82%
+#   vs random 0.96% (no per-block enrichment) yet simwin8k portfolios were
+#   best (1.82%, net +$0.04); sim_p99 the only enriching tail slice (1.22%
+#   vs pool 0.87%); tailfirst_simp99 fresh_surv 0.91% with 8/11 sign;
+#   ceiling_stack (simwin + tf_simp99) flopped (0.83%) with mild tail-lane
+#   pollution by sim_winner seeds (28.4% vs 23.4% admission).
+#   Forensics: real top-1% Σown 1.122 vs our pool 0.941 vs sim_winner 0.876
+#   — the chalk gap is the largest remaining composition gap.
+
+simwin_chalk:          # chalk gap: pull sim-winner draws toward owned players
+  gpp.seed_sim_winners: true
+  gpp.sim_winner_own_blend: 0.6
+
+simwin_greedy:         # concentrate harder on each world's actual winners
+  gpp.seed_sim_winners: true
+  gpp.sim_winner_temp: 0.08
+
+tf_simp99_wide:        # more of the only enriching slice
+  gpp.funnel_mode: tail_first
+  gpp.tail_metric: sim_p99
+  gpp.selector_score: tail
+  gpp.tail_admit_n: 10000
+
+tf_simp99_anchor0:     # does the cash anchor cost ceiling?
+  gpp.funnel_mode: tail_first
+  gpp.tail_metric: sim_p99
+  gpp.selector_score: tail
+  gpp.cash_anchor_fraction: 0.0
+
+simwin_tf_guard:       # recombine, but a $0 guardrail culls sim-favored torchers
+  gpp.seed_sim_winners: true
+  gpp.funnel_mode: tail_first
+  gpp.tail_metric: sim_p99
+  gpp.selector_score: tail
+  gpp.ev_guardrail: 0.0
