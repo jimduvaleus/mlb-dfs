@@ -217,12 +217,20 @@ class PipelineRunner:
         stop_check: Optional[Callable[[], bool]] = None,
         use_cached_candidates: bool = False,
         use_cached_field: bool = False,
+        persist_caches: bool = True,
+        sim_cache_path: Optional[str] = None,
     ):
         self._config_path = config_path
         self._cb = progress_cb or (lambda stage, data: None)
         self._stop_check = stop_check
         self._use_cached_candidates = use_cached_candidates
         self._use_cached_field = use_cached_field
+        # Replay-only knobs (scripts/replay_slate.py); the live server never
+        # sets these. persist_caches=False keeps offline replays from writing
+        # into the shared data/lineup_cache/. sim_cache_path reuses one
+        # simulation across config variants of the same archived slate.
+        self._persist_caches = persist_caches
+        self._sim_cache_path = sim_cache_path
 
     # ------------------------------------------------------------------
     # Public API
@@ -406,7 +414,31 @@ class PipelineRunner:
             copula, sim_players_df, batter_pca_model=pca_model, score_grid=score_grid,
             quantile_grids=quantile_grids,
         )
-        sim_results = engine.simulate(n_sims)
+        sim_results = None
+        if self._sim_cache_path and os.path.exists(self._sim_cache_path):
+            try:
+                with np.load(self._sim_cache_path) as _sim_npz:
+                    sim_results = SimulationResults(
+                        [int(p) for p in _sim_npz["player_ids"]],
+                        _sim_npz["results_matrix"].astype(np.float64),
+                    )
+                logger.info("Simulation loaded from cache %s", self._sim_cache_path)
+            except Exception as exc:
+                logger.warning(
+                    "Sim cache %s unreadable (%s) — re-simulating.",
+                    self._sim_cache_path, exc,
+                )
+                sim_results = None
+        if sim_results is None:
+            sim_results = engine.simulate(n_sims)
+            if self._sim_cache_path:
+                os.makedirs(os.path.dirname(self._sim_cache_path), exist_ok=True)
+                np.savez_compressed(
+                    self._sim_cache_path,
+                    player_ids=np.asarray(sim_results.player_ids, dtype=np.int64),
+                    results_matrix=sim_results.results_matrix.astype(np.float32),
+                )
+                logger.info("Simulation saved to cache %s", self._sim_cache_path)
         logger.info(
             "Simulation complete — matrix: %s  RSS=%.0f MB",
             sim_results.results_matrix.shape, _proc_rss_mb(),
@@ -711,7 +743,7 @@ class PipelineRunner:
                     "n_generated": len(candidates),
                     "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
                 })
-                if _slate_fp and not (_gpp_stopped and self._stop_check()):
+                if _slate_fp and self._persist_caches and not (_gpp_stopped and self._stop_check()):
                     save_candidates(_slate_fp, candidates, salary_floor=salary_floor_gpp)
 
             # Restore optimal lineups from persisted JSON if fingerprints match.
@@ -930,7 +962,7 @@ class PipelineRunner:
                 "n_generated": len(candidates),
                 "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
             })
-            if _slate_fp and candidates and not (_gpp_stopped and self._stop_check()):
+            if _slate_fp and candidates and self._persist_caches and not (_gpp_stopped and self._stop_check()):
                 save_candidates(_slate_fp, candidates, salary_floor=salary_floor_gpp)
             self._optimal_lineups = _optimal_lineups
             self._sim_optimal_lineups = _sim_optimal_lineups
@@ -1007,6 +1039,8 @@ class PipelineRunner:
                 dupe_stack_coef=float(gpp_cfg.get("dupe_stack_coef", 0.024)),
                 dupe_min_gross_payout=float(gpp_cfg.get("dupe_min_gross_payout", 15.0)),
                 salary_cap=float(roster_rules.salary_cap),
+                compute_tail_metrics=bool(gpp_cfg.get("compute_tail_metrics", True)),
+                tail_ev_min_gross=float(gpp_cfg.get("tail_ev_min_gross", 100.0)),
             )
             logger.info("Pre-scoring RSS: %.0f MB  (candidates=%d)", _proc_rss_mb(), len(candidates))
             _t_score = time.perf_counter()
@@ -1022,6 +1056,10 @@ class PipelineRunner:
                     {"n_done": n_done, "n_total": n_total},
                 ),
             )
+            # Mined tail metrics, kept row-aligned with robust_payout through
+            # refinement concats (ceiling-first redesign, Phase 2).
+            _mined_tail_ev = scorer.last_tail_ev
+            _mined_p_beat99 = scorer.last_p_beat99
             logger.info(
                 "[TIMING] score_candidates wall time: %.3fs  "
                 "robust_payout shape=%s (%.1f MB)  field_from_cache=%s  RSS=%.0f MB",
@@ -1029,7 +1067,7 @@ class PipelineRunner:
                 robust_payout.shape, robust_payout.nbytes / 1e6,
                 _cached_field is not None, _proc_rss_mb(),
             )
-            if _cached_field is None and scorer.last_raw_field_list and _slate_fp:
+            if _cached_field is None and scorer.last_raw_field_list and _slate_fp and self._persist_caches:
                 save_field(_slate_fp, scorer.last_raw_field_list)
             self._cb("gpp_score_done", {})
 
@@ -1208,6 +1246,9 @@ class PipelineRunner:
                     robust_payout = np.concatenate(
                         [robust_payout, _payout_new], axis=0
                     )
+                    if _mined_tail_ev is not None and scorer.last_tail_ev is not None:
+                        _mined_tail_ev = np.concatenate([_mined_tail_ev, scorer.last_tail_ev])
+                        _mined_p_beat99 = np.concatenate([_mined_p_beat99, scorer.last_p_beat99])
                     del _payout_new
                     logger.info(
                         "Refine round %d/%d post-concat  RSS=%.0f MB  robust_payout=%.0f MB",
@@ -1305,6 +1346,10 @@ class PipelineRunner:
             # whole pool, not just the fresh-scored slice Phase 3 consumes.
             _dump_pool_candidates: Optional[list] = None
             _dump_pool_mined_ev: Optional[np.ndarray] = None
+            _dump_pool_tail_ev: Optional[np.ndarray] = None
+            _dump_pool_p_beat99: Optional[np.ndarray] = None
+            _fresh_tail_ev: Optional[np.ndarray] = None
+            _fresh_p_beat99: Optional[np.ndarray] = None
             if (
                 final_k > 0 and rescore_cap > 0
                 and not (_gpp_stopped and self._stop_check())
@@ -1313,6 +1358,8 @@ class PipelineRunner:
                 _mined_ev = robust_payout.mean(axis=1)
                 _dump_pool_candidates = candidates
                 _dump_pool_mined_ev = _mined_ev
+                _dump_pool_tail_ev = _mined_tail_ev
+                _dump_pool_p_beat99 = _mined_p_beat99
                 _keep_idx = np.where(_mined_ev >= _floor)[0]
                 # Tiny-pool fallback: always rescore enough to fill a
                 # portfolio even when the floor culls nearly everything.
@@ -1405,6 +1452,8 @@ class PipelineRunner:
                     ),
                 )
                 _fresh_ev = robust_payout.mean(axis=1)
+                _fresh_tail_ev = scorer.last_tail_ev
+                _fresh_p_beat99 = scorer.last_p_beat99
                 # Winner's-curse telemetry: how much of the mined top-EV was
                 # overfit to the first-stage fields?
                 _wc_k = min(50, len(candidates))
@@ -1440,6 +1489,9 @@ class PipelineRunner:
                     robust_payout = robust_payout[_surv]
                     _fresh_ev = _fresh_ev[_surv]
                     _is_bypass = _is_bypass[_surv]
+                    if _fresh_tail_ev is not None:
+                        _fresh_tail_ev = _fresh_tail_ev[_surv]
+                        _fresh_p_beat99 = _fresh_p_beat99[_surv]
                 _n_bypass_survivors = int(_is_bypass.sum())
 
                 logger.info(
@@ -1606,16 +1658,37 @@ class PipelineRunner:
                     if _dump_pool_candidates is not None:
                         _dump_cands = _dump_pool_candidates
                         _dump_ev = _dump_pool_mined_ev
+                        _dump_tail_ev = _dump_pool_tail_ev
+                        _dump_p_beat99 = _dump_pool_p_beat99
                         _fresh_ev_map = {
                             frozenset(int(p) for p in _lu.player_ids): float(_v)
                             for _lu, _v in zip(
                                 candidates, robust_payout.mean(axis=1)
                             )
                         }
+                        _fresh_tail_map = {}
+                        _fresh_p99_map = {}
+                        if _fresh_tail_ev is not None:
+                            for _lu, _tv, _pv in zip(candidates, _fresh_tail_ev, _fresh_p_beat99):
+                                _k = frozenset(int(p) for p in _lu.player_ids)
+                                _fresh_tail_map[_k] = float(_tv)
+                                _fresh_p99_map[_k] = float(_pv)
                     else:
                         _dump_cands = candidates
                         _dump_ev = robust_payout.mean(axis=1)
+                        _dump_tail_ev = _mined_tail_ev
+                        _dump_p_beat99 = _mined_p_beat99
                         _fresh_ev_map = {}
+                        _fresh_tail_map = {}
+                        _fresh_p99_map = {}
+                    # Field-independent per-candidate ceiling stat, computed
+                    # unconditionally so every dump can grade sim-p99 as a
+                    # ranking currency (ceiling-first redesign, Phase 2).
+                    try:
+                        _dump_sim_p99 = _candidate_sim_tail_scores(_dump_cands, sim_results)
+                    except Exception as _sp_e:
+                        logger.warning("sim_p99 dump column failed (skipping): %s", _sp_e)
+                        _dump_sim_p99 = None
                     _dump_path = os.path.join(output_dir, "candidate_pool_debug.csv")
                     _pid_meta = {
                         int(r["player_id"]): r
@@ -1661,6 +1734,8 @@ class PipelineRunner:
                             "lineup_index", "player_id", "name", "position", "team",
                             "salary", "mean", "ownership", "mean_ev", "selected_risks",
                             "fresh_ev", "tail_bypass", "seed_source",
+                            "sim_p99", "tail_ev", "p_beat99",
+                            "fresh_tail_ev", "fresh_p_beat99",
                         ])
                         for _li, _lu in enumerate(_dump_cands):
                             _selected_risks = ",".join(_risk_membership.get(_li, []))
@@ -1668,6 +1743,23 @@ class PipelineRunner:
                             _fresh = _fresh_ev_map.get(_cand_keys[_li])
                             _fresh_ev = round(_fresh, 4) if _fresh is not None else ""
                             _tb = 1 if _cand_keys[_li] in _tail_bypass_keys else 0
+                            _sim_p99 = (
+                                round(float(_dump_sim_p99[_li]), 3)
+                                if _dump_sim_p99 is not None and np.isfinite(_dump_sim_p99[_li])
+                                else ""
+                            )
+                            _tail = (
+                                round(float(_dump_tail_ev[_li]), 4)
+                                if _dump_tail_ev is not None else ""
+                            )
+                            _p99 = (
+                                round(float(_dump_p_beat99[_li]), 5)
+                                if _dump_p_beat99 is not None else ""
+                            )
+                            _f_tail = _fresh_tail_map.get(_cand_keys[_li])
+                            _f_tail = round(_f_tail, 4) if _f_tail is not None else ""
+                            _f_p99 = _fresh_p99_map.get(_cand_keys[_li])
+                            _f_p99 = round(_f_p99, 5) if _f_p99 is not None else ""
                             if _cand_keys[_li] in _optimal_keys:
                                 _seed_source = "optimal"
                             elif _cand_keys[_li] in _sim_optimal_keys:
@@ -1690,6 +1782,11 @@ class PipelineRunner:
                                     _fresh_ev,
                                     _tb,
                                     _seed_source,
+                                    _sim_p99,
+                                    _tail,
+                                    _p99,
+                                    _f_tail,
+                                    _f_p99,
                                 ])
                     logger.info(
                         "Candidate pool written to %s (%d lineups%s)",

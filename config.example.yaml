@@ -56,6 +56,8 @@ gpp:
   final_n_field_samples: 3
   tail_bypass_n: 0
   tail_bypass_ev_floor: -1.0
+  compute_tail_metrics: true
+  tail_ev_min_gross: 100.0
   final_rescore_top: 20000
   evw_base: 0.15
   evw_max: 0.45

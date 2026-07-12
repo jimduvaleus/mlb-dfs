@@ -249,6 +249,8 @@ class ContestScorer:
         dupe_stack_coef: float = 0.024,
         dupe_min_gross_payout: float = 15.0,
         salary_cap: float = 50_000.0,
+        compute_tail_metrics: bool = False,
+        tail_ev_min_gross: float = 100.0,
     ) -> None:
         self._sim_results = sim_results
         self._players_df = players_df
@@ -297,6 +299,29 @@ class ContestScorer:
         else:
             # All-zero dilutable portion: the kernel's dilution term vanishes.
             self._dilute_cumsum = np.zeros_like(self._payout_cumsum)
+
+        # Tail-metric state (ceiling-first redesign). tail-EV is the expected
+        # GROSS dollars from the steep top payout bands only (ranks paying
+        # >= tail_ev_min_gross) — a ranking currency for ceiling, deliberately
+        # blind to the min-cash plateau that dominates mean EV. Reuses the
+        # dilutable-lookup builder (same "zero below a gross threshold, then
+        # band-average" transform) and the same tie-splitting kernel; the
+        # tail band is passed as its own dilutable portion so dupe dilution
+        # applies to it exactly as it does to mean EV's top bands.
+        self._compute_tail_metrics = bool(compute_tail_metrics)
+        self._tail_ev_min_gross = float(tail_ev_min_gross)
+        if self._compute_tail_metrics:
+            self._tail_cumsum = _payout_cumsum(_build_dilutable_lookup(
+                self._payout_arr, N=n_field_lineups,
+                min_gross_payout=self._tail_ev_min_gross,
+            ).astype(np.float32))
+        else:
+            self._tail_cumsum = None
+        # Populated by _score_col_lineups() when compute_tail_metrics is on,
+        # aligned to that call's candidate order (mined after score_candidates,
+        # fresh after rescore_fresh_fields).
+        self.last_tail_ev: Optional[np.ndarray] = None
+        self.last_p_beat99: Optional[np.ndarray] = None
 
         self._sim_matrix = sim_results.results_matrix.astype(np.float32)
         self._col_map: dict[int, int] = {
@@ -617,6 +642,13 @@ class ContestScorer:
         field_sorted_list = self._field_sorted_list
         M = col_lineups.shape[0]
         robust_payout = np.zeros((M, n_sims), dtype=np.float32)
+        # Tail metrics are reduced (M,) accumulators — never a second
+        # (M, n_sims) matrix, which would double the scoring memory peak.
+        tail_ev = np.zeros(M, dtype=np.float64) if self._compute_tail_metrics else None
+        p_beat99 = np.zeros(M, dtype=np.float64) if self._compute_tail_metrics else None
+        if self._compute_tail_metrics:
+            # kth field lineup such that beating it means beating >= 99% of N.
+            _p99_col = int(np.ceil(0.99 * self._n_field)) - 1
         n_batches = (M + self._batch_size - 1) // self._batch_size
         logger.info(
             "Scoring %d candidates in %d batches of %d...",
@@ -641,6 +673,17 @@ class ContestScorer:
                     self._payout_cumsum, self._dilute_cumsum, batch_dupe_scale,
                 )
                 batch_payout += payout_k
+                if self._compute_tail_metrics:
+                    # Same kernel over the tail-band-only lookup; the tail band
+                    # doubles as its own dilutable portion so E[dupes] dilutes
+                    # it exactly as it dilutes mean EV's top bands.
+                    tail_k = _compute_payout_from_sorted_field(
+                        cand_scores_batch, field_sorted,
+                        self._tail_cumsum, self._tail_cumsum, batch_dupe_scale,
+                    )
+                    tail_ev[start:end] += tail_k.mean(axis=1)
+                    thr = field_sorted[:, _p99_col]  # (n_sims,)
+                    p_beat99[start:end] += (cand_scores_batch >= thr[None, :]).mean(axis=1)
 
             robust_payout[start:end] = batch_payout / self._n_k
 
@@ -662,6 +705,15 @@ class ContestScorer:
                 "(loaded from cache for a different player pool?); zeroed out.",
                 int(invalid_mask.sum()),
             )
+
+        if self._compute_tail_metrics:
+            tail_ev /= self._n_k
+            p_beat99 /= self._n_k
+            if invalid_mask.any():
+                tail_ev[invalid_mask] = 0.0
+                p_beat99[invalid_mask] = 0.0
+            self.last_tail_ev = tail_ev
+            self.last_p_beat99 = p_beat99
 
         return robust_payout
 

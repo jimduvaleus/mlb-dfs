@@ -585,6 +585,157 @@ class CandidateGenerator:
 
         return results
 
+    def generate_sim_winners(
+        self,
+        sim_matrix: np.ndarray,
+        sim_player_ids: list[int],
+        sim_indices: list[int],
+        per_world: int = 1,
+        temp: float = 0.15,
+        own_blend: float = 0.25,
+        attempts_per_lineup: int = 6,
+        progress_cb: Optional[Callable[[int], None]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> list[Lineup]:
+        """Sample "sim winner" lineups: for each simulated world, draw stacked
+        lineups through the normal _sample_one machinery but with sampling
+        weights derived from that world's realized player scores instead of
+        ownership.
+
+        This is the scaled, diversity-preserving replacement for per-sim exact
+        ILP optima (generate_sim_optimal_lineups): sampling near the top of
+        each world rather than taking its argmax avoids the seed redundancy
+        and structural extremity of exact per-world optima while still
+        concentrating the pool on lineups that win *some* simulated world.
+
+        Parameters
+        ----------
+        sim_matrix : (n_sims, n_players) from SimulationResults
+        sim_player_ids : column order of sim_matrix
+        sim_indices : simulated worlds to draw from (typically
+            stratified_sim_sample so quiet and explosive run environments are
+            both represented)
+        per_world : lineups drawn per world
+        temp : rank-softmax temperature over each world's realized scores
+            (weight = exp((rank_pct - 1) / temp)); lower = greedier toward the
+            world's top scorers
+        own_blend : exponent on normalized ownership multiplied into the
+            world weights — 0 = pure sim-score sampling, 1 = full ownership
+            damping (keeps picks from drifting to unowned punts)
+        """
+        col_map = {int(p): i for i, p in enumerate(sim_player_ids)}
+        batter_pids = [pid for pid in self._pid_to_ow]
+        bat_cols = np.array([col_map.get(pid, -1) for pid in batter_pids], dtype=np.int64)
+        bat_own = np.array([self._pid_to_ow[pid] for pid in batter_pids], dtype=np.float64)
+        pit_ids, pit_own = self._pos_pools.get("P", ([], np.array([])))
+        pit_cols = np.array([col_map.get(pid, -1) for pid in pit_ids], dtype=np.int64)
+        pit_own = np.asarray(pit_own, dtype=np.float64)
+
+        def _norm(w: np.ndarray) -> np.ndarray:
+            mx = w.max() if len(w) and w.max() > 0 else 1.0
+            return w / mx
+
+        bat_own_n = np.power(np.clip(_norm(bat_own), 1e-6, None), own_blend)
+        pit_own_n = np.power(np.clip(_norm(pit_own), 1e-6, None), own_blend)
+
+        def _world_weights(scores: np.ndarray, own_n: np.ndarray, cols: np.ndarray) -> np.ndarray:
+            # rank_pct in (0, 1]; missing-from-sim players get the world floor.
+            n = len(scores)
+            rank_pct = np.empty(n, dtype=np.float64)
+            rank_pct[np.argsort(scores, kind="stable")] = (np.arange(n) + 1) / n
+            w = np.exp((rank_pct - 1.0) / max(temp, 1e-3)) * own_n
+            w[cols == -1] = w.min() if len(w) else 0.0
+            return w
+
+        # Per-team index into batter_pids for fast team-weight sums.
+        team_bat_idx: dict[str, np.ndarray] = {}
+        for i, pid in enumerate(batter_pids):
+            team_bat_idx.setdefault(self._pid_team[pid], []).append(i)
+        team_bat_idx = {t: np.array(ix, dtype=np.int64) for t, ix in team_bat_idx.items()}
+
+        _saved = (self._pid_to_ow, self._pos_pools, self._team_weights)
+        _all_keys = [5, 4, 3]
+        _all_probs = np.array(
+            [self.GROUP_FRACTIONS[k] for k in _all_keys], dtype=np.float64
+        )
+        rng = np.random.default_rng(self._rng_seed)
+        results: list[Lineup] = []
+        seen: set[frozenset] = set()
+        n_failed_worlds = 0
+        try:
+            for w_i, sim_idx in enumerate(sim_indices):
+                if stop_check is not None and w_i % 200 == 0 and stop_check():
+                    break
+                bat_scores = np.where(
+                    bat_cols >= 0, sim_matrix[sim_idx, np.maximum(bat_cols, 0)], -np.inf
+                )
+                pit_scores = np.where(
+                    pit_cols >= 0, sim_matrix[sim_idx, np.maximum(pit_cols, 0)], -np.inf
+                )
+                bw = _world_weights(bat_scores, bat_own_n, bat_cols)
+                pw = _world_weights(pit_scores, pit_own_n, pit_cols)
+
+                self._pid_to_ow = dict(zip(batter_pids, bw))
+                pools = dict(self._pos_pools)
+                for pos_name in _BATTER_POSITIONS:
+                    ids, _ = pools.get(pos_name, ([], np.array([])))
+                    pools[pos_name] = (ids, np.array(
+                        [self._pid_to_ow.get(pid, 0.0) for pid in ids], dtype=np.float64
+                    ))
+                pools["P"] = (pit_ids, pw)
+                self._pos_pools = pools
+                self._team_weights = {
+                    t: float(bw[ix].sum()) for t, ix in team_bat_idx.items()
+                }
+
+                # Primary team ∝ the world's team weight mass — the "hot team"
+                # of this world, softened by the same rank-softmax that formed
+                # the player weights.
+                teams = list(self._team_weights)
+                tw = np.array([self._team_weights[t] for t in teams], dtype=np.float64)
+                if tw.sum() <= 0:
+                    n_failed_worlds += 1
+                    continue
+                tw /= tw.sum()
+
+                made = 0
+                for _ in range(attempts_per_lineup * per_world):
+                    if made >= per_world:
+                        break
+                    primary_team = teams[int(np.searchsorted(np.cumsum(tw), rng.random()))]
+                    g = _all_keys[int(rng.choice(3, p=_all_probs))]
+                    pats = self.STACK_GROUPS[g]
+                    primary_size, secondary_size = pats[int(rng.integers(len(pats)))]
+                    floor = float(self._team_salary_floor.get(
+                        primary_team, self._salary_floor or 0.0
+                    ))
+                    ids, _pt, _st = self._sample_one(
+                        rng, primary_team, primary_size, secondary_size,
+                        effective_floor=floor,
+                    )
+                    if ids is None or not self._check_stack(ids):
+                        continue
+                    key = frozenset(int(p) for p in ids)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(Lineup(player_ids=ids))
+                    made += 1
+                if made == 0:
+                    n_failed_worlds += 1
+                if progress_cb is not None and (w_i + 1) % 500 == 0:
+                    progress_cb(len(results))
+        finally:
+            self._pid_to_ow, self._pos_pools, self._team_weights = _saved
+
+        logger.info(
+            "generate_sim_winners: %d lineups from %d worlds "
+            "(%d worlds produced nothing, %d duplicates avoided).",
+            len(results), len(sim_indices), n_failed_worlds,
+            len(sim_indices) * per_world - len(results) - n_failed_worlds * per_world,
+        )
+        return results
+
     def generate_mutants(
         self,
         parents: list[Lineup],

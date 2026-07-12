@@ -74,6 +74,12 @@ class GppConfig(BaseModel):
     # selector. 0 disables.
     tail_bypass_n: int = 2000
     tail_bypass_ev_floor: float = -1.0
+    # Tail-metric computation in ContestScorer (ceiling-first redesign):
+    # tail_ev = expected gross dollars from payout ranks paying
+    # >= tail_ev_min_gross only; p_beat99 = P(candidate beats the simulated
+    # field's p99). Adds a second kernel pass (~doubles scoring time).
+    compute_tail_metrics: bool = True
+    tail_ev_min_gross: float = 100.0
     # Safety cap on the fresh-rescore slice. The slice itself is defined by
     # ev_floor (rescore everything at/above it, then drop what falls below on
     # fresh EVs); this cap only bounds memory/time on pathological slates.

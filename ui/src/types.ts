@@ -59,6 +59,8 @@ export interface GppConfig {
   final_rescore_top: number
   tail_bypass_n: number
   tail_bypass_ev_floor: number
+  compute_tail_metrics: boolean
+  tail_ev_min_gross: number
   evw_base: number
   evw_max: number
   ev_floor: number
