@@ -856,6 +856,8 @@ class DeterminantPortfolioSelector:
         ev_floor: float = 0.20,
         rng_seed: Optional[int] = None,  # unused; kept for API consistency
         precomputed: Optional[tuple] = None,
+        ev_override: Optional[np.ndarray] = None,
+        cash_anchor_fraction: float = 0.0,
     ) -> None:
         self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
         self._candidates = candidates
@@ -868,6 +870,18 @@ class DeterminantPortfolioSelector:
         # one precompute to all five selectors instead of repeating the
         # M×M correlation matmul per risk.
         self._precomputed = precomputed
+        # Ceiling-first redesign (Phase 3): when ev_override is given (length
+        # = len(candidates), aligned with robust_payout rows), the greedy
+        # score's EV term ranks by it (e.g. fresh tail-EV) instead of mean
+        # dollar EV. The floor cull, the diversity/determinant term, and the
+        # reported per-lineup EVs stay on mean dollar EV. The first
+        # ceil(cash_anchor_fraction × portfolio_size) picks keep the mean-EV
+        # basis — a cash-anchor block preserving mean EV's proven cash-band
+        # signal inside an otherwise tail-ranked portfolio.
+        self._ev_override = (
+            np.asarray(ev_override, dtype=np.float64) if ev_override is not None else None
+        )
+        self._cash_anchor_fraction = float(cash_anchor_fraction)
 
     @staticmethod
     def evw_for_risk(risk: float, evw_base: float = 0.10, evw_max: float = 0.40) -> float:
@@ -953,12 +967,24 @@ class DeterminantPortfolioSelector:
         M_pool = len(pool_idx)
         evw, dew = self._evw, self._dew
 
+        # Selection-EV basis per pick: mean dollar EV for the cash-anchor
+        # block (and everywhere when no override), the override vector after.
+        if self._ev_override is not None:
+            override_vals = self._ev_override[pool_idx].astype(np.float64)
+            n_anchor = int(np.ceil(self._cash_anchor_fraction * self._portfolio_size))
+        else:
+            override_vals = None
+            n_anchor = self._portfolio_size
+
+        def _sel_ev_vals(step: int) -> np.ndarray:
+            return pool_ev_vals if (override_vals is None or step <= n_anchor) else override_vals
+
         # --- Greedy selection ---
         selected_in_pool: list[int] = []    # indices into pool (0..M_pool-1)
         remaining_mask = np.ones(M_pool, dtype=bool)
 
-        # Step 1: highest EV
-        first = int(np.argmax(pool_ev_vals))
+        # Step 1: highest EV on the step-1 basis
+        first = int(np.argmax(_sel_ev_vals(1)))
         selected_in_pool.append(first)
         remaining_mask[first] = False
         C_inv = np.array([[1.0]])  # 1×1, starts as correlation of lineup with itself
@@ -998,7 +1024,7 @@ class DeterminantPortfolioSelector:
             # Normalised EV (relative to current remaining pool).
             # Shift up by |min_ev| when negatives are present so EVn stays in
             # [0, 1]; shift is normalization-only and does not affect stored EVs.
-            ev_rem = pool_ev_vals[remaining_pool_idx]
+            ev_rem = _sel_ev_vals(step)[remaining_pool_idx]
             min_ev = ev_rem.min()
             shift = -min_ev if min_ev < 0.0 else 0.0
             ev_shifted = ev_rem + shift

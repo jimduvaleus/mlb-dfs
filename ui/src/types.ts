@@ -61,6 +61,17 @@ export interface GppConfig {
   tail_bypass_ev_floor: number
   compute_tail_metrics: boolean
   tail_ev_min_gross: number
+  funnel_mode: string
+  tail_metric: string
+  tail_admit_n: number
+  ev_guardrail: number
+  selector_score: string
+  cash_anchor_fraction: number
+  seed_sim_winners: boolean
+  n_sim_winner_worlds: number
+  sim_winner_per_world: number
+  sim_winner_temp: number
+  sim_winner_own_blend: number
   evw_base: number
   evw_max: number
   ev_floor: number

@@ -46,6 +46,11 @@ gpp:
   seed_optimal_lineups: false
   seed_sim_optimal_lineups: false
   n_sim_optimals: 1000
+  seed_sim_winners: false
+  n_sim_winner_worlds: 8000
+  sim_winner_per_world: 1
+  sim_winner_temp: 0.15
+  sim_winner_own_blend: 0.25
   dump_candidate_pool: true
   measure_sim_ceiling: 200
   candidate_floor_relief: 3000
@@ -58,6 +63,12 @@ gpp:
   tail_bypass_ev_floor: -1.0
   compute_tail_metrics: true
   tail_ev_min_gross: 100.0
+  funnel_mode: ev_first
+  tail_metric: tail_ev
+  tail_admit_n: 6000
+  ev_guardrail: -1.0
+  selector_score: mean_ev
+  cash_anchor_fraction: 0.25
   final_rescore_top: 20000
   evw_base: 0.15
   evw_max: 0.45

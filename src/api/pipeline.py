@@ -669,6 +669,7 @@ class PipelineRunner:
         _gpp_stopped = self._stop_check is not None and self._stop_check
         self._optimal_lineups: list = []  # populated only on fresh (non-cached) runs
         self._sim_optimal_lineups: list = []  # populated only on fresh (non-cached) runs
+        self._sim_winner_lineups: list = []  # populated only on fresh (non-cached) runs
 
         # Compute slate fingerprint for lineup cache (mtime_ns:size)
         from pathlib import Path as _Path
@@ -943,12 +944,57 @@ class PipelineRunner:
                     "n_generated": len(_sim_optimal_lineups),
                 })
 
-            _n_seeded = len(_optimal_lineups) + len(_sim_optimal_lineups)
+            # Sim-winner seeding (ceiling-first redesign, Phase 1b): sampled —
+            # not argmax — lineups from many simulated worlds, drawn through
+            # the normal stack machinery with per-world score-rank weights.
+            # The scaled successor to per-sim exact ILP optima.
+            _sim_winner_lineups: list = []
+            _seed_sim_winners = bool(gpp_cfg.get("seed_sim_winners", False))
+            _n_sim_winner_worlds = int(gpp_cfg.get("n_sim_winner_worlds", 8000))
+            if (
+                _seed_sim_winners and _n_sim_winner_worlds > 0
+                and not (_gpp_stopped and self._stop_check())
+            ):
+                from src.optimization.optimal_lineups import stratified_sim_sample
+                _t_sw = time.perf_counter()
+                self._cb("gpp_sim_winner_start", {"n_worlds": _n_sim_winner_worlds})
+                try:
+                    _sw_rng = np.random.default_rng(
+                        int(opt_cfg.get("rng_seed") or 42) + 224737
+                    )
+                    _sw_sampled = stratified_sim_sample(
+                        sim_results.results_matrix, _n_sim_winner_worlds, _sw_rng,
+                    )
+                    _sim_winner_lineups = gen.generate_sim_winners(
+                        sim_results.results_matrix,
+                        sim_results.player_ids,
+                        [s for s, _ in _sw_sampled],
+                        per_world=int(gpp_cfg.get("sim_winner_per_world", 1)),
+                        temp=float(gpp_cfg.get("sim_winner_temp", 0.15)),
+                        own_blend=float(gpp_cfg.get("sim_winner_own_blend", 0.25)),
+                        progress_cb=lambda n: self._cb(
+                            "gpp_sim_winner_progress",
+                            {"n": n, "total": _n_sim_winner_worlds},
+                        ),
+                        stop_check=self._stop_check,
+                    )
+                    logger.info(
+                        "[TIMING] Sim-winner seeding: %d lineups from %d worlds in %.1fs",
+                        len(_sim_winner_lineups), _n_sim_winner_worlds,
+                        time.perf_counter() - _t_sw,
+                    )
+                except Exception as _sw_e:
+                    logger.warning("Sim-winner seeding failed: %s", _sw_e)
+                    _sim_winner_lineups = []
+                self._cb("gpp_sim_winner_done", {"n_generated": len(_sim_winner_lineups)})
+
+            _n_seeded = len(_optimal_lineups) + len(_sim_optimal_lineups) + len(_sim_winner_lineups)
             n_random = max(0, n_candidates - _n_seeded)
             self._cb("gpp_generate_start", {
                 "n_candidates": n_random + _n_seeded,
                 **({"n_from_optimal": len(_optimal_lineups)} if _optimal_lineups else {}),
                 **({"n_from_sim_optimal": len(_sim_optimal_lineups)} if _sim_optimal_lineups else {}),
+                **({"n_from_sim_winner": len(_sim_winner_lineups)} if _sim_winner_lineups else {}),
             })
             random_cands = gen.generate(
                 n_candidates=n_random,
@@ -957,7 +1003,7 @@ class PipelineRunner:
                 stop_check=self._stop_check,
                 progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
             )
-            candidates = _optimal_lineups + _sim_optimal_lineups + random_cands
+            candidates = _optimal_lineups + _sim_optimal_lineups + _sim_winner_lineups + random_cands
             self._cb("gpp_generate_done", {
                 "n_generated": len(candidates),
                 "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
@@ -966,6 +1012,7 @@ class PipelineRunner:
                 save_candidates(_slate_fp, candidates, salary_floor=salary_floor_gpp)
             self._optimal_lineups = _optimal_lineups
             self._sim_optimal_lineups = _sim_optimal_lineups
+            self._sim_winner_lineups = _sim_winner_lineups
 
         logger.info("Candidate pool: %d lineups.", len(candidates))
         logger.info(
@@ -1339,6 +1386,22 @@ class PipelineRunner:
             # the winner's-curse protection extends to them too.
             _tail_bypass_n = int(gpp_cfg.get("tail_bypass_n", 2000))
             _tail_bypass_floor = float(gpp_cfg.get("tail_bypass_ev_floor", -1.0))
+            # Funnel mode (ceiling-first redesign, Phase 2e).
+            #   ev_first    — mined-EV floor is the primary admission lane;
+            #                 the tail lane is a side door of tail_bypass_n
+            #                 candidates held to tail_bypass_ev_floor.
+            #   tail_first  — the tail lane IS the primary lane: the top
+            #                 tail_admit_n candidates by gpp.tail_metric are
+            #                 admitted and held only to the ev_guardrail
+            #                 (mean EV demoted to a dollar-torcher guardrail).
+            #                 The EV-floor lane persists as the cash-anchor
+            #                 source. Implemented by reusing the bypass
+            #                 plumbing with the lane size and guardrail.
+            _funnel_mode = str(gpp_cfg.get("funnel_mode", "ev_first")).lower()
+            _tail_metric_name = str(gpp_cfg.get("tail_metric", "tail_ev")).lower()
+            if _funnel_mode == "tail_first":
+                _tail_bypass_n = int(gpp_cfg.get("tail_admit_n", 6000))
+                _tail_bypass_floor = float(gpp_cfg.get("ev_guardrail", -1.0))
             _tail_bypass_keys: set = set()
             _n_bypass_survivors = 0
             # Full mined pool retained for the candidate-pool debug dump:
@@ -1383,7 +1446,22 @@ class PipelineRunner:
                 _bypass_idx = np.array([], dtype=np.int64)
                 if _tail_bypass_n > 0:
                     try:
-                        _tail_scores = _candidate_sim_tail_scores(candidates, sim_results)
+                        # Tail-lane ranking currency (gpp.tail_metric):
+                        # tail_ev / p_beat99 come from the scorer's kernel
+                        # accumulators; sim_p99 is the field-independent
+                        # fallback (and the pre-redesign behavior).
+                        if _tail_metric_name == "tail_ev" and _mined_tail_ev is not None:
+                            _tail_scores = np.asarray(_mined_tail_ev, dtype=np.float64)
+                        elif _tail_metric_name == "p_beat99" and _mined_p_beat99 is not None:
+                            _tail_scores = np.asarray(_mined_p_beat99, dtype=np.float64)
+                        else:
+                            if _tail_metric_name not in ("sim_p99",):
+                                logger.warning(
+                                    "tail_metric '%s' unavailable "
+                                    "(compute_tail_metrics off?) — using sim_p99.",
+                                    _tail_metric_name,
+                                )
+                            _tail_scores = _candidate_sim_tail_scores(candidates, sim_results)
                         _in_keep = np.zeros(len(candidates), dtype=bool)
                         _in_keep[_keep_idx] = True
                         _below = np.where(~_in_keep & np.isfinite(_tail_scores))[0]
@@ -1548,9 +1626,34 @@ class PipelineRunner:
                     # tail-bypass survivor.
                     _ev_floor = min(_ev_floor, _tail_bypass_floor)
 
+                # Selector EV-term basis (ceiling-first redesign, Phase 3):
+                # "mean_ev" = today's behavior; "tail" ranks the EV term by
+                # the fresh tail currency (gpp.tail_metric), with the first
+                # ceil(cash_anchor_fraction × size) picks still on mean EV.
+                _selector_score = str(gpp_cfg.get("selector_score", "mean_ev")).lower()
+                _cash_anchor_fraction = float(gpp_cfg.get("cash_anchor_fraction", 0.25))
+                _ev_override_vec = None
+                if _selector_score == "tail":
+                    if _tail_metric_name == "tail_ev" and _fresh_tail_ev is not None:
+                        _ev_override_vec = np.asarray(_fresh_tail_ev, dtype=np.float64)
+                    elif _tail_metric_name == "p_beat99" and _fresh_p_beat99 is not None:
+                        _ev_override_vec = np.asarray(_fresh_p_beat99, dtype=np.float64)
+                    else:
+                        try:
+                            _sp = _candidate_sim_tail_scores(candidates, sim_results)
+                            _sp_min = float(np.min(_sp[np.isfinite(_sp)])) if np.isfinite(_sp).any() else 0.0
+                            _ev_override_vec = np.where(np.isfinite(_sp), _sp, _sp_min)
+                        except Exception as _so_e:
+                            logger.warning(
+                                "selector_score='tail' fallback sim_p99 failed "
+                                "(%s) — using mean EV.", _so_e,
+                            )
                 logger.info(
-                    "Det-EV sweep — portfolio_size=%d, risks=%s, evw_base=%.3f, evw_max=%.3f, ev_floor=%.2f",
+                    "Det-EV sweep — portfolio_size=%d, risks=%s, evw_base=%.3f, evw_max=%.3f, "
+                    "ev_floor=%.2f, selector_score=%s%s",
                     portfolio_size, _DET_SWEEP_RISKS, _evw_base, _evw_max, _ev_floor,
+                    _selector_score if _ev_override_vec is not None else "mean_ev",
+                    (f" (anchor={_cash_anchor_fraction:.2f})" if _ev_override_vec is not None else ""),
                 )
 
                 # Floor cull + correlation matrix are identical for every risk
@@ -1584,6 +1687,8 @@ class PipelineRunner:
                         evw_max=_evw_max,
                         ev_floor=_ev_floor,
                         precomputed=_det_pre,
+                        ev_override=_ev_override_vec,
+                        cash_anchor_fraction=_cash_anchor_fraction,
                     )
                     _det_result = _det_sel.select(
                         progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
@@ -1719,6 +1824,9 @@ class PipelineRunner:
                     _sim_optimal_keys = {
                         frozenset(int(p) for p in _lu.player_ids) for _lu in self._sim_optimal_lineups
                     }
+                    _sim_winner_keys = {
+                        frozenset(int(p) for p in _lu.player_ids) for _lu in self._sim_winner_lineups
+                    }
                     _risk_membership: dict[int, list[str]] = {}
                     for _risk, _port in _portfolio_sweep_raw:
                         _selected_keys = {
@@ -1764,6 +1872,8 @@ class PipelineRunner:
                                 _seed_source = "optimal"
                             elif _cand_keys[_li] in _sim_optimal_keys:
                                 _seed_source = "sim_optimal"
+                            elif _cand_keys[_li] in _sim_winner_keys:
+                                _seed_source = "sim_winner"
                             else:
                                 _seed_source = "random"
                             for _pid in _lu.player_ids:
