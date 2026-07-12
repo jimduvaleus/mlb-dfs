@@ -434,7 +434,7 @@ def replay_capable_slates() -> list[Path]:
             _slate_date(d.name)
         except ValueError:
             continue
-        if d.name.endswith("r"):  # re-run dirs duplicate their base contest
+        if d.name[8:].startswith("r"):  # r/r2/... re-run dirs duplicate their base contest
             continue
         if (
             (d / "DKSalaries.csv").exists()

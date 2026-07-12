@@ -93,7 +93,9 @@ def main() -> None:
     archive_root = PROJECT_ROOT / "archive"
     slates = []
     for d in sorted(archive_root.iterdir(), key=lambda p: p.name):
-        if not d.is_dir() or d.name.endswith("r"):
+        # r/r2/... suffixed dirs are re-runs of the same contest — training on
+        # them double-counts that contest's entries.
+        if not d.is_dir() or d.name[8:].startswith("r"):
             continue
         try:
             date = datetime.strptime(d.name[:8], "%m%d%Y")
