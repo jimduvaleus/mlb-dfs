@@ -46,6 +46,9 @@ gpp:
   seed_optimal_lineups: false
   seed_sim_optimal_lineups: false
   n_sim_optimals: 1000
+  sim_optimal_min_stack: 4
+  sim_optimal_min_secondary: 0
+  sim_optimal_salary_floor: null
   seed_sim_winners: false
   n_sim_winner_worlds: 8000
   sim_winner_per_world: 1

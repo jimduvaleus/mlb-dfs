@@ -914,13 +914,25 @@ class PipelineRunner:
                     _so_sampled = stratified_sim_sample(
                         sim_results.results_matrix, n_sim_optimals, _so_rng,
                     )
+                    # Shape knobs (ceiling-first round 3): unconstrained
+                    # per-world argmax optima are structurally unlike real
+                    # top-1% lineups (2.5% prim5 / 43% sec2 / 7.8% at-cap vs
+                    # 63.6% / 81% / 28.7%) — these force winner shape onto
+                    # the world-optimal player cores.
+                    _so_min_stack = int(gpp_cfg.get("sim_optimal_min_stack", 4))
+                    _so_min_secondary = int(gpp_cfg.get("sim_optimal_min_secondary", 0)) or None
+                    _so_floor_cfg = gpp_cfg.get("sim_optimal_salary_floor")
+                    _so_floor = (
+                        float(_so_floor_cfg) if _so_floor_cfg else salary_floor_gpp
+                    )
                     _sim_optimal_lineups = generate_sim_optimal_lineups(
                         cand_players_df,
                         sim_results.results_matrix,
                         sim_results.player_ids,
                         [s for s, _ in _so_sampled],
-                        min_stack=4,
-                        salary_floor=salary_floor_gpp,
+                        min_stack=_so_min_stack,
+                        min_secondary=_so_min_secondary,
+                        salary_floor=_so_floor,
                         seen={
                             frozenset(int(p) for p in lu.player_ids)
                             for lu in _optimal_lineups

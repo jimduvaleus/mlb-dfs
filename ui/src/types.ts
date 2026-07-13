@@ -67,6 +67,9 @@ export interface GppConfig {
   ev_guardrail: number
   selector_score: string
   cash_anchor_fraction: number
+  sim_optimal_min_stack: number
+  sim_optimal_min_secondary: number
+  sim_optimal_salary_floor: number | null
   seed_sim_winners: boolean
   n_sim_winner_worlds: number
   sim_winner_per_world: number

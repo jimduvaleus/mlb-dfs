@@ -72,6 +72,14 @@ class GppConfig(BaseModel):
     # sim-p99 (a ceiling statistic mean EV undervalues) into the fresh
     # re-score; they must keep fresh EV >= tail_bypass_ev_floor to reach the
     # selector. 0 disables.
+    # Shape constraints for per-sim optimal seeds (ceiling-first round 3):
+    # unconstrained per-world argmax optima are structurally unlike real
+    # top-1% lineups. min_secondary >= 1 requires a second team with that
+    # many batters; salary_floor overrides the optimizer floor for these
+    # solves only (null = optimizer floor).
+    sim_optimal_min_stack: int = 4
+    sim_optimal_min_secondary: int = 0
+    sim_optimal_salary_floor: Optional[float] = None
     # Sim-winner seeding (ceiling-first redesign): sampled lineups from many
     # simulated worlds via per-world score-rank weights — the scaled,
     # diversity-preserving successor to per-sim exact ILP optima.
