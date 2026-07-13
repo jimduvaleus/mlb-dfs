@@ -41,3 +41,14 @@ simopt5_simwin:        # both proven-mechanism seed blocks, no tail selector
   gpp.sim_optimal_min_secondary: 2
   gpp.sim_optimal_salary_floor: 49500
   gpp.seed_sim_winners: true
+
+# Addendum (registered 2026-07-13 after the 4-variant results, before this run):
+# the untested "everything that worked" config — sim-winner sampler + 3k shaped
+# seeds, EV-first funnel, mean-EV selector.
+ceiling_final:
+  gpp.seed_sim_winners: true
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 3000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
