@@ -1,0 +1,29 @@
+# Round-4 pre-registered matrix — ceiling-first redesign.
+# Registered 2026-07-13 BEFORE the batch (user-requested).
+#
+# Question: does a PURE shaped-seed pool (no ownership-sampled randoms)
+# out-portfolio the 3k+17k mix? Pool-level answer is already known by
+# construction (shaped block 1.18% vs mixed pool 0.97%); the open question
+# is downstream — selector diversity, cash rate, portfolio variance.
+# Second variant isolates the ev_floor relaxation the small pool motivates.
+#
+# Judgment: fresh_surv rate (expect ~1.2% if the funnel doesn't break),
+# portfolio hit99 AND cash_rate/net vs simopt5_3k, floor-set size telemetry
+# (does the $0.25 floor trip the min-keep fallback on a 3k pool?).
+
+simopt5_pure:            # 3k shaped seeds, zero randoms, floor as-is
+  gpp.n_candidates: 3000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 3000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+
+simopt5_pure_floor0:     # same + selector wiggle room (user-proposed)
+  gpp.n_candidates: 3000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 3000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.ev_floor: 0.0
