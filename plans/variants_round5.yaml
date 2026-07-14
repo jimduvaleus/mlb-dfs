@@ -1,0 +1,29 @@
+# Round-5 pre-registered matrix — ceiling-first redesign.
+# Registered 2026-07-14 BEFORE the batch (user-requested).
+#
+# Question: where is the knee in the shaped-seed dose-response curve?
+# Known points (pure-pool block rate): 1k = 1.03%, 3k = 1.18% (still rising,
+# ~zero dedupe loss at 3k). These extend the curve at 5k and 8k in the pure-
+# pool configuration (n_candidates = n_sim_optimals, no randoms), where the
+# knob also sets pool size.
+#
+# Judgment: seed-block (= pre-mutant pool) hit99/hit99.9 vs seed count, the
+# dedupe loss rate (unique seeds per 1k worlds solved, from block n), pool /
+# fresh_surv rates, portfolio cash guardrail, and solve wall time
+# ([TIMING] Sim-optimal seeding in the logs) for the live-budget call.
+
+simopt5_pure_5k:
+  gpp.n_candidates: 5000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+
+simopt5_pure_8k:
+  gpp.n_candidates: 8000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 8000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
