@@ -1,0 +1,49 @@
+# Holdout confirmation, tranche 1 (June) — pre-registered 2026-07-15 BEFORE
+# the batch, immediately after the round-7 verdict (branch
+# shape-preserving-seed-mutation).
+#
+# Question: rounds 1-7 selected the live candidate (pure shaped 5k pool +
+# 4 shape-preserving mutants per seed) entirely on the fixed 11-slate
+# comparator set (06/28-07/11) — seven rounds of selection pressure means
+# the winning config is partially fitted to those slates. The 05/08-06/27
+# replayable archives have never influenced any decision and serve as a
+# clean holdout. Tranche 1 = the 10 June slates (06/05-06/27), closest to
+# the validated fidelity regime; the 12 May slates are tranche 2 if June
+# passes. ONE SHOT: no iteration against holdout slates.
+#
+# holdout_frozen pins the round-7 mut4 winner EXACTLY as validated
+# (final_n_field_samples: 2, not the live K0 — round-6 showed K0/K2
+# equivalent in the seed-first pipeline, but we confirm what we measured).
+# holdout_baseline pins the round-1 production baseline (verified against
+# the archived run config outputs/replay/*/baseline/config.yaml) as the
+# regime control: its comparator-set pool rate is 0.87-0.97%; if it runs
+# materially colder on June slates, a frozen-config shortfall reads as
+# regime, not config.
+#
+# Judgment, pre-committed (pooled over the 10 June slates):
+#   PRIMARY (absolute): frozen pool, seed block, mutant block, and
+#     fresh_surv each >= 1.0% hit99, CI90 low >= ~0.9%.
+#   SECONDARY (regime-adjusted): frozen pool minus baseline pool on the
+#     same slates >= the comparator-set gap (~+0.2pp); use only to
+#     interpret a PRIMARY miss, never to promote a miss to a pass.
+#   Guardrails: portfolio cash ~0.3, no funnel stage below baseline.
+#   Slates: 06052026 06062026 06072026 06122026 06132026 06212026
+#           06222026 06242026 06262026 06272026
+
+holdout_frozen:
+  gpp.n_candidates: 5000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+  gpp.seed_mutants_per_parent: 4
+
+holdout_baseline:
+  gpp.n_candidates: 20000
+  gpp.seed_sim_optimal_lineups: false
+  gpp.refine_rounds: 2
+  gpp.final_n_field_samples: 3
+  gpp.seed_mutants_per_parent: 0
