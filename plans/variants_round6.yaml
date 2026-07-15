@@ -1,0 +1,34 @@
+# Round-6 pre-registered matrix — ceiling-first redesign.
+# Registered 2026-07-15 BEFORE the batch (user-requested).
+#
+# Question: with a pure shaped pool and refinement off, what does the fresh
+# re-score still buy? Rationale check: the rescore was built to correct the
+# winner's curse of EV-mining (refinement) and competitive rescore admission;
+# neither exists in the pure-seed pipeline. Comparator = simopt5_pure_5k
+# (already run: refine_rounds 2, final_n_field_samples 3).
+#
+# pure5k_lean matches the user's current LIVE config exactly (all knobs
+# pinned explicitly so base-config drift can't leak in).
+#
+# Judgment: pool/fresh/portfolio hit99, portfolio cash guardrail, selector-
+# pool size, wall time.
+
+pure5k_lean:             # live config: no refinement, K=2 fresh rescore
+  gpp.n_candidates: 5000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+
+pure5k_norescore:        # no refinement, no fresh rescore at all
+  gpp.n_candidates: 5000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 0
