@@ -1,0 +1,59 @@
+# Round-7 pre-registered matrix — shape-preserving seed mutation
+# (branch shape-preserving-seed-mutation). Registered 2026-07-15 BEFORE the batch.
+#
+# Question: round 6 showed refine_rounds=0 gives the best measured pool
+# (1.17%, = the shaped-block rate) but its portfolios ran worst (0.45%),
+# directionally consistent with refinement mutants feeding the Det selector's
+# diversity (floor set 2.3k vs 5.4k). The old refine mutants break seed shape
+# (any-team swaps); generate_shape_mutants preserves the parent's team-stack
+# profile exactly (same-team batter swaps, conflict-checked pitcher swaps).
+# Does restoring neighborhood diversity WITHOUT diluting shape recover the
+# portfolio level while keeping the pool at the block rate?
+#
+# Base = pure5k_lean (live config, round 6): pure shaped pool at 5k,
+# refine 0, K=2 fresh rescore. Comparator rows already in replay_summary.csv
+# (pure5k_lean, pure5k_norescore, and the refine-2 arms from rounds 4-5).
+#
+# Dose sweep: 1 / 2 / 4 mutants per parent (~10k / ~15k / ~25k pool).
+#
+# Judgment, pre-committed:
+#   - pool + fresh_surv hit99 must hold >= ~1.1% (mutant dilution check);
+#   - seed:seed_mutant block rate vs seed:sim_optimal block rate — the
+#     mutants are only "shape-preserving" in effect if their block holds
+#     near the seed block (>= ~1%), unlike historical refine mutants;
+#   - floor-set size (diversity feed) vs pure5k_lean's ~2.3k;
+#   - portfolio hit99 + cash guardrail (~0.32) + net $ — the actual target;
+#   - wall time (mutation should be seconds, not minutes).
+
+pure5k_mut1:
+  gpp.n_candidates: 5000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+  gpp.seed_mutants_per_parent: 1
+
+pure5k_mut2:
+  gpp.n_candidates: 5000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+  gpp.seed_mutants_per_parent: 2
+
+pure5k_mut4:
+  gpp.n_candidates: 5000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+  gpp.seed_mutants_per_parent: 4
