@@ -75,6 +75,9 @@ export interface GppConfig {
   sim_winner_per_world: number
   sim_winner_temp: number
   sim_winner_own_blend: number
+  seed_mutants_per_parent: number
+  seed_mutant_salary_locality: number
+  seed_mutant_pitcher_weight: number
   evw_base: number
   evw_max: number
   ev_floor: number

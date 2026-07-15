@@ -88,6 +88,14 @@ class GppConfig(BaseModel):
     sim_winner_per_world: int = 1
     sim_winner_temp: float = 0.15
     sim_winner_own_blend: float = 0.25
+    # Shape-preserving seed mutation (ceiling-first round-6 follow-up): each
+    # seed parent (sim_optimal + sim_winner) is expanded with N mutants whose
+    # team-stack profile matches the parent exactly (same-team batter swaps;
+    # pitcher swaps re-checked for opponent conflicts). Additive on top of
+    # n_candidates, like refinement mutants. 0 disables.
+    seed_mutants_per_parent: int = 0
+    seed_mutant_salary_locality: float = 2000.0
+    seed_mutant_pitcher_weight: float = 0.10
     tail_bypass_n: int = 2000
     tail_bypass_ev_floor: float = -1.0
     # Tail-metric computation in ContestScorer (ceiling-first redesign):

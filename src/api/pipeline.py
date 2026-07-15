@@ -670,6 +670,7 @@ class PipelineRunner:
         self._optimal_lineups: list = []  # populated only on fresh (non-cached) runs
         self._sim_optimal_lineups: list = []  # populated only on fresh (non-cached) runs
         self._sim_winner_lineups: list = []  # populated only on fresh (non-cached) runs
+        self._seed_mutant_lineups: list = []  # populated only on fresh (non-cached) runs
 
         # Compute slate fingerprint for lineup cache (mtime_ns:size)
         from pathlib import Path as _Path
@@ -1000,13 +1001,71 @@ class PipelineRunner:
                     _sim_winner_lineups = []
                 self._cb("gpp_sim_winner_done", {"n_generated": len(_sim_winner_lineups)})
 
+            # Shape-preserving seed mutation (ceiling-first round 6 follow-up):
+            # expand each seed parent with mutants that keep its team-stack
+            # profile exactly (same-team batter swaps; conflict-checked
+            # pitcher swaps). Restores the neighborhood diversity that
+            # refine_rounds=0 removed without diluting pool shape. Additive
+            # on top of n_candidates, like refinement mutants.
+            _seed_mutant_lineups: list = []
+            _n_seed_mut = int(gpp_cfg.get("seed_mutants_per_parent", 0))
+            _seed_parents = _sim_optimal_lineups + _sim_winner_lineups
+            if (
+                _n_seed_mut > 0 and _seed_parents
+                and not (_gpp_stopped and self._stop_check())
+            ):
+                _t_sm = time.perf_counter()
+                self._cb("gpp_seed_mutant_start", {
+                    "n_parents": len(_seed_parents),
+                    "per_parent": _n_seed_mut,
+                })
+                try:
+                    _sm_seen = {
+                        frozenset(int(p) for p in lu.player_ids)
+                        for lu in _optimal_lineups + _seed_parents
+                    }
+                    _sm_floor_cfg = gpp_cfg.get("sim_optimal_salary_floor")
+                    _seed_mutant_lineups = gen.generate_shape_mutants(
+                        _seed_parents,
+                        n_per_parent=_n_seed_mut,
+                        seen=_sm_seen,
+                        rng_seed=int(opt_cfg.get("rng_seed") or 42) + 611953,
+                        salary_locality=float(
+                            gpp_cfg.get("seed_mutant_salary_locality", 2000.0)
+                        ),
+                        pitcher_swap_weight=float(
+                            gpp_cfg.get("seed_mutant_pitcher_weight", 0.10)
+                        ),
+                        salary_floor=(
+                            float(_sm_floor_cfg) if _sm_floor_cfg else salary_floor_gpp
+                        ),
+                        progress_cb=lambda n: self._cb(
+                            "gpp_seed_mutant_progress",
+                            {"n": n, "total": len(_seed_parents)},
+                        ),
+                        stop_check=self._stop_check,
+                    )
+                    logger.info(
+                        "[TIMING] Seed mutation: %d shape-preserving mutants "
+                        "from %d parents in %.1fs",
+                        len(_seed_mutant_lineups), len(_seed_parents),
+                        time.perf_counter() - _t_sm,
+                    )
+                except Exception as _sm_e:
+                    logger.warning("Seed mutation failed: %s", _sm_e)
+                    _seed_mutant_lineups = []
+                self._cb("gpp_seed_mutant_done", {
+                    "n_generated": len(_seed_mutant_lineups),
+                })
+
             _n_seeded = len(_optimal_lineups) + len(_sim_optimal_lineups) + len(_sim_winner_lineups)
             n_random = max(0, n_candidates - _n_seeded)
             self._cb("gpp_generate_start", {
-                "n_candidates": n_random + _n_seeded,
+                "n_candidates": n_random + _n_seeded + len(_seed_mutant_lineups),
                 **({"n_from_optimal": len(_optimal_lineups)} if _optimal_lineups else {}),
                 **({"n_from_sim_optimal": len(_sim_optimal_lineups)} if _sim_optimal_lineups else {}),
                 **({"n_from_sim_winner": len(_sim_winner_lineups)} if _sim_winner_lineups else {}),
+                **({"n_from_seed_mutant": len(_seed_mutant_lineups)} if _seed_mutant_lineups else {}),
             })
             random_cands = gen.generate(
                 n_candidates=n_random,
@@ -1015,7 +1074,10 @@ class PipelineRunner:
                 stop_check=self._stop_check,
                 progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
             )
-            candidates = _optimal_lineups + _sim_optimal_lineups + _sim_winner_lineups + random_cands
+            candidates = (
+                _optimal_lineups + _sim_optimal_lineups + _sim_winner_lineups
+                + _seed_mutant_lineups + random_cands
+            )
             self._cb("gpp_generate_done", {
                 "n_generated": len(candidates),
                 "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
@@ -1025,6 +1087,7 @@ class PipelineRunner:
             self._optimal_lineups = _optimal_lineups
             self._sim_optimal_lineups = _sim_optimal_lineups
             self._sim_winner_lineups = _sim_winner_lineups
+            self._seed_mutant_lineups = _seed_mutant_lineups
 
         logger.info("Candidate pool: %d lineups.", len(candidates))
         logger.info(
@@ -1839,6 +1902,9 @@ class PipelineRunner:
                     _sim_winner_keys = {
                         frozenset(int(p) for p in _lu.player_ids) for _lu in self._sim_winner_lineups
                     }
+                    _seed_mutant_keys = {
+                        frozenset(int(p) for p in _lu.player_ids) for _lu in self._seed_mutant_lineups
+                    }
                     _risk_membership: dict[int, list[str]] = {}
                     for _risk, _port in _portfolio_sweep_raw:
                         _selected_keys = {
@@ -1886,6 +1952,8 @@ class PipelineRunner:
                                 _seed_source = "sim_optimal"
                             elif _cand_keys[_li] in _sim_winner_keys:
                                 _seed_source = "sim_winner"
+                            elif _cand_keys[_li] in _seed_mutant_keys:
+                                _seed_source = "seed_mutant"
                             else:
                                 _seed_source = "random"
                             for _pid in _lu.player_ids:

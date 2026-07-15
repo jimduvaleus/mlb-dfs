@@ -770,15 +770,7 @@ class CandidateGenerator:
             rng_seed if rng_seed is not None else self._rng_seed
         )
 
-        # Validation metadata: _pmeta plus eligible_positions when available,
-        # so Lineup.is_valid()'s slot matching honors multi-position players.
-        if not hasattr(self, "_mutant_meta"):
-            self._mutant_meta = {pid: dict(m) for pid, m in self._pmeta.items()}
-            if "eligible_positions" in self._players_df.columns:
-                for r in self._players_df.itertuples(index=False):
-                    ep = r.eligible_positions
-                    if ep is not None:
-                        self._mutant_meta[int(r.player_id)]["eligible_positions"] = list(ep)
+        meta = self._ensure_mutant_meta()
 
         out: list[Lineup] = []
         for parent in parents:
@@ -853,7 +845,163 @@ class CandidateGenerator:
                 if not self._check_stack(ids):
                     continue
                 mutant = Lineup(player_ids=ids)
-                if not mutant.is_valid(self._mutant_meta):
+                if not mutant.is_valid(meta):
+                    continue
+
+                seen.add(key)
+                out.append(mutant)
+                produced += 1
+
+        return out
+
+    def generate_shape_mutants(
+        self,
+        parents: list[Lineup],
+        n_per_parent: int,
+        seen: set,
+        rng_seed: Optional[int] = None,
+        max_attempts_per_mutant: int = 25,
+        salary_locality: float = 2000.0,
+        pitcher_swap_weight: float = 0.10,
+        salary_floor: Optional[float] = None,
+        progress_cb: Optional[Callable[[int], None]] = None,
+        progress_every: int = 500,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> list[Lineup]:
+        """Shape-preserving neighborhood mutants of seed parent lineups.
+
+        Unlike generate_mutants (any-team same-position swaps — mutants
+        routinely break the parent's stack shape), every swap here preserves
+        the parent's team-stack profile exactly:
+
+          - batter slots swap only within the same team, so the per-team
+            hitter counts (primary size, secondary size, team identities)
+            are unchanged by construction; the swap-in must also cover the
+            outgoing player's primary position so slot matching stays
+            feasible;
+          - pitcher slots swap to any pitcher whose opponent has no hitters
+            in the lineup, leaving the hitter shape and DK's
+            pitcher-vs-batter rule untouched.
+
+        Built for seed-first pools (ceiling-first round 6): shaped ILP seeds
+        at refine_rounds=0 give the best measured pool hit99 but starve the
+        Det selector of neighborhood diversity; these mutants restore the
+        diversity without diluting the shape. Replacement sampling is
+        salary-local (weight ∝ exp(-|Δsalary| / salary_locality)).
+
+        Parameters
+        ----------
+        parents : seed lineups to mutate (shaped sim-optimal / sim-winner
+            seeds; any valid lineup works — its shape is what's preserved)
+        n_per_parent : mutants to produce per parent
+        seen : set of frozenset(player_ids) covering the seeds themselves;
+            mutants are deduped against it and added to it
+        salary_floor : overrides the generator floor for these mutants
+            (pass the shaped-seed floor, e.g. gpp.sim_optimal_salary_floor).
+            A mutant below the floor is rejected unless it still spends at
+            least its parent's salary.
+        progress_cb : called with the number of parents processed, every
+            progress_every parents
+        """
+        rng = np.random.default_rng(
+            rng_seed if rng_seed is not None else self._rng_seed
+        )
+        meta = self._ensure_mutant_meta()
+        floor = salary_floor if salary_floor is not None else self._salary_floor
+        pid_salary = self._pid_salary
+        pid_team = self._pid_team
+        pmeta = self._pmeta
+        pitcher_pool, _ = self._pos_pools.get("P", ([], np.array([])))
+
+        def _covers(cand: int, pos: str) -> bool:
+            m = meta[cand]
+            if m["position"] == pos:
+                return True
+            ep = m.get("eligible_positions")
+            return bool(ep) and pos in ep
+
+        out: list[Lineup] = []
+        for n_done, parent in enumerate(parents):
+            if stop_check is not None and stop_check():
+                break
+            if progress_cb is not None and n_done and n_done % progress_every == 0:
+                progress_cb(n_done)
+            p_ids = [int(pid) for pid in parent.player_ids]
+            if any(pid not in pmeta for pid in p_ids):
+                continue
+            parent_salary = sum(pid_salary[pid] for pid in p_ids)
+            roster_size = len(p_ids)
+            hitter_teams = {
+                pid_team[pid] for pid in p_ids if pmeta[pid]["position"] != "P"
+            }
+
+            slot_w = np.array(
+                [
+                    pitcher_swap_weight if pmeta[pid]["position"] == "P" else 1.0
+                    for pid in p_ids
+                ],
+                dtype=np.float64,
+            )
+            slot_w /= slot_w.sum()
+
+            produced = 0
+            attempts = 0
+            max_attempts = n_per_parent * max_attempts_per_mutant
+            while produced < n_per_parent and attempts < max_attempts:
+                attempts += 1
+                ids = list(p_ids)
+                n_swaps = 1 if rng.random() < 0.6 else 2
+                swap_slots = rng.choice(roster_size, size=n_swaps, replace=False, p=slot_w)
+
+                feasible_swap = True
+                for j in swap_slots:
+                    old_pid = ids[j]
+                    pos = pmeta[old_pid]["position"]
+                    in_lineup = set(ids)
+                    if pos == "P":
+                        cand_pids = [
+                            pid for pid in pitcher_pool
+                            if pid not in in_lineup
+                            and self._pid_opponent.get(pid, "") not in hitter_teams
+                        ]
+                    else:
+                        cand_pids = [
+                            pid
+                            for pid in self._team_batters.get(pid_team[old_pid], ())
+                            if pid not in in_lineup and _covers(pid, pos)
+                        ]
+                    if not cand_pids:
+                        feasible_swap = False
+                        break
+                    old_sal = pid_salary[old_pid]
+                    w = np.array(
+                        [
+                            math.exp(-abs(pid_salary[pid] - old_sal) / salary_locality)
+                            for pid in cand_pids
+                        ],
+                        dtype=np.float64,
+                    )
+                    w_sum = w.sum()
+                    if w_sum <= 0:
+                        feasible_swap = False
+                        break
+                    pick = int(np.searchsorted(np.cumsum(w / w_sum), rng.random()))
+                    ids[j] = cand_pids[min(pick, len(cand_pids) - 1)]
+                if not feasible_swap:
+                    continue
+
+                key = frozenset(ids)
+                if key in seen:
+                    continue
+
+                salary = sum(pid_salary[pid] for pid in ids)
+                if floor is not None and salary < floor and salary < parent_salary:
+                    continue
+
+                if not self._check_stack(ids):
+                    continue
+                mutant = Lineup(player_ids=ids)
+                if not mutant.is_valid(meta):
                     continue
 
                 seen.add(key)
@@ -865,6 +1013,18 @@ class CandidateGenerator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _ensure_mutant_meta(self) -> dict:
+        """Validation metadata: _pmeta plus eligible_positions when available,
+        so Lineup.is_valid()'s slot matching honors multi-position players."""
+        if not hasattr(self, "_mutant_meta"):
+            self._mutant_meta = {pid: dict(m) for pid, m in self._pmeta.items()}
+            if "eligible_positions" in self._players_df.columns:
+                for r in self._players_df.itertuples(index=False):
+                    ep = r.eligible_positions
+                    if ep is not None:
+                        self._mutant_meta[int(r.player_id)]["eligible_positions"] = list(ep)
+        return self._mutant_meta
 
     def _check_stack(self, ids: list[int]) -> bool:
         """Return True iff lineup satisfies the GPP stacking requirement."""

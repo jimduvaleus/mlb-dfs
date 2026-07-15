@@ -54,6 +54,11 @@ gpp:
   sim_winner_per_world: 1
   sim_winner_temp: 0.15
   sim_winner_own_blend: 0.25
+  # Shape-preserving seed mutation: N mutants per seed parent, exact
+  # team-stack profile preserved (additive on top of n_candidates). 0 = off.
+  seed_mutants_per_parent: 0
+  seed_mutant_salary_locality: 2000.0
+  seed_mutant_pitcher_weight: 0.10
   dump_candidate_pool: true
   measure_sim_ceiling: 200
   candidate_floor_relief: 3000
