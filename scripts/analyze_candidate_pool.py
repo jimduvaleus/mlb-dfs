@@ -299,7 +299,8 @@ def build_lineup_table(pool_df: pd.DataFrame, fpts_map: dict[int, float]) -> pd.
     # the ceiling-first redesign; carried through generically so newer dumps
     # grade richer and older dumps still load.
     _extra_metric_cols = [
-        c for c in ("sim_p99", "tail_ev", "p_beat99", "fresh_tail_ev", "fresh_p_beat99")
+        c for c in ("sim_p99", "tail_ev", "p_beat99", "fresh_tail_ev", "fresh_p_beat99",
+                    "p_beat999", "est_dupes", "win_equity")
         if c in df.columns
     ]
     grouped = df.groupby("lineup_index")

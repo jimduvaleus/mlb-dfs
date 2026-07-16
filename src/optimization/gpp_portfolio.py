@@ -322,6 +322,11 @@ class ContestScorer:
         # fresh after rescore_fresh_fields).
         self.last_tail_ev: Optional[np.ndarray] = None
         self.last_p_beat99: Optional[np.ndarray] = None
+        self.last_p_beat999: Optional[np.ndarray] = None
+        # E[dupes] per candidate (log-linear model) — computed on every
+        # score_candidates() call regardless of dupe_penalty, so the
+        # win-equity currency (p_beat999 / (1+E[dupes])) is always dumpable.
+        self.last_e_dupes: Optional[np.ndarray] = None
 
         self._sim_matrix = sim_results.results_matrix.astype(np.float32)
         self._col_map: dict[int, int] = {
@@ -646,9 +651,13 @@ class ContestScorer:
         # (M, n_sims) matrix, which would double the scoring memory peak.
         tail_ev = np.zeros(M, dtype=np.float64) if self._compute_tail_metrics else None
         p_beat99 = np.zeros(M, dtype=np.float64) if self._compute_tail_metrics else None
+        p_beat999 = np.zeros(M, dtype=np.float64) if self._compute_tail_metrics else None
         if self._compute_tail_metrics:
             # kth field lineup such that beating it means beating >= 99% of N.
             _p99_col = int(np.ceil(0.99 * self._n_field)) - 1
+            # ... and >= 99.9% of N (the real-contest money zone: ~30% of
+            # prize mass sits above p99.9).
+            _p999_col = int(np.ceil(0.999 * self._n_field)) - 1
         n_batches = (M + self._batch_size - 1) // self._batch_size
         logger.info(
             "Scoring %d candidates in %d batches of %d...",
@@ -684,6 +693,8 @@ class ContestScorer:
                     tail_ev[start:end] += tail_k.mean(axis=1)
                     thr = field_sorted[:, _p99_col]  # (n_sims,)
                     p_beat99[start:end] += (cand_scores_batch >= thr[None, :]).mean(axis=1)
+                    thr999 = field_sorted[:, _p999_col]  # (n_sims,)
+                    p_beat999[start:end] += (cand_scores_batch >= thr999[None, :]).mean(axis=1)
 
             robust_payout[start:end] = batch_payout / self._n_k
 
@@ -709,11 +720,14 @@ class ContestScorer:
         if self._compute_tail_metrics:
             tail_ev /= self._n_k
             p_beat99 /= self._n_k
+            p_beat999 /= self._n_k
             if invalid_mask.any():
                 tail_ev[invalid_mask] = 0.0
                 p_beat99[invalid_mask] = 0.0
+                p_beat999[invalid_mask] = 0.0
             self.last_tail_ev = tail_ev
             self.last_p_beat99 = p_beat99
+            self.last_p_beat999 = p_beat999
 
         return robust_payout
 
@@ -727,12 +741,11 @@ class ContestScorer:
         E[dupes] is the log-linear model documented on the class. Ownership
         comes from the field vector (the real-universe %drafted estimate that
         drives opponent field generation), not the candidate pool's internal
-        sampling weights. Returns all ones when the penalty is disabled.
+        sampling weights. E[dupes] is always computed and stored on
+        self.last_e_dupes (the win-equity currency needs it); the returned
+        payout scale is all ones when the penalty is disabled.
         """
         M = len(candidates)
-        if not self._dupe_penalty:
-            return np.ones(M, dtype=np.float32)
-
         fdf = self._field_players_df
         pids = fdf["player_id"].astype(int).to_numpy()
         own_map = dict(zip(pids, np.asarray(self._field_ownership_vec, dtype=np.float64)))
@@ -768,12 +781,16 @@ class ContestScorer:
             scale[i] = np.float32(1.0 / (1.0 + e_dupes))
 
         logger.info(
-            "Dupe penalty: E[dupes] min=%.3f  p50=%.3f  p90=%.3f  max=%.1f  "
-            "(top-band payout scale p50=%.3f)",
+            "Dupe model: E[dupes] min=%.3f  p50=%.3f  p90=%.3f  max=%.1f  "
+            "(top-band payout scale p50=%.3f, penalty %s)",
             float(e_dupes_all.min()), float(np.percentile(e_dupes_all, 50)),
             float(np.percentile(e_dupes_all, 90)), float(e_dupes_all.max()),
             float(np.percentile(scale, 50)),
+            "on" if self._dupe_penalty else "off",
         )
+        self.last_e_dupes = e_dupes_all
+        if not self._dupe_penalty:
+            return np.ones(M, dtype=np.float32)
         return scale
 
     def _build_col_lineups(self, candidates: list[Lineup]) -> np.ndarray:

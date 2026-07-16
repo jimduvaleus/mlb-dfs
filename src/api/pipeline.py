@@ -1182,6 +1182,8 @@ class PipelineRunner:
             # refinement concats (ceiling-first redesign, Phase 2).
             _mined_tail_ev = scorer.last_tail_ev
             _mined_p_beat99 = scorer.last_p_beat99
+            _mined_p_beat999 = scorer.last_p_beat999
+            _mined_e_dupes = scorer.last_e_dupes
             logger.info(
                 "[TIMING] score_candidates wall time: %.3fs  "
                 "robust_payout shape=%s (%.1f MB)  field_from_cache=%s  RSS=%.0f MB",
@@ -1371,6 +1373,9 @@ class PipelineRunner:
                     if _mined_tail_ev is not None and scorer.last_tail_ev is not None:
                         _mined_tail_ev = np.concatenate([_mined_tail_ev, scorer.last_tail_ev])
                         _mined_p_beat99 = np.concatenate([_mined_p_beat99, scorer.last_p_beat99])
+                        _mined_p_beat999 = np.concatenate([_mined_p_beat999, scorer.last_p_beat999])
+                    if _mined_e_dupes is not None and scorer.last_e_dupes is not None:
+                        _mined_e_dupes = np.concatenate([_mined_e_dupes, scorer.last_e_dupes])
                     del _payout_new
                     logger.info(
                         "Refine round %d/%d post-concat  RSS=%.0f MB  robust_payout=%.0f MB",
@@ -1486,6 +1491,8 @@ class PipelineRunner:
             _dump_pool_mined_ev: Optional[np.ndarray] = None
             _dump_pool_tail_ev: Optional[np.ndarray] = None
             _dump_pool_p_beat99: Optional[np.ndarray] = None
+            _dump_pool_p_beat999: Optional[np.ndarray] = None
+            _dump_pool_e_dupes: Optional[np.ndarray] = None
             _fresh_tail_ev: Optional[np.ndarray] = None
             _fresh_p_beat99: Optional[np.ndarray] = None
             if (
@@ -1498,6 +1505,8 @@ class PipelineRunner:
                 _dump_pool_mined_ev = _mined_ev
                 _dump_pool_tail_ev = _mined_tail_ev
                 _dump_pool_p_beat99 = _mined_p_beat99
+                _dump_pool_p_beat999 = _mined_p_beat999
+                _dump_pool_e_dupes = _mined_e_dupes
                 _keep_idx = np.where(_mined_ev >= _floor)[0]
                 # Tiny-pool fallback: always rescore enough to fill a
                 # portfolio even when the floor culls nearly everything.
@@ -1840,6 +1849,8 @@ class PipelineRunner:
                         _dump_ev = _dump_pool_mined_ev
                         _dump_tail_ev = _dump_pool_tail_ev
                         _dump_p_beat99 = _dump_pool_p_beat99
+                        _dump_p_beat999 = _dump_pool_p_beat999
+                        _dump_e_dupes = _dump_pool_e_dupes
                         _fresh_ev_map = {
                             frozenset(int(p) for p in _lu.player_ids): float(_v)
                             for _lu, _v in zip(
@@ -1858,6 +1869,8 @@ class PipelineRunner:
                         _dump_ev = robust_payout.mean(axis=1)
                         _dump_tail_ev = _mined_tail_ev
                         _dump_p_beat99 = _mined_p_beat99
+                        _dump_p_beat999 = _mined_p_beat999
+                        _dump_e_dupes = _mined_e_dupes
                         _fresh_ev_map = {}
                         _fresh_tail_map = {}
                         _fresh_p99_map = {}
@@ -1922,6 +1935,7 @@ class PipelineRunner:
                             "fresh_ev", "tail_bypass", "seed_source",
                             "sim_p99", "tail_ev", "p_beat99",
                             "fresh_tail_ev", "fresh_p_beat99",
+                            "p_beat999", "est_dupes", "win_equity",
                         ])
                         for _li, _lu in enumerate(_dump_cands):
                             _selected_risks = ",".join(_risk_membership.get(_li, []))
@@ -1946,6 +1960,21 @@ class PipelineRunner:
                             _f_tail = round(_f_tail, 4) if _f_tail is not None else ""
                             _f_p99 = _fresh_p99_map.get(_cand_keys[_li])
                             _f_p99 = round(_f_p99, 5) if _f_p99 is not None else ""
+                            # Win-equity currency: P(beat sim-field p99.9)
+                            # discounted by expected duplicates — targets
+                            # money-zone tickets in undiluted form.
+                            _p999 = (
+                                round(float(_dump_p_beat999[_li]), 6)
+                                if _dump_p_beat999 is not None else ""
+                            )
+                            _edup = (
+                                round(float(_dump_e_dupes[_li]), 4)
+                                if _dump_e_dupes is not None else ""
+                            )
+                            _weq = (
+                                round(float(_dump_p_beat999[_li]) / (1.0 + float(_dump_e_dupes[_li])), 6)
+                                if _dump_p_beat999 is not None and _dump_e_dupes is not None else ""
+                            )
                             if _cand_keys[_li] in _optimal_keys:
                                 _seed_source = "optimal"
                             elif _cand_keys[_li] in _sim_optimal_keys:
@@ -1977,6 +2006,9 @@ class PipelineRunner:
                                     _p99,
                                     _f_tail,
                                     _f_p99,
+                                    _p999,
+                                    _edup,
+                                    _weq,
                                 ])
                     logger.info(
                         "Candidate pool written to %s (%d lineups%s)",

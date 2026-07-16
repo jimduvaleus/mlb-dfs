@@ -1,0 +1,46 @@
+# Round-9 pre-registered — tail preservation + win-equity currency
+# (registered 2026-07-16 BEFORE the batch; branch shape-preserving-seed-mutation).
+#
+# Motivation (payout-fix economics, 2026-07-16): ~30% of real prize mass
+# sits above p99.9; field-average tail contribution ≈ $1.01/entry. Our
+# measured plateau edge (+~0.55 vs field ex-tail) puts breakeven at a
+# portfolio-stage top-0.1% rate of ~1.15-1.3× field. The POOL has 1.25×
+# (hit999 0.125%, n>150k). Whether SELECTION preserves it is unmeasured —
+# the decisive open number of the whole program. Money-zone forensics
+# (21 contests): winners are ownership-AVERAGE (Σown 1.155 vs field 1.164)
+# and 92% unduplicated — uniqueness-in-combination, not leverage. Hence
+# the win-equity currency: p_beat999 / (1 + E[dupes]) — sim tail
+# probability discounted by the fitted dupe model — added to the pool
+# dump this round (p_beat999, est_dupes, win_equity columns).
+#
+# Design: blend_full (round-8 winner) re-run at --portfolio-size 150 (the
+# real DK 150-max format; Det-selector cost at 500 is prohibitive) with
+# --rank-col win_equity --top-n 2000, across ALL 21 graded slates
+# (comparator 11 + June 10 — this is machinery measurement, not config
+# selection, so using June does not spend further holdout; May stays
+# untouched). Pseudo-portfolio n across risk tiers ≈ 10-15k entries.
+#
+# Judgment, pre-committed:
+#   PRIMARY (tail preservation): risk_all pseudo-portfolio hit999 pooled
+#     over 21 slates vs the same runs' pool hit999. Preservation ratio
+#     >= ~0.8 (selection keeps the pool's tail edge) = pass; ratio <= ~0.5
+#     = selection demonstrably destroys tail (structural finding). n≈15
+#     expected events — coarse; CI reported, no overclaiming.
+#   SECONDARY (currency validation): offline top-500/1000/2000 slices by
+#     win_equity vs sim_p99 vs p_beat999 vs projected_ev (mined mean EV),
+#     judged on hit999 first, hit99 second, across the same 21 slates.
+#     win_equity earns funnel wiring only if it beats sim_p99 (the round-1
+#     validated ceiling currency) on hit999 at n>=30k slice size.
+#   Guardrails: size-150 portfolio cash rate reported (expected to sag vs
+#     size-20; informational), wall time per run.
+
+blend_full_p150:
+  gpp.n_candidates: 20000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.seed_mutants_per_parent: 4
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
