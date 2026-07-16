@@ -235,16 +235,26 @@ def run_variant(
 # ---------------------------------------------------------------------------
 
 def _payout_curve(n_field: int) -> tuple[np.ndarray, float]:
-    """Per-rank gross payout (rank 1..n_field) — the reference contest's
-    payout tiers rank-scaled proportionally to the real field size."""
+    """Per-rank gross payout (rank 1..n_field): the reference contest's
+    payout curve sampled at each rank's percentile, renormalized so the
+    paid fraction of collected fees matches the reference exactly (DK's
+    ~16% rake is fixed across contest sizes). The previous rank-interval
+    scaling let the single-rank top tiers overwrite each other at scaled
+    indices, destroying 20-50% of the top-heavy prize mass (implied rake
+    24-29% at common field sizes) and understating every realized-net
+    figure's tail."""
     pj = json.loads(PAYOUT_JSON.read_text())
-    scale = n_field / pj["total_entries"]
-    curve = np.zeros(n_field)
+    fee = float(pj.get("entry_fee", 4.0))
+    ref_n = int(pj["total_entries"])
+    ref = np.zeros(ref_n)
     for tier in pj["payouts"]:
-        lo = int(np.floor((tier["start"] - 1) * scale))
-        hi = min(int(np.ceil(tier["end"] * scale)), n_field)
-        curve[lo:hi] = tier["amount"]
-    return curve, float(pj.get("entry_fee", 4.0))
+        ref[tier["start"] - 1: tier["end"]] = tier["amount"]
+    idx = np.minimum((np.arange(n_field) * ref_n) // n_field, ref_n - 1)
+    curve = ref[idx].astype(np.float64)
+    ref_pool_frac = ref.sum() / (ref_n * fee)
+    if curve.sum() > 0:
+        curve *= (n_field * fee * ref_pool_frac) / curve.sum()
+    return curve, fee
 
 
 def _load_actuals(archive_dir: Path) -> dict[int, float]:
