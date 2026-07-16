@@ -1,0 +1,15 @@
+# Round-8 June confirmation — blend_full only (the pre-registered winner of
+# the comparator-set selection; see variants_round8.yaml for the full
+# registration and the pre-stated June predictions). Knobs identical to
+# blend_full there. One shot on the 10 June holdout slates.
+
+blend_full:
+  gpp.n_candidates: 20000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.seed_mutants_per_parent: 4
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
