@@ -1,0 +1,70 @@
+# Round-8 pre-registered matrix — blended pool (registered 2026-07-15 BEFORE
+# any run; branch shape-preserving-seed-mutation).
+#
+# Motivation (June holdout + shaidy transcripts, archive/shaidy*.txt):
+#   - June holdout: frozen pure pool (sim-conviction) and baseline
+#     (ownership-breadth) are ANTI-correlated per-slate (r = -0.62 over 10
+#     June slates) with similar solo rates — a textbook diversification
+#     pair. The pure pool is a concentrated bet on the world model; when
+#     the model is off-regime it misses uniformly (June 06/05-06/22 pool
+#     0.54% vs baseline 0.79%) and when on-regime it dominates (14
+#     contiguous slates 06/24-07/11).
+#   - shaidy's three-P framing: the POOL should span your uncertainty
+#     ("lineups you're happy playing"); the PORTFOLIO math (our Det
+#     selector — determinant maximization over the contest-sim payout
+#     matrix = his "diversify returns, not exposures") should be what
+#     manages risk. pure5k collapsed that separation.
+#   - Hypothesis: a pool holding BOTH instruments lets the Det selector
+#     exploit the anti-correlation — near-max ceiling in-regime, floor
+#     protection off-regime. The selector sees low payout correlation
+#     between blocks and should mix them without hand-set quotas.
+#
+# Design: shaped seeds + mut4 mutants (conviction block) at full round-7
+# strength, PLUS ownership-weighted randoms (breadth block) at two doses.
+# Selector/funnel untouched (mean_ev, ev_first, Det) — the blend is purely
+# a pool intervention. refine 0, K2 as validated.
+#
+# Runtime note: ~45k-candidate pools score slower (~15-18 min/run est).
+#
+# Judgment, pre-committed:
+#   Selection set = the 11-slate comparator set ONLY (06/28-07/11):
+#     - portfolio hit99 and cash (~0.32) not worse than pure5k_mut4;
+#     - per-block pool rates hold (sim_optimal ~1.17%, seed_mutant ~1.18%,
+#       random ~0.9%): blending must not degrade either block;
+#     - floor set contains BOTH blocks materially (each >= ~15% of the
+#       floor set) — else the funnel, not the selector, is allocating;
+#     - NEW shaidy metric: slate-level portfolio floor — wipeout rate
+#       (slates where 0 portfolio lineups cash) and p10 slate net $ —
+#       must be no worse than pure5k_mut4's.
+#   Confirmation (hypothesis pre-stated here, run AFTER selection): the
+#   winning blend on the 10 June holdout slates. The diversification claim
+#   predicts: June portfolio wipeout rate and pooled net $ better than
+#   BOTH June arms (holdout_frozen -2.21 $/entry, holdout_baseline -2.00),
+#   and June pool hit99 between the two components' (0.69 / 0.65) rather
+#   than at the frozen floor. May tranche (12 slates) stays unspent.
+#
+# NOT judged on: pooled pool-level hit99 of the whole blended pool (the
+# random block mechanically dilutes it — per-block rates are the honest
+# unit here).
+
+blend_full:              # breadth block at legacy production size
+  gpp.n_candidates: 20000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.seed_mutants_per_parent: 4
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+
+blend_light:             # half-size breadth block
+  gpp.n_candidates: 10000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.seed_mutants_per_parent: 4
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
