@@ -1,0 +1,117 @@
+# Round-10 pre-registered — selector objective: det vs kelly vs coverage
+# (registered 2026-07-17 BEFORE any implementation or batch; branch
+# shape-preserving-seed-mutation. Runs AFTER the round-9 batch reports —
+# same machinery, independent axis: round-9 measures whether selection
+# preserves the pool's tail, round-10 asks whether a different selection
+# OBJECTIVE preserves more of it.)
+#
+# Motivation (oracle-field study + theory, 2026-07-17): linear expected
+# dollars is (to within negligible self-tie effects) additive over a
+# portfolio, so under that objective the optimal portfolio is top-N by EV
+# regardless of correlation — diversification is only justified by
+# (1) concave utility / bankroll growth, (2) hedging our own projection-
+# measure error, (3) union objectives (P(>=1 entry in the top band)).
+# The Det selector's covariance-determinant term is a geometric proxy for
+# all three at once, dominated by min-cash-band co-movement where most
+# payout variance lives — not by the sparse tail worlds that carry ~30%
+# of prize mass. Round-10 tests two selectors that optimize (1) and (3)
+# directly, on the same robust_payout artifact the Det selector already
+# consumes:
+#
+#   kelly    — greedy argmax ΔE[log(B + portfolio_payout_w)] over sim
+#              worlds w (exact per-sim arithmetic on robust_payout).
+#              Diminishing marginal utility in already-covered worlds =
+#              derived world-partitioning. Risk tier maps to bankroll:
+#              B = fee × portfolio_size × {0.5, 1, 2, 4, 8} for risk
+#              1..5 (risk 5 ≈ linear-EV limit, risk 1 = strongest
+#              diversifier) — mirrors det's evw interpolation.
+#   coverage — greedy weighted max-coverage on per-sim booleans
+#              "candidate beats the sim field's p99.9 in world w"
+#              (the p_beat999 machinery, keeping the boolean matrix
+#              instead of its row mean; bit-packed M×S/8 ≈ 35 MB at
+#              pool 11k). World weight = 1 in this round (simplest
+#              pre-committable version); ties broken by win_equity.
+#              Submodular ⇒ greedy carries the (1−1/e) guarantee.
+#              Risk tier is a no-op for coverage; run risk 3 only.
+#
+# Both modes keep the existing funnel unchanged upstream (ev_floor cull,
+# fresh re-score, tail bypass) and keep the cash-anchor block: the first
+# ceil(cash_anchor_fraction × size) picks stay on mean dollar EV.
+#
+# Implementation prerequisites (to build before the batch, no retuning
+# after results start arriving):
+#   1. gpp_portfolio.py: selector_mode: det|kelly|coverage on
+#      DeterminantPortfolioSelector.select() peers (shared floor cull +
+#      candidate bookkeeping; kelly/coverage skip the M×M corr matmul).
+#   2. ContestScorer: retain per-candidate per-sim beat-p999 booleans
+#      (fresh-field pass) behind gpp.compute_tail_metrics.
+#   3. Config plumbing: gpp.selector_mode + gpp.kelly_bankroll_mult in
+#      config.yaml + src/api/models.py GppConfig (UI exposure deferred —
+#      replay-only knob this round; types.ts sync when/if it goes live).
+#   4. Pool dump: selected_risks column semantics unchanged; selector
+#      mode is per-variant (one mode per run), recorded in the variant
+#      name and run config.yaml.
+#
+# Design: blend_full pool config frozen from round-8/9 (identical
+# generation config + seed ⇒ bit-identical pools across the three
+# variants; sims reused from sim_cache) at --portfolio-size 150, across
+# ALL 21 graded slates (machinery measurement, not config selection —
+# June does not spend further holdout; May stays untouched).
+#
+# Judgment, pre-committed (risk_all pseudo-portfolio unless stated;
+# det variant is the control, graded from the same batch):
+#   PRIMARY (union objective, justification #3): slate hit-rate — the
+#     fraction of the 21 slates with >=1 portfolio entry above the real
+#     field p99.9 (secondary read at p99). kelly or coverage must beat
+#     det on this count to earn further work; ties broken by portfolio
+#     hit999 preservation ratio vs pool (round-9 primary, computed
+#     identically).
+#   SECONDARY (growth objective, justification #1): per-slate log-growth
+#     of a notional bankroll = log((B0 + slate net)/B0), B0 = 150 × $4;
+#     plus the round-8 slate-floor metrics: wipeout rate (slates with
+#     ~zero cashes) and p10 slate net. kelly is expected to win here by
+#     construction; report whether it does so without giving up PRIMARY.
+#   GUARDRAILS: portfolio cash rate and mean net $/entry within noise of
+#     det (report CIs; no adoption if mean net degrades beyond CI);
+#     mean pairwise payout correlation of the selected 150 (diversity
+#     audit — coverage should be lowest); wall time per selection.
+#   Adoption rule: a challenger replaces det as the live default only if
+#     it wins PRIMARY outright AND does not lose either guardrail; any
+#     other outcome = structural finding, no live change this round.
+#     n≈21 slates is coarse — CIs reported, no overclaiming.
+
+det_p150:
+  gpp.n_candidates: 20000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.seed_mutants_per_parent: 4
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+  gpp.selector_mode: det
+
+kelly_p150:
+  gpp.n_candidates: 20000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.seed_mutants_per_parent: 4
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+  gpp.selector_mode: kelly
+
+coverage_p150:
+  gpp.n_candidates: 20000
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 5000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.seed_mutants_per_parent: 4
+  gpp.refine_rounds: 0
+  gpp.final_n_field_samples: 2
+  gpp.selector_mode: coverage
