@@ -1495,6 +1495,12 @@ class PipelineRunner:
             _dump_pool_e_dupes: Optional[np.ndarray] = None
             _fresh_tail_ev: Optional[np.ndarray] = None
             _fresh_p_beat99: Optional[np.ndarray] = None
+            # Round-10 selector-mode state (kelly/coverage need fresh-pass
+            # artifacts the det path never consumed).
+            _selector_mode = str(gpp_cfg.get("selector_mode", "det")).lower()
+            _fresh_p_beat999: Optional[np.ndarray] = None
+            _fresh_e_dupes: Optional[np.ndarray] = None
+            _fresh_beat_bits: Optional[np.ndarray] = None
             if (
                 final_k > 0 and rescore_cap > 0
                 and not (_gpp_stopped and self._stop_check())
@@ -1596,6 +1602,10 @@ class PipelineRunner:
                 # already holds everything the telemetry needs.
                 robust_payout = None
                 gc.collect()
+                # Coverage selector consumes per-world beat-p999 bits from
+                # this pass only; keep the flag off for every other mode so
+                # the mined-stage memory profile is unchanged.
+                scorer.retain_beat999_worlds = _selector_mode in ("coverage", "all")
                 robust_payout = scorer.rescore_fresh_fields(
                     candidates, n_samples=final_k,
                     stop_check=self._stop_check,
@@ -1616,6 +1626,11 @@ class PipelineRunner:
                 _fresh_ev = robust_payout.mean(axis=1)
                 _fresh_tail_ev = scorer.last_tail_ev
                 _fresh_p_beat99 = scorer.last_p_beat99
+                _fresh_p_beat999 = scorer.last_p_beat999
+                _fresh_e_dupes = scorer.last_e_dupes
+                _fresh_beat_bits = scorer.last_beat999_bits
+                scorer.retain_beat999_worlds = False
+                scorer.last_beat999_bits = None
                 # Winner's-curse telemetry: how much of the mined top-EV was
                 # overfit to the first-stage fields?
                 _wc_k = min(50, len(candidates))
@@ -1654,6 +1669,12 @@ class PipelineRunner:
                     if _fresh_tail_ev is not None:
                         _fresh_tail_ev = _fresh_tail_ev[_surv]
                         _fresh_p_beat99 = _fresh_p_beat99[_surv]
+                    if _fresh_p_beat999 is not None:
+                        _fresh_p_beat999 = _fresh_p_beat999[_surv]
+                    if _fresh_e_dupes is not None:
+                        _fresh_e_dupes = _fresh_e_dupes[_surv]
+                    if _fresh_beat_bits is not None:
+                        _fresh_beat_bits = _fresh_beat_bits[_surv]
                 _n_bypass_survivors = int(_is_bypass.sum())
 
                 logger.info(
@@ -1740,14 +1761,111 @@ class PipelineRunner:
                     (f" (anchor={_cash_anchor_fraction:.2f})" if _ev_override_vec is not None else ""),
                 )
 
+                # Round-10 selector modes. kelly/coverage build the sweep
+                # themselves and skip the det path's M×M correlation matmul;
+                # det (default) keeps today's behavior exactly. "all" runs
+                # every mode off the one pipeline run (replay economics:
+                # generation + scoring dominate; selection is seconds), with
+                # kelly labeled risk+10 (11-15) and coverage labeled 23 so
+                # the sweep keys and dump's selected_risks stay distinct.
+                _det_sweep_risks = _DET_SWEEP_RISKS
+                if _selector_mode in ("kelly", "all"):
+                    from src.optimization.gpp_portfolio import KellyPortfolioSelector
+                    _entry_fee = float(getattr(scorer, "_entry_fee", 4.0))
+                    # Risk → bankroll: B = fee × size × mult (pre-registered
+                    # round-10 table; mult must stay > 1 or the all-lose world
+                    # hits log(<=0)). kelly_bankroll_mult is a global scale.
+                    _kelly_mults = {1.0: 1.25, 2.0: 1.5, 3.0: 2.0, 4.0: 4.0, 5.0: 8.0}
+                    _kelly_scale = max(float(gpp_cfg.get("kelly_bankroll_mult", 1.0)), 1e-6)
+                    _kelly_lbl_off = 10.0 if _selector_mode == "all" else 0.0
+                    if _selector_mode == "kelly":
+                        _det_sweep_risks = []
+                    for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
+                        if self._stop_check is not None and self._stop_check():
+                            break
+                        _B = _entry_fee * portfolio_size * _kelly_mults[_sweep_risk] * _kelly_scale
+                        logger.info(
+                            "Kelly risk %d/%d (risk=%.0f, B=$%.0f)",
+                            _risk_idx + 1, len(_DET_SWEEP_RISKS), _sweep_risk, _B,
+                        )
+                        self._cb("gpp_det_risk_start", {
+                            "risk": _sweep_risk + _kelly_lbl_off,
+                            "risk_index": _risk_idx + 1,
+                            "total_risks": len(_DET_SWEEP_RISKS),
+                        })
+                        _k_sel = KellyPortfolioSelector(
+                            robust_payout=robust_payout,
+                            candidates=candidates,
+                            portfolio_size=portfolio_size,
+                            bankroll=_B,
+                            ev_floor=_ev_floor,
+                            cash_anchor_fraction=_cash_anchor_fraction,
+                        )
+                        _portfolio_sweep_raw.append((_sweep_risk + _kelly_lbl_off, _k_sel.select(
+                            stop_check=self._stop_check,
+                            progress_cb=lambda data, r=_sweep_risk + _kelly_lbl_off, ri=_risk_idx: self._cb(
+                                "gpp_det_select_progress",
+                                {**data, "risk": r, "risk_index": ri + 1,
+                                 "total_risks": len(_DET_SWEEP_RISKS)},
+                            ),
+                        )))
+                        del _k_sel
+                if _selector_mode in ("coverage", "all"):
+                    if (
+                        _fresh_beat_bits is None
+                        or len(_fresh_beat_bits) != len(candidates)
+                    ):
+                        logger.warning(
+                            "selector_mode='coverage' needs the fresh-pass "
+                            "beat-p999 bits (final_n_field_samples > 0 and "
+                            "compute_tail_metrics on); falling back to det.",
+                        )
+                    else:
+                        from src.optimization.gpp_portfolio import CoveragePortfolioSelector
+                        _tb = None
+                        if _fresh_p_beat999 is not None:
+                            _tb = np.asarray(_fresh_p_beat999, dtype=np.float64)
+                            if _fresh_e_dupes is not None:
+                                _tb = _tb / (1.0 + np.maximum(
+                                    np.asarray(_fresh_e_dupes, dtype=np.float64), 0.0,
+                                ))
+                        if _selector_mode == "coverage":
+                            _det_sweep_risks = []
+                        # Risk is a no-op for coverage: single tier, labeled
+                        # 23 in "all" mode to stay distinct from det 1-5 and
+                        # kelly 11-15.
+                        _cov_risk = 23.0 if _selector_mode == "all" else 3.0
+                        self._cb("gpp_det_risk_start", {
+                            "risk": _cov_risk, "risk_index": 1, "total_risks": 1,
+                        })
+                        _c_sel = CoveragePortfolioSelector(
+                            robust_payout=robust_payout,
+                            candidates=candidates,
+                            portfolio_size=portfolio_size,
+                            beat999_bits=_fresh_beat_bits,
+                            tie_break=_tb,
+                            ev_floor=_ev_floor,
+                            cash_anchor_fraction=_cash_anchor_fraction,
+                        )
+                        _portfolio_sweep_raw.append((_cov_risk, _c_sel.select(
+                            stop_check=self._stop_check,
+                            progress_cb=lambda data: self._cb(
+                                "gpp_det_select_progress",
+                                {**data, "risk": _cov_risk, "risk_index": 1,
+                                 "total_risks": 1},
+                            ),
+                        )))
+                        del _c_sel
+
                 # Floor cull + correlation matrix are identical for every risk
                 # (risk only changes the EVw/DEw blend) — compute once and
                 # share across the sweep instead of repeating the M×M matmul
                 # per risk (~23s each at pool=11k).
-                _det_pre = DeterminantPortfolioSelector.precompute_pool(
-                    robust_payout, _ev_floor,
+                _det_pre = (
+                    DeterminantPortfolioSelector.precompute_pool(robust_payout, _ev_floor)
+                    if _det_sweep_risks else None
                 )
-                for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
+                for _risk_idx, _sweep_risk in enumerate(_det_sweep_risks):
                     if self._stop_check is not None and self._stop_check():
                         break
                     _evw = DeterminantPortfolioSelector.evw_for_risk(_sweep_risk, _evw_base, _evw_max)

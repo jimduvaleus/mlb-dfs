@@ -323,6 +323,13 @@ class ContestScorer:
         self.last_tail_ev: Optional[np.ndarray] = None
         self.last_p_beat99: Optional[np.ndarray] = None
         self.last_p_beat999: Optional[np.ndarray] = None
+        # Round-10 coverage selector: when retain_beat999_worlds is set (the
+        # pipeline flips it on just for the fresh re-score), _score_col_lineups
+        # also keeps the per-world beat-p999 booleans, bit-packed to
+        # (M, K × ceil(n_sims/8)) uint8 on last_beat999_bits — one bit per
+        # (field sample, sim) world, ~n_K × M × n_sims/8 bytes.
+        self.retain_beat999_worlds: bool = False
+        self.last_beat999_bits: Optional[np.ndarray] = None
         # E[dupes] per candidate (log-linear model) — computed on every
         # score_candidates() call regardless of dupe_penalty, so the
         # win-equity currency (p_beat999 / (1+E[dupes])) is always dumpable.
@@ -658,6 +665,10 @@ class ContestScorer:
             # ... and >= 99.9% of N (the real-contest money zone: ~30% of
             # prize mass sits above p99.9).
             _p999_col = int(np.ceil(0.999 * self._n_field)) - 1
+        beat_bits = None
+        if self._compute_tail_metrics and self.retain_beat999_worlds:
+            _n_bytes = (n_sims + 7) // 8
+            beat_bits = np.zeros((M, len(field_sorted_list) * _n_bytes), dtype=np.uint8)
         n_batches = (M + self._batch_size - 1) // self._batch_size
         logger.info(
             "Scoring %d candidates in %d batches of %d...",
@@ -676,7 +687,7 @@ class ContestScorer:
             # Accumulate payout over K field samples
             batch_payout = np.zeros((end - start, n_sims), dtype=np.float32)
             batch_dupe_scale = np.ascontiguousarray(dupe_scale[start:end])
-            for field_sorted in field_sorted_list:
+            for _field_k, field_sorted in enumerate(field_sorted_list):
                 payout_k = _compute_payout_from_sorted_field(
                     cand_scores_batch, field_sorted,
                     self._payout_cumsum, self._dilute_cumsum, batch_dupe_scale,
@@ -694,7 +705,12 @@ class ContestScorer:
                     thr = field_sorted[:, _p99_col]  # (n_sims,)
                     p_beat99[start:end] += (cand_scores_batch >= thr[None, :]).mean(axis=1)
                     thr999 = field_sorted[:, _p999_col]  # (n_sims,)
-                    p_beat999[start:end] += (cand_scores_batch >= thr999[None, :]).mean(axis=1)
+                    _beat999 = cand_scores_batch >= thr999[None, :]
+                    p_beat999[start:end] += _beat999.mean(axis=1)
+                    if beat_bits is not None:
+                        beat_bits[start:end, _field_k * _n_bytes:(_field_k + 1) * _n_bytes] = (
+                            np.packbits(_beat999, axis=1)
+                        )
 
             robust_payout[start:end] = batch_payout / self._n_k
 
@@ -728,6 +744,10 @@ class ContestScorer:
             self.last_tail_ev = tail_ev
             self.last_p_beat99 = p_beat99
             self.last_p_beat999 = p_beat999
+        if beat_bits is not None:
+            if invalid_mask.any():
+                beat_bits[invalid_mask] = 0
+            self.last_beat999_bits = beat_bits
 
         return robust_payout
 
@@ -1094,5 +1114,248 @@ class DeterminantPortfolioSelector:
         logger.info(
             "DeterminantSelector done: %d lineups in %.1fs",
             len(result), time.perf_counter() - t0,
+        )
+        return result
+
+
+@njit(parallel=True, cache=True)
+def _kelly_gains_all(payout: np.ndarray, denom: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Marginal expected-log-growth of each candidate against the current
+    portfolio: mean_w[log1p(payout[m, w] / denom[w])] for unmasked rows.
+    denom[w] = bankroll + portfolio payout in world w (always > 0)."""
+    M, n_sims = payout.shape
+    out = np.full(M, -np.inf)
+    for m in prange(M):
+        if not mask[m]:
+            continue
+        s = 0.0
+        for w in range(n_sims):
+            p = payout[m, w]
+            if p != 0.0:
+                s += np.log1p(p / denom[w])
+        out[m] = s / n_sims
+    return out
+
+
+@njit(cache=True)
+def _kelly_gain_one(pay_row: np.ndarray, denom: np.ndarray) -> float:
+    n_sims = pay_row.shape[0]
+    s = 0.0
+    for w in range(n_sims):
+        p = pay_row[w]
+        if p != 0.0:
+            s += np.log1p(p / denom[w])
+    return s / n_sims
+
+
+class KellyPortfolioSelector:
+    """Round-10 selector: greedy expected-log-growth (fractional Kelly).
+
+    Objective: maximize E_w[log(B + portfolio_payout_w)] over sim worlds w,
+    exactly, on the same fresh robust_payout matrix the Det selector
+    consumes. Concavity makes marginal gains shrink in worlds the portfolio
+    already covers — world-partitioning derived from the objective rather
+    than proxied by a covariance determinant. Marginal gains are also
+    monotonically non-increasing as the portfolio grows, so lazy greedy
+    (stale gains as upper bounds, re-evaluate the heap top) is exact.
+
+    The first ceil(cash_anchor_fraction × portfolio_size) picks are pure
+    mean-EV rank (the cash-anchor block, mirroring the det path's anchor
+    semantics), with the anchors' payouts entering the portfolio state
+    before the Kelly picks begin.
+
+    B must exceed the maximum possible portfolio loss (fee × size) or the
+    all-entries-lose world sends log to a domain error; the caller enforces
+    the bankroll table's mult > 1.
+    """
+
+    def __init__(
+        self,
+        robust_payout: np.ndarray,
+        candidates: list[Lineup],
+        portfolio_size: int,
+        bankroll: float,
+        ev_floor: float = 0.20,
+        cash_anchor_fraction: float = 0.0,
+    ) -> None:
+        self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        self._candidates = candidates
+        self._portfolio_size = portfolio_size
+        self._bankroll = float(bankroll)
+        self._ev_floor = float(ev_floor)
+        self._cash_anchor_fraction = float(cash_anchor_fraction)
+
+    def select(
+        self,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> list[tuple[Lineup, float]]:
+        t0 = time.perf_counter()
+        pool_ev = self._robust_payout.mean(axis=1).astype(np.float64)
+        pool_idx = np.where(pool_ev >= self._ev_floor)[0]
+        if len(pool_idx) == 0:
+            logger.warning("KellySelector: no candidates with EV >= $%.2f.", self._ev_floor)
+            return []
+        # float32 rows with float64 accumulators/denominator: the log1p sums
+        # are float64 either way, and the float64 copy would be ~3 GB at
+        # production pool sizes.
+        payout = np.ascontiguousarray(self._robust_payout[pool_idx])  # (M_pool, n_sims) f32
+        ev_vals = pool_ev[pool_idx]
+        M_pool, n_sims = payout.shape
+        size = min(self._portfolio_size, M_pool)
+        n_anchor = int(np.ceil(self._cash_anchor_fraction * self._portfolio_size))
+
+        denom = np.full(n_sims, self._bankroll, dtype=np.float64)
+        selected: list[int] = []
+        remaining = np.ones(M_pool, dtype=bool)
+
+        # Cash-anchor block: pure mean-EV picks; their payouts still update
+        # the portfolio state so the Kelly picks respond to them.
+        anchor_order = np.argsort(ev_vals)[::-1]
+        for i in anchor_order[: min(n_anchor, size)]:
+            selected.append(int(i))
+            remaining[int(i)] = False
+            denom += payout[int(i)]
+
+        # Kelly picks, lazy greedy.
+        gains = _kelly_gains_all(payout, denom, remaining)
+        stale = np.zeros(M_pool, dtype=bool)
+        while len(selected) < size:
+            if stop_check is not None and stop_check():
+                logger.info("KellySelector: stop requested at step %d.", len(selected) + 1)
+                break
+            while True:
+                best = int(np.argmax(gains))
+                if gains[best] == -np.inf:
+                    break
+                if stale[best]:
+                    gains[best] = _kelly_gain_one(payout[best], denom)
+                    stale[best] = False
+                    continue
+                break
+            if gains[best] == -np.inf:
+                break
+            selected.append(best)
+            remaining[best] = False
+            denom += payout[best]
+            gains[best] = -np.inf
+            stale[remaining] = True
+            if progress_cb is not None:
+                progress_cb({
+                    "step": len(selected),
+                    "portfolio_size": size,
+                    "lineup_ev": float(ev_vals[best]),
+                    "n_remaining": int(remaining.sum()),
+                })
+
+        result = [(self._candidates[pool_idx[i]], float(ev_vals[i])) for i in selected]
+        logger.info(
+            "KellySelector done: %d lineups (anchor=%d, B=$%.0f) in %.1fs",
+            len(result), min(n_anchor, size), self._bankroll, time.perf_counter() - t0,
+        )
+        return result
+
+
+_POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+
+class CoveragePortfolioSelector:
+    """Round-10 selector: greedy weighted max-coverage on tail worlds.
+
+    Each candidate carries a bit-vector over worlds (sim × fresh-field
+    pairs): 1 where the candidate beats the simulated field's p99.9. Greedy
+    picks the candidate covering the most uncovered worlds (submodular ⇒
+    (1−1/e) guarantee); ties — including the everything-covered endgame —
+    break by the tie_break vector (win_equity), then mean EV. The first
+    ceil(cash_anchor_fraction × portfolio_size) picks are pure mean-EV rank
+    (cash-anchor block); worlds they cover count as covered.
+    """
+
+    def __init__(
+        self,
+        robust_payout: np.ndarray,
+        candidates: list[Lineup],
+        portfolio_size: int,
+        beat999_bits: np.ndarray,      # (M, n_bytes) uint8, packed world bits
+        tie_break: Optional[np.ndarray] = None,   # (M,) higher = preferred
+        ev_floor: float = 0.20,
+        cash_anchor_fraction: float = 0.0,
+    ) -> None:
+        self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        self._candidates = candidates
+        self._portfolio_size = portfolio_size
+        self._bits = np.asarray(beat999_bits, dtype=np.uint8)
+        self._tie_break = tie_break
+        self._ev_floor = float(ev_floor)
+        self._cash_anchor_fraction = float(cash_anchor_fraction)
+
+    def select(
+        self,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> list[tuple[Lineup, float]]:
+        t0 = time.perf_counter()
+        pool_ev = self._robust_payout.mean(axis=1).astype(np.float64)
+        pool_idx = np.where(pool_ev >= self._ev_floor)[0]
+        if len(pool_idx) == 0:
+            logger.warning("CoverageSelector: no candidates with EV >= $%.2f.", self._ev_floor)
+            return []
+        bits = self._bits[pool_idx]                    # (M_pool, n_bytes)
+        ev_vals = pool_ev[pool_idx]
+        if self._tie_break is not None:
+            tb = np.asarray(self._tie_break, dtype=np.float64)[pool_idx]
+        else:
+            tb = ev_vals
+        M_pool = len(pool_idx)
+        size = min(self._portfolio_size, M_pool)
+        n_anchor = int(np.ceil(self._cash_anchor_fraction * self._portfolio_size))
+
+        uncovered = np.full(bits.shape[1], 0xFF, dtype=np.uint8)
+        selected: list[int] = []
+        remaining = np.ones(M_pool, dtype=bool)
+
+        def _cover(i: int) -> None:
+            np.bitwise_and(uncovered, np.bitwise_not(bits[i]), out=uncovered)
+
+        anchor_order = np.argsort(ev_vals)[::-1]
+        for i in anchor_order[: min(n_anchor, size)]:
+            selected.append(int(i))
+            remaining[int(i)] = False
+            _cover(int(i))
+
+        # Tie-break rank: primary tb, secondary mean EV — encode as a single
+        # dense rank so np.lexsort runs once, not per pick.
+        tb_rank = np.lexsort((ev_vals, tb))            # ascending; higher = better
+        tb_score = np.empty(M_pool, dtype=np.float64)
+        tb_score[tb_rank] = np.arange(M_pool, dtype=np.float64)
+
+        while len(selected) < size:
+            if stop_check is not None and stop_check():
+                logger.info("CoverageSelector: stop requested at step %d.", len(selected) + 1)
+                break
+            new_bits = np.bitwise_and(bits, uncovered[None, :])
+            gains = _POPCOUNT_LUT[new_bits].sum(axis=1).astype(np.float64)  # (M_pool,)
+            gains[~remaining] = -1.0
+            # Ties (incl. the all-covered endgame where every gain is 0)
+            # break by tb_score, which is < 1 in units of whole worlds.
+            best = int(np.argmax(gains + tb_score / M_pool))
+            if gains[best] < 0:
+                break
+            selected.append(best)
+            remaining[best] = False
+            _cover(best)
+            if progress_cb is not None:
+                progress_cb({
+                    "step": len(selected),
+                    "portfolio_size": size,
+                    "lineup_ev": float(ev_vals[best]),
+                    "worlds_gained": int(gains[best]),
+                    "n_remaining": int(remaining.sum()),
+                })
+
+        result = [(self._candidates[pool_idx[i]], float(ev_vals[i])) for i in selected]
+        logger.info(
+            "CoverageSelector done: %d lineups (anchor=%d, %d world-bytes) in %.1fs",
+            len(result), min(n_anchor, size), bits.shape[1], time.perf_counter() - t0,
         )
         return result

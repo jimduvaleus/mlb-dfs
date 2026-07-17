@@ -22,9 +22,14 @@
 #              worlds w (exact per-sim arithmetic on robust_payout).
 #              Diminishing marginal utility in already-covered worlds =
 #              derived world-partitioning. Risk tier maps to bankroll:
-#              B = fee × portfolio_size × {0.5, 1, 2, 4, 8} for risk
+#              B = fee × portfolio_size × {1.25, 1.5, 2, 4, 8} for risk
 #              1..5 (risk 5 ≈ linear-EV limit, risk 1 = strongest
 #              diversifier) — mirrors det's evw interpolation.
+#              [AMENDED 2026-07-17, pre-implementation, no results seen:
+#              originally {0.5, 1, 2, 4, 8}; mult <= 1 makes B <= total
+#              stake so the all-entries-lose world hits log(<=0) —
+#              domain error, not a judgment change. gpp.kelly_bankroll_mult
+#              is a global scale on this table (default 1.0).]
 #   coverage — greedy weighted max-coverage on per-sim booleans
 #              "candidate beats the sim field's p99.9 in world w"
 #              (the p_beat999 machinery, keeping the boolean matrix
@@ -58,6 +63,24 @@
 # ALL 21 graded slates (machinery measurement, not config selection —
 # June does not spend further holdout; May stays untouched).
 #
+# [AMENDED 2026-07-17, pre-implementation-complete, no results seen:
+#  1. Single-run design: generation + scoring dominate wall time (~20
+#     min/slate, round-9 log) and are identical across the three arms, so
+#     one variant (sel3_p150, gpp.selector_mode: all) produces all three
+#     portfolios per run — det under sweep risks 1-5, kelly labeled
+#     11-15, coverage labeled 23 — instead of three separate runs.
+#     Grading compares stages risk1-5 (det control) vs risk11-15 (kelly)
+#     vs risk23 (coverage) from the same run; risk_all mixes modes and is
+#     NOT a judgment stage this round. det picks double as a consistency
+#     check against the existing round-9 blend_full_p150 runs.
+#  2. Slate set: all 35 graded slates (the round-9 blend_full_p150 set in
+#     replay_summary.csv) — the "21" in the original text undercounted
+#     the graded archive; more slates, same discipline.
+#  3. Explicit pins added (simulation.n_sims: 25000,
+#     gpp.candidate_floor_relief: 3000): the machine config.yaml has
+#     drifted to test values (20000/1500) since round-9; the pins restore
+#     the round-9 run config so pools are bit-identical to the control.]
+#
 # Judgment, pre-committed (risk_all pseudo-portfolio unless stated;
 # det variant is the control, graded from the same batch):
 #   PRIMARY (union objective, justification #3): slate hit-rate — the
@@ -80,8 +103,10 @@
 #     other outcome = structural finding, no live change this round.
 #     n≈21 slates is coarse — CIs reported, no overclaiming.
 
-det_p150:
+sel3_p150:
+  simulation.n_sims: 25000
   gpp.n_candidates: 20000
+  gpp.candidate_floor_relief: 3000
   gpp.seed_sim_optimal_lineups: true
   gpp.n_sim_optimals: 5000
   gpp.sim_optimal_min_stack: 5
@@ -90,28 +115,5 @@ det_p150:
   gpp.seed_mutants_per_parent: 4
   gpp.refine_rounds: 0
   gpp.final_n_field_samples: 2
-  gpp.selector_mode: det
-
-kelly_p150:
-  gpp.n_candidates: 20000
-  gpp.seed_sim_optimal_lineups: true
-  gpp.n_sim_optimals: 5000
-  gpp.sim_optimal_min_stack: 5
-  gpp.sim_optimal_min_secondary: 2
-  gpp.sim_optimal_salary_floor: 49500
-  gpp.seed_mutants_per_parent: 4
-  gpp.refine_rounds: 0
-  gpp.final_n_field_samples: 2
-  gpp.selector_mode: kelly
-
-coverage_p150:
-  gpp.n_candidates: 20000
-  gpp.seed_sim_optimal_lineups: true
-  gpp.n_sim_optimals: 5000
-  gpp.sim_optimal_min_stack: 5
-  gpp.sim_optimal_min_secondary: 2
-  gpp.sim_optimal_salary_floor: 49500
-  gpp.seed_mutants_per_parent: 4
-  gpp.refine_rounds: 0
-  gpp.final_n_field_samples: 2
-  gpp.selector_mode: coverage
+  gpp.selector_mode: all
+  gpp.kelly_bankroll_mult: 1.0

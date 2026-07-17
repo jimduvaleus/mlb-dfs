@@ -116,6 +116,13 @@ class GppConfig(BaseModel):
     ev_guardrail: float = -1.0
     selector_score: str = "mean_ev"
     cash_anchor_fraction: float = 0.25
+    # Round-10 selector objective (plans/variants_round10.yaml):
+    # "det" (default) | "kelly" (greedy expected-log-growth on the fresh
+    # robust_payout; risk tier → bankroll B = fee × size × {1.25,1.5,2,4,8},
+    # kelly_bankroll_mult scales the table) | "coverage" (greedy max-coverage
+    # on fresh per-world beat-p999 bits; single risk tier).
+    selector_mode: str = "det"
+    kelly_bankroll_mult: float = 1.0
     # Safety cap on the fresh-rescore slice. The slice itself is defined by
     # ev_floor (rescore everything at/above it, then drop what falls below on
     # fresh EVs); this cap only bounds memory/time on pathological slates.

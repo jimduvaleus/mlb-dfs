@@ -77,6 +77,9 @@ gpp:
   ev_guardrail: -1.0
   selector_score: mean_ev
   cash_anchor_fraction: 0.25
+  # Round-10 selector objective: det (default) | kelly | coverage
+  selector_mode: det
+  kelly_bankroll_mult: 1.0
   final_rescore_top: 20000
   evw_base: 0.15
   evw_max: 0.45
