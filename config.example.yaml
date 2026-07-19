@@ -46,6 +46,19 @@ gpp:
   seed_optimal_lineups: false
   seed_sim_optimal_lineups: false
   n_sim_optimals: 1000
+  sim_optimal_min_stack: 4
+  sim_optimal_min_secondary: 0
+  sim_optimal_salary_floor: null
+  seed_sim_winners: false
+  n_sim_winner_worlds: 8000
+  sim_winner_per_world: 1
+  sim_winner_temp: 0.15
+  sim_winner_own_blend: 0.25
+  # Shape-preserving seed mutation: N mutants per seed parent, exact
+  # team-stack profile preserved (additive on top of n_candidates). 0 = off.
+  seed_mutants_per_parent: 0
+  seed_mutant_salary_locality: 2000.0
+  seed_mutant_pitcher_weight: 0.10
   dump_candidate_pool: true
   measure_sim_ceiling: 200
   candidate_floor_relief: 3000
@@ -56,6 +69,17 @@ gpp:
   final_n_field_samples: 3
   tail_bypass_n: 0
   tail_bypass_ev_floor: -1.0
+  compute_tail_metrics: true
+  tail_ev_min_gross: 100.0
+  funnel_mode: ev_first
+  tail_metric: tail_ev
+  tail_admit_n: 6000
+  ev_guardrail: -1.0
+  selector_score: mean_ev
+  cash_anchor_fraction: 0.25
+  # Round-10 selector objective: det (default) | kelly | coverage
+  selector_mode: det
+  kelly_bankroll_mult: 1.0
   final_rescore_top: 20000
   evw_base: 0.15
   evw_max: 0.45

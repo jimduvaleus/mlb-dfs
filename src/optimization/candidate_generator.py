@@ -585,6 +585,157 @@ class CandidateGenerator:
 
         return results
 
+    def generate_sim_winners(
+        self,
+        sim_matrix: np.ndarray,
+        sim_player_ids: list[int],
+        sim_indices: list[int],
+        per_world: int = 1,
+        temp: float = 0.15,
+        own_blend: float = 0.25,
+        attempts_per_lineup: int = 6,
+        progress_cb: Optional[Callable[[int], None]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> list[Lineup]:
+        """Sample "sim winner" lineups: for each simulated world, draw stacked
+        lineups through the normal _sample_one machinery but with sampling
+        weights derived from that world's realized player scores instead of
+        ownership.
+
+        This is the scaled, diversity-preserving replacement for per-sim exact
+        ILP optima (generate_sim_optimal_lineups): sampling near the top of
+        each world rather than taking its argmax avoids the seed redundancy
+        and structural extremity of exact per-world optima while still
+        concentrating the pool on lineups that win *some* simulated world.
+
+        Parameters
+        ----------
+        sim_matrix : (n_sims, n_players) from SimulationResults
+        sim_player_ids : column order of sim_matrix
+        sim_indices : simulated worlds to draw from (typically
+            stratified_sim_sample so quiet and explosive run environments are
+            both represented)
+        per_world : lineups drawn per world
+        temp : rank-softmax temperature over each world's realized scores
+            (weight = exp((rank_pct - 1) / temp)); lower = greedier toward the
+            world's top scorers
+        own_blend : exponent on normalized ownership multiplied into the
+            world weights — 0 = pure sim-score sampling, 1 = full ownership
+            damping (keeps picks from drifting to unowned punts)
+        """
+        col_map = {int(p): i for i, p in enumerate(sim_player_ids)}
+        batter_pids = [pid for pid in self._pid_to_ow]
+        bat_cols = np.array([col_map.get(pid, -1) for pid in batter_pids], dtype=np.int64)
+        bat_own = np.array([self._pid_to_ow[pid] for pid in batter_pids], dtype=np.float64)
+        pit_ids, pit_own = self._pos_pools.get("P", ([], np.array([])))
+        pit_cols = np.array([col_map.get(pid, -1) for pid in pit_ids], dtype=np.int64)
+        pit_own = np.asarray(pit_own, dtype=np.float64)
+
+        def _norm(w: np.ndarray) -> np.ndarray:
+            mx = w.max() if len(w) and w.max() > 0 else 1.0
+            return w / mx
+
+        bat_own_n = np.power(np.clip(_norm(bat_own), 1e-6, None), own_blend)
+        pit_own_n = np.power(np.clip(_norm(pit_own), 1e-6, None), own_blend)
+
+        def _world_weights(scores: np.ndarray, own_n: np.ndarray, cols: np.ndarray) -> np.ndarray:
+            # rank_pct in (0, 1]; missing-from-sim players get the world floor.
+            n = len(scores)
+            rank_pct = np.empty(n, dtype=np.float64)
+            rank_pct[np.argsort(scores, kind="stable")] = (np.arange(n) + 1) / n
+            w = np.exp((rank_pct - 1.0) / max(temp, 1e-3)) * own_n
+            w[cols == -1] = w.min() if len(w) else 0.0
+            return w
+
+        # Per-team index into batter_pids for fast team-weight sums.
+        team_bat_idx: dict[str, np.ndarray] = {}
+        for i, pid in enumerate(batter_pids):
+            team_bat_idx.setdefault(self._pid_team[pid], []).append(i)
+        team_bat_idx = {t: np.array(ix, dtype=np.int64) for t, ix in team_bat_idx.items()}
+
+        _saved = (self._pid_to_ow, self._pos_pools, self._team_weights)
+        _all_keys = [5, 4, 3]
+        _all_probs = np.array(
+            [self.GROUP_FRACTIONS[k] for k in _all_keys], dtype=np.float64
+        )
+        rng = np.random.default_rng(self._rng_seed)
+        results: list[Lineup] = []
+        seen: set[frozenset] = set()
+        n_failed_worlds = 0
+        try:
+            for w_i, sim_idx in enumerate(sim_indices):
+                if stop_check is not None and w_i % 200 == 0 and stop_check():
+                    break
+                bat_scores = np.where(
+                    bat_cols >= 0, sim_matrix[sim_idx, np.maximum(bat_cols, 0)], -np.inf
+                )
+                pit_scores = np.where(
+                    pit_cols >= 0, sim_matrix[sim_idx, np.maximum(pit_cols, 0)], -np.inf
+                )
+                bw = _world_weights(bat_scores, bat_own_n, bat_cols)
+                pw = _world_weights(pit_scores, pit_own_n, pit_cols)
+
+                self._pid_to_ow = dict(zip(batter_pids, bw))
+                pools = dict(self._pos_pools)
+                for pos_name in _BATTER_POSITIONS:
+                    ids, _ = pools.get(pos_name, ([], np.array([])))
+                    pools[pos_name] = (ids, np.array(
+                        [self._pid_to_ow.get(pid, 0.0) for pid in ids], dtype=np.float64
+                    ))
+                pools["P"] = (pit_ids, pw)
+                self._pos_pools = pools
+                self._team_weights = {
+                    t: float(bw[ix].sum()) for t, ix in team_bat_idx.items()
+                }
+
+                # Primary team ∝ the world's team weight mass — the "hot team"
+                # of this world, softened by the same rank-softmax that formed
+                # the player weights.
+                teams = list(self._team_weights)
+                tw = np.array([self._team_weights[t] for t in teams], dtype=np.float64)
+                if tw.sum() <= 0:
+                    n_failed_worlds += 1
+                    continue
+                tw /= tw.sum()
+
+                made = 0
+                for _ in range(attempts_per_lineup * per_world):
+                    if made >= per_world:
+                        break
+                    primary_team = teams[int(np.searchsorted(np.cumsum(tw), rng.random()))]
+                    g = _all_keys[int(rng.choice(3, p=_all_probs))]
+                    pats = self.STACK_GROUPS[g]
+                    primary_size, secondary_size = pats[int(rng.integers(len(pats)))]
+                    floor = float(self._team_salary_floor.get(
+                        primary_team, self._salary_floor or 0.0
+                    ))
+                    ids, _pt, _st = self._sample_one(
+                        rng, primary_team, primary_size, secondary_size,
+                        effective_floor=floor,
+                    )
+                    if ids is None or not self._check_stack(ids):
+                        continue
+                    key = frozenset(int(p) for p in ids)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(Lineup(player_ids=ids))
+                    made += 1
+                if made == 0:
+                    n_failed_worlds += 1
+                if progress_cb is not None and (w_i + 1) % 500 == 0:
+                    progress_cb(len(results))
+        finally:
+            self._pid_to_ow, self._pos_pools, self._team_weights = _saved
+
+        logger.info(
+            "generate_sim_winners: %d lineups from %d worlds "
+            "(%d worlds produced nothing, %d duplicates avoided).",
+            len(results), len(sim_indices), n_failed_worlds,
+            len(sim_indices) * per_world - len(results) - n_failed_worlds * per_world,
+        )
+        return results
+
     def generate_mutants(
         self,
         parents: list[Lineup],
@@ -619,15 +770,7 @@ class CandidateGenerator:
             rng_seed if rng_seed is not None else self._rng_seed
         )
 
-        # Validation metadata: _pmeta plus eligible_positions when available,
-        # so Lineup.is_valid()'s slot matching honors multi-position players.
-        if not hasattr(self, "_mutant_meta"):
-            self._mutant_meta = {pid: dict(m) for pid, m in self._pmeta.items()}
-            if "eligible_positions" in self._players_df.columns:
-                for r in self._players_df.itertuples(index=False):
-                    ep = r.eligible_positions
-                    if ep is not None:
-                        self._mutant_meta[int(r.player_id)]["eligible_positions"] = list(ep)
+        meta = self._ensure_mutant_meta()
 
         out: list[Lineup] = []
         for parent in parents:
@@ -702,7 +845,163 @@ class CandidateGenerator:
                 if not self._check_stack(ids):
                     continue
                 mutant = Lineup(player_ids=ids)
-                if not mutant.is_valid(self._mutant_meta):
+                if not mutant.is_valid(meta):
+                    continue
+
+                seen.add(key)
+                out.append(mutant)
+                produced += 1
+
+        return out
+
+    def generate_shape_mutants(
+        self,
+        parents: list[Lineup],
+        n_per_parent: int,
+        seen: set,
+        rng_seed: Optional[int] = None,
+        max_attempts_per_mutant: int = 25,
+        salary_locality: float = 2000.0,
+        pitcher_swap_weight: float = 0.10,
+        salary_floor: Optional[float] = None,
+        progress_cb: Optional[Callable[[int], None]] = None,
+        progress_every: int = 500,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> list[Lineup]:
+        """Shape-preserving neighborhood mutants of seed parent lineups.
+
+        Unlike generate_mutants (any-team same-position swaps — mutants
+        routinely break the parent's stack shape), every swap here preserves
+        the parent's team-stack profile exactly:
+
+          - batter slots swap only within the same team, so the per-team
+            hitter counts (primary size, secondary size, team identities)
+            are unchanged by construction; the swap-in must also cover the
+            outgoing player's primary position so slot matching stays
+            feasible;
+          - pitcher slots swap to any pitcher whose opponent has no hitters
+            in the lineup, leaving the hitter shape and DK's
+            pitcher-vs-batter rule untouched.
+
+        Built for seed-first pools (ceiling-first round 6): shaped ILP seeds
+        at refine_rounds=0 give the best measured pool hit99 but starve the
+        Det selector of neighborhood diversity; these mutants restore the
+        diversity without diluting the shape. Replacement sampling is
+        salary-local (weight ∝ exp(-|Δsalary| / salary_locality)).
+
+        Parameters
+        ----------
+        parents : seed lineups to mutate (shaped sim-optimal / sim-winner
+            seeds; any valid lineup works — its shape is what's preserved)
+        n_per_parent : mutants to produce per parent
+        seen : set of frozenset(player_ids) covering the seeds themselves;
+            mutants are deduped against it and added to it
+        salary_floor : overrides the generator floor for these mutants
+            (pass the shaped-seed floor, e.g. gpp.sim_optimal_salary_floor).
+            A mutant below the floor is rejected unless it still spends at
+            least its parent's salary.
+        progress_cb : called with the number of parents processed, every
+            progress_every parents
+        """
+        rng = np.random.default_rng(
+            rng_seed if rng_seed is not None else self._rng_seed
+        )
+        meta = self._ensure_mutant_meta()
+        floor = salary_floor if salary_floor is not None else self._salary_floor
+        pid_salary = self._pid_salary
+        pid_team = self._pid_team
+        pmeta = self._pmeta
+        pitcher_pool, _ = self._pos_pools.get("P", ([], np.array([])))
+
+        def _covers(cand: int, pos: str) -> bool:
+            m = meta[cand]
+            if m["position"] == pos:
+                return True
+            ep = m.get("eligible_positions")
+            return bool(ep) and pos in ep
+
+        out: list[Lineup] = []
+        for n_done, parent in enumerate(parents):
+            if stop_check is not None and stop_check():
+                break
+            if progress_cb is not None and n_done and n_done % progress_every == 0:
+                progress_cb(n_done)
+            p_ids = [int(pid) for pid in parent.player_ids]
+            if any(pid not in pmeta for pid in p_ids):
+                continue
+            parent_salary = sum(pid_salary[pid] for pid in p_ids)
+            roster_size = len(p_ids)
+            hitter_teams = {
+                pid_team[pid] for pid in p_ids if pmeta[pid]["position"] != "P"
+            }
+
+            slot_w = np.array(
+                [
+                    pitcher_swap_weight if pmeta[pid]["position"] == "P" else 1.0
+                    for pid in p_ids
+                ],
+                dtype=np.float64,
+            )
+            slot_w /= slot_w.sum()
+
+            produced = 0
+            attempts = 0
+            max_attempts = n_per_parent * max_attempts_per_mutant
+            while produced < n_per_parent and attempts < max_attempts:
+                attempts += 1
+                ids = list(p_ids)
+                n_swaps = 1 if rng.random() < 0.6 else 2
+                swap_slots = rng.choice(roster_size, size=n_swaps, replace=False, p=slot_w)
+
+                feasible_swap = True
+                for j in swap_slots:
+                    old_pid = ids[j]
+                    pos = pmeta[old_pid]["position"]
+                    in_lineup = set(ids)
+                    if pos == "P":
+                        cand_pids = [
+                            pid for pid in pitcher_pool
+                            if pid not in in_lineup
+                            and self._pid_opponent.get(pid, "") not in hitter_teams
+                        ]
+                    else:
+                        cand_pids = [
+                            pid
+                            for pid in self._team_batters.get(pid_team[old_pid], ())
+                            if pid not in in_lineup and _covers(pid, pos)
+                        ]
+                    if not cand_pids:
+                        feasible_swap = False
+                        break
+                    old_sal = pid_salary[old_pid]
+                    w = np.array(
+                        [
+                            math.exp(-abs(pid_salary[pid] - old_sal) / salary_locality)
+                            for pid in cand_pids
+                        ],
+                        dtype=np.float64,
+                    )
+                    w_sum = w.sum()
+                    if w_sum <= 0:
+                        feasible_swap = False
+                        break
+                    pick = int(np.searchsorted(np.cumsum(w / w_sum), rng.random()))
+                    ids[j] = cand_pids[min(pick, len(cand_pids) - 1)]
+                if not feasible_swap:
+                    continue
+
+                key = frozenset(ids)
+                if key in seen:
+                    continue
+
+                salary = sum(pid_salary[pid] for pid in ids)
+                if floor is not None and salary < floor and salary < parent_salary:
+                    continue
+
+                if not self._check_stack(ids):
+                    continue
+                mutant = Lineup(player_ids=ids)
+                if not mutant.is_valid(meta):
                     continue
 
                 seen.add(key)
@@ -714,6 +1013,18 @@ class CandidateGenerator:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _ensure_mutant_meta(self) -> dict:
+        """Validation metadata: _pmeta plus eligible_positions when available,
+        so Lineup.is_valid()'s slot matching honors multi-position players."""
+        if not hasattr(self, "_mutant_meta"):
+            self._mutant_meta = {pid: dict(m) for pid, m in self._pmeta.items()}
+            if "eligible_positions" in self._players_df.columns:
+                for r in self._players_df.itertuples(index=False):
+                    ep = r.eligible_positions
+                    if ep is not None:
+                        self._mutant_meta[int(r.player_id)]["eligible_positions"] = list(ep)
+        return self._mutant_meta
 
     def _check_stack(self, ids: list[int]) -> bool:
         """Return True iff lineup satisfies the GPP stacking requirement."""

@@ -72,8 +72,57 @@ class GppConfig(BaseModel):
     # sim-p99 (a ceiling statistic mean EV undervalues) into the fresh
     # re-score; they must keep fresh EV >= tail_bypass_ev_floor to reach the
     # selector. 0 disables.
+    # Shape constraints for per-sim optimal seeds (ceiling-first round 3):
+    # unconstrained per-world argmax optima are structurally unlike real
+    # top-1% lineups. min_secondary >= 1 requires a second team with that
+    # many batters; salary_floor overrides the optimizer floor for these
+    # solves only (null = optimizer floor).
+    sim_optimal_min_stack: int = 4
+    sim_optimal_min_secondary: int = 0
+    sim_optimal_salary_floor: Optional[float] = None
+    # Sim-winner seeding (ceiling-first redesign): sampled lineups from many
+    # simulated worlds via per-world score-rank weights — the scaled,
+    # diversity-preserving successor to per-sim exact ILP optima.
+    seed_sim_winners: bool = False
+    n_sim_winner_worlds: int = 8000
+    sim_winner_per_world: int = 1
+    sim_winner_temp: float = 0.15
+    sim_winner_own_blend: float = 0.25
+    # Shape-preserving seed mutation (ceiling-first round-6 follow-up): each
+    # seed parent (sim_optimal + sim_winner) is expanded with N mutants whose
+    # team-stack profile matches the parent exactly (same-team batter swaps;
+    # pitcher swaps re-checked for opponent conflicts). Additive on top of
+    # n_candidates, like refinement mutants. 0 disables.
+    seed_mutants_per_parent: int = 0
+    seed_mutant_salary_locality: float = 2000.0
+    seed_mutant_pitcher_weight: float = 0.10
     tail_bypass_n: int = 2000
     tail_bypass_ev_floor: float = -1.0
+    # Tail-metric computation in ContestScorer (ceiling-first redesign):
+    # tail_ev = expected gross dollars from payout ranks paying
+    # >= tail_ev_min_gross only; p_beat99 = P(candidate beats the simulated
+    # field's p99). Adds a second kernel pass (~doubles scoring time).
+    compute_tail_metrics: bool = True
+    tail_ev_min_gross: float = 100.0
+    # Funnel + selector currency (ceiling-first redesign, Phases 2e/3).
+    # funnel_mode: "ev_first" (EV floor primary, tail lane = tail_bypass_n
+    # side door) | "tail_first" (top tail_admit_n by tail_metric admitted,
+    # held only to ev_guardrail; EV floor lane persists as cash anchor).
+    # selector_score: "mean_ev" | "tail" (EV term = fresh tail currency,
+    # first ceil(cash_anchor_fraction × size) picks stay on mean EV).
+    funnel_mode: str = "ev_first"
+    tail_metric: str = "tail_ev"
+    tail_admit_n: int = 6000
+    ev_guardrail: float = -1.0
+    selector_score: str = "mean_ev"
+    cash_anchor_fraction: float = 0.25
+    # Round-10 selector objective (plans/variants_round10.yaml):
+    # "det" (default) | "kelly" (greedy expected-log-growth on the fresh
+    # robust_payout; risk tier → bankroll B = fee × size × {1.25,1.5,2,4,8},
+    # kelly_bankroll_mult scales the table) | "coverage" (greedy max-coverage
+    # on fresh per-world beat-p999 bits; single risk tier).
+    selector_mode: str = "det"
+    kelly_bankroll_mult: float = 1.0
     # Safety cap on the fresh-rescore slice. The slice itself is defined by
     # ev_floor (rescore everything at/above it, then drop what falls below on
     # fresh EVs); this cap only bounds memory/time on pathological slates.

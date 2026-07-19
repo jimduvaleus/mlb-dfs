@@ -59,6 +59,25 @@ export interface GppConfig {
   final_rescore_top: number
   tail_bypass_n: number
   tail_bypass_ev_floor: number
+  compute_tail_metrics: boolean
+  tail_ev_min_gross: number
+  funnel_mode: string
+  tail_metric: string
+  tail_admit_n: number
+  ev_guardrail: number
+  selector_score: string
+  cash_anchor_fraction: number
+  sim_optimal_min_stack: number
+  sim_optimal_min_secondary: number
+  sim_optimal_salary_floor: number | null
+  seed_sim_winners: boolean
+  n_sim_winner_worlds: number
+  sim_winner_per_world: number
+  sim_winner_temp: number
+  sim_winner_own_blend: number
+  seed_mutants_per_parent: number
+  seed_mutant_salary_locality: number
+  seed_mutant_pitcher_weight: number
   evw_base: number
   evw_max: number
   ev_floor: number
@@ -351,7 +370,7 @@ export interface GppDetSelectProgressEvent extends SSEEvent {
   step: number
   portfolio_size: number
   lineup_ev: number
-  partial_var: number
+  distance: number
   score: number
   n_remaining: number
   risk: number
@@ -391,6 +410,16 @@ export interface GppFieldInjectEvent extends SSEEvent {
   n_k: number
 }
 
+export interface ExternalPoolStatus {
+  available: boolean
+  lineups_file: string | null
+  projections_file: string | null
+  n_lineups: number | null
+  n_contests: number | null
+  paired_by_token: boolean
+  error?: string | null
+}
+
 export interface CacheStatus {
   fingerprint: string
   candidates: number | null   // null = no cache
@@ -399,6 +428,7 @@ export interface CacheStatus {
   n_configured_field_k: number
   is_gpp: boolean
   n_batter_teams: number
+  external_pool?: ExternalPoolStatus
 }
 
 export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 'replacing' | 'reselecting'

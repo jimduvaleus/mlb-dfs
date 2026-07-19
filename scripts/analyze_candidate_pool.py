@@ -295,6 +295,14 @@ def build_lineup_table(pool_df: pd.DataFrame, fpts_map: dict[int, float]) -> pd.
     if "tail_bypass" not in df.columns:
         df["tail_bypass"] = 0
 
+    # Per-lineup ranking-metric columns (constant per lineup_index) added by
+    # the ceiling-first redesign; carried through generically so newer dumps
+    # grade richer and older dumps still load.
+    _extra_metric_cols = [
+        c for c in ("sim_p99", "tail_ev", "p_beat99", "fresh_tail_ev", "fresh_p_beat99",
+                    "p_beat999", "est_dupes", "win_equity")
+        if c in df.columns
+    ]
     grouped = df.groupby("lineup_index")
     out = grouped.agg(
         projected_score=("mean", "sum"),
@@ -308,6 +316,7 @@ def build_lineup_table(pool_df: pd.DataFrame, fpts_map: dict[int, float]) -> pd.
         n_players=("player_id", "count"),
         n_missing=("actual_fpts", lambda s: s.isna().sum()),
         actual_score=("actual_fpts", "sum"),
+        **{c: (c, "first") for c in _extra_metric_cols},
     ).reset_index()
     out.loc[out["n_missing"] > 0, "actual_score"] = np.nan
     return out

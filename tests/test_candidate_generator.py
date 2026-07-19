@@ -604,3 +604,123 @@ def test_cheap_primary_team_proportional_with_salary_floor():
         f"CHEAP generated only {cheap_primary_count}/{len(results)} primary lineups; "
         "expected ≥ 10. Per-team floor may not be lowering correctly for cheap teams."
     )
+
+
+# ------------------------------------------------------------------ #
+#  Shape-preserving seed mutation tests                                #
+# ------------------------------------------------------------------ #
+
+def _team_stack_profile(lu, pid_pos, pid_team):
+    """Hitter count per team — the shape the mutants must preserve exactly."""
+    counts: dict[str, int] = {}
+    for pid in lu.player_ids:
+        if pid_pos[pid] != "P":
+            t = pid_team[pid]
+            counts[t] = counts.get(t, 0) + 1
+    return counts
+
+
+@pytest.fixture
+def pid_lookups(players_df):
+    pid_pos = dict(zip(players_df["player_id"], players_df["position"]))
+    pid_team = dict(zip(players_df["player_id"], players_df["team"]))
+    pid_sal = dict(zip(players_df["player_id"], players_df["salary"]))
+    pid_opp = dict(zip(players_df["player_id"], players_df["opponent"]))
+    return pid_pos, pid_team, pid_sal, pid_opp
+
+
+def test_shape_mutants_preserve_team_stack_profile(generator, pid_lookups):
+    pid_pos, pid_team, _, _ = pid_lookups
+    parents = generator.generate(n_candidates=30)
+    seen = {frozenset(lu.player_ids) for lu in parents}
+    n_mutants = 0
+    for parent in parents:
+        mutants = generator.generate_shape_mutants(
+            [parent], n_per_parent=3, seen=seen, rng_seed=7,
+        )
+        p_profile = _team_stack_profile(parent, pid_pos, pid_team)
+        for m in mutants:
+            assert _team_stack_profile(m, pid_pos, pid_team) == p_profile, (
+                f"Mutant broke parent stack profile: {p_profile} -> "
+                f"{_team_stack_profile(m, pid_pos, pid_team)}"
+            )
+        n_mutants += len(mutants)
+    assert n_mutants >= 10, f"Only {n_mutants} mutants produced across 30 parents"
+
+
+def test_shape_mutants_valid_unique_and_deduped(generator, players_df):
+    from src.optimization.optimizer import _build_player_meta
+    pmeta = _build_player_meta(players_df)
+    parents = generator.generate(n_candidates=20)
+    seen = {frozenset(lu.player_ids) for lu in parents}
+    parent_keys = set(seen)
+    mutants = generator.generate_shape_mutants(
+        parents, n_per_parent=3, seen=seen, rng_seed=11,
+    )
+    assert mutants, "No mutants produced"
+    keys = [frozenset(m.player_ids) for m in mutants]
+    assert len(set(keys)) == len(keys), "Duplicate mutants"
+    assert not (set(keys) & parent_keys), "Mutant duplicates a parent"
+    for m in mutants:
+        assert len(set(m.player_ids)) == 10
+        assert m.is_valid(pmeta), f"Invalid mutant: {m.player_ids}"
+
+
+def test_shape_mutants_no_pitcher_batter_conflict(generator, pid_lookups):
+    pid_pos, pid_team, _, pid_opp = pid_lookups
+    parents = generator.generate(n_candidates=30)
+    seen = {frozenset(lu.player_ids) for lu in parents}
+    mutants = generator.generate_shape_mutants(
+        parents, n_per_parent=3, seen=seen, rng_seed=13,
+        pitcher_swap_weight=0.5,  # force plenty of pitcher swaps
+    )
+    assert mutants
+    for m in mutants:
+        hitter_teams = {pid_team[p] for p in m.player_ids if pid_pos[p] != "P"}
+        for p in m.player_ids:
+            if pid_pos[p] == "P":
+                assert pid_opp[p] not in hitter_teams, (
+                    f"Pitcher {p} opposes rostered hitters in {m.player_ids}"
+                )
+
+
+def test_shape_mutants_salary_floor_relief(generator, pid_lookups):
+    _, _, pid_sal, _ = pid_lookups
+    parents = generator.generate(n_candidates=20)
+    seen = {frozenset(lu.player_ids) for lu in parents}
+    # Unreachable floor: every mutant must then spend >= its parent's salary.
+    for parent in parents:
+        mutants = generator.generate_shape_mutants(
+            [parent], n_per_parent=3, seen=seen, rng_seed=17,
+            salary_floor=60_000.0,
+        )
+        p_sal = sum(pid_sal[p] for p in parent.player_ids)
+        for m in mutants:
+            assert sum(pid_sal[p] for p in m.player_ids) >= p_sal
+
+
+def test_shape_mutants_deterministic(generator):
+    parents = generator.generate(n_candidates=15)
+    base_seen = {frozenset(lu.player_ids) for lu in parents}
+    m1 = generator.generate_shape_mutants(
+        parents, n_per_parent=2, seen=set(base_seen), rng_seed=23,
+    )
+    m2 = generator.generate_shape_mutants(
+        parents, n_per_parent=2, seen=set(base_seen), rng_seed=23,
+    )
+    assert [m.player_ids for m in m1] == [m.player_ids for m in m2]
+
+
+def test_shape_mutants_respect_preexisting_seen(generator):
+    parents = generator.generate(n_candidates=15)
+    base_seen = {frozenset(lu.player_ids) for lu in parents}
+    first = generator.generate_shape_mutants(
+        parents, n_per_parent=2, seen=set(base_seen), rng_seed=29,
+    )
+    assert first
+    blocked = set(base_seen) | {frozenset(m.player_ids) for m in first}
+    second = generator.generate_shape_mutants(
+        parents, n_per_parent=2, seen=blocked, rng_seed=29,
+    )
+    assert not ({frozenset(m.player_ids) for m in second}
+                & {frozenset(m.player_ids) for m in first})

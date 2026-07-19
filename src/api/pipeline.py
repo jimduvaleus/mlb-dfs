@@ -217,12 +217,29 @@ class PipelineRunner:
         stop_check: Optional[Callable[[], bool]] = None,
         use_cached_candidates: bool = False,
         use_cached_field: bool = False,
+        persist_caches: bool = True,
+        sim_cache_path: Optional[str] = None,
+        use_external_pool: bool = False,
     ):
         self._config_path = config_path
         self._cb = progress_cb or (lambda stage, data: None)
         self._stop_check = stop_check
         self._use_cached_candidates = use_cached_candidates
         self._use_cached_field = use_cached_field
+        # External candidate pool mode (SaberSim import): bypass generation
+        # and contest simulation, allocate per-contest portfolios from the
+        # imported pool. Cached candidates/field are meaningless here.
+        self._use_external_pool = use_external_pool
+        self._external_mode = False
+        if use_external_pool:
+            self._use_cached_candidates = False
+            self._use_cached_field = False
+        # Replay-only knobs (scripts/replay_slate.py); the live server never
+        # sets these. persist_caches=False keeps offline replays from writing
+        # into the shared data/lineup_cache/. sim_cache_path reuses one
+        # simulation across config variants of the same archived slate.
+        self._persist_caches = persist_caches
+        self._sim_cache_path = sim_cache_path
 
     # ------------------------------------------------------------------
     # Public API
@@ -296,6 +313,12 @@ class PipelineRunner:
         slate_df = ingestor.get_slate_dataframe()
         n_teams = slate_df["team"].nunique()
         logger.info("Slate loaded: %d players, %d teams", len(slate_df), n_teams)
+
+        if self._use_external_pool:
+            return self._run_external(
+                cfg, paths, sim_cfg, platform, slate_path, slate_df,
+                all_file_entries, entry_handlers, output_dir,
+            )
 
         # --- Projections (optional) --------------------------------------
         proj_df = None
@@ -406,7 +429,31 @@ class PipelineRunner:
             copula, sim_players_df, batter_pca_model=pca_model, score_grid=score_grid,
             quantile_grids=quantile_grids,
         )
-        sim_results = engine.simulate(n_sims)
+        sim_results = None
+        if self._sim_cache_path and os.path.exists(self._sim_cache_path):
+            try:
+                with np.load(self._sim_cache_path) as _sim_npz:
+                    sim_results = SimulationResults(
+                        [int(p) for p in _sim_npz["player_ids"]],
+                        _sim_npz["results_matrix"].astype(np.float64),
+                    )
+                logger.info("Simulation loaded from cache %s", self._sim_cache_path)
+            except Exception as exc:
+                logger.warning(
+                    "Sim cache %s unreadable (%s) — re-simulating.",
+                    self._sim_cache_path, exc,
+                )
+                sim_results = None
+        if sim_results is None:
+            sim_results = engine.simulate(n_sims)
+            if self._sim_cache_path:
+                os.makedirs(os.path.dirname(self._sim_cache_path), exist_ok=True)
+                np.savez_compressed(
+                    self._sim_cache_path,
+                    player_ids=np.asarray(sim_results.player_ids, dtype=np.int64),
+                    results_matrix=sim_results.results_matrix.astype(np.float32),
+                )
+                logger.info("Simulation saved to cache %s", self._sim_cache_path)
         logger.info(
             "Simulation complete — matrix: %s  RSS=%.0f MB",
             sim_results.results_matrix.shape, _proc_rss_mb(),
@@ -637,6 +684,8 @@ class PipelineRunner:
         _gpp_stopped = self._stop_check is not None and self._stop_check
         self._optimal_lineups: list = []  # populated only on fresh (non-cached) runs
         self._sim_optimal_lineups: list = []  # populated only on fresh (non-cached) runs
+        self._sim_winner_lineups: list = []  # populated only on fresh (non-cached) runs
+        self._seed_mutant_lineups: list = []  # populated only on fresh (non-cached) runs
 
         # Compute slate fingerprint for lineup cache (mtime_ns:size)
         from pathlib import Path as _Path
@@ -711,7 +760,7 @@ class PipelineRunner:
                     "n_generated": len(candidates),
                     "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
                 })
-                if _slate_fp and not (_gpp_stopped and self._stop_check()):
+                if _slate_fp and self._persist_caches and not (_gpp_stopped and self._stop_check()):
                     save_candidates(_slate_fp, candidates, salary_floor=salary_floor_gpp)
 
             # Restore optimal lineups from persisted JSON if fingerprints match.
@@ -881,13 +930,25 @@ class PipelineRunner:
                     _so_sampled = stratified_sim_sample(
                         sim_results.results_matrix, n_sim_optimals, _so_rng,
                     )
+                    # Shape knobs (ceiling-first round 3): unconstrained
+                    # per-world argmax optima are structurally unlike real
+                    # top-1% lineups (2.5% prim5 / 43% sec2 / 7.8% at-cap vs
+                    # 63.6% / 81% / 28.7%) — these force winner shape onto
+                    # the world-optimal player cores.
+                    _so_min_stack = int(gpp_cfg.get("sim_optimal_min_stack", 4))
+                    _so_min_secondary = int(gpp_cfg.get("sim_optimal_min_secondary", 0)) or None
+                    _so_floor_cfg = gpp_cfg.get("sim_optimal_salary_floor")
+                    _so_floor = (
+                        float(_so_floor_cfg) if _so_floor_cfg else salary_floor_gpp
+                    )
                     _sim_optimal_lineups = generate_sim_optimal_lineups(
                         cand_players_df,
                         sim_results.results_matrix,
                         sim_results.player_ids,
                         [s for s, _ in _so_sampled],
-                        min_stack=4,
-                        salary_floor=salary_floor_gpp,
+                        min_stack=_so_min_stack,
+                        min_secondary=_so_min_secondary,
+                        salary_floor=_so_floor,
                         seen={
                             frozenset(int(p) for p in lu.player_ids)
                             for lu in _optimal_lineups
@@ -911,12 +972,115 @@ class PipelineRunner:
                     "n_generated": len(_sim_optimal_lineups),
                 })
 
-            _n_seeded = len(_optimal_lineups) + len(_sim_optimal_lineups)
+            # Sim-winner seeding (ceiling-first redesign, Phase 1b): sampled —
+            # not argmax — lineups from many simulated worlds, drawn through
+            # the normal stack machinery with per-world score-rank weights.
+            # The scaled successor to per-sim exact ILP optima.
+            _sim_winner_lineups: list = []
+            _seed_sim_winners = bool(gpp_cfg.get("seed_sim_winners", False))
+            _n_sim_winner_worlds = int(gpp_cfg.get("n_sim_winner_worlds", 8000))
+            if (
+                _seed_sim_winners and _n_sim_winner_worlds > 0
+                and not (_gpp_stopped and self._stop_check())
+            ):
+                from src.optimization.optimal_lineups import stratified_sim_sample
+                _t_sw = time.perf_counter()
+                self._cb("gpp_sim_winner_start", {"n_worlds": _n_sim_winner_worlds})
+                try:
+                    _sw_rng = np.random.default_rng(
+                        int(opt_cfg.get("rng_seed") or 42) + 224737
+                    )
+                    _sw_sampled = stratified_sim_sample(
+                        sim_results.results_matrix, _n_sim_winner_worlds, _sw_rng,
+                    )
+                    _sim_winner_lineups = gen.generate_sim_winners(
+                        sim_results.results_matrix,
+                        sim_results.player_ids,
+                        [s for s, _ in _sw_sampled],
+                        per_world=int(gpp_cfg.get("sim_winner_per_world", 1)),
+                        temp=float(gpp_cfg.get("sim_winner_temp", 0.15)),
+                        own_blend=float(gpp_cfg.get("sim_winner_own_blend", 0.25)),
+                        progress_cb=lambda n: self._cb(
+                            "gpp_sim_winner_progress",
+                            {"n": n, "total": _n_sim_winner_worlds},
+                        ),
+                        stop_check=self._stop_check,
+                    )
+                    logger.info(
+                        "[TIMING] Sim-winner seeding: %d lineups from %d worlds in %.1fs",
+                        len(_sim_winner_lineups), _n_sim_winner_worlds,
+                        time.perf_counter() - _t_sw,
+                    )
+                except Exception as _sw_e:
+                    logger.warning("Sim-winner seeding failed: %s", _sw_e)
+                    _sim_winner_lineups = []
+                self._cb("gpp_sim_winner_done", {"n_generated": len(_sim_winner_lineups)})
+
+            # Shape-preserving seed mutation (ceiling-first round 6 follow-up):
+            # expand each seed parent with mutants that keep its team-stack
+            # profile exactly (same-team batter swaps; conflict-checked
+            # pitcher swaps). Restores the neighborhood diversity that
+            # refine_rounds=0 removed without diluting pool shape. Additive
+            # on top of n_candidates, like refinement mutants.
+            _seed_mutant_lineups: list = []
+            _n_seed_mut = int(gpp_cfg.get("seed_mutants_per_parent", 0))
+            _seed_parents = _sim_optimal_lineups + _sim_winner_lineups
+            if (
+                _n_seed_mut > 0 and _seed_parents
+                and not (_gpp_stopped and self._stop_check())
+            ):
+                _t_sm = time.perf_counter()
+                self._cb("gpp_seed_mutant_start", {
+                    "n_parents": len(_seed_parents),
+                    "per_parent": _n_seed_mut,
+                })
+                try:
+                    _sm_seen = {
+                        frozenset(int(p) for p in lu.player_ids)
+                        for lu in _optimal_lineups + _seed_parents
+                    }
+                    _sm_floor_cfg = gpp_cfg.get("sim_optimal_salary_floor")
+                    _seed_mutant_lineups = gen.generate_shape_mutants(
+                        _seed_parents,
+                        n_per_parent=_n_seed_mut,
+                        seen=_sm_seen,
+                        rng_seed=int(opt_cfg.get("rng_seed") or 42) + 611953,
+                        salary_locality=float(
+                            gpp_cfg.get("seed_mutant_salary_locality", 2000.0)
+                        ),
+                        pitcher_swap_weight=float(
+                            gpp_cfg.get("seed_mutant_pitcher_weight", 0.10)
+                        ),
+                        salary_floor=(
+                            float(_sm_floor_cfg) if _sm_floor_cfg else salary_floor_gpp
+                        ),
+                        progress_cb=lambda n: self._cb(
+                            "gpp_seed_mutant_progress",
+                            {"n": n, "total": len(_seed_parents)},
+                        ),
+                        stop_check=self._stop_check,
+                    )
+                    logger.info(
+                        "[TIMING] Seed mutation: %d shape-preserving mutants "
+                        "from %d parents in %.1fs",
+                        len(_seed_mutant_lineups), len(_seed_parents),
+                        time.perf_counter() - _t_sm,
+                    )
+                except Exception as _sm_e:
+                    logger.warning("Seed mutation failed: %s", _sm_e)
+                    _seed_mutant_lineups = []
+                self._cb("gpp_seed_mutant_done", {
+                    "n_generated": len(_seed_mutant_lineups),
+                })
+
+            _n_seeded = len(_optimal_lineups) + len(_sim_optimal_lineups) + len(_sim_winner_lineups)
             n_random = max(0, n_candidates - _n_seeded)
             self._cb("gpp_generate_start", {
-                "n_candidates": n_random + _n_seeded,
+                "n_candidates": n_random + _n_seeded + len(_seed_mutant_lineups),
                 **({"n_from_optimal": len(_optimal_lineups)} if _optimal_lineups else {}),
                 **({"n_from_sim_optimal": len(_sim_optimal_lineups)} if _sim_optimal_lineups else {}),
+                **({"n_from_sim_winner": len(_sim_winner_lineups)} if _sim_winner_lineups else {}),
+                **({"n_from_seed_mutant": len(_seed_mutant_lineups)} if _seed_mutant_lineups else {}),
             })
             random_cands = gen.generate(
                 n_candidates=n_random,
@@ -925,15 +1089,20 @@ class PipelineRunner:
                 stop_check=self._stop_check,
                 progress_cb=lambda n: self._cb("gpp_generate_progress", {"n": n}),
             )
-            candidates = _optimal_lineups + _sim_optimal_lineups + random_cands
+            candidates = (
+                _optimal_lineups + _sim_optimal_lineups + _sim_winner_lineups
+                + _seed_mutant_lineups + random_cands
+            )
             self._cb("gpp_generate_done", {
                 "n_generated": len(candidates),
                 "team_distribution": _candidate_team_distribution(candidates, cand_players_df),
             })
-            if _slate_fp and candidates and not (_gpp_stopped and self._stop_check()):
+            if _slate_fp and candidates and self._persist_caches and not (_gpp_stopped and self._stop_check()):
                 save_candidates(_slate_fp, candidates, salary_floor=salary_floor_gpp)
             self._optimal_lineups = _optimal_lineups
             self._sim_optimal_lineups = _sim_optimal_lineups
+            self._sim_winner_lineups = _sim_winner_lineups
+            self._seed_mutant_lineups = _seed_mutant_lineups
 
         logger.info("Candidate pool: %d lineups.", len(candidates))
         logger.info(
@@ -1007,6 +1176,8 @@ class PipelineRunner:
                 dupe_stack_coef=float(gpp_cfg.get("dupe_stack_coef", 0.024)),
                 dupe_min_gross_payout=float(gpp_cfg.get("dupe_min_gross_payout", 15.0)),
                 salary_cap=float(roster_rules.salary_cap),
+                compute_tail_metrics=bool(gpp_cfg.get("compute_tail_metrics", True)),
+                tail_ev_min_gross=float(gpp_cfg.get("tail_ev_min_gross", 100.0)),
             )
             logger.info("Pre-scoring RSS: %.0f MB  (candidates=%d)", _proc_rss_mb(), len(candidates))
             _t_score = time.perf_counter()
@@ -1022,6 +1193,12 @@ class PipelineRunner:
                     {"n_done": n_done, "n_total": n_total},
                 ),
             )
+            # Mined tail metrics, kept row-aligned with robust_payout through
+            # refinement concats (ceiling-first redesign, Phase 2).
+            _mined_tail_ev = scorer.last_tail_ev
+            _mined_p_beat99 = scorer.last_p_beat99
+            _mined_p_beat999 = scorer.last_p_beat999
+            _mined_e_dupes = scorer.last_e_dupes
             logger.info(
                 "[TIMING] score_candidates wall time: %.3fs  "
                 "robust_payout shape=%s (%.1f MB)  field_from_cache=%s  RSS=%.0f MB",
@@ -1029,7 +1206,7 @@ class PipelineRunner:
                 robust_payout.shape, robust_payout.nbytes / 1e6,
                 _cached_field is not None, _proc_rss_mb(),
             )
-            if _cached_field is None and scorer.last_raw_field_list and _slate_fp:
+            if _cached_field is None and scorer.last_raw_field_list and _slate_fp and self._persist_caches:
                 save_field(_slate_fp, scorer.last_raw_field_list)
             self._cb("gpp_score_done", {})
 
@@ -1208,6 +1385,12 @@ class PipelineRunner:
                     robust_payout = np.concatenate(
                         [robust_payout, _payout_new], axis=0
                     )
+                    if _mined_tail_ev is not None and scorer.last_tail_ev is not None:
+                        _mined_tail_ev = np.concatenate([_mined_tail_ev, scorer.last_tail_ev])
+                        _mined_p_beat99 = np.concatenate([_mined_p_beat99, scorer.last_p_beat99])
+                        _mined_p_beat999 = np.concatenate([_mined_p_beat999, scorer.last_p_beat999])
+                    if _mined_e_dupes is not None and scorer.last_e_dupes is not None:
+                        _mined_e_dupes = np.concatenate([_mined_e_dupes, scorer.last_e_dupes])
                     del _payout_new
                     logger.info(
                         "Refine round %d/%d post-concat  RSS=%.0f MB  robust_payout=%.0f MB",
@@ -1298,6 +1481,22 @@ class PipelineRunner:
             # the winner's-curse protection extends to them too.
             _tail_bypass_n = int(gpp_cfg.get("tail_bypass_n", 2000))
             _tail_bypass_floor = float(gpp_cfg.get("tail_bypass_ev_floor", -1.0))
+            # Funnel mode (ceiling-first redesign, Phase 2e).
+            #   ev_first    — mined-EV floor is the primary admission lane;
+            #                 the tail lane is a side door of tail_bypass_n
+            #                 candidates held to tail_bypass_ev_floor.
+            #   tail_first  — the tail lane IS the primary lane: the top
+            #                 tail_admit_n candidates by gpp.tail_metric are
+            #                 admitted and held only to the ev_guardrail
+            #                 (mean EV demoted to a dollar-torcher guardrail).
+            #                 The EV-floor lane persists as the cash-anchor
+            #                 source. Implemented by reusing the bypass
+            #                 plumbing with the lane size and guardrail.
+            _funnel_mode = str(gpp_cfg.get("funnel_mode", "ev_first")).lower()
+            _tail_metric_name = str(gpp_cfg.get("tail_metric", "tail_ev")).lower()
+            if _funnel_mode == "tail_first":
+                _tail_bypass_n = int(gpp_cfg.get("tail_admit_n", 6000))
+                _tail_bypass_floor = float(gpp_cfg.get("ev_guardrail", -1.0))
             _tail_bypass_keys: set = set()
             _n_bypass_survivors = 0
             # Full mined pool retained for the candidate-pool debug dump:
@@ -1305,6 +1504,18 @@ class PipelineRunner:
             # whole pool, not just the fresh-scored slice Phase 3 consumes.
             _dump_pool_candidates: Optional[list] = None
             _dump_pool_mined_ev: Optional[np.ndarray] = None
+            _dump_pool_tail_ev: Optional[np.ndarray] = None
+            _dump_pool_p_beat99: Optional[np.ndarray] = None
+            _dump_pool_p_beat999: Optional[np.ndarray] = None
+            _dump_pool_e_dupes: Optional[np.ndarray] = None
+            _fresh_tail_ev: Optional[np.ndarray] = None
+            _fresh_p_beat99: Optional[np.ndarray] = None
+            # Round-10 selector-mode state (kelly/coverage need fresh-pass
+            # artifacts the det path never consumed).
+            _selector_mode = str(gpp_cfg.get("selector_mode", "det")).lower()
+            _fresh_p_beat999: Optional[np.ndarray] = None
+            _fresh_e_dupes: Optional[np.ndarray] = None
+            _fresh_beat_bits: Optional[np.ndarray] = None
             if (
                 final_k > 0 and rescore_cap > 0
                 and not (_gpp_stopped and self._stop_check())
@@ -1313,6 +1524,10 @@ class PipelineRunner:
                 _mined_ev = robust_payout.mean(axis=1)
                 _dump_pool_candidates = candidates
                 _dump_pool_mined_ev = _mined_ev
+                _dump_pool_tail_ev = _mined_tail_ev
+                _dump_pool_p_beat99 = _mined_p_beat99
+                _dump_pool_p_beat999 = _mined_p_beat999
+                _dump_pool_e_dupes = _mined_e_dupes
                 _keep_idx = np.where(_mined_ev >= _floor)[0]
                 # Tiny-pool fallback: always rescore enough to fill a
                 # portfolio even when the floor culls nearly everything.
@@ -1336,7 +1551,22 @@ class PipelineRunner:
                 _bypass_idx = np.array([], dtype=np.int64)
                 if _tail_bypass_n > 0:
                     try:
-                        _tail_scores = _candidate_sim_tail_scores(candidates, sim_results)
+                        # Tail-lane ranking currency (gpp.tail_metric):
+                        # tail_ev / p_beat99 come from the scorer's kernel
+                        # accumulators; sim_p99 is the field-independent
+                        # fallback (and the pre-redesign behavior).
+                        if _tail_metric_name == "tail_ev" and _mined_tail_ev is not None:
+                            _tail_scores = np.asarray(_mined_tail_ev, dtype=np.float64)
+                        elif _tail_metric_name == "p_beat99" and _mined_p_beat99 is not None:
+                            _tail_scores = np.asarray(_mined_p_beat99, dtype=np.float64)
+                        else:
+                            if _tail_metric_name not in ("sim_p99",):
+                                logger.warning(
+                                    "tail_metric '%s' unavailable "
+                                    "(compute_tail_metrics off?) — using sim_p99.",
+                                    _tail_metric_name,
+                                )
+                            _tail_scores = _candidate_sim_tail_scores(candidates, sim_results)
                         _in_keep = np.zeros(len(candidates), dtype=bool)
                         _in_keep[_keep_idx] = True
                         _below = np.where(~_in_keep & np.isfinite(_tail_scores))[0]
@@ -1387,6 +1617,10 @@ class PipelineRunner:
                 # already holds everything the telemetry needs.
                 robust_payout = None
                 gc.collect()
+                # Coverage selector consumes per-world beat-p999 bits from
+                # this pass only; keep the flag off for every other mode so
+                # the mined-stage memory profile is unchanged.
+                scorer.retain_beat999_worlds = _selector_mode in ("coverage", "all")
                 robust_payout = scorer.rescore_fresh_fields(
                     candidates, n_samples=final_k,
                     stop_check=self._stop_check,
@@ -1405,6 +1639,13 @@ class PipelineRunner:
                     ),
                 )
                 _fresh_ev = robust_payout.mean(axis=1)
+                _fresh_tail_ev = scorer.last_tail_ev
+                _fresh_p_beat99 = scorer.last_p_beat99
+                _fresh_p_beat999 = scorer.last_p_beat999
+                _fresh_e_dupes = scorer.last_e_dupes
+                _fresh_beat_bits = scorer.last_beat999_bits
+                scorer.retain_beat999_worlds = False
+                scorer.last_beat999_bits = None
                 # Winner's-curse telemetry: how much of the mined top-EV was
                 # overfit to the first-stage fields?
                 _wc_k = min(50, len(candidates))
@@ -1440,6 +1681,15 @@ class PipelineRunner:
                     robust_payout = robust_payout[_surv]
                     _fresh_ev = _fresh_ev[_surv]
                     _is_bypass = _is_bypass[_surv]
+                    if _fresh_tail_ev is not None:
+                        _fresh_tail_ev = _fresh_tail_ev[_surv]
+                        _fresh_p_beat99 = _fresh_p_beat99[_surv]
+                    if _fresh_p_beat999 is not None:
+                        _fresh_p_beat999 = _fresh_p_beat999[_surv]
+                    if _fresh_e_dupes is not None:
+                        _fresh_e_dupes = _fresh_e_dupes[_surv]
+                    if _fresh_beat_bits is not None:
+                        _fresh_beat_bits = _fresh_beat_bits[_surv]
                 _n_bypass_survivors = int(_is_bypass.sum())
 
                 logger.info(
@@ -1496,19 +1746,141 @@ class PipelineRunner:
                     # tail-bypass survivor.
                     _ev_floor = min(_ev_floor, _tail_bypass_floor)
 
+                # Selector EV-term basis (ceiling-first redesign, Phase 3):
+                # "mean_ev" = today's behavior; "tail" ranks the EV term by
+                # the fresh tail currency (gpp.tail_metric), with the first
+                # ceil(cash_anchor_fraction × size) picks still on mean EV.
+                _selector_score = str(gpp_cfg.get("selector_score", "mean_ev")).lower()
+                _cash_anchor_fraction = float(gpp_cfg.get("cash_anchor_fraction", 0.25))
+                _ev_override_vec = None
+                if _selector_score == "tail":
+                    if _tail_metric_name == "tail_ev" and _fresh_tail_ev is not None:
+                        _ev_override_vec = np.asarray(_fresh_tail_ev, dtype=np.float64)
+                    elif _tail_metric_name == "p_beat99" and _fresh_p_beat99 is not None:
+                        _ev_override_vec = np.asarray(_fresh_p_beat99, dtype=np.float64)
+                    else:
+                        try:
+                            _sp = _candidate_sim_tail_scores(candidates, sim_results)
+                            _sp_min = float(np.min(_sp[np.isfinite(_sp)])) if np.isfinite(_sp).any() else 0.0
+                            _ev_override_vec = np.where(np.isfinite(_sp), _sp, _sp_min)
+                        except Exception as _so_e:
+                            logger.warning(
+                                "selector_score='tail' fallback sim_p99 failed "
+                                "(%s) — using mean EV.", _so_e,
+                            )
                 logger.info(
-                    "Det-EV sweep — portfolio_size=%d, risks=%s, evw_base=%.3f, evw_max=%.3f, ev_floor=%.2f",
+                    "Det-EV sweep — portfolio_size=%d, risks=%s, evw_base=%.3f, evw_max=%.3f, "
+                    "ev_floor=%.2f, selector_score=%s%s",
                     portfolio_size, _DET_SWEEP_RISKS, _evw_base, _evw_max, _ev_floor,
+                    _selector_score if _ev_override_vec is not None else "mean_ev",
+                    (f" (anchor={_cash_anchor_fraction:.2f})" if _ev_override_vec is not None else ""),
                 )
+
+                # Round-10 selector modes. kelly/coverage build the sweep
+                # themselves and skip the det path's M×M correlation matmul;
+                # det (default) keeps today's behavior exactly. "all" runs
+                # every mode off the one pipeline run (replay economics:
+                # generation + scoring dominate; selection is seconds), with
+                # kelly labeled risk+10 (11-15) and coverage labeled 23 so
+                # the sweep keys and dump's selected_risks stay distinct.
+                _det_sweep_risks = _DET_SWEEP_RISKS
+                if _selector_mode in ("kelly", "all"):
+                    from src.optimization.gpp_portfolio import KellyPortfolioSelector
+                    _entry_fee = float(getattr(scorer, "_entry_fee", 4.0))
+                    # Risk → bankroll: B = fee × size × mult (pre-registered
+                    # round-10 table; mult must stay > 1 or the all-lose world
+                    # hits log(<=0)). kelly_bankroll_mult is a global scale.
+                    _kelly_mults = {1.0: 1.25, 2.0: 1.5, 3.0: 2.0, 4.0: 4.0, 5.0: 8.0}
+                    _kelly_scale = max(float(gpp_cfg.get("kelly_bankroll_mult", 1.0)), 1e-6)
+                    _kelly_lbl_off = 10.0 if _selector_mode == "all" else 0.0
+                    if _selector_mode == "kelly":
+                        _det_sweep_risks = []
+                    for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
+                        if self._stop_check is not None and self._stop_check():
+                            break
+                        _B = _entry_fee * portfolio_size * _kelly_mults[_sweep_risk] * _kelly_scale
+                        logger.info(
+                            "Kelly risk %d/%d (risk=%.0f, B=$%.0f)",
+                            _risk_idx + 1, len(_DET_SWEEP_RISKS), _sweep_risk, _B,
+                        )
+                        self._cb("gpp_det_risk_start", {
+                            "risk": _sweep_risk + _kelly_lbl_off,
+                            "risk_index": _risk_idx + 1,
+                            "total_risks": len(_DET_SWEEP_RISKS),
+                        })
+                        _k_sel = KellyPortfolioSelector(
+                            robust_payout=robust_payout,
+                            candidates=candidates,
+                            portfolio_size=portfolio_size,
+                            bankroll=_B,
+                            ev_floor=_ev_floor,
+                            cash_anchor_fraction=_cash_anchor_fraction,
+                        )
+                        _portfolio_sweep_raw.append((_sweep_risk + _kelly_lbl_off, _k_sel.select(
+                            stop_check=self._stop_check,
+                            progress_cb=lambda data, r=_sweep_risk + _kelly_lbl_off, ri=_risk_idx: self._cb(
+                                "gpp_det_select_progress",
+                                {**data, "risk": r, "risk_index": ri + 1,
+                                 "total_risks": len(_DET_SWEEP_RISKS)},
+                            ),
+                        )))
+                        del _k_sel
+                if _selector_mode in ("coverage", "all"):
+                    if (
+                        _fresh_beat_bits is None
+                        or len(_fresh_beat_bits) != len(candidates)
+                    ):
+                        logger.warning(
+                            "selector_mode='coverage' needs the fresh-pass "
+                            "beat-p999 bits (final_n_field_samples > 0 and "
+                            "compute_tail_metrics on); falling back to det.",
+                        )
+                    else:
+                        from src.optimization.gpp_portfolio import CoveragePortfolioSelector
+                        _tb = None
+                        if _fresh_p_beat999 is not None:
+                            _tb = np.asarray(_fresh_p_beat999, dtype=np.float64)
+                            if _fresh_e_dupes is not None:
+                                _tb = _tb / (1.0 + np.maximum(
+                                    np.asarray(_fresh_e_dupes, dtype=np.float64), 0.0,
+                                ))
+                        if _selector_mode == "coverage":
+                            _det_sweep_risks = []
+                        # Risk is a no-op for coverage: single tier, labeled
+                        # 23 in "all" mode to stay distinct from det 1-5 and
+                        # kelly 11-15.
+                        _cov_risk = 23.0 if _selector_mode == "all" else 3.0
+                        self._cb("gpp_det_risk_start", {
+                            "risk": _cov_risk, "risk_index": 1, "total_risks": 1,
+                        })
+                        _c_sel = CoveragePortfolioSelector(
+                            robust_payout=robust_payout,
+                            candidates=candidates,
+                            portfolio_size=portfolio_size,
+                            beat999_bits=_fresh_beat_bits,
+                            tie_break=_tb,
+                            ev_floor=_ev_floor,
+                            cash_anchor_fraction=_cash_anchor_fraction,
+                        )
+                        _portfolio_sweep_raw.append((_cov_risk, _c_sel.select(
+                            stop_check=self._stop_check,
+                            progress_cb=lambda data: self._cb(
+                                "gpp_det_select_progress",
+                                {**data, "risk": _cov_risk, "risk_index": 1,
+                                 "total_risks": 1},
+                            ),
+                        )))
+                        del _c_sel
 
                 # Floor cull + correlation matrix are identical for every risk
                 # (risk only changes the EVw/DEw blend) — compute once and
                 # share across the sweep instead of repeating the M×M matmul
                 # per risk (~23s each at pool=11k).
-                _det_pre = DeterminantPortfolioSelector.precompute_pool(
-                    robust_payout, _ev_floor,
+                _det_pre = (
+                    DeterminantPortfolioSelector.precompute_pool(robust_payout, _ev_floor)
+                    if _det_sweep_risks else None
                 )
-                for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
+                for _risk_idx, _sweep_risk in enumerate(_det_sweep_risks):
                     if self._stop_check is not None and self._stop_check():
                         break
                     _evw = DeterminantPortfolioSelector.evw_for_risk(_sweep_risk, _evw_base, _evw_max)
@@ -1532,6 +1904,8 @@ class PipelineRunner:
                         evw_max=_evw_max,
                         ev_floor=_ev_floor,
                         precomputed=_det_pre,
+                        ev_override=_ev_override_vec,
+                        cash_anchor_fraction=_cash_anchor_fraction,
                     )
                     _det_result = _det_sel.select(
                         progress_cb=lambda data, r=_sweep_risk, ri=_risk_idx: self._cb(
@@ -1606,16 +1980,41 @@ class PipelineRunner:
                     if _dump_pool_candidates is not None:
                         _dump_cands = _dump_pool_candidates
                         _dump_ev = _dump_pool_mined_ev
+                        _dump_tail_ev = _dump_pool_tail_ev
+                        _dump_p_beat99 = _dump_pool_p_beat99
+                        _dump_p_beat999 = _dump_pool_p_beat999
+                        _dump_e_dupes = _dump_pool_e_dupes
                         _fresh_ev_map = {
                             frozenset(int(p) for p in _lu.player_ids): float(_v)
                             for _lu, _v in zip(
                                 candidates, robust_payout.mean(axis=1)
                             )
                         }
+                        _fresh_tail_map = {}
+                        _fresh_p99_map = {}
+                        if _fresh_tail_ev is not None:
+                            for _lu, _tv, _pv in zip(candidates, _fresh_tail_ev, _fresh_p_beat99):
+                                _k = frozenset(int(p) for p in _lu.player_ids)
+                                _fresh_tail_map[_k] = float(_tv)
+                                _fresh_p99_map[_k] = float(_pv)
                     else:
                         _dump_cands = candidates
                         _dump_ev = robust_payout.mean(axis=1)
+                        _dump_tail_ev = _mined_tail_ev
+                        _dump_p_beat99 = _mined_p_beat99
+                        _dump_p_beat999 = _mined_p_beat999
+                        _dump_e_dupes = _mined_e_dupes
                         _fresh_ev_map = {}
+                        _fresh_tail_map = {}
+                        _fresh_p99_map = {}
+                    # Field-independent per-candidate ceiling stat, computed
+                    # unconditionally so every dump can grade sim-p99 as a
+                    # ranking currency (ceiling-first redesign, Phase 2).
+                    try:
+                        _dump_sim_p99 = _candidate_sim_tail_scores(_dump_cands, sim_results)
+                    except Exception as _sp_e:
+                        logger.warning("sim_p99 dump column failed (skipping): %s", _sp_e)
+                        _dump_sim_p99 = None
                     _dump_path = os.path.join(output_dir, "candidate_pool_debug.csv")
                     _pid_meta = {
                         int(r["player_id"]): r
@@ -1646,6 +2045,12 @@ class PipelineRunner:
                     _sim_optimal_keys = {
                         frozenset(int(p) for p in _lu.player_ids) for _lu in self._sim_optimal_lineups
                     }
+                    _sim_winner_keys = {
+                        frozenset(int(p) for p in _lu.player_ids) for _lu in self._sim_winner_lineups
+                    }
+                    _seed_mutant_keys = {
+                        frozenset(int(p) for p in _lu.player_ids) for _lu in self._seed_mutant_lineups
+                    }
                     _risk_membership: dict[int, list[str]] = {}
                     for _risk, _port in _portfolio_sweep_raw:
                         _selected_keys = {
@@ -1661,6 +2066,9 @@ class PipelineRunner:
                             "lineup_index", "player_id", "name", "position", "team",
                             "salary", "mean", "ownership", "mean_ev", "selected_risks",
                             "fresh_ev", "tail_bypass", "seed_source",
+                            "sim_p99", "tail_ev", "p_beat99",
+                            "fresh_tail_ev", "fresh_p_beat99",
+                            "p_beat999", "est_dupes", "win_equity",
                         ])
                         for _li, _lu in enumerate(_dump_cands):
                             _selected_risks = ",".join(_risk_membership.get(_li, []))
@@ -1668,10 +2076,46 @@ class PipelineRunner:
                             _fresh = _fresh_ev_map.get(_cand_keys[_li])
                             _fresh_ev = round(_fresh, 4) if _fresh is not None else ""
                             _tb = 1 if _cand_keys[_li] in _tail_bypass_keys else 0
+                            _sim_p99 = (
+                                round(float(_dump_sim_p99[_li]), 3)
+                                if _dump_sim_p99 is not None and np.isfinite(_dump_sim_p99[_li])
+                                else ""
+                            )
+                            _tail = (
+                                round(float(_dump_tail_ev[_li]), 4)
+                                if _dump_tail_ev is not None else ""
+                            )
+                            _p99 = (
+                                round(float(_dump_p_beat99[_li]), 5)
+                                if _dump_p_beat99 is not None else ""
+                            )
+                            _f_tail = _fresh_tail_map.get(_cand_keys[_li])
+                            _f_tail = round(_f_tail, 4) if _f_tail is not None else ""
+                            _f_p99 = _fresh_p99_map.get(_cand_keys[_li])
+                            _f_p99 = round(_f_p99, 5) if _f_p99 is not None else ""
+                            # Win-equity currency: P(beat sim-field p99.9)
+                            # discounted by expected duplicates — targets
+                            # money-zone tickets in undiluted form.
+                            _p999 = (
+                                round(float(_dump_p_beat999[_li]), 6)
+                                if _dump_p_beat999 is not None else ""
+                            )
+                            _edup = (
+                                round(float(_dump_e_dupes[_li]), 4)
+                                if _dump_e_dupes is not None else ""
+                            )
+                            _weq = (
+                                round(float(_dump_p_beat999[_li]) / (1.0 + float(_dump_e_dupes[_li])), 6)
+                                if _dump_p_beat999 is not None and _dump_e_dupes is not None else ""
+                            )
                             if _cand_keys[_li] in _optimal_keys:
                                 _seed_source = "optimal"
                             elif _cand_keys[_li] in _sim_optimal_keys:
                                 _seed_source = "sim_optimal"
+                            elif _cand_keys[_li] in _sim_winner_keys:
+                                _seed_source = "sim_winner"
+                            elif _cand_keys[_li] in _seed_mutant_keys:
+                                _seed_source = "seed_mutant"
                             else:
                                 _seed_source = "random"
                             for _pid in _lu.player_ids:
@@ -1690,6 +2134,14 @@ class PipelineRunner:
                                     _fresh_ev,
                                     _tb,
                                     _seed_source,
+                                    _sim_p99,
+                                    _tail,
+                                    _p99,
+                                    _f_tail,
+                                    _f_p99,
+                                    _p999,
+                                    _edup,
+                                    _weq,
                                 ])
                     logger.info(
                         "Candidate pool written to %s (%d lineups%s)",
@@ -1843,6 +2295,249 @@ class PipelineRunner:
 
         return result
 
+    # ------------------------------------------------------------------
+    # External candidate pool mode (SaberSim import)
+    # ------------------------------------------------------------------
+
+    def _run_external(
+        self,
+        cfg: dict,
+        paths: dict,
+        sim_cfg: dict,
+        platform,
+        slate_path: str,
+        slate_df: pd.DataFrame,
+        all_file_entries: list,
+        entry_handlers: dict,
+        output_dir: str,
+    ) -> list[dict]:
+        """External pool mode: imported lineups + per-contest ROI replace
+        generation and contest simulation; the player-level sim runs only to
+        supply the selector's diversity correlation. One portfolio per
+        entered contest, highest entry fee first; a lineup never appears in
+        two contests."""
+        from pathlib import Path as _Path
+
+        from src.api import external_pool as ep
+        from .slate_exclusions import compute_file_fingerprint
+
+        gpp_cfg = cfg.get("gpp", {})
+        raw_dir = os.path.dirname(slate_path) if slate_path else ""
+        found = ep.discover_external_files(raw_dir)
+        if not found["lineups_path"] or not found["projections_path"]:
+            raise ValueError(
+                "External pool mode: could not find a lineups_*.csv / "
+                "projections CSV pair in %s." % (raw_dir or "data/raw")
+            )
+        if not all_file_entries:
+            raise ValueError(
+                "External pool mode requires *Entries.csv files in the slate "
+                "directory — per-contest allocation has nothing to allocate to."
+            )
+        self._cb("external_load", {
+            "lineups_file": found["lineups_path"].name,
+            "projections_file": found["projections_path"].name,
+            "paired_by_token": found["paired_by_token"],
+        })
+
+        _config_root = _Path(self._config_path).resolve().parent
+        _slate_fp = compute_file_fingerprint(_config_root / slate_path)
+        ep.archive_external_inputs(
+            _config_root, slate_path, found["lineups_path"], found["projections_path"],
+        )
+
+        valid_ids = set(slate_df["player_id"].astype(int))
+        pool = ep.parse_lineup_pool(found["lineups_path"], valid_ids)
+        if not pool.lineups:
+            raise ValueError("External pool mode: every lineup in the file was dropped "
+                             "(unknown player ids) — is the export for this slate?")
+        proj_ext = ep.parse_player_projections(found["projections_path"])
+        pool_pids = {int(p) for lu in pool.lineups for p in lu.player_ids}
+        players_df = ep.build_external_players_df(
+            slate_df, proj_ext, pool_pids, self._derive_opponent,
+        )
+        self._cb("load_slate", {
+            "n_players": len(players_df),
+            "n_teams": int(players_df["team"].nunique()),
+        })
+
+        # --- Player-level sim for the diversity correlation ---------------
+        copula = EmpiricalCopula(paths["copula"])
+        grids = ep.build_quantile_grids(proj_ext)
+        n_sims = int(sim_cfg.get("n_sims", 10_000))
+        self._cb("simulate", {"n_sims": n_sims})
+        engine = SimulationEngine(
+            copula, players_df, batter_pca_model=None, score_grid=None,
+            quantile_grids=grids,
+        )
+        sim_results = engine.simulate(n_sims)
+        corr = ep.compute_pool_corr(pool.lineups, sim_results)
+        self._cb("external_pool", {
+            "n_lineups": len(pool.lineups),
+            "n_contests_covered": len(pool.contests),
+            "n_dropped_unknown": pool.n_dropped_unknown_players,
+            "n_dropped_duplicates": pool.n_dropped_duplicates,
+        })
+
+        # --- Contest grouping + ROI matching ------------------------------
+        groups = ep.group_and_match_contests(all_file_entries, pool)
+        total_entries = sum(len(g.entries) for g in groups)
+        self._cb("external_contests", {
+            "contests": [
+                {
+                    "contest_name": g.contest_name,
+                    "entry_fee": g.entry_fee_cents / 100.0,
+                    "n_entries": len(g.entries),
+                    "roi_source": pool.contests[g.roi_key].raw_name,
+                    "fallback": g.roi_fallback,
+                }
+                for g in groups
+            ],
+            "total_entries": total_entries,
+            "pool_size": len(pool.lineups),
+        })
+        if total_entries > len(pool.lineups):
+            logger.warning(
+                "External pool: %d entries but only %d lineups — later "
+                "contests will be left unfilled.", total_entries, len(pool.lineups),
+            )
+
+        # --- 5-risk sweep: independent per-contest allocations -------------
+        _evw_base = float(gpp_cfg.get("evw_base", 0.10))
+        _evw_max = float(gpp_cfg.get("evw_max", 0.40))
+        _risks = [1.0, 2.0, 3.0, 4.0, 5.0]
+        allocations: dict[float, "ep.ExternalAllocation"] = {}
+        for _risk_idx, _risk in enumerate(_risks):
+            if self._stop_check is not None and self._stop_check():
+                break
+            self._cb("gpp_det_risk_start", {
+                "risk": _risk, "risk_index": _risk_idx + 1, "total_risks": len(_risks),
+            })
+            allocations[_risk] = ep.allocate_contests(
+                pool, corr, groups, risk=_risk,
+                evw_base=_evw_base, evw_max=_evw_max,
+                stop_check=self._stop_check,
+                progress_cb=lambda data, r=_risk, ri=_risk_idx: self._cb(
+                    "gpp_det_select_progress",
+                    {**data, "risk": r, "risk_index": ri + 1, "total_risks": len(_risks)},
+                ),
+            )
+        if not allocations:
+            self._cb("stopped", {"portfolio": [], "n_lineups": 0,
+                                 "optimal_lineups": [], "portfolio_sweep": []})
+            return []
+
+        # The entry plan is risk-invariant by construction (same contest
+        # order, same per-contest slot counts); assert rather than assume.
+        _plans = [
+            [rec.entry_id for _, rec in a.entry_plan] for a in allocations.values()
+        ]
+        if any(p != _plans[0] for p in _plans[1:]):
+            raise RuntimeError("external allocation entry plans diverged across risks")
+
+        _first_risk = min(allocations.keys())
+        _alloc = allocations[_first_risk]
+        portfolio = _alloc.portfolio
+        _portfolio_sweep_raw = [(r, allocations[r].portfolio) for r in sorted(allocations)]
+        if _alloc.unfilled:
+            logger.warning(
+                "External pool: %d entries left unfilled (pool exhausted).",
+                len(_alloc.unfilled),
+            )
+
+        # --- Persist + finalize (mirrors the tail of run()) ----------------
+        self._external_mode = True
+        self._external_entry_plan = _alloc.entry_plan
+        self._external_unfilled = _alloc.unfilled
+        self._sweep_portfolios_raw = {r: p for r, p in _portfolio_sweep_raw}
+        self._raw_portfolio = portfolio
+        self._portfolio_has_dollar_ev = True  # score slot carries contest ROI
+        self._discarded_lineups = set()
+        self._all_file_entries = all_file_entries
+        self._entry_handlers = entry_handlers
+        self._slate_df = slate_df
+        self._output_dir = output_dir
+        self._platform = platform
+        self._players_df = players_df
+        self._sim_results = None  # replace_lineup is unsupported in this mode
+
+        entry_map = self._build_external_entry_map()
+        result = self._serialize_portfolio(portfolio, players_df, mean_ev_from_score=True)
+        for lr in result:
+            info = entry_map.get(lr["lineup_index"])
+            if info:
+                lr.update(info)
+
+        os.makedirs(output_dir, exist_ok=True)
+        portfolio_df = self._format_portfolio_df(portfolio, players_df, mean_ev_from_score=True)
+        portfolio_df.to_csv(
+            os.path.join(output_dir, f"portfolio_{platform.value}.csv"), index=False,
+        )
+
+        _sweep_payload = []
+        for r, p in _portfolio_sweep_raw:
+            lineups = self._serialize_portfolio(p, players_df, mean_ev_from_score=True)
+            for lr in lineups:
+                info = entry_map.get(lr["lineup_index"])
+                if info:
+                    lr.update(info)
+            _sweep_payload.append({"risk": r, "lineups": lineups})
+        _sweep_cache_path = os.path.join(output_dir, f"portfolio_sweep_{platform.value}.json")
+        try:
+            with open(_sweep_cache_path, "w") as _f:
+                json.dump({
+                    "slate_fingerprint": _slate_fp or "",
+                    "active_risk": _first_risk,
+                    "mode": "external",
+                    "sweep": _sweep_payload,
+                }, _f)
+        except Exception as _e:
+            logger.warning("Failed to save external sweep cache: %s", _e)
+
+        was_stopped = self._stop_check is not None and self._stop_check()
+        if not was_stopped:
+            assignments = self._external_assignments(portfolio)
+            paths_written = entry_handlers["write"](
+                all_file_entries, assignments, slate_df, output_dir
+            )
+            self._cb("upload_files", {"n_files": len(paths_written), "paths": paths_written})
+            meta_path = os.path.join(output_dir, f"portfolio_entries_{platform.value}.json")
+            with open(meta_path, "w") as f:
+                json.dump({str(k): v for k, v in entry_map.items()}, f)
+
+        stage = "stopped" if was_stopped else "complete"
+        self._cb(stage, {
+            "portfolio": result,
+            "n_lineups": len(result),
+            "optimal_lineups": [],
+            "portfolio_sweep": _sweep_payload,
+            "external": True,
+        })
+        return result
+
+    def _external_assignments(self, portfolio: list) -> dict:
+        """Direct per-contest assignment: lineup i fills the entry it was
+        selected for (replaces the prize-pool/fee ratio sort of
+        assign_lineups_to_entries)."""
+        assignments: dict = {}
+        for (lineup, _), (file_path, rec) in zip(portfolio, self._external_entry_plan):
+            assignments.setdefault(file_path, []).append((rec, lineup))
+        return assignments
+
+    def _build_external_entry_map(self) -> dict:
+        """Entry meta keyed by 1-based lineup index, in fill order.
+        entry_sort_order = fill index, so PortfolioTable's existing ascending
+        sort renders the per-contest, descending-entry-fee fill order."""
+        entry_map: dict[int, dict] = {}
+        for i, (file_path, rec) in enumerate(self._external_entry_plan):
+            entry_map[i + 1] = {
+                "upload_tag": _extract_upload_tag(file_path.name),
+                "entry_fee": rec.entry_fee_raw,
+                "contest_name": _shorten_contest_name(rec.contest_name),
+                "entry_sort_order": i,
+            }
+        return entry_map
+
     def activate_sweep_risk(self, risk: float) -> list[dict]:
         """Switch the active portfolio to a different det_ev sweep risk level.
 
@@ -1873,7 +2568,10 @@ class PipelineRunner:
 
         if self._all_file_entries:
             self.write_upload_files()
-            entry_map = self._build_lineup_entry_map(self._all_file_entries, portfolio)
+            if getattr(self, "_external_mode", False):
+                entry_map = self._build_external_entry_map()
+            else:
+                entry_map = self._build_lineup_entry_map(self._all_file_entries, portfolio)
             for lr in result:
                 info = entry_map.get(lr["lineup_index"])
                 if info:
@@ -1906,7 +2604,10 @@ class PipelineRunner:
             raise RuntimeError("No pipeline run artifacts available.")
         if not self._all_file_entries:
             return []
-        assignments = self._entry_handlers["assign"](self._all_file_entries, self._raw_portfolio)
+        if getattr(self, "_external_mode", False):
+            assignments = self._external_assignments(self._raw_portfolio)
+        else:
+            assignments = self._entry_handlers["assign"](self._all_file_entries, self._raw_portfolio)
         return self._entry_handlers["write"](
             self._all_file_entries, assignments, self._slate_df, self._output_dir
         )
@@ -1923,6 +2624,8 @@ class PipelineRunner:
         list[dict]
             Updated portfolio serialized in the same format as ``run()``.
         """
+        if getattr(self, "_external_mode", False):
+            raise RuntimeError("Lineup replacement is not available in external pool mode.")
         idx = lineup_index - 1
         deleted_lineup, _ = self._raw_portfolio[idx]
         remaining = self._raw_portfolio[:idx] + self._raw_portfolio[idx + 1:]

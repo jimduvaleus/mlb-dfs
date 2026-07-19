@@ -47,6 +47,7 @@ def generate_sim_optimal_lineups(
     seen: Optional[set] = None,
     progress_cb: Optional[Callable[[int], None]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
+    min_secondary: Optional[int] = None,
 ) -> list[Lineup]:
     """Per-sim optimal lineups: for each sim index, solve the roster ILP with
     that sim's *realized* player scores as the objective — the lineup that
@@ -82,6 +83,7 @@ def generate_sim_optimal_lineups(
         d["mean"] = scores
         lineups = generate_optimal_lineups(
             d, n=1, min_uniques=1, min_stack=min_stack, salary_floor=salary_floor,
+            min_secondary=min_secondary,
         )
         return lineups[0] if lineups else None
 
@@ -119,6 +121,7 @@ def generate_optimal_lineups(
     progress_cb: Optional[Callable[[int], None]] = None,
     prior_lineups: Optional[list] = None,
     min_uniques_vs_prior: Optional[int] = None,
+    min_secondary: Optional[int] = None,
 ) -> list[Lineup]:
     """Return up to N optimal lineups by projected mean score.
 
@@ -292,6 +295,22 @@ def generate_optimal_lineups(
         for j in team_batter_js[tm]:
             c.SetCoefficient(xp[j], 1)
         c.SetCoefficient(z[t], -float(min_stack))
+
+    # C8b (optional): secondary-stack shape — at least TWO teams must each
+    # carry >= min_secondary batters (the min_stack team trivially qualifies,
+    # so this forces a genuine second stack). Real top-1% GPP entries carry a
+    # 2+ batter secondary ~81% of the time; unconstrained per-sim argmax
+    # optima only ~43% (see scripts/seed_block_forensics.py).
+    if min_secondary is not None and min_secondary >= 1:
+        w = [solver.BoolVar(f"w_{t}") for t in range(T)]
+        for t, tm in enumerate(batter_teams):
+            c = solver.Constraint(0, solver.infinity())
+            for j in team_batter_js[tm]:
+                c.SetCoefficient(xp[j], 1)
+            c.SetCoefficient(w[t], -float(min_secondary))
+        c = solver.Constraint(2, T)
+        for t in range(T):
+            c.SetCoefficient(w[t], 1)
 
     # C9: <= 9 players per game (ensures >= 2 games)
     for _g, js in game_js.items():

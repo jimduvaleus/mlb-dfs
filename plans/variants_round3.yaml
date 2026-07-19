@@ -1,0 +1,54 @@
+# Round-3 pre-registered matrix — ceiling-first redesign.
+# Registered 2026-07-13 BEFORE the batch. Target: the pool gap (no variant
+# has lifted pool hit99 above 1%; best 0.91%).
+#
+# Mechanism: shape-constrained per-sim optimal seeds. Forensics (round 1)
+# showed unconstrained per-world argmax optima are structurally unlike real
+# top-1% entries (prim5 2.5% vs 63.6%, sec2 43% vs 81%, at-cap 7.8% vs
+# 28.7%) yet still matched the random block on hit99 — the "wins a sim
+# world" core is valuable but the wrapper shape is wrong. These variants
+# force winner shape (min_stack=5, second stack >= 2, near-cap salary) onto
+# world-optimal cores. All run the ev_first funnel + mean_ev selector
+# (round 2 proved sim-based seeds must not feed a sim-based tail selector).
+#
+# Judgment: pool hit99 + seed-block A/B (block vs random, pooled + sign),
+# fresh_surv, portfolios, with hit99.9 as the deep-tail readout.
+
+simopt5_1k:
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 1000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+
+simopt5_3k:            # scale test — does tripling shaped seeds move the pool?
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 3000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+
+simopt5_soft:          # isolate the salary constraint — shape without the floor
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 1000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+
+simopt5_simwin:        # both proven-mechanism seed blocks, no tail selector
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 1000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500
+  gpp.seed_sim_winners: true
+
+# Addendum (registered 2026-07-13 after the 4-variant results, before this run):
+# the untested "everything that worked" config — sim-winner sampler + 3k shaped
+# seeds, EV-first funnel, mean-EV selector.
+ceiling_final:
+  gpp.seed_sim_winners: true
+  gpp.seed_sim_optimal_lineups: true
+  gpp.n_sim_optimals: 3000
+  gpp.sim_optimal_min_stack: 5
+  gpp.sim_optimal_min_secondary: 2
+  gpp.sim_optimal_salary_floor: 49500

@@ -185,7 +185,7 @@ def test_progress_callback_called():
     assert calls[0]["step"] == 1
     assert calls[-1]["step"] == 5
     for d in calls:
-        assert 0.0 <= d["partial_var"] <= 1.0
+        assert 0.0 <= d["distance"] <= 1.0
         assert d["n_remaining"] >= 0
 
 

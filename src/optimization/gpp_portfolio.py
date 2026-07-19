@@ -249,6 +249,8 @@ class ContestScorer:
         dupe_stack_coef: float = 0.024,
         dupe_min_gross_payout: float = 15.0,
         salary_cap: float = 50_000.0,
+        compute_tail_metrics: bool = False,
+        tail_ev_min_gross: float = 100.0,
     ) -> None:
         self._sim_results = sim_results
         self._players_df = players_df
@@ -297,6 +299,41 @@ class ContestScorer:
         else:
             # All-zero dilutable portion: the kernel's dilution term vanishes.
             self._dilute_cumsum = np.zeros_like(self._payout_cumsum)
+
+        # Tail-metric state (ceiling-first redesign). tail-EV is the expected
+        # GROSS dollars from the steep top payout bands only (ranks paying
+        # >= tail_ev_min_gross) — a ranking currency for ceiling, deliberately
+        # blind to the min-cash plateau that dominates mean EV. Reuses the
+        # dilutable-lookup builder (same "zero below a gross threshold, then
+        # band-average" transform) and the same tie-splitting kernel; the
+        # tail band is passed as its own dilutable portion so dupe dilution
+        # applies to it exactly as it does to mean EV's top bands.
+        self._compute_tail_metrics = bool(compute_tail_metrics)
+        self._tail_ev_min_gross = float(tail_ev_min_gross)
+        if self._compute_tail_metrics:
+            self._tail_cumsum = _payout_cumsum(_build_dilutable_lookup(
+                self._payout_arr, N=n_field_lineups,
+                min_gross_payout=self._tail_ev_min_gross,
+            ).astype(np.float32))
+        else:
+            self._tail_cumsum = None
+        # Populated by _score_col_lineups() when compute_tail_metrics is on,
+        # aligned to that call's candidate order (mined after score_candidates,
+        # fresh after rescore_fresh_fields).
+        self.last_tail_ev: Optional[np.ndarray] = None
+        self.last_p_beat99: Optional[np.ndarray] = None
+        self.last_p_beat999: Optional[np.ndarray] = None
+        # Round-10 coverage selector: when retain_beat999_worlds is set (the
+        # pipeline flips it on just for the fresh re-score), _score_col_lineups
+        # also keeps the per-world beat-p999 booleans, bit-packed to
+        # (M, K × ceil(n_sims/8)) uint8 on last_beat999_bits — one bit per
+        # (field sample, sim) world, ~n_K × M × n_sims/8 bytes.
+        self.retain_beat999_worlds: bool = False
+        self.last_beat999_bits: Optional[np.ndarray] = None
+        # E[dupes] per candidate (log-linear model) — computed on every
+        # score_candidates() call regardless of dupe_penalty, so the
+        # win-equity currency (p_beat999 / (1+E[dupes])) is always dumpable.
+        self.last_e_dupes: Optional[np.ndarray] = None
 
         self._sim_matrix = sim_results.results_matrix.astype(np.float32)
         self._col_map: dict[int, int] = {
@@ -617,6 +654,21 @@ class ContestScorer:
         field_sorted_list = self._field_sorted_list
         M = col_lineups.shape[0]
         robust_payout = np.zeros((M, n_sims), dtype=np.float32)
+        # Tail metrics are reduced (M,) accumulators — never a second
+        # (M, n_sims) matrix, which would double the scoring memory peak.
+        tail_ev = np.zeros(M, dtype=np.float64) if self._compute_tail_metrics else None
+        p_beat99 = np.zeros(M, dtype=np.float64) if self._compute_tail_metrics else None
+        p_beat999 = np.zeros(M, dtype=np.float64) if self._compute_tail_metrics else None
+        if self._compute_tail_metrics:
+            # kth field lineup such that beating it means beating >= 99% of N.
+            _p99_col = int(np.ceil(0.99 * self._n_field)) - 1
+            # ... and >= 99.9% of N (the real-contest money zone: ~30% of
+            # prize mass sits above p99.9).
+            _p999_col = int(np.ceil(0.999 * self._n_field)) - 1
+        beat_bits = None
+        if self._compute_tail_metrics and self.retain_beat999_worlds:
+            _n_bytes = (n_sims + 7) // 8
+            beat_bits = np.zeros((M, len(field_sorted_list) * _n_bytes), dtype=np.uint8)
         n_batches = (M + self._batch_size - 1) // self._batch_size
         logger.info(
             "Scoring %d candidates in %d batches of %d...",
@@ -635,12 +687,30 @@ class ContestScorer:
             # Accumulate payout over K field samples
             batch_payout = np.zeros((end - start, n_sims), dtype=np.float32)
             batch_dupe_scale = np.ascontiguousarray(dupe_scale[start:end])
-            for field_sorted in field_sorted_list:
+            for _field_k, field_sorted in enumerate(field_sorted_list):
                 payout_k = _compute_payout_from_sorted_field(
                     cand_scores_batch, field_sorted,
                     self._payout_cumsum, self._dilute_cumsum, batch_dupe_scale,
                 )
                 batch_payout += payout_k
+                if self._compute_tail_metrics:
+                    # Same kernel over the tail-band-only lookup; the tail band
+                    # doubles as its own dilutable portion so E[dupes] dilutes
+                    # it exactly as it dilutes mean EV's top bands.
+                    tail_k = _compute_payout_from_sorted_field(
+                        cand_scores_batch, field_sorted,
+                        self._tail_cumsum, self._tail_cumsum, batch_dupe_scale,
+                    )
+                    tail_ev[start:end] += tail_k.mean(axis=1)
+                    thr = field_sorted[:, _p99_col]  # (n_sims,)
+                    p_beat99[start:end] += (cand_scores_batch >= thr[None, :]).mean(axis=1)
+                    thr999 = field_sorted[:, _p999_col]  # (n_sims,)
+                    _beat999 = cand_scores_batch >= thr999[None, :]
+                    p_beat999[start:end] += _beat999.mean(axis=1)
+                    if beat_bits is not None:
+                        beat_bits[start:end, _field_k * _n_bytes:(_field_k + 1) * _n_bytes] = (
+                            np.packbits(_beat999, axis=1)
+                        )
 
             robust_payout[start:end] = batch_payout / self._n_k
 
@@ -663,6 +733,22 @@ class ContestScorer:
                 int(invalid_mask.sum()),
             )
 
+        if self._compute_tail_metrics:
+            tail_ev /= self._n_k
+            p_beat99 /= self._n_k
+            p_beat999 /= self._n_k
+            if invalid_mask.any():
+                tail_ev[invalid_mask] = 0.0
+                p_beat99[invalid_mask] = 0.0
+                p_beat999[invalid_mask] = 0.0
+            self.last_tail_ev = tail_ev
+            self.last_p_beat99 = p_beat99
+            self.last_p_beat999 = p_beat999
+        if beat_bits is not None:
+            if invalid_mask.any():
+                beat_bits[invalid_mask] = 0
+            self.last_beat999_bits = beat_bits
+
         return robust_payout
 
     # ------------------------------------------------------------------
@@ -675,12 +761,11 @@ class ContestScorer:
         E[dupes] is the log-linear model documented on the class. Ownership
         comes from the field vector (the real-universe %drafted estimate that
         drives opponent field generation), not the candidate pool's internal
-        sampling weights. Returns all ones when the penalty is disabled.
+        sampling weights. E[dupes] is always computed and stored on
+        self.last_e_dupes (the win-equity currency needs it); the returned
+        payout scale is all ones when the penalty is disabled.
         """
         M = len(candidates)
-        if not self._dupe_penalty:
-            return np.ones(M, dtype=np.float32)
-
         fdf = self._field_players_df
         pids = fdf["player_id"].astype(int).to_numpy()
         own_map = dict(zip(pids, np.asarray(self._field_ownership_vec, dtype=np.float64)))
@@ -716,12 +801,16 @@ class ContestScorer:
             scale[i] = np.float32(1.0 / (1.0 + e_dupes))
 
         logger.info(
-            "Dupe penalty: E[dupes] min=%.3f  p50=%.3f  p90=%.3f  max=%.1f  "
-            "(top-band payout scale p50=%.3f)",
+            "Dupe model: E[dupes] min=%.3f  p50=%.3f  p90=%.3f  max=%.1f  "
+            "(top-band payout scale p50=%.3f, penalty %s)",
             float(e_dupes_all.min()), float(np.percentile(e_dupes_all, 50)),
             float(np.percentile(e_dupes_all, 90)), float(e_dupes_all.max()),
             float(np.percentile(scale, 50)),
+            "on" if self._dupe_penalty else "off",
         )
+        self.last_e_dupes = e_dupes_all
+        if not self._dupe_penalty:
+            return np.ones(M, dtype=np.float32)
         return scale
 
     def _build_col_lineups(self, candidates: list[Lineup]) -> np.ndarray:
@@ -760,22 +849,33 @@ class ContestScorer:
 # ------------------------------------------------------------------ #
 
 class DeterminantPortfolioSelector:
-    """Greedy portfolio construction via incremental determinant maximisation.
+    """Greedy portfolio construction via incremental correlation-distance maximisation.
 
     At each step scores every remaining +EV candidate on a weighted combination of:
       EVn — normalised mean dollar payout (robust_payout.mean(axis=1))
-      DEn — normalised incremental determinant contribution (partial variance of the
-             candidate's payout vector given the lineups already selected)
+      Dn  — normalised correlation distance between the candidate's payout and
+            the running portfolio's aggregate payout (the sum of the payout
+            vectors of the lineups already selected)
 
-    The determinant of the payout correlation matrix measures how jointly the
-    portfolio's dollar returns move across simulations.  Maximising it is
-    equivalent to minimising return correlation — the Shaidy diversification
-    principle applied to dollar EV rather than raw scores.
+    For standardised (zero-mean, unit-variance) random variables X, Y:
+      E[(X-Y)^2] = 2(1 - corr(X,Y))
+    so (1 - r) / 2 is the natural, normalised [0, 1] distance implied by a
+    correlation — monotonically *decreasing* in r, not in |r|. A candidate
+    anti-correlated with the portfolio (r -> -1) is strictly farther
+    (Dn -> 1) than an uncorrelated one (r = 0, Dn = 0.5), which is strictly
+    farther than a co-correlated one (r -> 1, Dn -> 0). This is deliberately
+    different from a partial-variance/Schur-complement formulation (1 - r^2),
+    which is symmetric in the sign of r and treats a hedge as no better than
+    an equally-sized co-movement.
 
-    The incremental contribution is computed via the Schur complement:
-      partial_var(c) = 1 - r_c^T C_k^{-1} r_c
-    where r_c is the vector of correlations between candidate c and the k
-    already-selected lineups, and C_k^{-1} is maintained with O(k^2) updates.
+    Generalising from a single reference lineup to a k-lineup running
+    portfolio: let P_k = sum of the k already-selected (standardised) payout
+    vectors. The candidate's correlation with the portfolio's aggregate
+    payout is
+      r_c = Cov(x_c, P_k) / sqrt(Var(P_k)) = (sum_i r_{c,i}) / sqrt(sum_{i,j} r_{i,j})
+    (sums over the selected set i, j; each x is standardised so Var(x_c) = 1).
+    Both the numerator and Var(P_k) update in O(k) per step as lineups are
+    added — no matrix inverse, no Schur complement.
 
     No fresh simulations, no hybrid fields, no correlation thresholds —
     the Phase-1 robust_payout matrix is the only input required.
@@ -804,8 +904,16 @@ class DeterminantPortfolioSelector:
         ev_floor: float = 0.20,
         rng_seed: Optional[int] = None,  # unused; kept for API consistency
         precomputed: Optional[tuple] = None,
+        ev_override: Optional[np.ndarray] = None,
+        cash_anchor_fraction: float = 0.0,
     ) -> None:
-        self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        # robust_payout may be None when `precomputed` is supplied (external
+        # pool mode passes (pool_idx, ROI vector, corr) directly): the greedy
+        # loop runs entirely off the precompute tuple, and pool_ev_vals is
+        # then whatever EV currency the caller chose (ev_floor is unused).
+        self._robust_payout = (
+            None if robust_payout is None else np.asarray(robust_payout, dtype=np.float32)
+        )
         self._candidates = candidates
         self._portfolio_size = portfolio_size
         self._evw = self.evw_for_risk(risk, evw_base, evw_max)
@@ -816,6 +924,18 @@ class DeterminantPortfolioSelector:
         # one precompute to all five selectors instead of repeating the
         # M×M correlation matmul per risk.
         self._precomputed = precomputed
+        # Ceiling-first redesign (Phase 3): when ev_override is given (length
+        # = len(candidates), aligned with robust_payout rows), the greedy
+        # score's EV term ranks by it (e.g. fresh tail-EV) instead of mean
+        # dollar EV. The floor cull, the diversity/determinant term, and the
+        # reported per-lineup EVs stay on mean dollar EV. The first
+        # ceil(cash_anchor_fraction × portfolio_size) picks keep the mean-EV
+        # basis — a cash-anchor block preserving mean EV's proven cash-band
+        # signal inside an otherwise tail-ranked portfolio.
+        self._ev_override = (
+            np.asarray(ev_override, dtype=np.float64) if ev_override is not None else None
+        )
+        self._cash_anchor_fraction = float(cash_anchor_fraction)
 
     @staticmethod
     def evw_for_risk(risk: float, evw_base: float = 0.10, evw_max: float = 0.40) -> float:
@@ -887,6 +1007,10 @@ class DeterminantPortfolioSelector:
         # when the caller passed precompute_pool() output) ---
         pre = self._precomputed
         if pre is None:
+            if self._robust_payout is None:
+                raise ValueError(
+                    "robust_payout is required when precomputed is not supplied"
+                )
             pre = self.precompute_pool(self._robust_payout, self._ev_floor)
         if pre is None:
             logger.warning("No candidates with EV >= $%.2f; returning empty portfolio.", self._ev_floor)
@@ -901,22 +1025,35 @@ class DeterminantPortfolioSelector:
         M_pool = len(pool_idx)
         evw, dew = self._evw, self._dew
 
+        # Selection-EV basis per pick: mean dollar EV for the cash-anchor
+        # block (and everywhere when no override), the override vector after.
+        if self._ev_override is not None:
+            override_vals = self._ev_override[pool_idx].astype(np.float64)
+            n_anchor = int(np.ceil(self._cash_anchor_fraction * self._portfolio_size))
+        else:
+            override_vals = None
+            n_anchor = self._portfolio_size
+
+        def _sel_ev_vals(step: int) -> np.ndarray:
+            return pool_ev_vals if (override_vals is None or step <= n_anchor) else override_vals
+
         # --- Greedy selection ---
         selected_in_pool: list[int] = []    # indices into pool (0..M_pool-1)
         remaining_mask = np.ones(M_pool, dtype=bool)
 
-        # Step 1: highest EV
-        first = int(np.argmax(pool_ev_vals))
+        # Step 1: highest EV on the step-1 basis
+        first = int(np.argmax(_sel_ev_vals(1)))
         selected_in_pool.append(first)
         remaining_mask[first] = False
-        C_inv = np.array([[1.0]])  # 1×1, starts as correlation of lineup with itself
+        # Var(P_1) in standardised units — a single lineup's self-correlation.
+        portfolio_var = 1.0
 
         if progress_cb is not None:
             progress_cb({
                 "step": 1,
                 "portfolio_size": self._portfolio_size,
                 "lineup_ev": float(pool_ev_vals[first]),
-                "partial_var": 1.0,
+                "distance": 1.0,
                 "score": 1.0,
                 "n_remaining": int(remaining_mask.sum()),
             })
@@ -932,30 +1069,33 @@ class DeterminantPortfolioSelector:
             if M_rem == 0:
                 break
 
-            k = len(selected_in_pool)
-
             # Correlation of each remaining candidate with each selected lineup
             R = corr_matrix[np.ix_(remaining_pool_idx, selected_in_pool)].astype(np.float64)  # (M_rem, k)
 
-            # Partial variance: how much independent variance each candidate adds
-            # partial_var[m] = 1 - R[m] @ C_inv @ R[m]
-            temp = R @ C_inv               # (M_rem, k)
-            partial_var = 1.0 - (temp * R).sum(axis=1)   # (M_rem,)
-            partial_var = np.clip(partial_var, 0.0, 1.0)
+            # Correlation-distance to the running portfolio's aggregate payout
+            # P_k = sum of the selected (standardised) payout vectors. Since
+            # each is unit-variance, Cov(x_c, P_k) = sum_i r_{c,i} and
+            # Var(P_k) = sum_{i,j} r_{i,j} = portfolio_var (maintained
+            # incrementally below), so r_c = Cov / sqrt(Var(P_k)) directly —
+            # no matrix inverse needed.
+            cov_to_portfolio = R.sum(axis=1)                         # (M_rem,)
+            r_to_portfolio = cov_to_portfolio / np.sqrt(portfolio_var)
+            r_to_portfolio = np.clip(r_to_portfolio, -1.0, 1.0)       # fp-noise guard
+            distance = (1.0 - r_to_portfolio) / 2.0                   # (M_rem,) in [0, 1]
 
             # Normalised EV (relative to current remaining pool).
             # Shift up by |min_ev| when negatives are present so EVn stays in
             # [0, 1]; shift is normalization-only and does not affect stored EVs.
-            ev_rem = pool_ev_vals[remaining_pool_idx]
+            ev_rem = _sel_ev_vals(step)[remaining_pool_idx]
             min_ev = ev_rem.min()
             shift = -min_ev if min_ev < 0.0 else 0.0
             ev_shifted = ev_rem + shift
             max_ev_shifted = ev_shifted.max()
             EVn = ev_shifted / max_ev_shifted if max_ev_shifted > 1e-12 else np.ones(M_rem)
 
-            # Normalised determinant contribution
-            max_pv = partial_var.max()
-            DEn = partial_var / max_pv if max_pv > 1e-8 else np.ones(M_rem)
+            # distance is already a bounded, self-normalised [0, 1] quantity
+            # (unlike partial_var, it needs no per-step max-rescaling).
+            DEn = distance
 
             score = np.sqrt((evw * EVn) ** 2 + (dew * DEn) ** 2)
             best_in_rem = int(np.argmax(score))
@@ -964,21 +1104,15 @@ class DeterminantPortfolioSelector:
             selected_in_pool.append(best_pool)
             remaining_mask[best_pool] = False
 
-            # Schur complement update for C_inv
-            s = float(partial_var[best_in_rem])
-            s = max(s, 1e-10)  # clamp for numerical stability
-            r_new = R[best_in_rem]          # (k,)
-            v = C_inv @ r_new               # (k,)
-            new_row = (-v / s)[None, :]     # (1, k)
-            C_inv = np.block([
-                [C_inv + np.outer(v, v) / s, (-v / s)[:, None]],
-                [new_row,                     np.array([[1.0 / s]])],
-            ])
+            # Var(P_{k+1}) = Var(P_k) + Var(x_new) + 2*Cov(P_k, x_new)
+            #              = portfolio_var + 1 + 2*cov_to_portfolio[picked]
+            portfolio_var += 1.0 + 2.0 * float(cov_to_portfolio[best_in_rem])
+            portfolio_var = max(portfolio_var, 1e-10)  # clamp for numerical stability
 
             logger.debug(
-                "Det-EV step %d: pool_idx=%d  ev=$%.4f  partial_var=%.4f  score=%.4f",
+                "Det-EV step %d: pool_idx=%d  ev=$%.4f  distance=%.4f  score=%.4f",
                 step, pool_idx[best_pool],
-                float(pool_ev_vals[best_pool]), float(partial_var[best_in_rem]),
+                float(pool_ev_vals[best_pool]), float(distance[best_in_rem]),
                 float(score[best_in_rem]),
             )
 
@@ -987,7 +1121,7 @@ class DeterminantPortfolioSelector:
                     "step": step,
                     "portfolio_size": self._portfolio_size,
                     "lineup_ev": float(pool_ev_vals[best_pool]),
-                    "partial_var": float(partial_var[best_in_rem]),
+                    "distance": float(distance[best_in_rem]),
                     "score": float(score[best_in_rem]),
                     "n_remaining": int(remaining_mask.sum()),
                 })
@@ -999,5 +1133,248 @@ class DeterminantPortfolioSelector:
         logger.info(
             "DeterminantSelector done: %d lineups in %.1fs",
             len(result), time.perf_counter() - t0,
+        )
+        return result
+
+
+@njit(parallel=True, cache=True)
+def _kelly_gains_all(payout: np.ndarray, denom: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Marginal expected-log-growth of each candidate against the current
+    portfolio: mean_w[log1p(payout[m, w] / denom[w])] for unmasked rows.
+    denom[w] = bankroll + portfolio payout in world w (always > 0)."""
+    M, n_sims = payout.shape
+    out = np.full(M, -np.inf)
+    for m in prange(M):
+        if not mask[m]:
+            continue
+        s = 0.0
+        for w in range(n_sims):
+            p = payout[m, w]
+            if p != 0.0:
+                s += np.log1p(p / denom[w])
+        out[m] = s / n_sims
+    return out
+
+
+@njit(cache=True)
+def _kelly_gain_one(pay_row: np.ndarray, denom: np.ndarray) -> float:
+    n_sims = pay_row.shape[0]
+    s = 0.0
+    for w in range(n_sims):
+        p = pay_row[w]
+        if p != 0.0:
+            s += np.log1p(p / denom[w])
+    return s / n_sims
+
+
+class KellyPortfolioSelector:
+    """Round-10 selector: greedy expected-log-growth (fractional Kelly).
+
+    Objective: maximize E_w[log(B + portfolio_payout_w)] over sim worlds w,
+    exactly, on the same fresh robust_payout matrix the Det selector
+    consumes. Concavity makes marginal gains shrink in worlds the portfolio
+    already covers — world-partitioning derived from the objective rather
+    than proxied by a covariance determinant. Marginal gains are also
+    monotonically non-increasing as the portfolio grows, so lazy greedy
+    (stale gains as upper bounds, re-evaluate the heap top) is exact.
+
+    The first ceil(cash_anchor_fraction × portfolio_size) picks are pure
+    mean-EV rank (the cash-anchor block, mirroring the det path's anchor
+    semantics), with the anchors' payouts entering the portfolio state
+    before the Kelly picks begin.
+
+    B must exceed the maximum possible portfolio loss (fee × size) or the
+    all-entries-lose world sends log to a domain error; the caller enforces
+    the bankroll table's mult > 1.
+    """
+
+    def __init__(
+        self,
+        robust_payout: np.ndarray,
+        candidates: list[Lineup],
+        portfolio_size: int,
+        bankroll: float,
+        ev_floor: float = 0.20,
+        cash_anchor_fraction: float = 0.0,
+    ) -> None:
+        self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        self._candidates = candidates
+        self._portfolio_size = portfolio_size
+        self._bankroll = float(bankroll)
+        self._ev_floor = float(ev_floor)
+        self._cash_anchor_fraction = float(cash_anchor_fraction)
+
+    def select(
+        self,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> list[tuple[Lineup, float]]:
+        t0 = time.perf_counter()
+        pool_ev = self._robust_payout.mean(axis=1).astype(np.float64)
+        pool_idx = np.where(pool_ev >= self._ev_floor)[0]
+        if len(pool_idx) == 0:
+            logger.warning("KellySelector: no candidates with EV >= $%.2f.", self._ev_floor)
+            return []
+        # float32 rows with float64 accumulators/denominator: the log1p sums
+        # are float64 either way, and the float64 copy would be ~3 GB at
+        # production pool sizes.
+        payout = np.ascontiguousarray(self._robust_payout[pool_idx])  # (M_pool, n_sims) f32
+        ev_vals = pool_ev[pool_idx]
+        M_pool, n_sims = payout.shape
+        size = min(self._portfolio_size, M_pool)
+        n_anchor = int(np.ceil(self._cash_anchor_fraction * self._portfolio_size))
+
+        denom = np.full(n_sims, self._bankroll, dtype=np.float64)
+        selected: list[int] = []
+        remaining = np.ones(M_pool, dtype=bool)
+
+        # Cash-anchor block: pure mean-EV picks; their payouts still update
+        # the portfolio state so the Kelly picks respond to them.
+        anchor_order = np.argsort(ev_vals)[::-1]
+        for i in anchor_order[: min(n_anchor, size)]:
+            selected.append(int(i))
+            remaining[int(i)] = False
+            denom += payout[int(i)]
+
+        # Kelly picks, lazy greedy.
+        gains = _kelly_gains_all(payout, denom, remaining)
+        stale = np.zeros(M_pool, dtype=bool)
+        while len(selected) < size:
+            if stop_check is not None and stop_check():
+                logger.info("KellySelector: stop requested at step %d.", len(selected) + 1)
+                break
+            while True:
+                best = int(np.argmax(gains))
+                if gains[best] == -np.inf:
+                    break
+                if stale[best]:
+                    gains[best] = _kelly_gain_one(payout[best], denom)
+                    stale[best] = False
+                    continue
+                break
+            if gains[best] == -np.inf:
+                break
+            selected.append(best)
+            remaining[best] = False
+            denom += payout[best]
+            gains[best] = -np.inf
+            stale[remaining] = True
+            if progress_cb is not None:
+                progress_cb({
+                    "step": len(selected),
+                    "portfolio_size": size,
+                    "lineup_ev": float(ev_vals[best]),
+                    "n_remaining": int(remaining.sum()),
+                })
+
+        result = [(self._candidates[pool_idx[i]], float(ev_vals[i])) for i in selected]
+        logger.info(
+            "KellySelector done: %d lineups (anchor=%d, B=$%.0f) in %.1fs",
+            len(result), min(n_anchor, size), self._bankroll, time.perf_counter() - t0,
+        )
+        return result
+
+
+_POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
+
+
+class CoveragePortfolioSelector:
+    """Round-10 selector: greedy weighted max-coverage on tail worlds.
+
+    Each candidate carries a bit-vector over worlds (sim × fresh-field
+    pairs): 1 where the candidate beats the simulated field's p99.9. Greedy
+    picks the candidate covering the most uncovered worlds (submodular ⇒
+    (1−1/e) guarantee); ties — including the everything-covered endgame —
+    break by the tie_break vector (win_equity), then mean EV. The first
+    ceil(cash_anchor_fraction × portfolio_size) picks are pure mean-EV rank
+    (cash-anchor block); worlds they cover count as covered.
+    """
+
+    def __init__(
+        self,
+        robust_payout: np.ndarray,
+        candidates: list[Lineup],
+        portfolio_size: int,
+        beat999_bits: np.ndarray,      # (M, n_bytes) uint8, packed world bits
+        tie_break: Optional[np.ndarray] = None,   # (M,) higher = preferred
+        ev_floor: float = 0.20,
+        cash_anchor_fraction: float = 0.0,
+    ) -> None:
+        self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        self._candidates = candidates
+        self._portfolio_size = portfolio_size
+        self._bits = np.asarray(beat999_bits, dtype=np.uint8)
+        self._tie_break = tie_break
+        self._ev_floor = float(ev_floor)
+        self._cash_anchor_fraction = float(cash_anchor_fraction)
+
+    def select(
+        self,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> list[tuple[Lineup, float]]:
+        t0 = time.perf_counter()
+        pool_ev = self._robust_payout.mean(axis=1).astype(np.float64)
+        pool_idx = np.where(pool_ev >= self._ev_floor)[0]
+        if len(pool_idx) == 0:
+            logger.warning("CoverageSelector: no candidates with EV >= $%.2f.", self._ev_floor)
+            return []
+        bits = self._bits[pool_idx]                    # (M_pool, n_bytes)
+        ev_vals = pool_ev[pool_idx]
+        if self._tie_break is not None:
+            tb = np.asarray(self._tie_break, dtype=np.float64)[pool_idx]
+        else:
+            tb = ev_vals
+        M_pool = len(pool_idx)
+        size = min(self._portfolio_size, M_pool)
+        n_anchor = int(np.ceil(self._cash_anchor_fraction * self._portfolio_size))
+
+        uncovered = np.full(bits.shape[1], 0xFF, dtype=np.uint8)
+        selected: list[int] = []
+        remaining = np.ones(M_pool, dtype=bool)
+
+        def _cover(i: int) -> None:
+            np.bitwise_and(uncovered, np.bitwise_not(bits[i]), out=uncovered)
+
+        anchor_order = np.argsort(ev_vals)[::-1]
+        for i in anchor_order[: min(n_anchor, size)]:
+            selected.append(int(i))
+            remaining[int(i)] = False
+            _cover(int(i))
+
+        # Tie-break rank: primary tb, secondary mean EV — encode as a single
+        # dense rank so np.lexsort runs once, not per pick.
+        tb_rank = np.lexsort((ev_vals, tb))            # ascending; higher = better
+        tb_score = np.empty(M_pool, dtype=np.float64)
+        tb_score[tb_rank] = np.arange(M_pool, dtype=np.float64)
+
+        while len(selected) < size:
+            if stop_check is not None and stop_check():
+                logger.info("CoverageSelector: stop requested at step %d.", len(selected) + 1)
+                break
+            new_bits = np.bitwise_and(bits, uncovered[None, :])
+            gains = _POPCOUNT_LUT[new_bits].sum(axis=1).astype(np.float64)  # (M_pool,)
+            gains[~remaining] = -1.0
+            # Ties (incl. the all-covered endgame where every gain is 0)
+            # break by tb_score, which is < 1 in units of whole worlds.
+            best = int(np.argmax(gains + tb_score / M_pool))
+            if gains[best] < 0:
+                break
+            selected.append(best)
+            remaining[best] = False
+            _cover(best)
+            if progress_cb is not None:
+                progress_cb({
+                    "step": len(selected),
+                    "portfolio_size": size,
+                    "lineup_ev": float(ev_vals[best]),
+                    "worlds_gained": int(gains[best]),
+                    "n_remaining": int(remaining.sum()),
+                })
+
+        result = [(self._candidates[pool_idx[i]], float(ev_vals[i])) for i in selected]
+        logger.info(
+            "CoverageSelector done: %d lineups (anchor=%d, %d world-bytes) in %.1fs",
+            len(result), min(n_anchor, size), bits.shape[1], time.perf_counter() - t0,
         )
         return result
