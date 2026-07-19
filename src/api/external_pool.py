@@ -403,10 +403,26 @@ def group_and_match_contests(
 # ---------------------------------------------------------------------------
 
 def compute_pool_corr(lineups: list, sim_results) -> np.ndarray:
-    """(M, M) float32 correlation of simulated lineup scores. Every pool
-    player is guaranteed present in sim_results (players_df includes all pool
-    players), so the indicator matmul needs no -1 handling."""
+    """(M, M) float32 correlation of PAYOUT-SPACE lineup returns.
+
+    Round-11/12 (plans/round11_kernel_selector.md, plans/round12_shrinkage.md)
+    measured raw-score (points-space) and composition-only diversification
+    losing to dollar-space payout covariance by ~1.5pp mean_pct / ~1.4pp cash
+    pooled over 33 replay slates, and losing the chalky-first-pick ordering
+    property entirely — the payout curve's rank-compression/tail-extremity
+    nonlinearity, not raw score covariance, is where the diversification
+    signal actually lives. External mode has no simulated opponent field to
+    price that nonlinearity against, so it uses the pool itself as a
+    same-size proxy field (round-12's winning lambda=0 construction): each
+    sim's within-pool rank is mapped through the reference GPP payout curve
+    (scripts/replay_slate.py's percentile-sampled scaling, shared via
+    src.optimization.payout.scaled_payout_curve) scaled to the pool size,
+    then correlated. Every pool player is guaranteed present in sim_results
+    (players_df includes all pool players), so the indicator matmul needs no
+    -1 handling.
+    """
     from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
+    from src.optimization.payout import load_payout_structure, scaled_payout_curve
 
     col_map = {int(p): i for i, p in enumerate(sim_results.player_ids)}
     P = len(col_map)
@@ -415,8 +431,16 @@ def compute_pool_corr(lineups: list, sim_results) -> np.ndarray:
     for j, lu in enumerate(lineups):
         for pid in lu.player_ids:
             I[col_map[int(pid)], j] = 1.0
-    scores = (sim_results.results_matrix.astype(np.float32) @ I).T  # (M, n_sims)
-    pre = DeterminantPortfolioSelector.precompute_pool(scores, float("-inf"))
+    scores = sim_results.results_matrix.astype(np.float32) @ I  # (n_sims, M)
+
+    curve, _fee = scaled_payout_curve(load_payout_structure("dk_classic_gpp"), M)
+    # rank[s, j] = 0-indexed finish rank (0=best) of lineup j within the pool
+    # for sim s — a double argsort, fully vectorized (no per-sim Python loop).
+    rank = np.argsort(np.argsort(-scores, axis=1), axis=1)
+    payout = curve[rank].astype(np.float32)  # (n_sims, M)
+    payout -= payout.mean(axis=0, keepdims=True)
+
+    pre = DeterminantPortfolioSelector.precompute_pool(payout.T, float("-inf"))
     assert pre is not None and len(pre[0]) == M
     return pre[2]
 

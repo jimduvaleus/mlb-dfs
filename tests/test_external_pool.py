@@ -12,6 +12,7 @@ from src.api.external_pool import (
     ExternalPool,
     allocate_contests,
     build_quantile_grids,
+    compute_pool_corr,
     discover_external_files,
     group_and_match_contests,
     normalize_contest_name,
@@ -19,6 +20,7 @@ from src.api.external_pool import (
     parse_player_projections,
 )
 from src.optimization.lineup import Lineup
+from src.simulation.results import SimulationResults
 
 ROOT = Path(__file__).resolve().parent.parent
 LINEUPS_CSV = ROOT / "data" / "raw" / "lineups_dk_mlb_classic_7-17-2026_705pm.csv"
@@ -245,6 +247,76 @@ class TestAllocation:
         picks1 = {id(lu) for lu, _ in a1.portfolio}
         picks5 = {id(lu) for lu, _ in a5.portfolio}
         assert picks1 != picks5  # different EV/diversity blends pick differently
+
+
+class TestComputePoolCorr:
+    """Synthetic sim_results: exercises the payout-space transform (round-11/12
+    finding — dollar-space correlation beats raw points-space) without needing
+    real projections/sims.
+
+    Player means are drawn from a tight range (10 +/- 1) with substantial
+    per-sim noise (scale=5) so no lineup's pool-rank is degenerate (locked
+    to the same rank every sim, which would zero its payout variance) —
+    the noise-vs-mean-spread ratio here keeps every candidate's rank
+    genuinely stochastic across sims."""
+
+    def _sim_results(self, n_players=50, n_sims=800, seed=0):
+        rng = np.random.default_rng(seed)
+        player_ids = list(range(1, n_players + 1))
+        means = rng.uniform(9, 11, n_players)
+        results_matrix = rng.normal(
+            loc=means, scale=5.0, size=(n_sims, n_players)
+        ).astype(np.float32)
+        return SimulationResults(player_ids=player_ids, results_matrix=results_matrix)
+
+    def test_shape_symmetric_and_diagonal_near_one(self):
+        sim_results = self._sim_results()
+        rng = np.random.default_rng(1)
+        lineups = [
+            Lineup(player_ids=list(rng.choice(range(1, 51), size=10, replace=False)))
+            for _ in range(40)
+        ]
+        corr = compute_pool_corr(lineups, sim_results)
+        assert corr.shape == (40, 40)
+        np.testing.assert_allclose(corr, corr.T, atol=1e-4)
+        assert np.allclose(np.diag(corr), 1.0, atol=1e-3)
+
+    def test_identical_lineups_are_each_others_top_match(self):
+        """Two lineups with the same 10 players are not perfectly correlated
+        in payout space (stable-sort tie-breaking assigns them adjacent —
+        not equal — ranks every sim, and the payout curve's top-heavy
+        nonlinearity can amplify that adjacent-rank gap: this is the exact
+        mechanism, not a bug, behind round-11/12's points-vs-dollar-space
+        finding). The robust invariant is relative, not absolute: an exact
+        duplicate lineup should still be the single most-correlated partner
+        in the whole pool."""
+        sim_results = self._sim_results()
+        shared = list(range(1, 11))
+        rng = np.random.default_rng(2)
+        lineups = [Lineup(player_ids=shared), Lineup(player_ids=shared)] + [
+            Lineup(player_ids=list(rng.choice(range(1, 51), size=10, replace=False)))
+            for _ in range(20)
+        ]
+        corr = compute_pool_corr(lineups, sim_results)
+        row0 = corr[0].copy()
+        row0[0] = -np.inf  # exclude self
+        assert np.argmax(row0) == 1
+
+    def test_disjoint_lineups_less_correlated_than_identical(self):
+        sim_results = self._sim_results(n_players=60)
+        rng = np.random.default_rng(3)
+        shared = list(range(1, 11))
+        disjoint_a = list(range(11, 21))
+        disjoint_b = list(range(21, 31))
+        lineups = [
+            Lineup(player_ids=shared), Lineup(player_ids=shared),
+            Lineup(player_ids=disjoint_a), Lineup(player_ids=disjoint_b),
+        ] + [
+            Lineup(player_ids=list(rng.choice(range(1, 61), size=10, replace=False)))
+            for _ in range(20)
+        ]
+        corr = compute_pool_corr(lineups, sim_results)
+        assert corr[0, 1] > corr[2, 3]
 
 
 @needs_files
