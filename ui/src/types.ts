@@ -370,7 +370,7 @@ export interface GppDetSelectProgressEvent extends SSEEvent {
   step: number
   portfolio_size: number
   lineup_ev: number
-  partial_var: number
+  distance: number
   score: number
   n_remaining: number
   risk: number

@@ -531,7 +531,7 @@ export function ProgressPanel({ events, running }: Props) {
                   <span className="event-stage event-stage-lineup">{label} R{risk}</span>
                   <span className="event-detail">
                     {isComplete && 'complete'}
-                    {isActive && stepForRisk && `step ${stepForRisk.step}/${stepForRisk.portfolio_size} · EV $${stepForRisk.lineup_ev.toFixed(3)} · det ${(stepForRisk.partial_var * 100).toFixed(1)}%`}
+                    {isActive && stepForRisk && `step ${stepForRisk.step}/${stepForRisk.portfolio_size} · EV $${stepForRisk.lineup_ev.toFixed(3)} · dist ${(stepForRisk.distance * 100).toFixed(1)}%`}
                     {isActive && !stepForRisk && 'starting…'}
                     {!isComplete && !isActive && ''}
                   </span>

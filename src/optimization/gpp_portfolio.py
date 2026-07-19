@@ -849,22 +849,33 @@ class ContestScorer:
 # ------------------------------------------------------------------ #
 
 class DeterminantPortfolioSelector:
-    """Greedy portfolio construction via incremental determinant maximisation.
+    """Greedy portfolio construction via incremental correlation-distance maximisation.
 
     At each step scores every remaining +EV candidate on a weighted combination of:
       EVn — normalised mean dollar payout (robust_payout.mean(axis=1))
-      DEn — normalised incremental determinant contribution (partial variance of the
-             candidate's payout vector given the lineups already selected)
+      Dn  — normalised correlation distance between the candidate's payout and
+            the running portfolio's aggregate payout (the sum of the payout
+            vectors of the lineups already selected)
 
-    The determinant of the payout correlation matrix measures how jointly the
-    portfolio's dollar returns move across simulations.  Maximising it is
-    equivalent to minimising return correlation — the Shaidy diversification
-    principle applied to dollar EV rather than raw scores.
+    For standardised (zero-mean, unit-variance) random variables X, Y:
+      E[(X-Y)^2] = 2(1 - corr(X,Y))
+    so (1 - r) / 2 is the natural, normalised [0, 1] distance implied by a
+    correlation — monotonically *decreasing* in r, not in |r|. A candidate
+    anti-correlated with the portfolio (r -> -1) is strictly farther
+    (Dn -> 1) than an uncorrelated one (r = 0, Dn = 0.5), which is strictly
+    farther than a co-correlated one (r -> 1, Dn -> 0). This is deliberately
+    different from a partial-variance/Schur-complement formulation (1 - r^2),
+    which is symmetric in the sign of r and treats a hedge as no better than
+    an equally-sized co-movement.
 
-    The incremental contribution is computed via the Schur complement:
-      partial_var(c) = 1 - r_c^T C_k^{-1} r_c
-    where r_c is the vector of correlations between candidate c and the k
-    already-selected lineups, and C_k^{-1} is maintained with O(k^2) updates.
+    Generalising from a single reference lineup to a k-lineup running
+    portfolio: let P_k = sum of the k already-selected (standardised) payout
+    vectors. The candidate's correlation with the portfolio's aggregate
+    payout is
+      r_c = Cov(x_c, P_k) / sqrt(Var(P_k)) = (sum_i r_{c,i}) / sqrt(sum_{i,j} r_{i,j})
+    (sums over the selected set i, j; each x is standardised so Var(x_c) = 1).
+    Both the numerator and Var(P_k) update in O(k) per step as lineups are
+    added — no matrix inverse, no Schur complement.
 
     No fresh simulations, no hybrid fields, no correlation thresholds —
     the Phase-1 robust_payout matrix is the only input required.
@@ -1034,14 +1045,15 @@ class DeterminantPortfolioSelector:
         first = int(np.argmax(_sel_ev_vals(1)))
         selected_in_pool.append(first)
         remaining_mask[first] = False
-        C_inv = np.array([[1.0]])  # 1×1, starts as correlation of lineup with itself
+        # Var(P_1) in standardised units — a single lineup's self-correlation.
+        portfolio_var = 1.0
 
         if progress_cb is not None:
             progress_cb({
                 "step": 1,
                 "portfolio_size": self._portfolio_size,
                 "lineup_ev": float(pool_ev_vals[first]),
-                "partial_var": 1.0,
+                "distance": 1.0,
                 "score": 1.0,
                 "n_remaining": int(remaining_mask.sum()),
             })
@@ -1057,16 +1069,19 @@ class DeterminantPortfolioSelector:
             if M_rem == 0:
                 break
 
-            k = len(selected_in_pool)
-
             # Correlation of each remaining candidate with each selected lineup
             R = corr_matrix[np.ix_(remaining_pool_idx, selected_in_pool)].astype(np.float64)  # (M_rem, k)
 
-            # Partial variance: how much independent variance each candidate adds
-            # partial_var[m] = 1 - R[m] @ C_inv @ R[m]
-            temp = R @ C_inv               # (M_rem, k)
-            partial_var = 1.0 - (temp * R).sum(axis=1)   # (M_rem,)
-            partial_var = np.clip(partial_var, 0.0, 1.0)
+            # Correlation-distance to the running portfolio's aggregate payout
+            # P_k = sum of the selected (standardised) payout vectors. Since
+            # each is unit-variance, Cov(x_c, P_k) = sum_i r_{c,i} and
+            # Var(P_k) = sum_{i,j} r_{i,j} = portfolio_var (maintained
+            # incrementally below), so r_c = Cov / sqrt(Var(P_k)) directly —
+            # no matrix inverse needed.
+            cov_to_portfolio = R.sum(axis=1)                         # (M_rem,)
+            r_to_portfolio = cov_to_portfolio / np.sqrt(portfolio_var)
+            r_to_portfolio = np.clip(r_to_portfolio, -1.0, 1.0)       # fp-noise guard
+            distance = (1.0 - r_to_portfolio) / 2.0                   # (M_rem,) in [0, 1]
 
             # Normalised EV (relative to current remaining pool).
             # Shift up by |min_ev| when negatives are present so EVn stays in
@@ -1078,9 +1093,9 @@ class DeterminantPortfolioSelector:
             max_ev_shifted = ev_shifted.max()
             EVn = ev_shifted / max_ev_shifted if max_ev_shifted > 1e-12 else np.ones(M_rem)
 
-            # Normalised determinant contribution
-            max_pv = partial_var.max()
-            DEn = partial_var / max_pv if max_pv > 1e-8 else np.ones(M_rem)
+            # distance is already a bounded, self-normalised [0, 1] quantity
+            # (unlike partial_var, it needs no per-step max-rescaling).
+            DEn = distance
 
             score = np.sqrt((evw * EVn) ** 2 + (dew * DEn) ** 2)
             best_in_rem = int(np.argmax(score))
@@ -1089,21 +1104,15 @@ class DeterminantPortfolioSelector:
             selected_in_pool.append(best_pool)
             remaining_mask[best_pool] = False
 
-            # Schur complement update for C_inv
-            s = float(partial_var[best_in_rem])
-            s = max(s, 1e-10)  # clamp for numerical stability
-            r_new = R[best_in_rem]          # (k,)
-            v = C_inv @ r_new               # (k,)
-            new_row = (-v / s)[None, :]     # (1, k)
-            C_inv = np.block([
-                [C_inv + np.outer(v, v) / s, (-v / s)[:, None]],
-                [new_row,                     np.array([[1.0 / s]])],
-            ])
+            # Var(P_{k+1}) = Var(P_k) + Var(x_new) + 2*Cov(P_k, x_new)
+            #              = portfolio_var + 1 + 2*cov_to_portfolio[picked]
+            portfolio_var += 1.0 + 2.0 * float(cov_to_portfolio[best_in_rem])
+            portfolio_var = max(portfolio_var, 1e-10)  # clamp for numerical stability
 
             logger.debug(
-                "Det-EV step %d: pool_idx=%d  ev=$%.4f  partial_var=%.4f  score=%.4f",
+                "Det-EV step %d: pool_idx=%d  ev=$%.4f  distance=%.4f  score=%.4f",
                 step, pool_idx[best_pool],
-                float(pool_ev_vals[best_pool]), float(partial_var[best_in_rem]),
+                float(pool_ev_vals[best_pool]), float(distance[best_in_rem]),
                 float(score[best_in_rem]),
             )
 
@@ -1112,7 +1121,7 @@ class DeterminantPortfolioSelector:
                     "step": step,
                     "portfolio_size": self._portfolio_size,
                     "lineup_ev": float(pool_ev_vals[best_pool]),
-                    "partial_var": float(partial_var[best_in_rem]),
+                    "distance": float(distance[best_in_rem]),
                     "score": float(score[best_in_rem]),
                     "n_remaining": int(remaining_mask.sum()),
                 })
