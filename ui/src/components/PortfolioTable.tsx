@@ -16,6 +16,7 @@ interface Props {
   platform?: PlatformType
   evwBase?: number
   evwMax?: number
+  externalMode?: boolean
 }
 
 function formatFdEntryInfo(entryFee?: string | null, contestName?: string | null): string {
@@ -179,7 +180,8 @@ function parseFeeCents(entryFee: string | null | undefined): number {
 
 // Average $EV across a portfolio's lineups, weighted by each lineup's entry fee,
 // then normalized by /4 since mean_ev is computed assuming a $4 entry fee.
-function calcWeightedAvgEv(lineups: LineupResult[]): number | null {
+// In external mode mean_ev already IS a per-contest ROI, so no /4 rescale.
+function calcWeightedAvgEv(lineups: LineupResult[], externalMode = false): number | null {
   let weightedSum = 0
   let totalFee = 0
   for (const l of lineups) {
@@ -189,7 +191,7 @@ function calcWeightedAvgEv(lineups: LineupResult[]): number | null {
     totalFee += fee
   }
   if (totalFee === 0) return null
-  return (weightedSum / totalFee) / 4
+  return externalMode ? weightedSum / totalFee : (weightedSum / totalFee) / 4
 }
 
 function entrySortKey(lineup: LineupResult): [number, number, number] {
@@ -220,7 +222,7 @@ function evwForRisk(risk: number, evwBase: number, evwMax: number): number {
   return Math.min(Math.max(evwBase + t * (evwMax - evwBase), 0), 1)
 }
 
-export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = [], activeRisk = 1, onActivateRisk, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform, evwBase = 0.10, evwMax = 0.40 }: Props) {
+export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = [], activeRisk = 1, onActivateRisk, unconfirmedPlayerIds, onDeleteLineup, replacingLineupIndex, platform, evwBase = 0.10, evwMax = 0.40, externalMode = false }: Props) {
   const [activeTab, setActiveTab] = useState<'portfolio' | 'optimal'>('portfolio')
   // viewingRisk: which risk the user is currently browsing (null = showing active)
   const [viewingRisk, setViewingRisk] = useState<number | null>(null)
@@ -493,9 +495,13 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                   {isActive && <span className="portfolio-risk-star">★ </span>}Risk {entry.risk}
                   <span className="portfolio-risk-btn-stats">EVw {evwForRisk(entry.risk, evwBase, evwMax).toFixed(3)}</span>
                   {(() => {
-                    const weightedAvgEv = calcWeightedAvgEv(entry.lineups)
+                    const weightedAvgEv = calcWeightedAvgEv(entry.lineups, externalMode)
                     return weightedAvgEv != null && (
-                      <span className="portfolio-risk-btn-stats">${weightedAvgEv.toFixed(2)} avg $EV</span>
+                      <span className="portfolio-risk-btn-stats">
+                        {externalMode
+                          ? `${(weightedAvgEv * 100).toFixed(1)}% avg ROI`
+                          : `$${weightedAvgEv.toFixed(2)} avg $EV`}
+                      </span>
                     )
                   })()}
                   {contestNormalized.size > 0 && (() => {
@@ -641,7 +647,11 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                 <span className="lineup-card-num">#{lineup.lineup_index}</span>
                 <span className="lineup-card-salary">${lineup.lineup_salary.toLocaleString()}</span>
                 {lineup.mean_ev != null && (
-                  <span className="lineup-card-ev">${lineup.mean_ev.toFixed(1)}</span>
+                  <span className="lineup-card-ev">
+                    {externalMode
+                      ? `ROI ${(lineup.mean_ev * 100).toFixed(1)}%`
+                      : `$${lineup.mean_ev.toFixed(1)}`}
+                  </span>
                 )}
                 {optIdx != null && (
                   <span className="lineup-card-opt-ref">Opt #{optIdx}</span>

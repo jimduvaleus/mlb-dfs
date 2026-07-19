@@ -2944,12 +2944,47 @@ def run_cache_status():
     except Exception:
         pass
 
+    # External candidate pool availability (SaberSim import mode).
+    external_pool: dict = {"available": False, "lineups_file": None,
+                           "projections_file": None, "n_lineups": None,
+                           "n_contests": None, "paired_by_token": False,
+                           "error": None}
+    try:
+        from .external_pool import discover_external_files
+        raw_dir = str((PROJECT_ROOT / slate_path).parent) if slate_path else ""
+        found = discover_external_files(raw_dir) if raw_dir else {}
+        if found.get("lineups_path") and found.get("projections_path"):
+            import csv as _csv
+            with open(found["lineups_path"], newline="", encoding="utf-8-sig") as _f:
+                _reader = _csv.reader(_f)
+                _header = next(_reader)
+                _n_lineups = sum(1 for _ in _reader)
+            _hset = set(_header)
+            _n_contests = sum(
+                1 for c in _header
+                if c.endswith(" ROI") and f"{c[:-4]} Sim Dupes" in _hset
+            )
+            external_pool.update({
+                "available": _n_contests > 0,
+                "lineups_file": found["lineups_path"].name,
+                "projections_file": found["projections_path"].name,
+                "n_lineups": _n_lineups,
+                "n_contests": _n_contests,
+                "paired_by_token": bool(found.get("paired_by_token")),
+                "error": None if _n_contests > 0 else "no contest ROI blocks found",
+            })
+        else:
+            external_pool["error"] = "no lineups_*.csv / projections pair in data/raw"
+    except Exception as exc:
+        external_pool["error"] = str(exc)
+
     return {
         **status,
         "is_gpp": is_gpp,
         "n_configured_candidates": cfg.gpp.n_candidates,
         "n_configured_field_k": cfg.gpp.n_field_samples,
         "n_batter_teams": n_batter_teams,
+        "external_pool": external_pool,
     }
 
 
@@ -2960,6 +2995,7 @@ async def run_stream(
     use_field: bool = False,
     seed_optimal: bool = False,
     seed_sim_optimal: bool = False,
+    use_external_pool: bool = False,
 ):
     if _state["status"] in ("running", "replacing"):
         raise HTTPException(409, "A run is already in progress")
@@ -3000,7 +3036,8 @@ async def run_stream(
             from .pipeline import PipelineRunner
             import yaml as _yaml
             _cfg_path = str(PROJECT_ROOT / "config.yaml")
-            if seed_optimal or seed_sim_optimal:
+            # Seed flags are meaningless when the pool is externally sourced.
+            if (seed_optimal or seed_sim_optimal) and not use_external_pool:
                 with open(_cfg_path) as _f:
                     _cfg = _yaml.safe_load(_f) or {}
                 if seed_optimal:
@@ -3021,6 +3058,7 @@ async def run_stream(
                 stop_check=_stop_event.is_set,
                 use_cached_candidates=use_candidates,
                 use_cached_field=use_field,
+                use_external_pool=use_external_pool,
             )
             portfolio = runner.run()
             _state["portfolio"] = portfolio
@@ -3134,7 +3172,8 @@ def get_portfolio_sweep():
         if data.get("slate_fingerprint") != current_fp:
             return {"sweep": [], "active_risk": 1}
 
-        return {"sweep": data.get("sweep", []), "active_risk": data.get("active_risk", 1)}
+        return {"sweep": data.get("sweep", []), "active_risk": data.get("active_risk", 1),
+                "mode": data.get("mode")}
     except Exception:
         return {"sweep": [], "active_risk": 1}
 

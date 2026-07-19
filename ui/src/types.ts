@@ -410,6 +410,16 @@ export interface GppFieldInjectEvent extends SSEEvent {
   n_k: number
 }
 
+export interface ExternalPoolStatus {
+  available: boolean
+  lineups_file: string | null
+  projections_file: string | null
+  n_lineups: number | null
+  n_contests: number | null
+  paired_by_token: boolean
+  error?: string | null
+}
+
 export interface CacheStatus {
   fingerprint: string
   candidates: number | null   // null = no cache
@@ -418,6 +428,7 @@ export interface CacheStatus {
   n_configured_field_k: number
   is_gpp: boolean
   n_batter_teams: number
+  external_pool?: ExternalPoolStatus
 }
 
 export type RunStatus = 'idle' | 'running' | 'complete' | 'stopped' | 'error' | 'replacing' | 'reselecting'

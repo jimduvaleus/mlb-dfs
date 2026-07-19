@@ -14,6 +14,8 @@ data/processed/batter_pca_model.npz
 data/processed/batter_score_grid.npy
 data/raw/DKSalaries.csv
 data/raw/FanDuel-MLB-*.csv
+data/raw/lineups_*.csv
+data/raw/MLB_*.csv
 data/processed/projections.csv
 outputs/
 archive/

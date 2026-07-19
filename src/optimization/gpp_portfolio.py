@@ -896,7 +896,13 @@ class DeterminantPortfolioSelector:
         ev_override: Optional[np.ndarray] = None,
         cash_anchor_fraction: float = 0.0,
     ) -> None:
-        self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        # robust_payout may be None when `precomputed` is supplied (external
+        # pool mode passes (pool_idx, ROI vector, corr) directly): the greedy
+        # loop runs entirely off the precompute tuple, and pool_ev_vals is
+        # then whatever EV currency the caller chose (ev_floor is unused).
+        self._robust_payout = (
+            None if robust_payout is None else np.asarray(robust_payout, dtype=np.float32)
+        )
         self._candidates = candidates
         self._portfolio_size = portfolio_size
         self._evw = self.evw_for_risk(risk, evw_base, evw_max)
@@ -990,6 +996,10 @@ class DeterminantPortfolioSelector:
         # when the caller passed precompute_pool() output) ---
         pre = self._precomputed
         if pre is None:
+            if self._robust_payout is None:
+                raise ValueError(
+                    "robust_payout is required when precomputed is not supplied"
+                )
             pre = self.precompute_pool(self._robust_payout, self._ev_floor)
         if pre is None:
             logger.warning("No candidates with EV >= $%.2f; returning empty portfolio.", self._ev_floor)

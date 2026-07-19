@@ -219,12 +219,21 @@ class PipelineRunner:
         use_cached_field: bool = False,
         persist_caches: bool = True,
         sim_cache_path: Optional[str] = None,
+        use_external_pool: bool = False,
     ):
         self._config_path = config_path
         self._cb = progress_cb or (lambda stage, data: None)
         self._stop_check = stop_check
         self._use_cached_candidates = use_cached_candidates
         self._use_cached_field = use_cached_field
+        # External candidate pool mode (SaberSim import): bypass generation
+        # and contest simulation, allocate per-contest portfolios from the
+        # imported pool. Cached candidates/field are meaningless here.
+        self._use_external_pool = use_external_pool
+        self._external_mode = False
+        if use_external_pool:
+            self._use_cached_candidates = False
+            self._use_cached_field = False
         # Replay-only knobs (scripts/replay_slate.py); the live server never
         # sets these. persist_caches=False keeps offline replays from writing
         # into the shared data/lineup_cache/. sim_cache_path reuses one
@@ -304,6 +313,12 @@ class PipelineRunner:
         slate_df = ingestor.get_slate_dataframe()
         n_teams = slate_df["team"].nunique()
         logger.info("Slate loaded: %d players, %d teams", len(slate_df), n_teams)
+
+        if self._use_external_pool:
+            return self._run_external(
+                cfg, paths, sim_cfg, platform, slate_path, slate_df,
+                all_file_entries, entry_handlers, output_dir,
+            )
 
         # --- Projections (optional) --------------------------------------
         proj_df = None
@@ -2280,6 +2295,249 @@ class PipelineRunner:
 
         return result
 
+    # ------------------------------------------------------------------
+    # External candidate pool mode (SaberSim import)
+    # ------------------------------------------------------------------
+
+    def _run_external(
+        self,
+        cfg: dict,
+        paths: dict,
+        sim_cfg: dict,
+        platform,
+        slate_path: str,
+        slate_df: pd.DataFrame,
+        all_file_entries: list,
+        entry_handlers: dict,
+        output_dir: str,
+    ) -> list[dict]:
+        """External pool mode: imported lineups + per-contest ROI replace
+        generation and contest simulation; the player-level sim runs only to
+        supply the selector's diversity correlation. One portfolio per
+        entered contest, highest entry fee first; a lineup never appears in
+        two contests."""
+        from pathlib import Path as _Path
+
+        from src.api import external_pool as ep
+        from .slate_exclusions import compute_file_fingerprint
+
+        gpp_cfg = cfg.get("gpp", {})
+        raw_dir = os.path.dirname(slate_path) if slate_path else ""
+        found = ep.discover_external_files(raw_dir)
+        if not found["lineups_path"] or not found["projections_path"]:
+            raise ValueError(
+                "External pool mode: could not find a lineups_*.csv / "
+                "projections CSV pair in %s." % (raw_dir or "data/raw")
+            )
+        if not all_file_entries:
+            raise ValueError(
+                "External pool mode requires *Entries.csv files in the slate "
+                "directory — per-contest allocation has nothing to allocate to."
+            )
+        self._cb("external_load", {
+            "lineups_file": found["lineups_path"].name,
+            "projections_file": found["projections_path"].name,
+            "paired_by_token": found["paired_by_token"],
+        })
+
+        _config_root = _Path(self._config_path).resolve().parent
+        _slate_fp = compute_file_fingerprint(_config_root / slate_path)
+        ep.archive_external_inputs(
+            _config_root, slate_path, found["lineups_path"], found["projections_path"],
+        )
+
+        valid_ids = set(slate_df["player_id"].astype(int))
+        pool = ep.parse_lineup_pool(found["lineups_path"], valid_ids)
+        if not pool.lineups:
+            raise ValueError("External pool mode: every lineup in the file was dropped "
+                             "(unknown player ids) — is the export for this slate?")
+        proj_ext = ep.parse_player_projections(found["projections_path"])
+        pool_pids = {int(p) for lu in pool.lineups for p in lu.player_ids}
+        players_df = ep.build_external_players_df(
+            slate_df, proj_ext, pool_pids, self._derive_opponent,
+        )
+        self._cb("load_slate", {
+            "n_players": len(players_df),
+            "n_teams": int(players_df["team"].nunique()),
+        })
+
+        # --- Player-level sim for the diversity correlation ---------------
+        copula = EmpiricalCopula(paths["copula"])
+        grids = ep.build_quantile_grids(proj_ext)
+        n_sims = int(sim_cfg.get("n_sims", 10_000))
+        self._cb("simulate", {"n_sims": n_sims})
+        engine = SimulationEngine(
+            copula, players_df, batter_pca_model=None, score_grid=None,
+            quantile_grids=grids,
+        )
+        sim_results = engine.simulate(n_sims)
+        corr = ep.compute_pool_corr(pool.lineups, sim_results)
+        self._cb("external_pool", {
+            "n_lineups": len(pool.lineups),
+            "n_contests_covered": len(pool.contests),
+            "n_dropped_unknown": pool.n_dropped_unknown_players,
+            "n_dropped_duplicates": pool.n_dropped_duplicates,
+        })
+
+        # --- Contest grouping + ROI matching ------------------------------
+        groups = ep.group_and_match_contests(all_file_entries, pool)
+        total_entries = sum(len(g.entries) for g in groups)
+        self._cb("external_contests", {
+            "contests": [
+                {
+                    "contest_name": g.contest_name,
+                    "entry_fee": g.entry_fee_cents / 100.0,
+                    "n_entries": len(g.entries),
+                    "roi_source": pool.contests[g.roi_key].raw_name,
+                    "fallback": g.roi_fallback,
+                }
+                for g in groups
+            ],
+            "total_entries": total_entries,
+            "pool_size": len(pool.lineups),
+        })
+        if total_entries > len(pool.lineups):
+            logger.warning(
+                "External pool: %d entries but only %d lineups — later "
+                "contests will be left unfilled.", total_entries, len(pool.lineups),
+            )
+
+        # --- 5-risk sweep: independent per-contest allocations -------------
+        _evw_base = float(gpp_cfg.get("evw_base", 0.10))
+        _evw_max = float(gpp_cfg.get("evw_max", 0.40))
+        _risks = [1.0, 2.0, 3.0, 4.0, 5.0]
+        allocations: dict[float, "ep.ExternalAllocation"] = {}
+        for _risk_idx, _risk in enumerate(_risks):
+            if self._stop_check is not None and self._stop_check():
+                break
+            self._cb("gpp_det_risk_start", {
+                "risk": _risk, "risk_index": _risk_idx + 1, "total_risks": len(_risks),
+            })
+            allocations[_risk] = ep.allocate_contests(
+                pool, corr, groups, risk=_risk,
+                evw_base=_evw_base, evw_max=_evw_max,
+                stop_check=self._stop_check,
+                progress_cb=lambda data, r=_risk, ri=_risk_idx: self._cb(
+                    "gpp_det_select_progress",
+                    {**data, "risk": r, "risk_index": ri + 1, "total_risks": len(_risks)},
+                ),
+            )
+        if not allocations:
+            self._cb("stopped", {"portfolio": [], "n_lineups": 0,
+                                 "optimal_lineups": [], "portfolio_sweep": []})
+            return []
+
+        # The entry plan is risk-invariant by construction (same contest
+        # order, same per-contest slot counts); assert rather than assume.
+        _plans = [
+            [rec.entry_id for _, rec in a.entry_plan] for a in allocations.values()
+        ]
+        if any(p != _plans[0] for p in _plans[1:]):
+            raise RuntimeError("external allocation entry plans diverged across risks")
+
+        _first_risk = min(allocations.keys())
+        _alloc = allocations[_first_risk]
+        portfolio = _alloc.portfolio
+        _portfolio_sweep_raw = [(r, allocations[r].portfolio) for r in sorted(allocations)]
+        if _alloc.unfilled:
+            logger.warning(
+                "External pool: %d entries left unfilled (pool exhausted).",
+                len(_alloc.unfilled),
+            )
+
+        # --- Persist + finalize (mirrors the tail of run()) ----------------
+        self._external_mode = True
+        self._external_entry_plan = _alloc.entry_plan
+        self._external_unfilled = _alloc.unfilled
+        self._sweep_portfolios_raw = {r: p for r, p in _portfolio_sweep_raw}
+        self._raw_portfolio = portfolio
+        self._portfolio_has_dollar_ev = True  # score slot carries contest ROI
+        self._discarded_lineups = set()
+        self._all_file_entries = all_file_entries
+        self._entry_handlers = entry_handlers
+        self._slate_df = slate_df
+        self._output_dir = output_dir
+        self._platform = platform
+        self._players_df = players_df
+        self._sim_results = None  # replace_lineup is unsupported in this mode
+
+        entry_map = self._build_external_entry_map()
+        result = self._serialize_portfolio(portfolio, players_df, mean_ev_from_score=True)
+        for lr in result:
+            info = entry_map.get(lr["lineup_index"])
+            if info:
+                lr.update(info)
+
+        os.makedirs(output_dir, exist_ok=True)
+        portfolio_df = self._format_portfolio_df(portfolio, players_df, mean_ev_from_score=True)
+        portfolio_df.to_csv(
+            os.path.join(output_dir, f"portfolio_{platform.value}.csv"), index=False,
+        )
+
+        _sweep_payload = []
+        for r, p in _portfolio_sweep_raw:
+            lineups = self._serialize_portfolio(p, players_df, mean_ev_from_score=True)
+            for lr in lineups:
+                info = entry_map.get(lr["lineup_index"])
+                if info:
+                    lr.update(info)
+            _sweep_payload.append({"risk": r, "lineups": lineups})
+        _sweep_cache_path = os.path.join(output_dir, f"portfolio_sweep_{platform.value}.json")
+        try:
+            with open(_sweep_cache_path, "w") as _f:
+                json.dump({
+                    "slate_fingerprint": _slate_fp or "",
+                    "active_risk": _first_risk,
+                    "mode": "external",
+                    "sweep": _sweep_payload,
+                }, _f)
+        except Exception as _e:
+            logger.warning("Failed to save external sweep cache: %s", _e)
+
+        was_stopped = self._stop_check is not None and self._stop_check()
+        if not was_stopped:
+            assignments = self._external_assignments(portfolio)
+            paths_written = entry_handlers["write"](
+                all_file_entries, assignments, slate_df, output_dir
+            )
+            self._cb("upload_files", {"n_files": len(paths_written), "paths": paths_written})
+            meta_path = os.path.join(output_dir, f"portfolio_entries_{platform.value}.json")
+            with open(meta_path, "w") as f:
+                json.dump({str(k): v for k, v in entry_map.items()}, f)
+
+        stage = "stopped" if was_stopped else "complete"
+        self._cb(stage, {
+            "portfolio": result,
+            "n_lineups": len(result),
+            "optimal_lineups": [],
+            "portfolio_sweep": _sweep_payload,
+            "external": True,
+        })
+        return result
+
+    def _external_assignments(self, portfolio: list) -> dict:
+        """Direct per-contest assignment: lineup i fills the entry it was
+        selected for (replaces the prize-pool/fee ratio sort of
+        assign_lineups_to_entries)."""
+        assignments: dict = {}
+        for (lineup, _), (file_path, rec) in zip(portfolio, self._external_entry_plan):
+            assignments.setdefault(file_path, []).append((rec, lineup))
+        return assignments
+
+    def _build_external_entry_map(self) -> dict:
+        """Entry meta keyed by 1-based lineup index, in fill order.
+        entry_sort_order = fill index, so PortfolioTable's existing ascending
+        sort renders the per-contest, descending-entry-fee fill order."""
+        entry_map: dict[int, dict] = {}
+        for i, (file_path, rec) in enumerate(self._external_entry_plan):
+            entry_map[i + 1] = {
+                "upload_tag": _extract_upload_tag(file_path.name),
+                "entry_fee": rec.entry_fee_raw,
+                "contest_name": _shorten_contest_name(rec.contest_name),
+                "entry_sort_order": i,
+            }
+        return entry_map
+
     def activate_sweep_risk(self, risk: float) -> list[dict]:
         """Switch the active portfolio to a different det_ev sweep risk level.
 
@@ -2310,7 +2568,10 @@ class PipelineRunner:
 
         if self._all_file_entries:
             self.write_upload_files()
-            entry_map = self._build_lineup_entry_map(self._all_file_entries, portfolio)
+            if getattr(self, "_external_mode", False):
+                entry_map = self._build_external_entry_map()
+            else:
+                entry_map = self._build_lineup_entry_map(self._all_file_entries, portfolio)
             for lr in result:
                 info = entry_map.get(lr["lineup_index"])
                 if info:
@@ -2343,7 +2604,10 @@ class PipelineRunner:
             raise RuntimeError("No pipeline run artifacts available.")
         if not self._all_file_entries:
             return []
-        assignments = self._entry_handlers["assign"](self._all_file_entries, self._raw_portfolio)
+        if getattr(self, "_external_mode", False):
+            assignments = self._external_assignments(self._raw_portfolio)
+        else:
+            assignments = self._entry_handlers["assign"](self._all_file_entries, self._raw_portfolio)
         return self._entry_handlers["write"](
             self._all_file_entries, assignments, self._slate_df, self._output_dir
         )
@@ -2360,6 +2624,8 @@ class PipelineRunner:
         list[dict]
             Updated portfolio serialized in the same format as ``run()``.
         """
+        if getattr(self, "_external_mode", False):
+            raise RuntimeError("Lineup replacement is not available in external pool mode.")
         idx = lineup_index - 1
         deleted_lineup, _ = self._raw_portfolio[idx]
         remaining = self._raw_portfolio[:idx] + self._raw_portfolio[idx + 1:]
