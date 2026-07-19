@@ -250,15 +250,15 @@ class TestAllocation:
 
 
 class TestComputePoolCorr:
-    """Synthetic sim_results: exercises the payout-space transform (round-11/12
-    finding — dollar-space correlation beats raw points-space) without needing
-    real projections/sims.
+    """Synthetic sim_results: exercises the points-space correlation used for
+    external-pool diversity without needing real projections/sims.
 
-    Player means are drawn from a tight range (10 +/- 1) with substantial
-    per-sim noise (scale=5) so no lineup's pool-rank is degenerate (locked
-    to the same rank every sim, which would zero its payout variance) —
-    the noise-vs-mean-spread ratio here keeps every candidate's rank
-    genuinely stochastic across sims."""
+    A within-pool-rank payout transform was tried and reverted here — it
+    collapsed the diversity signal for pools without tight near-duplicate
+    clustering, making the risk sweep produce near-identical portfolios at
+    every risk level (see compute_pool_corr's docstring). These tests use
+    plain simulated-score correlation, which does not have that failure
+    mode."""
 
     def _sim_results(self, n_players=50, n_sims=800, seed=0):
         rng = np.random.default_rng(seed)
@@ -281,15 +281,9 @@ class TestComputePoolCorr:
         np.testing.assert_allclose(corr, corr.T, atol=1e-4)
         assert np.allclose(np.diag(corr), 1.0, atol=1e-3)
 
-    def test_identical_lineups_are_each_others_top_match(self):
-        """Two lineups with the same 10 players are not perfectly correlated
-        in payout space (stable-sort tie-breaking assigns them adjacent —
-        not equal — ranks every sim, and the payout curve's top-heavy
-        nonlinearity can amplify that adjacent-rank gap: this is the exact
-        mechanism, not a bug, behind round-11/12's points-vs-dollar-space
-        finding). The robust invariant is relative, not absolute: an exact
-        duplicate lineup should still be the single most-correlated partner
-        in the whole pool."""
+    def test_identical_lineups_perfectly_correlated(self):
+        """Two lineups with the same 10 players score identically every sim
+        -> correlation exactly 1 in points-space (no rank-tie artifacts)."""
         sim_results = self._sim_results()
         shared = list(range(1, 11))
         rng = np.random.default_rng(2)
@@ -298,9 +292,7 @@ class TestComputePoolCorr:
             for _ in range(20)
         ]
         corr = compute_pool_corr(lineups, sim_results)
-        row0 = corr[0].copy()
-        row0[0] = -np.inf  # exclude self
-        assert np.argmax(row0) == 1
+        assert corr[0, 1] == pytest.approx(1.0, abs=1e-4)
 
     def test_disjoint_lineups_less_correlated_than_identical(self):
         sim_results = self._sim_results(n_players=60)
@@ -317,6 +309,81 @@ class TestComputePoolCorr:
         ]
         corr = compute_pool_corr(lineups, sim_results)
         assert corr[0, 1] > corr[2, 3]
+
+    def test_partial_overlap_correlation_between_extremes(self):
+        """5-of-10 shared players -> correlation strictly between the
+        identical (10/10 shared) and disjoint (0/10 shared) cases. This is
+        the graded structure the rank-based payout transform destroyed —
+        the regression this test guards against."""
+        sim_results = self._sim_results(n_players=60, seed=7)
+        rng = np.random.default_rng(4)
+        base = list(range(1, 11))
+        half_shared = base[:5] + list(range(11, 16))
+        disjoint = list(range(21, 31))
+        lineups = [
+            Lineup(player_ids=base), Lineup(player_ids=base),
+            Lineup(player_ids=half_shared), Lineup(player_ids=disjoint),
+        ] + [
+            Lineup(player_ids=list(rng.choice(range(1, 61), size=10, replace=False)))
+            for _ in range(20)
+        ]
+        corr = compute_pool_corr(lineups, sim_results)
+        assert corr[0, 1] > corr[0, 2] > corr[0, 3]
+
+
+class TestRiskSweepDifferentiation:
+    """Regression guard: on a realistic pool (correlated team-stack blocks,
+    matching how a real candidate/external pool clusters), risk=1 (diversity-
+    heavy) and risk=5 (EV-heavy) must select meaningfully different
+    portfolios. This directly reproduces the bug the within-pool-rank
+    payout transform caused: with a degenerate (near-constant) diversity
+    term, every risk level collapses to the same EV-only ranking."""
+
+    def _stacked_pool(self, n_teams=30, team_size=10, n_sims=4000, M=1200, seed=0):
+        rng = np.random.default_rng(seed)
+        n_players = n_teams * team_size
+        team_of = np.repeat(np.arange(n_teams), team_size)
+        player_mean = rng.uniform(9, 11, n_players)
+        team_shocks = rng.normal(0, 4.0, size=(n_sims, n_teams)).astype(np.float32)
+        noise = rng.normal(0, 3.0, size=(n_sims, n_players)).astype(np.float32)
+        results_matrix = (player_mean[None, :] + team_shocks[:, team_of] + noise).astype(np.float32)
+        sim_results = SimulationResults(
+            player_ids=list(range(1, n_players + 1)), results_matrix=results_matrix,
+        )
+        lineups = []
+        for _ in range(M):
+            t = rng.integers(0, n_teams)
+            team_players = rng.choice(
+                np.arange(t * team_size, t * team_size + team_size), size=5, replace=False,
+            )
+            others = rng.choice(
+                np.setdiff1d(np.arange(n_players), team_players), size=5, replace=False,
+            )
+            pids = [int(p) + 1 for p in list(team_players) + list(others)]
+            lineups.append(Lineup(player_ids=pids))
+        roi = rng.normal(0, 0.3, M)
+        return sim_results, lineups, roi
+
+    def test_risk_extremes_produce_different_portfolios(self):
+        from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
+
+        sim_results, lineups, roi = self._stacked_pool()
+        corr = compute_pool_corr(lineups, sim_results)
+        M = len(lineups)
+        picks = {}
+        for risk in (1.0, 5.0):
+            sel = DeterminantPortfolioSelector(
+                robust_payout=None, candidates=lineups, portfolio_size=150, risk=risk,
+                evw_base=0.10, evw_max=0.40, ev_floor=float("-inf"),
+                precomputed=(np.arange(M), roi.astype(np.float64), corr),
+                cash_anchor_fraction=0.0,
+            )
+            picks[risk] = {id(lu) for lu, _ in sel.select()}
+        overlap = len(picks[1.0] & picks[5.0])
+        assert overlap < 100, (
+            f"risk=1 and risk=5 portfolios share {overlap}/150 lineups — "
+            "the diversity term is not differentiating the risk sweep."
+        )
 
 
 @needs_files
