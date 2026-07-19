@@ -432,9 +432,12 @@ def allocate_contests(
     progress_cb: Optional[Callable[[dict], None]] = None,
 ) -> ExternalAllocation:
     """One risk universe: per-contest greedy selection with shared removal.
-    EV currency = the contest's ROI column; ev_floor is -inf so contests
-    whose ROI is uniformly negative still fill their entries (the selector's
-    EVn shift handles negative EVs)."""
+    EV currency = the contest's ROI column. The candidate pool is culled
+    per contest to ROI >= 0.0 *before* the Det/ROI math runs — no legacy
+    dollar-EV floor applies here (`ev_floor` is passed as -inf/unused
+    since `precomputed` is supplied pre-culled). A contest with fewer
+    ROI >= 0.0 lineups than entries leaves the remainder unfilled rather
+    than backfilling with negative-ROI lineups."""
     from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
 
     M = len(pool.lineups)
@@ -451,7 +454,8 @@ def allocate_contests(
         roi = contest.roi
         fill_value = float(np.nanmin(roi) - 1.0) if np.isfinite(np.nanmin(roi)) else -1.0
         roi = np.nan_to_num(roi, nan=fill_value)
-        rem = np.where(mask)[0]
+        rem_all = np.where(mask)[0]
+        rem = rem_all[roi[rem_all] >= 0.0]
         k = min(len(g.entries), len(rem))
         if k < len(g.entries):
             unfilled.extend(g.entries[k:])

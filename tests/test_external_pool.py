@@ -190,20 +190,44 @@ class TestAllocation:
 
     def test_pool_exhaustion_reports_unfilled(self):
         pool = self._pool(M=8)
+        # Force every ROI positive so the ROI>=0.0 cull isn't the binding
+        # constraint here — this test is about pool-size exhaustion.
+        for c in pool.contests.values():
+            c.roi = np.abs(c.roi)
         corr = np.eye(8, dtype=np.float32)
         groups = self._groups(pool, [6, 5])
         alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
         assert len(alloc.portfolio) == 8
         assert len(alloc.unfilled) == 3
 
-    def test_all_negative_roi_still_fills(self):
+    def test_negative_roi_lineups_culled_and_left_unfilled(self):
+        """Candidates are culled to ROI >= 0.0 per contest before the
+        Det/ROI selection runs — a contest with no non-negative-ROI
+        lineups left in the pool goes unfilled rather than backfilling
+        with negative-ROI picks."""
         pool = self._pool()
         for c in pool.contests.values():
             c.roi = -np.abs(c.roi) - 0.5
         corr = np.eye(len(pool.lineups), dtype=np.float32)
         groups = self._groups(pool, [7])
         alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
-        assert len(alloc.portfolio) == 7
+        assert len(alloc.portfolio) == 0
+        assert len(alloc.unfilled) == 7
+
+    def test_roi_cull_is_per_contest(self):
+        """A lineup with negative ROI in one contest but non-negative ROI
+        in another is still eligible for the latter."""
+        pool = self._pool(M=10, n_contests=2)
+        keys = list(pool.contests.keys())
+        pool.contests[keys[0]].roi = np.full(10, -1.0)
+        pool.contests[keys[1]].roi = np.full(10, 1.0)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [3])
+        # Route the single group at the second (all-positive-ROI) contest.
+        groups[0].roi_key = keys[1]
+        alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        assert len(alloc.portfolio) == 3
+        assert not alloc.unfilled
 
     def test_risk_universes_independent(self):
         pool = self._pool(M=120, seed=3)
