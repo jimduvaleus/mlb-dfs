@@ -89,6 +89,9 @@ export interface GppConfig {
   dupe_salary_coef: number
   dupe_stack_coef: number
   dupe_min_gross_payout: number
+  external_pool_roi_floor_pct: number
+  external_pool_ceiling_weight: number
+  external_pool_cash_anchor_fraction: number
 }
 
 export interface AppConfig {

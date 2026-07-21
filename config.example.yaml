@@ -92,3 +92,6 @@ gpp:
   dupe_salary_coef: 0.095
   dupe_stack_coef: -0.102
   dupe_min_gross_payout: 15.0
+  external_pool_roi_floor_pct: 40.0
+  external_pool_ceiling_weight: 0.25
+  external_pool_cash_anchor_fraction: 0.25

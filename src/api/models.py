@@ -141,6 +141,23 @@ class GppConfig(BaseModel):
     dupe_salary_coef: float = 0.089
     dupe_stack_coef: float = 0.024
     dupe_min_gross_payout: float = 15.0
+    # External pool mode: per-contest ROI percentile floor for the pre-Det
+    # cull (see allocate_contests in src/api/external_pool.py). A raw ROI
+    # cutoff doesn't generalize across contests of different sizes/payout
+    # structures, so the floor is expressed as "cull the bottom N% of this
+    # contest's own ROI distribution" — computed independently per contest.
+    external_pool_roi_floor_pct: float = 40.0
+    # Ceiling lean: ranks the post-floor pool by roi + weight * (residualized,
+    # normalized ROI StDev) instead of plain roi (see compute_ceiling_ev in
+    # external_pool.py) — no-ops when the export has no ROI StDev column.
+    # cash_anchor_fraction mirrors the internal pipeline's ceiling-first
+    # cash-anchor block: that fraction of each contest's picks still ranks
+    # on plain roi regardless of ceiling_weight. Unvalidated against real
+    # settled external-pool outcomes (too little archive data yet) — start
+    # conservative and recalibrate as archive/analyze_external_pool.py
+    # accumulates more settled slates.
+    external_pool_ceiling_weight: float = 0.25
+    external_pool_cash_anchor_fraction: float = 0.25
 
 
 class AppConfig(BaseModel):

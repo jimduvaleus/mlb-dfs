@@ -2405,6 +2405,9 @@ class PipelineRunner:
         # --- 5-risk sweep: independent per-contest allocations -------------
         _evw_base = float(gpp_cfg.get("evw_base", 0.10))
         _evw_max = float(gpp_cfg.get("evw_max", 0.40))
+        _roi_floor_pct = float(gpp_cfg.get("external_pool_roi_floor_pct", 40.0))
+        _ceiling_weight = float(gpp_cfg.get("external_pool_ceiling_weight", 0.25))
+        _cash_anchor = float(gpp_cfg.get("external_pool_cash_anchor_fraction", 0.25))
         _risks = [1.0, 2.0, 3.0, 4.0, 5.0]
         allocations: dict[float, "ep.ExternalAllocation"] = {}
         for _risk_idx, _risk in enumerate(_risks):
@@ -2416,6 +2419,9 @@ class PipelineRunner:
             allocations[_risk] = ep.allocate_contests(
                 pool, corr, groups, risk=_risk,
                 evw_base=_evw_base, evw_max=_evw_max,
+                roi_floor_percentile=_roi_floor_pct,
+                ceiling_weight=_ceiling_weight,
+                cash_anchor_fraction=_cash_anchor,
                 stop_check=self._stop_check,
                 progress_cb=lambda data, r=_risk, ri=_risk_idx: self._cb(
                     "gpp_det_select_progress",

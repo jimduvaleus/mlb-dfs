@@ -1,5 +1,6 @@
 """Tests for the external candidate pool mode (src/api/external_pool.py),
 run against the real 7/17 example export files when present."""
+import csv
 import numpy as np
 import pandas as pd
 import pytest
@@ -12,6 +13,7 @@ from src.api.external_pool import (
     ExternalPool,
     allocate_contests,
     build_quantile_grids,
+    compute_ceiling_ev,
     compute_pool_corr,
     discover_external_files,
     group_and_match_contests,
@@ -192,29 +194,76 @@ class TestAllocation:
 
     def test_pool_exhaustion_reports_unfilled(self):
         pool = self._pool(M=8)
-        # Force every ROI positive so the ROI>=0.0 cull isn't the binding
-        # constraint here — this test is about pool-size exhaustion.
+        # Force every ROI positive *and* disable the percentile cull
+        # (roi_floor_percentile=0.0 -> threshold = the contest's own min,
+        # which is >=0 here so the absolute ROI>=0.0 guard is also a no-op)
+        # — this test is about pool-size exhaustion, not either cull.
         for c in pool.contests.values():
-            c.roi = np.abs(c.roi)
+            c.roi = np.abs(c.roi) + 0.01
         corr = np.eye(8, dtype=np.float32)
         groups = self._groups(pool, [6, 5])
-        alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+                                   roi_floor_percentile=0.0)
         assert len(alloc.portfolio) == 8
         assert len(alloc.unfilled) == 3
 
-    def test_negative_roi_lineups_culled_and_left_unfilled(self):
-        """Candidates are culled to ROI >= 0.0 per contest before the
-        Det/ROI selection runs — a contest with no non-negative-ROI
-        lineups left in the pool goes unfilled rather than backfilling
-        with negative-ROI picks."""
-        pool = self._pool()
-        for c in pool.contests.values():
-            c.roi = -np.abs(c.roi) - 0.5
-        corr = np.eye(len(pool.lineups), dtype=np.float32)
+    def test_percentile_floor_culls_bottom_fraction(self):
+        """The per-contest cull is a percentile of that contest's own ROI
+        column, not a single absolute cutoff — when the whole distribution
+        is comfortably above 0.0, the percentile (not the ROI>=0.0 guard)
+        is the binding constraint and culls the bottom
+        roi_floor_percentile% specifically."""
+        pool = self._pool(M=10, n_contests=1)
+        key = next(iter(pool.contests))
+        # Evenly spaced, all positive and above the 0.0 guard: 40th
+        # percentile lands exactly between the 4th and 5th smallest values,
+        # so the bottom 4 are culled and 6 survive under the default
+        # roi_floor_percentile=40.
+        pool.contests[key].roi = np.arange(10, dtype=np.float64) + 1.0
+        corr = np.eye(10, dtype=np.float32)
         groups = self._groups(pool, [7])
         alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        assert len(alloc.portfolio) == 6
+        assert len(alloc.unfilled) == 1
+        threshold = np.percentile(pool.contests[key].roi, 40)
+        assert min(roi for _, roi in alloc.portfolio) >= threshold
+
+    def test_zero_roi_guard_overrides_lenient_percentile(self):
+        """Even when the configured percentile floor is lenient (or the
+        contest's own distribution is entirely negative, making the
+        percentile threshold negative), an absolute ROI>=0.0 guard still
+        applies: max(percentile_threshold, 0.0). A contest with no
+        non-negative-ROI lineups at all goes fully unfilled."""
+        pool = self._pool(M=10, n_contests=1)
+        key = next(iter(pool.contests))
+        pool.contests[key].roi = np.arange(10, dtype=np.float64) - 20.0  # all negative
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [7])
+        # roi_floor_percentile=0.0 would otherwise admit everything (the
+        # percentile alone floors at the distribution's own min).
+        alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+                                   roi_floor_percentile=0.0)
         assert len(alloc.portfolio) == 0
         assert len(alloc.unfilled) == 7
+
+    def test_percentile_floor_independent_across_contests(self):
+        """Skewing contest A's ROI distribution (and therefore its own cull
+        threshold) must not change what gets culled for contest B, even
+        though both draw from the same underlying lineup pool."""
+        pool = self._pool(M=10, n_contests=2)
+        keys = list(pool.contests.keys())
+        base = np.arange(10, dtype=np.float64)
+        pool.contests[keys[0]].roi = base.copy()
+        pool.contests[keys[1]].roi = base.copy()
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [10])
+        groups[0].roi_key = keys[1]
+        alloc_before = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        pool.contests[keys[0]].roi = np.concatenate([np.full(9, -1000.0), [1000.0]])
+        alloc_after = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        ids_before = sorted(id(lu) for lu, _ in alloc_before.portfolio)
+        ids_after = sorted(id(lu) for lu, _ in alloc_after.portfolio)
+        assert ids_before == ids_after
 
     def test_roi_cull_is_per_contest(self):
         """A lineup with negative ROI in one contest but non-negative ROI
@@ -230,6 +279,41 @@ class TestAllocation:
         alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
         assert len(alloc.portfolio) == 3
         assert not alloc.unfilled
+
+    def test_ceiling_weight_noop_without_stddev_data(self):
+        """ceiling_weight has no effect when the pool's ExternalContest has
+        no roi_stddev (older exports / synthetic pools without the column)."""
+        pool = self._pool()
+        corr = np.eye(len(pool.lineups), dtype=np.float32)
+        groups = self._groups(pool, [10])
+        baseline = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        with_ceiling = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ceiling_weight=0.5, cash_anchor_fraction=0.25,
+        )
+        ids_a = [id(lu) for lu, _ in baseline.portfolio]
+        ids_b = [id(lu) for lu, _ in with_ceiling.portfolio]
+        assert ids_a == ids_b
+
+    def test_ceiling_weight_changes_selection_with_stddev_data(self):
+        """With a real roi_stddev column (uncorrelated-with-roi excess
+        component) and identity correlation (diversity term is constant,
+        so ranking is EV-only), a nonzero ceiling_weight must reorder picks."""
+        pool = self._pool(M=200, n_contests=1)
+        key = next(iter(pool.contests))
+        rng = np.random.default_rng(11)
+        roi = pool.contests[key].roi
+        pool.contests[key].roi_stddev = np.abs(roi) * 1.5 + rng.normal(0, 1.0, len(roi)) ** 2
+        corr = np.eye(len(pool.lineups), dtype=np.float32)
+        groups = self._groups(pool, [15])
+        baseline = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        with_ceiling = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ceiling_weight=2.0, cash_anchor_fraction=0.0,
+        )
+        ids_a = {id(lu) for lu, _ in baseline.portfolio}
+        ids_b = {id(lu) for lu, _ in with_ceiling.portfolio}
+        assert ids_a != ids_b
 
     def test_risk_universes_independent(self):
         pool = self._pool(M=120, seed=3)
@@ -247,6 +331,55 @@ class TestAllocation:
         picks1 = {id(lu) for lu, _ in a1.portfolio}
         picks5 = {id(lu) for lu, _ in a5.portfolio}
         assert picks1 != picks5  # different EV/diversity blends pick differently
+
+
+class TestComputeCeilingEv:
+    def test_returns_none_without_stddev(self):
+        roi = np.linspace(-0.2, 0.5, 50)
+        assert compute_ceiling_ev(roi, None, weight=0.3) is None
+
+    def test_returns_none_when_weight_zero(self):
+        roi = np.linspace(-0.2, 0.5, 50)
+        stddev = np.abs(roi) * 2 + 0.1
+        assert compute_ceiling_ev(roi, stddev, weight=0.0) is None
+
+    def test_returns_none_for_small_pool(self):
+        roi = np.linspace(-0.2, 0.5, 10)
+        stddev = np.abs(roi) * 2 + 0.1
+        assert compute_ceiling_ev(roi, stddev, weight=0.3) is None
+
+    def test_exactly_predicted_stddev_returns_none(self):
+        """If roi_stddev is an exact linear function of roi, the residual is
+        (numerically) zero everywhere — not enough signal to build a
+        ceiling lean from, so this falls back to plain roi via a None
+        return, rather than z-scoring near-zero noise up to full effect."""
+        rng = np.random.default_rng(0)
+        roi = rng.normal(0.2, 0.3, 200)
+        stddev = 2.0 * roi + 0.5  # exact linear relationship -> zero residual
+        assert compute_ceiling_ev(roi, stddev, weight=1.0) is None
+
+    def test_excess_residual_lifts_ranking(self):
+        """Two lineups with identical roi: the one with residual (excess)
+        stddev beyond what roi alone predicts should rank higher under a
+        positive ceiling weight."""
+        rng = np.random.default_rng(1)
+        n = 200
+        roi = rng.normal(0.2, 0.3, n)
+        stddev = np.abs(roi) * 1.5 + 0.3 + rng.normal(0, 0.05, n)
+        roi = np.concatenate([roi, [0.2, 0.2]])
+        stddev = np.concatenate([stddev, [0.1, 5.0]])
+        ceiling = compute_ceiling_ev(roi, stddev, weight=0.5)
+        assert ceiling[-1] > ceiling[-2]
+
+    def test_negative_weight_penalizes_excess_residual(self):
+        rng = np.random.default_rng(1)
+        n = 200
+        roi = rng.normal(0.2, 0.3, n)
+        stddev = np.abs(roi) * 1.5 + 0.3 + rng.normal(0, 0.05, n)
+        roi = np.concatenate([roi, [0.2, 0.2]])
+        stddev = np.concatenate([stddev, [0.1, 5.0]])
+        ceiling = compute_ceiling_ev(roi, stddev, weight=-0.5)
+        assert ceiling[-1] < ceiling[-2]
 
 
 class TestComputePoolCorr:
@@ -337,7 +470,18 @@ class TestRiskSweepDifferentiation:
     heavy) and risk=5 (EV-heavy) must select meaningfully different
     portfolios. This directly reproduces the bug the within-pool-rank
     payout transform caused: with a degenerate (near-constant) diversity
-    term, every risk level collapses to the same EV-only ranking."""
+    term, every risk level collapses to the same EV-only ranking.
+
+    Baseline shifted when the EV/diversity combination switched from a
+    quadratic blend (sqrt((evw*EVn)^2 + (dew*DEn)^2)) to a linear one
+    (evw*EVn + dew*DEn): quadratic amplifies whichever weight currently
+    dominates, so risk=1 and risk=5 pull toward opposite extremes harder.
+    Measured on this exact scenario: quadratic gave 40/150 overlap, linear
+    gives 114/150 — real, not noise (confirmed by toggling the formula and
+    rerunning). The threshold below reflects the new linear baseline with
+    headroom; it still catches genuine inertness (overlap creeping toward
+    150), just not at the old quadratic-era bar. evw_base/evw_max may be
+    widened later to restore more separation under linear blending."""
 
     def _stacked_pool(self, n_teams=30, team_size=10, n_sims=4000, M=1200, seed=0):
         rng = np.random.default_rng(seed)
@@ -380,10 +524,53 @@ class TestRiskSweepDifferentiation:
             )
             picks[risk] = {id(lu) for lu, _ in sel.select()}
         overlap = len(picks[1.0] & picks[5.0])
-        assert overlap < 100, (
+        assert overlap < 135, (
             f"risk=1 and risk=5 portfolios share {overlap}/150 lineups — "
             "the diversity term is not differentiating the risk sweep."
         )
+
+
+def test_parse_lineup_pool_roi_stddev(tmp_path):
+    """A 'ROI StDev' sibling column is parsed and divided by 100 to sit on
+    the same unscaled-fraction footing as `roi` (see ExternalContest.roi_stddev
+    for the units reasoning)."""
+    header = (
+        ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+        + ["MLB $1K Test ROI", "MLB $1K Test Sim Dupes", "MLB $1K Test Win Rate",
+           "MLB $1K Test Cash Rate", "MLB $1K Test ROI StDev"]
+    )
+    rows = [
+        [str(i) for i in range(1, 11)] + ["1.5", "0.02", "0.001", "0.3", "86.9"],
+        [str(i) for i in range(11, 21)] + ["0.8", "0.03", "0.0008", "0.35", "30.0"],
+    ]
+    path = tmp_path / "lineups_test.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 21)))
+    contest = pool.contests[normalize_contest_name("MLB $1K Test")]
+    assert contest.roi_stddev is not None
+    np.testing.assert_allclose(contest.roi_stddev, [0.869, 0.300])
+
+
+def test_parse_lineup_pool_missing_roi_stddev_column(tmp_path):
+    """Older exports without a 'ROI StDev' sibling column parse fine —
+    roi_stddev is None, not a crash."""
+    header = (
+        ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+        + ["MLB $1K Test ROI", "MLB $1K Test Sim Dupes", "MLB $1K Test Win Rate",
+           "MLB $1K Test Cash Rate"]
+    )
+    rows = [[str(i) for i in range(1, 11)] + ["1.5", "0.02", "0.001", "0.3"]]
+    path = tmp_path / "lineups_test.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 11)))
+    contest = pool.contests[normalize_contest_name("MLB $1K Test")]
+    assert contest.roi_stddev is None
 
 
 @needs_files

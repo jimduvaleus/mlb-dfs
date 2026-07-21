@@ -189,6 +189,35 @@ def test_progress_callback_called():
         assert d["n_remaining"] >= 0
 
 
+def test_score_is_linear_not_quadratic():
+    """score = evw*EVn + dew*DEn (linear), not sqrt((evw*EVn)^2+(dew*DEn)^2).
+
+    Engineered EVn/DEn pair where the two combination rules pick a
+    different second lineup: candidate 1 has the higher remaining EV but
+    is strongly correlated with the anchor (EVn=1.0, DEn=0.05); candidate 2
+    has lower EV but is anti-correlated with the anchor (EVn=0.6, DEn=0.6).
+    Linear scores candidate 2 higher (0.6 vs 0.525); the quadratic
+    combination this replaced scored candidate 1 higher (0.501 vs 0.424) —
+    this guards against reverting to it.
+    """
+    candidates = [_make_lineup(list(range(i * 10, i * 10 + 10))) for i in range(3)]
+    pool_idx = np.arange(3)
+    pool_ev_vals = np.array([100.0, 10.0, 6.0])  # candidate 0 anchors (highest EV)
+    corr_matrix = np.array([
+        [1.0, 0.9, -0.2],
+        [0.9, 1.0, 0.0],
+        [-0.2, 0.0, 1.0],
+    ], dtype=np.float32)
+    sel = DeterminantPortfolioSelector(
+        robust_payout=None, candidates=candidates, portfolio_size=2,
+        evw_base=0.5, evw_max=0.5, risk=3.0,
+        precomputed=(pool_idx, pool_ev_vals, corr_matrix),
+    )
+    result = sel.select()
+    picked_idx = {candidates.index(lu) for lu, _ in result}
+    assert picked_idx == {0, 2}, f"expected anchor(0) + candidate 2, got {picked_idx}"
+
+
 def test_stop_check_respected():
     rng = np.random.default_rng(7)
     payout = _identity_payout(30, 100, rng)

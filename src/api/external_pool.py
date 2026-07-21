@@ -49,6 +49,15 @@ class ExternalContest:
     roi: np.ndarray               # (M,) float64, NaN where blank
     prize_pool_cents: Optional[int]
     single_entry: bool
+    # (M,) float64, NaN where blank, or None for exports predating this
+    # column. Saber's raw "ROI StDev" cell is already in the same
+    # percentage-point scale as `roi * 100` (verified against a real
+    # archived slate: raw roi_stddev/100 divided by raw roi gave a
+    # coefficient of variation of ~0.28, in line with the lineup's own
+    # points-space CV of ~0.29; treating both columns as needing the same
+    # x100 gave an implausible ~28x ratio) — so this is stored /100 to sit
+    # on the same *unscaled fraction* footing as `roi` itself.
+    roi_stddev: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -136,6 +145,7 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
 
     header_set = set(header)
     contest_cols: dict[str, tuple[str, int]] = {}  # norm_name -> (raw prefix, col idx)
+    stddev_cols: dict[str, int] = {}  # norm_name -> col idx of "<prefix> ROI StDev", if present
     for idx, col in enumerate(header):
         if not col.endswith(" ROI"):
             continue
@@ -147,6 +157,9 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
             logger.warning("External pool: duplicate contest block %r — keeping first.", prefix)
             continue
         contest_cols[norm] = (prefix, idx)
+        std_col = f"{prefix} ROI StDev"
+        if std_col in header_set:
+            stddev_cols[norm] = header.index(std_col)
     if not contest_cols:
         raise ValueError(
             f"External lineup file has no contest ROI blocks "
@@ -155,6 +168,7 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
 
     lineups: list[Lineup] = []
     roi_rows: list[list[float]] = []
+    stddev_rows: list[list[float]] = []
     seen: set[frozenset[int]] = set()
     n_unknown = 0
     n_dup = 0
@@ -176,6 +190,7 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
         seen.add(key)
         lineups.append(Lineup(player_ids=pids))
         vals = []
+        std_vals = []
         for norm in norm_names:
             _, idx = contest_cols[norm]
             cell = r[idx] if idx < len(r) else ""
@@ -183,9 +198,22 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
                 vals.append(float(cell))
             except ValueError:
                 vals.append(np.nan)
+            std_idx = stddev_cols.get(norm)
+            cell = r[std_idx] if std_idx is not None and std_idx < len(r) else ""
+            try:
+                std_vals.append(float(cell))
+            except ValueError:
+                std_vals.append(np.nan)
         roi_rows.append(vals)
+        stddev_rows.append(std_vals)
 
     roi_mat = np.array(roi_rows, dtype=np.float64) if roi_rows else np.zeros((0, len(norm_names)))
+    # See ExternalContest.roi_stddev: Saber's raw cell is already pct-pt
+    # scaled like `roi * 100`, so /100 puts it on roi's own fraction scale.
+    stddev_mat = (
+        np.array(stddev_rows, dtype=np.float64) / 100.0
+        if stddev_rows else np.zeros((0, len(norm_names)))
+    )
     contests = {}
     for j, norm in enumerate(norm_names):
         raw, _ = contest_cols[norm]
@@ -195,6 +223,7 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
             roi=roi_mat[:, j],
             prize_pool_cents=_parse_prize_pool_cents(raw),
             single_entry=bool(_SINGLE_ENTRY_RE.search(raw)),
+            roi_stddev=stddev_mat[:, j] if norm in stddev_cols else None,
         )
     logger.info(
         "External pool: %d lineups (%d dropped unknown-player, %d duplicate), %d contests: %s",
@@ -402,6 +431,51 @@ def group_and_match_contests(
 # Correlation + allocation
 # ---------------------------------------------------------------------------
 
+_MIN_CEILING_FIT_N = 30
+
+
+def compute_ceiling_ev(
+    roi: np.ndarray, roi_stddev: Optional[np.ndarray], weight: float,
+) -> Optional[np.ndarray]:
+    """roi + weight * (residual of roi_stddev after regressing out roi),
+    z-scored then rescaled to roi's own spread.
+
+    roi_stddev is highly correlated with roi itself (0.83 measured against
+    a real archived slate's mini-MAX tier) — most of what it says about a
+    lineup's upside is already implied by roi. Regressing roi_stddev on roi
+    and using the *residual* isolates the part that's genuinely new
+    information (more upside variance than roi alone predicts) instead of
+    rewarding high-roi lineups a second time for being high-roi. The
+    residual is z-scored, then rescaled by roi's own stddev so `weight` is
+    a unitless multiplier comparable across contests of very different
+    scale (coefficient of variation ranged from -1.07 to +0.28 across
+    contest tiers in one archived slate).
+
+    Returns None (caller should fall back to plain roi) when roi_stddev is
+    unavailable, weight is 0, or the pool is too small/degenerate to fit a
+    meaningful residual.
+    """
+    if roi_stddev is None or weight == 0.0:
+        return None
+    finite = np.isfinite(roi) & np.isfinite(roi_stddev)
+    if int(finite.sum()) < _MIN_CEILING_FIT_N:
+        return None
+    roi_std = float(roi[finite].std())
+    if roi_std < 1e-12:
+        return None
+
+    slope, intercept = np.polyfit(roi[finite], roi_stddev[finite], 1)
+    predicted = intercept + slope * roi
+    resid = roi_stddev - predicted
+    resid_std = float(np.nanstd(resid[finite]))
+    if resid_std < 1e-12:
+        return None
+    resid_z = resid / resid_std
+    ceiling = roi + weight * resid_z * roi_std
+    # Non-finite inputs (missing per-lineup StDev) fall back to plain roi.
+    return np.where(np.isfinite(ceiling), ceiling, roi)
+
+
 def compute_pool_corr(lineups: list, sim_results) -> np.ndarray:
     """(M, M) float32 correlation of simulated lineup scores (points-space).
 
@@ -453,16 +527,46 @@ def allocate_contests(
     risk: float,
     evw_base: float,
     evw_max: float,
+    roi_floor_percentile: float = 40.0,
+    ceiling_weight: float = 0.0,
+    cash_anchor_fraction: float = 0.0,
     stop_check: Optional[Callable[[], bool]] = None,
     progress_cb: Optional[Callable[[dict], None]] = None,
 ) -> ExternalAllocation:
     """One risk universe: per-contest greedy selection with shared removal.
     EV currency = the contest's ROI column. The candidate pool is culled
-    per contest to ROI >= 0.0 *before* the Det/ROI math runs — no legacy
-    dollar-EV floor applies here (`ev_floor` is passed as -inf/unused
-    since `precomputed` is supplied pre-culled). A contest with fewer
-    ROI >= 0.0 lineups than entries leaves the remainder unfilled rather
-    than backfilling with negative-ROI lineups."""
+    per contest *before* the Det/ROI math runs — no legacy dollar-EV floor
+    applies here (`ev_floor` is passed as -inf/unused since `precomputed`
+    is supplied pre-culled).
+
+    ceiling_weight > 0 (with cash_anchor_fraction, mirroring the internal
+    pipeline's ceiling-first `selector_score: tail` pattern) leans the
+    *ranking* inside the greedy selection toward each contest's ROI StDev
+    (see compute_ceiling_ev) without changing the floor cull, the
+    correlation/diversity term, or the reported per-lineup EV — all three
+    stay on plain roi. No-ops (falls back to plain roi ranking) when the
+    pool's ExternalContest has no roi_stddev (older exports).
+
+    A raw ROI cutoff (e.g. >= 0.0) doesn't generalize across contests of
+    different sizes/payout structures, so the floor is a percentile of
+    that contest's own full ROI column: `roi_floor_percentile=40` culls
+    the bottom 40% of `contest.roi` values. The threshold is computed from
+    the contest's complete (un-masked) ROI distribution, so which lineups
+    get culled for one contest never depends on what another contest culled
+    or picked — pools legitimately differ across contests, but only because
+    each contest's own ROI distribution differs, not because of cross-contest
+    interference. The shared-removal `mask` (a lineup picked for one contest
+    is unavailable to the rest) is a separate mechanism and still applies on
+    top of the per-contest cull. Blank/unparseable ROI cells always cull
+    (they sort below any real percentile). A contest with fewer surviving
+    lineups than entries leaves the remainder unfilled rather than
+    backfilling with sub-floor lineups.
+
+    An absolute ROI >= 0.0 guard always applies on top of the percentile:
+    the effective floor is `max(percentile_threshold, 0.0)`, so a contest
+    whose bottom `roi_floor_percentile`% is still non-negative (e.g. a
+    strong pool) never admits a lineup projected to lose money, even
+    though the percentile alone would have let it through."""
     from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
 
     M = len(pool.lineups)
@@ -477,10 +581,15 @@ def allocate_contests(
             break
         contest = pool.contests[g.roi_key]
         roi = contest.roi
-        fill_value = float(np.nanmin(roi) - 1.0) if np.isfinite(np.nanmin(roi)) else -1.0
+        finite_roi = roi[np.isfinite(roi)]
+        if finite_roi.size == 0:
+            unfilled.extend(g.entries)
+            continue
+        roi_floor = max(float(np.percentile(finite_roi, roi_floor_percentile)), 0.0)
+        fill_value = float(finite_roi.min() - 1.0)
         roi = np.nan_to_num(roi, nan=fill_value)
         rem_all = np.where(mask)[0]
-        rem = rem_all[roi[rem_all] >= 0.0]
+        rem = rem_all[roi[rem_all] >= roi_floor]
         k = min(len(g.entries), len(rem))
         if k < len(g.entries):
             unfilled.extend(g.entries[k:])
@@ -490,6 +599,16 @@ def allocate_contests(
             picks = [int(rem[int(np.argmax(roi[rem]))])]
             pairs = [(pool.lineups[picks[0]], float(roi[picks[0]]))]
         else:
+            ev_override = None
+            eff_cash_anchor = 0.0
+            stddev = contest.roi_stddev
+            ceiling = compute_ceiling_ev(
+                roi[rem], stddev[rem] if stddev is not None else None, ceiling_weight,
+            )
+            if ceiling is not None:
+                ev_override = np.full(M, np.nan)
+                ev_override[rem] = ceiling
+                eff_cash_anchor = cash_anchor_fraction
             sel = DeterminantPortfolioSelector(
                 robust_payout=None,
                 candidates=pool.lineups,
@@ -503,7 +622,8 @@ def allocate_contests(
                     roi[rem].astype(np.float64),
                     np.ascontiguousarray(corr_matrix[np.ix_(rem, rem)]),
                 ),
-                cash_anchor_fraction=0.0,
+                ev_override=ev_override,
+                cash_anchor_fraction=eff_cash_anchor,
             )
             pairs = sel.select(stop_check=stop_check, progress_cb=progress_cb)
             picks = [idx_of[id(lu)] for lu, _ in pairs]
@@ -529,7 +649,17 @@ def archive_external_inputs(
 ) -> Optional[Path]:
     """Copy the two external CSVs (plus DKSalaries, mirroring the server's
     archive convention) into archive/MMDDYYYY derived from the slate's Game
-    Info date. Best-effort: returns the archive dir or None."""
+    Info date. Best-effort: returns the archive dir or None.
+
+    DKSalaries.csv is only copied once (the slate itself doesn't change
+    intra-day). lineups_*.csv and the MLB_*.csv projections companion are
+    always re-copied, overwriting whatever's already archived: SaberSim-style
+    exports get refreshed repeatedly as a slate firms up (scratches, lineup
+    confirmations), and post-slate analysis (analyze_external_pool.py) wants
+    the latest pre-lock snapshot, not whatever happened to be captured first
+    — an early snapshot can otherwise leave since-scratched players in the
+    archived pool with no way to resolve a real FPTS for them.
+    """
     try:
         gi = pd.read_csv(slate_path, usecols=["Game Info"])
         m = re.search(r"(\d{2})/(\d{2})/(\d{4})", str(gi["Game Info"].dropna().iloc[0]))
@@ -538,13 +668,13 @@ def archive_external_inputs(
         mo, dy, yr = m.groups()
         d = project_root / "archive" / f"{mo}{dy}{yr}"
         d.mkdir(parents=True, exist_ok=True)
-        for src, dst_name in [
-            (Path(slate_path), "DKSalaries.csv"),
-            (lineups_path, lineups_path.name),
-            (proj_path, proj_path.name),
+        for src, dst_name, always_refresh in [
+            (Path(slate_path), "DKSalaries.csv", False),
+            (lineups_path, lineups_path.name, True),
+            (proj_path, proj_path.name, True),
         ]:
             dst = d / dst_name
-            if not dst.exists():
+            if always_refresh or not dst.exists():
                 shutil.copy2(str(src), str(dst))
         return d
     except Exception as exc:

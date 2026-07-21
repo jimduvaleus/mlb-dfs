@@ -1097,7 +1097,7 @@ class DeterminantPortfolioSelector:
             # (unlike partial_var, it needs no per-step max-rescaling).
             DEn = distance
 
-            score = np.sqrt((evw * EVn) ** 2 + (dew * DEn) ** 2)
+            score = evw * EVn + dew * DEn
             best_in_rem = int(np.argmax(score))
             best_pool = int(remaining_pool_idx[best_in_rem])
 
