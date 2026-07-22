@@ -15,11 +15,13 @@ from src.api.external_pool import (
     build_quantile_grids,
     compute_ceiling_ev,
     compute_pool_corr,
+    compute_ppd_roi_adjustment,
     discover_external_files,
     group_and_match_contests,
     normalize_contest_name,
     parse_lineup_pool,
     parse_player_projections,
+    _pava,
 )
 from src.optimization.lineup import Lineup
 from src.simulation.results import SimulationResults
@@ -462,6 +464,148 @@ class TestComputePoolCorr:
         ]
         corr = compute_pool_corr(lineups, sim_results)
         assert corr[0, 1] > corr[0, 2] > corr[0, 3]
+
+
+def test_pava_produces_monotone_nondecreasing_fit():
+    y = np.array([1.0, 3.0, 2.0, 4.0, 0.5, 5.0])
+    fit = _pava(y)
+    assert np.all(np.diff(fit) >= -1e-12)
+    assert len(fit) == len(y)
+
+
+class TestComputePpdRoiAdjustment:
+    """compute_ppd_roi_adjustment: percentile-delta PPD haircut for external
+    ROI/ROI StdDev, built on the exact PipelineRunner._apply_ppd_to_simulation
+    zeroing the internal pipeline already uses for candidates."""
+
+    def _pool(self, n_players=40, n_sims=3000, seed=0):
+        rng = np.random.default_rng(seed)
+        player_ids = list(range(1, n_players + 1))
+        player_mean = rng.uniform(8, 12, n_players)
+        results_matrix = rng.normal(
+            loc=player_mean, scale=4.0, size=(n_sims, n_players)
+        ).astype(np.float32)
+        sim_results = SimulationResults(player_ids=player_ids, results_matrix=results_matrix)
+        # Players 1-10 are the "A@B" at-risk game; 11-40 are a safe game.
+        players_df = pd.DataFrame({
+            "player_id": player_ids,
+            "game": ["A@B" if p <= 10 else "C@D" for p in player_ids],
+        })
+        return rng, player_mean, sim_results, players_df
+
+    def _make_lineups(self, rng, player_mean, n_filler=25):
+        lineup_light = Lineup(player_ids=[1] + list(range(11, 20)))               # 1 exposed
+        lineup_heavy = Lineup(player_ids=list(range(1, 6)) + list(range(20, 25)))  # 5 exposed
+        lineup_safe = Lineup(player_ids=list(range(11, 21)))                       # 0 exposed
+        fillers = [
+            Lineup(player_ids=[int(p) for p in rng.choice(range(1, 41), size=10, replace=False)])
+            for _ in range(n_filler)
+        ]
+        lineups = [lineup_light, lineup_heavy, lineup_safe] + fillers
+        # ROI roughly tracks lineup quality (mean projected points) so the
+        # percentile -> roi curve has a real, mostly-monotone shape to fit.
+        roi = np.array([
+            np.mean([player_mean[p - 1] for p in lu.player_ids]) / 20.0 - 0.4
+            for lu in lineups
+        ]) + rng.normal(0, 0.02, len(lineups))
+        return lineups, roi
+
+    def _pool_and_contest(self, lineups, roi, roi_stddev=None):
+        return ExternalPool(
+            lineups=lineups,
+            contests={"test": ExternalContest(
+                raw_name="Test ROI", norm_name="test", roi=roi.copy(),
+                prize_pool_cents=None, single_entry=False,
+                roi_stddev=roi_stddev.copy() if roi_stddev is not None else None,
+            )},
+            n_dropped_unknown_players=0, n_dropped_duplicates=0, source_path=Path("x"),
+        )
+
+    def _apply_real_ppd(self, sim_results, players_df, pcts, seed=7):
+        from src.api.pipeline import PipelineRunner
+        return PipelineRunner._apply_ppd_to_simulation(sim_results, players_df, pcts, rng_seed=seed)
+
+    def test_heavier_exposure_gets_larger_roi_haircut(self):
+        rng, player_mean, sim_results, players_df = self._pool()
+        lineups, roi = self._make_lineups(rng, player_mean)
+        pool = self._pool_and_contest(lineups, roi)
+        orig_roi = roi.copy()
+
+        sim_ppd, _ = self._apply_real_ppd(sim_results, players_df, {"A@B": 20.0})
+        compute_ppd_roi_adjustment(pool, sim_results, sim_ppd, min_fit_points=10)
+        adjusted = pool.contests["test"].roi
+
+        delta_light = adjusted[0] - orig_roi[0]
+        delta_heavy = adjusted[1] - orig_roi[1]
+        delta_safe = adjusted[2] - orig_roi[2]
+        # More exposure -> bigger haircut; zero exposure -> exactly no change.
+        assert delta_heavy < delta_light < 0
+        assert delta_safe == pytest.approx(0.0, abs=1e-9)
+
+    def test_no_exposure_lineup_gets_zero_delta_including_stddev(self):
+        rng, player_mean, sim_results, players_df = self._pool()
+        lineups, roi = self._make_lineups(rng, player_mean)
+        stddev = np.abs(roi) * 1.5 + 0.2 + rng.normal(0, 0.02, len(lineups))
+        pool = self._pool_and_contest(lineups, roi, stddev)
+        orig_roi, orig_std = roi.copy(), stddev.copy()
+
+        sim_ppd, _ = self._apply_real_ppd(sim_results, players_df, {"A@B": 20.0})
+        compute_ppd_roi_adjustment(pool, sim_results, sim_ppd, min_fit_points=10)
+        assert pool.contests["test"].roi[2] == pytest.approx(orig_roi[2], abs=1e-9)
+        assert pool.contests["test"].roi_stddev[2] == pytest.approx(orig_std[2], abs=1e-9)
+
+    def test_empty_ppd_pcts_is_full_noop(self):
+        rng, player_mean, sim_results, players_df = self._pool()
+        lineups, roi = self._make_lineups(rng, player_mean)
+        stddev = np.abs(roi) * 1.5 + 0.2
+        pool = self._pool_and_contest(lineups, roi, stddev)
+        orig_roi, orig_std = roi.copy(), stddev.copy()
+
+        sim_ppd, stats = self._apply_real_ppd(sim_results, players_df, {})
+        assert stats == {}
+        compute_ppd_roi_adjustment(pool, sim_results, sim_ppd, min_fit_points=10)
+        np.testing.assert_array_equal(pool.contests["test"].roi, orig_roi)
+        np.testing.assert_array_equal(pool.contests["test"].roi_stddev, orig_std)
+
+    def test_roi_stddev_none_leaves_stddev_none(self):
+        rng, player_mean, sim_results, players_df = self._pool()
+        lineups, roi = self._make_lineups(rng, player_mean)
+        pool = self._pool_and_contest(lineups, roi, roi_stddev=None)
+        orig_roi = roi.copy()
+
+        sim_ppd, _ = self._apply_real_ppd(sim_results, players_df, {"A@B": 20.0})
+        compute_ppd_roi_adjustment(pool, sim_results, sim_ppd, min_fit_points=10)
+        assert pool.contests["test"].roi_stddev is None
+        assert not np.array_equal(pool.contests["test"].roi, orig_roi)  # roi still adjusted
+
+    def test_small_pool_skipped_without_raising(self):
+        rng, player_mean, sim_results, players_df = self._pool()
+        lineups, roi = self._make_lineups(rng, player_mean, n_filler=2)  # tiny pool
+        pool = self._pool_and_contest(lineups, roi)
+        orig_roi = roi.copy()
+
+        sim_ppd, _ = self._apply_real_ppd(sim_results, players_df, {"A@B": 20.0})
+        compute_ppd_roi_adjustment(pool, sim_results, sim_ppd, min_fit_points=30)
+        np.testing.assert_array_equal(pool.contests["test"].roi, orig_roi)
+
+    def test_stddev_shrinks_consistently_with_roi_for_exposed_lineup(self):
+        """Guards the confounded-residual bug: roi_stddev must move along the
+        same percentile axis as roi for a PPD-exposed lineup, not stay fixed
+        while roi drops (which would hand compute_ceiling_ev a spurious
+        positive residual for what is really downside PPD risk)."""
+        rng, player_mean, sim_results, players_df = self._pool()
+        lineups, roi = self._make_lineups(rng, player_mean, n_filler=40)
+        stddev = np.abs(roi) * 1.5 + 0.3 + rng.normal(0, 0.02, len(lineups))
+        pool = self._pool_and_contest(lineups, roi, stddev)
+        orig_std = stddev.copy()
+
+        sim_ppd, _ = self._apply_real_ppd(sim_results, players_df, {"A@B": 20.0})
+        compute_ppd_roi_adjustment(pool, sim_results, sim_ppd, min_fit_points=10)
+        adjusted_std = pool.contests["test"].roi_stddev
+        # Heavy-exposure lineup (index 1): stddev should have moved (not been
+        # left at its original value) in the same direction as roi (down).
+        assert adjusted_std[1] != pytest.approx(orig_std[1], abs=1e-9)
+        assert adjusted_std[1] < orig_std[1]
 
 
 class TestRiskSweepDifferentiation:

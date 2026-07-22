@@ -2319,7 +2319,7 @@ class PipelineRunner:
         from pathlib import Path as _Path
 
         from src.api import external_pool as ep
-        from .slate_exclusions import compute_file_fingerprint
+        from .slate_exclusions import compute_file_fingerprint, compute_slate_id, read_exclusions
 
         gpp_cfg = cfg.get("gpp", {})
         raw_dir = os.path.dirname(slate_path) if slate_path else ""
@@ -2372,6 +2372,27 @@ class PipelineRunner:
         )
         sim_results = engine.simulate(n_sims)
         corr = ep.compute_pool_corr(pool.lineups, sim_results)
+
+        # --- PPD risk: haircut ROI/ROI StdDev for lineups exposed to an
+        # at-risk game, using the same per-game zeroing the internal pipeline
+        # uses (see _apply_ppd_to_simulation / compute_ppd_roi_adjustment) ---
+        current_games = [g for g in players_df["game"].dropna().unique().tolist() if g]
+        stored_excl = read_exclusions(compute_slate_id(current_games), _slate_fp) if current_games else {}
+        game_ppd_pcts = {k: v for k, v in stored_excl.get("game_ppd_pcts", {}).items() if v and v > 0}
+        if game_ppd_pcts:
+            sim_results_ppd, ppd_stats = self._apply_ppd_to_simulation(
+                sim_results, players_df, game_ppd_pcts,
+                rng_seed=int(gpp_cfg.get("rng_seed") or 42),
+            )
+            ep.compute_ppd_roi_adjustment(pool, sim_results, sim_results_ppd)
+            self._cb("external_ppd_applied", {
+                "games": [
+                    {"game": g, "ppd_pct": s["ppd_pct"], "n_sims_zeroed": s["n_sims_zeroed"]}
+                    for g, s in ppd_stats.items()
+                ],
+                "n_sims_total": n_sims,
+            })
+
         self._cb("external_pool", {
             "n_lineups": len(pool.lineups),
             "n_contests_covered": len(pool.contests),

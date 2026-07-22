@@ -168,6 +168,7 @@ export type SSEStage =
   | 'load_slate'
   | 'simulate'
   | 'ppd_applied'
+  | 'external_ppd_applied'
   | 'compute_target'
   | 'optimize_lineup'
   | 'portfolio_stats'

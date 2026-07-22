@@ -25,6 +25,7 @@ const STAGE_LABELS: Record<string, string> = {
   load_slate: 'Load slate',
   simulate: 'Simulate',
   ppd_applied: 'PPD applied',
+  external_ppd_applied: 'PPD applied',
   compute_target: 'Compute target',
   calibrate_beta: 'Calibrate beta',
   optimize_lineup: 'Optimize lineups',
@@ -621,7 +622,8 @@ function renderDetail(e: SSEEvent): string {
       const ev = e as unknown as { n_sims: number }
       return `${ev.n_sims.toLocaleString()} simulations`
     }
-    case 'ppd_applied': {
+    case 'ppd_applied':
+    case 'external_ppd_applied': {
       const ev = e as unknown as { games: { game: string; ppd_pct: number; n_sims_zeroed: number }[]; n_sims_total: number }
       const parts = ev.games.map(g => `${g.game} ${g.ppd_pct}% (${g.n_sims_zeroed.toLocaleString()} sims)`)
       return `${parts.join(', ')} — zeroed independently`

@@ -25,6 +25,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 from src.api.dk_entries import EntryRecord, _parse_prize_pool_cents
 from src.optimization.lineup import Lineup
@@ -476,6 +477,166 @@ def compute_ceiling_ev(
     return np.where(np.isfinite(ceiling), ceiling, roi)
 
 
+def _lineup_indicator_matrix(lineups: list, player_ids: list) -> np.ndarray:
+    """(P, M) float32 indicator: I[p, j] = 1.0 if player p is in lineup j.
+    Every pool player is guaranteed present in player_ids (players_df includes
+    all pool players), so no -1/missing handling is needed."""
+    col_map = {int(p): i for i, p in enumerate(player_ids)}
+    P = len(col_map)
+    M = len(lineups)
+    I = np.zeros((P, M), dtype=np.float32)
+    for j, lu in enumerate(lineups):
+        for pid in lu.player_ids:
+            I[col_map[int(pid)], j] = 1.0
+    return I
+
+
+def _pava(y: np.ndarray, w: Optional[np.ndarray] = None) -> np.ndarray:
+    """Pool-adjacent-violators: least-squares monotone (non-decreasing) fit
+    to y, optionally weighted. Pure numpy/list implementation — sklearn is
+    not a project dependency (mirrors scripts/evaluate_ownership.py's _pava)."""
+    y = np.asarray(y, dtype=float)
+    w = np.ones(len(y)) if w is None else np.asarray(w, dtype=float)
+    blocks: list[list[float]] = []  # [value, weight, count]
+    for yi, wi in zip(y, w):
+        blocks.append([float(yi), float(wi), 1])
+        while len(blocks) > 1 and blocks[-2][0] > blocks[-1][0]:
+            v2, w2, c2 = blocks.pop()
+            v1, w1, c1 = blocks.pop()
+            tw = w1 + w2
+            blocks.append([(v1 * w1 + v2 * w2) / tw, tw, c1 + c2])
+    if not blocks:
+        return np.array([], dtype=float)
+    return np.concatenate([np.full(int(c), v) for v, _, c in blocks])
+
+
+def _fit_percentile_curve(
+    x: np.ndarray, y: np.ndarray, min_points: int,
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """PAVA-fit y (non-decreasing) against x, returning np.interp-ready knots
+    (x, y) with duplicate x collapsed to their mean y. None when fewer than
+    min_points finite (x, y) pairs are available to fit."""
+    finite = np.isfinite(x) & np.isfinite(y)
+    if int(finite.sum()) < min_points:
+        return None
+    order = np.argsort(x[finite], kind="stable")
+    xs = x[finite][order]
+    ys = _pava(y[finite][order])
+    knots = pd.DataFrame({"x": xs, "y": ys}).groupby("x", as_index=False)["y"].mean()
+    return knots["x"].to_numpy(), knots["y"].to_numpy()
+
+
+def _interp_extrapolated(x: np.ndarray, knot_x: np.ndarray, knot_y: np.ndarray) -> np.ndarray:
+    """np.interp, but linearly extrapolated past the knot range using the
+    boundary segment's slope instead of flat-clamping.
+
+    A PPD hit can push a lineup's score below the pool's own observed
+    minimum (or, symmetrically, above its max) — most plausible for a
+    lineup that was already the pool's weakest by raw score before the
+    zeroing was applied. np.interp's default flat clamp would then report
+    zero further ROI change no matter how much worse the score got, since
+    there's no data past the boundary knot to interpolate against. Extending
+    the nearest fitted segment's slope keeps the adjustment responsive to
+    exposure magnitude even at the tails, at the cost of a linear (not
+    PAVA-monotone-guaranteed) extrapolation outside the fitted range.
+    """
+    y = np.interp(x, knot_x, knot_y)
+    if len(knot_x) < 2:
+        return y
+    below = x < knot_x[0]
+    if np.any(below):
+        dx = knot_x[1] - knot_x[0]
+        slope = (knot_y[1] - knot_y[0]) / dx if dx > 0 else 0.0
+        y = np.where(below, knot_y[0] + slope * (x - knot_x[0]), y)
+    above = x > knot_x[-1]
+    if np.any(above):
+        dx = knot_x[-1] - knot_x[-2]
+        slope = (knot_y[-1] - knot_y[-2]) / dx if dx > 0 else 0.0
+        y = np.where(above, knot_y[-1] + slope * (x - knot_x[-1]), y)
+    return y
+
+
+def compute_ppd_roi_adjustment(
+    pool: "ExternalPool", sim_results, sim_results_ppd, min_fit_points: int = _MIN_CEILING_FIT_N,
+) -> None:
+    """Mutates each ExternalContest.roi (and roi_stddev, when present) in
+    pool.contests in place to reflect PPD risk. sim_results is the plain
+    player-level sim (no PPD applied); sim_results_ppd is the same sim after
+    PipelineRunner._apply_ppd_to_simulation has zeroed at-risk games' player
+    columns in a random fraction of sim rows — the identical mechanism the
+    internal pipeline uses, so the joint-risk structure (multiple at-risk
+    games, shared per-game row-zeroing) is consistent between modes.
+
+    Method: project every lineup's own score onto both sim matrices (the same
+    player-indicator trick compute_pool_corr uses), reduce each to a
+    per-lineup mean, and convert both into percentiles via a Normal-CDF
+    z-score against the *raw* (no-PPD) score distribution's own mean/std — a
+    fixed yardstick for "how good is this lineup, in the pool's own terms,"
+    before and after the PPD hit. A lineup untouched by any at-risk game gets
+    identical raw/ppd scores and therefore an identical percentile — an exact
+    no-op. A rank-based percentile (e.g. np.searchsorted into the sorted raw
+    scores) was tried and rejected: it saturates at 0/1 for any lineup that's
+    already the pool's best/worst by raw score, so an already-weak, heavily
+    PPD-exposed lineup could show *zero* delta despite a large absolute score
+    drop, simply because it had nowhere lower to rank to. The z-score CDF has
+    no such floor/ceiling — a further score drop always maps to a further
+    (if shrinking) percentile decrease.
+
+    Per contest, fit an empirical monotonic percentile -> value curve (PAVA)
+    from the pool's own (raw_percentile, roi) pairs. This is what makes the
+    adjustment convexity-aware without guessing a payout shape: the curve
+    *is* Saber's own simulated payout structure for that contest, read off
+    empirically. Apply the resulting value change as a *delta* on top of the
+    lineup's own reported figure (not a replacement), so a curve-fit bias at
+    a given percentile can't move a zero-exposure lineup's number.
+
+    roi_stddev gets the identical percentile-delta treatment (a second curve
+    fit from (raw_percentile, roi_stddev), floored at 0). This matters
+    because compute_ceiling_ev regresses roi_stddev on roi and rewards the
+    residual as a ceiling bonus — leaving roi_stddev untouched while roi drops
+    would make a PPD-exposed lineup look anomalously high-stddev-for-its-roi,
+    handing back a spurious ceiling credit for what is actually downside PPD
+    risk, not upside variance.
+    """
+    lineups = pool.lineups
+    M = len(lineups)
+    if M == 0:
+        return
+    I = _lineup_indicator_matrix(lineups, sim_results.player_ids)
+    scores_raw = (sim_results.results_matrix.astype(np.float32) @ I).T       # (M, n_sims)
+    scores_ppd = (sim_results_ppd.results_matrix.astype(np.float32) @ I).T   # (M, n_sims)
+    raw_stat = scores_raw.mean(axis=1).astype(np.float64)
+    ppd_stat = scores_ppd.mean(axis=1).astype(np.float64)
+
+    mu = float(raw_stat.mean())
+    sigma = float(raw_stat.std())
+    if sigma < 1e-9:
+        return  # degenerate pool (near-identical lineups) — nothing to rank
+    raw_percentile = norm.cdf((raw_stat - mu) / sigma)
+    ppd_percentile = norm.cdf((ppd_stat - mu) / sigma)
+    if np.array_equal(raw_percentile, ppd_percentile):
+        return  # no lineup exposed to any at-risk game
+
+    for contest in pool.contests.values():
+        curve = _fit_percentile_curve(raw_percentile, contest.roi, min_fit_points)
+        if curve is not None:
+            knot_x, knot_y = curve
+            delta = (
+                _interp_extrapolated(ppd_percentile, knot_x, knot_y)
+                - _interp_extrapolated(raw_percentile, knot_x, knot_y)
+            )
+            contest.roi = contest.roi + delta
+        if contest.roi_stddev is not None:
+            std_curve = _fit_percentile_curve(raw_percentile, contest.roi_stddev, min_fit_points)
+            if std_curve is not None:
+                knot_x, knot_y = std_curve
+                std_delta = (
+                    _interp_extrapolated(ppd_percentile, knot_x, knot_y)
+                    - _interp_extrapolated(raw_percentile, knot_x, knot_y)
+                )
+                contest.roi_stddev = np.maximum(contest.roi_stddev + std_delta, 0.0)
+
+
 def compute_pool_corr(lineups: list, sim_results) -> np.ndarray:
     """(M, M) float32 correlation of simulated lineup scores (points-space).
 
@@ -507,13 +668,8 @@ def compute_pool_corr(lineups: list, sim_results) -> np.ndarray:
     """
     from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
 
-    col_map = {int(p): i for i, p in enumerate(sim_results.player_ids)}
-    P = len(col_map)
     M = len(lineups)
-    I = np.zeros((P, M), dtype=np.float32)
-    for j, lu in enumerate(lineups):
-        for pid in lu.player_ids:
-            I[col_map[int(pid)], j] = 1.0
+    I = _lineup_indicator_matrix(lineups, sim_results.player_ids)
     scores = (sim_results.results_matrix.astype(np.float32) @ I).T  # (M, n_sims)
     pre = DeterminantPortfolioSelector.precompute_pool(scores, float("-inf"))
     assert pre is not None and len(pre[0]) == M
