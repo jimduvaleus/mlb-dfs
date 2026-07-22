@@ -16,9 +16,11 @@ def run_test():
     print("Initializing EmpiricalCopula...")
     copula = EmpiricalCopula("data/processed/empirical_copula.parquet")
     
-    # Step 3: Create a mock slate of players (2 teams, 1 game)
-    # Team A batters 1-9 vs Team B pitcher (slot 10)
-    # Team B batters 1-9 vs Team A pitcher (slot 10)
+    # Step 3: Create a mock slate of players (2 teams, 1 game). Each pitcher
+    # is labeled with its own real team/opponent (production-pattern
+    # labeling, matching build_external_players_df / PipelineRunner.
+    # _build_players_df) -- SimulationEngine.simulate() is responsible for
+    # regrouping each pitcher under the team it's actually facing.
     print("Creating mock slate...")
     players_data = []
     # Game: Team A vs Team B

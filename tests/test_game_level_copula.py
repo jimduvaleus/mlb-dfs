@@ -123,6 +123,60 @@ class TestEngineGameLevelSampling:
         assert results.results_matrix.shape == (50, 3)
 
 
+class TestGroupingIdentity:
+    """A team's own real pitcher must draw from the OPPOSING team's copula
+    row (slot 10 there holds his historical quantile), not his own team's
+    row. sample_games() randomizes which physical row lands at index 0 vs 1
+    on every sim, so a fixed-value assertion doesn't work here -- instead
+    this checks the *relationship* invariant (same unit-group -> same per-sim
+    draw) using distinct per-row fills, which the same-value-both-rows
+    fixtures above can't observe at all."""
+
+    def _players(self):
+        # Production-pattern labeling: each pitcher's team/opponent are his
+        # own real team/opponent, exactly as build_external_players_df /
+        # PipelineRunner._build_players_df construct it.
+        return pd.DataFrame([
+            {'player_id': 1, 'team': 'AAA', 'opponent': 'BBB', 'slot': 1,
+             'mean': 5.0, 'std_dev': 2.0},
+            {'player_id': 2, 'team': 'BBB', 'opponent': 'AAA', 'slot': 1,
+             'mean': 5.0, 'std_dev': 2.0},
+            {'player_id': 100, 'team': 'AAA', 'opponent': 'BBB', 'slot': 10,
+             'mean': 15.0, 'std_dev': 6.0},
+            {'player_id': 200, 'team': 'BBB', 'opponent': 'AAA', 'slot': 10,
+             'mean': 15.0, 'std_dev': 6.0},
+        ])
+
+    def test_pitcher_groups_with_opposing_batters_not_own(self, tmp_path):
+        copula = EmpiricalCopula(
+            _write_copula(
+                tmp_path,
+                rows=[0.99, 0.3],  # AAA's row fills 0.99, BBB's row fills 0.3
+                index_tuples=[("G1", "AAA"), ("G1", "BBB")],
+            ),
+            env_overlay_gamma=0.0, env_overlay_delta=0.0,
+        )
+        engine = SimulationEngine(copula, self._players())
+        results = engine.simulate(n_sims=200)
+        col = {pid: i for i, pid in enumerate(results.player_ids)}
+        m = results.results_matrix
+
+        # Correct unit membership: AAA's batter (1) always draws the same
+        # per-sim source row -- and so is perfectly correlated, even though
+        # the two players have different marginals -- as BBB's own pitcher
+        # (200), since that pitcher opposes AAA. Symmetrically for BBB's
+        # batter (2) and AAA's own pitcher (100).
+        assert np.isclose(np.corrcoef(m[:, col[1]], m[:, col[200]])[0, 1], 1.0)
+        assert np.isclose(np.corrcoef(m[:, col[2]], m[:, col[100]])[0, 1], 1.0)
+
+        # Contrast: a team's own pitcher must NOT track its own batter (the
+        # bug this test catches) -- opposite unit groups always draw the
+        # complementary row of the pair, so the relationship is perfectly
+        # *anti*-correlated instead.
+        assert np.isclose(np.corrcoef(m[:, col[1]], m[:, col[100]])[0, 1], -1.0)
+        assert np.isclose(np.corrcoef(m[:, col[2]], m[:, col[200]])[0, 1], -1.0)
+
+
 class TestEnvOverlay:
     """The sim-time dependence overlay must hit its correlation targets while
     leaving marginals unchanged (uniform on the rank scale)."""

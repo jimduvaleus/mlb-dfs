@@ -6,6 +6,18 @@ from src.models.marginals import EmpiricalQuantileMarginal, GaussianMarginal
 from src.models.batter_model import BatterPCAModel, BatterMixtureMarginal
 from src.simulation.results import SimulationResults
 
+
+def _effective_team_opponent(players_df: pd.DataFrame) -> tuple:
+    """Copula rows keyed (team=X, opponent=Y) hold Y's own starter at slot 10
+    (see scripts/process_historical.py assign_slots) -- a pitcher's own
+    team/opponent point to the wrong unit. Swap only pitcher rows so they
+    group with the team they're actually facing."""
+    is_pitcher = players_df['slot'] == 10
+    eff_team = players_df['team'].where(~is_pitcher, players_df['opponent'])
+    eff_opponent = players_df['opponent'].where(~is_pitcher, players_df['team'])
+    return eff_team, eff_opponent
+
+
 class SimulationEngine:
     """
     Core simulation engine for MLB DFS.
@@ -79,12 +91,17 @@ class SimulationEngine:
         # We group players into 10-player "units" to match the copula structure.
         # Each unit consists of the 9 batters from a team and the pitcher from their opponent.
         # We use (team, opponent) as the grouping key.
-        
+
         # Note: A game between Team A and Team B will have two units:
         # Unit 1: (Team=A, Opponent=B) - Includes Team A batters and Team B pitcher.
         # Unit 2: (Team=B, Opponent=A) - Includes Team B batters and Team A pitcher.
-        
-        units = self.players_df.groupby(['team', 'opponent'])
+        # players_df labels every row (batters AND pitchers) with its own real
+        # team/opponent, so a pitcher's natural (team, opponent) points at his
+        # own team's unit, not the opposing unit slot 10 is meant to hold —
+        # swap it only for pitcher rows so he groups with the team he's
+        # actually facing.
+        eff_team, eff_opponent = _effective_team_opponent(self.players_df)
+        units = self.players_df.groupby([eff_team, eff_opponent])
         
         import logging
         _log = logging.getLogger(__name__)
