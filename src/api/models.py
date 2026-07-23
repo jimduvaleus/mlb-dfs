@@ -16,7 +16,7 @@ class PathsConfig(BaseModel):
     batter_score_grid: Optional[str] = None
     batter_pca_model_fd: Optional[str] = None
     batter_score_grid_fd: Optional[str] = None
-    projections_source: str = "rotowire"  # "rotowire" or "dailyfantasyfuel"
+    projections_source: str = "rotowire"  # "rotowire", "dailyfantasyfuel", "market_odds", or "sabersim"
 
 
 class SimulationConfig(BaseModel):

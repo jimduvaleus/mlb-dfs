@@ -564,7 +564,7 @@ export default function App() {
           {configError && <p className="error">{configError}</p>}
           {state.config ? (
             <div className="config-layout">
-              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} refreshTrigger={projStatusTrigger} unlockedBatterCount={[...new Set(projectionPlayers.map(p => p.team))].filter(t => t && !state.twitterLineups.find(l => l.team === t && l.locked)).length * 9} teamTotalsSource={teamTotalsSource} />
+              <ProjectionsPanel disabled={running} onFetched={() => { refreshUnconfirmed(); refreshProjectionPlayers() }} mergeInfo={mergeInfo} onMergeInfo={setMergeInfo} projFetchExcluded={projFetchExcluded} onFetchingChange={setProjFetching} refreshTrigger={projStatusTrigger} unlockedBatterCount={state.config?.paths.projections_source === 'sabersim' ? undefined : [...new Set(projectionPlayers.map(p => p.team))].filter(t => t && !state.twitterLineups.find(l => l.team === t && l.locked)).length * 9} teamTotalsSource={teamTotalsSource} />
               <ConfigForm
                 config={state.config}
                 onSaved={cfg => {
@@ -603,6 +603,7 @@ export default function App() {
             twitterLineups={state.twitterLineups}
             onLockToggle={handleLockToggle}
             onRefresh={handleRefresh}
+            isSaberSimSource={state.config?.paths.projections_source === 'sabersim'}
           />
         )}
 

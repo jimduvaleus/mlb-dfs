@@ -1464,7 +1464,10 @@ def projections_status() -> ProjectionsStatus:
         row_count = len(df)
         if {"slot_confirmed", "player_id"}.issubset(df.columns):
             unconf = df[~df["slot_confirmed"].astype(bool)].copy()
-            confirmed = get_confirmed_team_lineups(_slate_fingerprint())
+            # SaberSim is its own confirmed-lineup source of truth — Twitter/
+            # Underdog notifications must not override its slot_confirmed data.
+            is_sabersim = (cfg.paths.projections_source or "").strip().lower() == "sabersim"
+            confirmed = {} if is_sabersim else get_confirmed_team_lineups(_slate_fingerprint())
             if confirmed:
                 twitter_pids = {pid for pid_to_slot in confirmed.values() for pid in pid_to_slot}
                 unconf = unconf[~unconf["player_id"].isin(twitter_pids)]
@@ -1529,7 +1532,10 @@ def projections_unconfirmed():
             return {"player_ids": []}
         unconfirmed = df[~df["slot_confirmed"].astype(bool)].copy()
 
-        confirmed = get_confirmed_team_lineups(_slate_fingerprint())
+        # SaberSim is its own confirmed-lineup source of truth — Twitter/Underdog
+        # notifications must not override its slot_confirmed data.
+        is_sabersim = (cfg.paths.projections_source or "").strip().lower() == "sabersim"
+        confirmed = {} if is_sabersim else get_confirmed_team_lineups(_slate_fingerprint())
         if confirmed:
             # Players in Twitter-confirmed lineups are confirmed regardless of CSV value
             twitter_pids = {pid for pid_to_slot in confirmed.values() for pid in pid_to_slot}
@@ -1572,12 +1578,18 @@ def projections_players():
             if _opt in slate_df.columns:
                 slate_cols.append(_opt)
         slate_sub = slate_df[slate_cols]
-        proj_sub  = proj_df[["player_id", "mean", "lineup_slot", "slot_confirmed"]]
+        proj_cols = ["player_id", "mean", "lineup_slot", "slot_confirmed"]
+        if "ownership" in proj_df.columns:
+            proj_cols.append("ownership")
+        proj_sub  = proj_df[proj_cols]
         merged = slate_sub.merge(proj_sub, on="player_id", how="inner")
 
         # Twitter confirmed lineups are authoritative: drop scratched batters and
         # update slot/slot_confirmed for the players who are actually starting.
-        confirmed = get_confirmed_team_lineups(_slate_fingerprint())
+        # SaberSim is its own confirmed-lineup source of truth, so this is
+        # skipped for that source — its CSV data must not be superseded.
+        is_sabersim = (cfg.paths.projections_source or "").strip().lower() == "sabersim"
+        confirmed = {} if is_sabersim else get_confirmed_team_lineups(_slate_fingerprint())
         if confirmed:
             batter_mask = merged["position"] != "P"
             for team, pid_to_slot in confirmed.items():
@@ -1618,51 +1630,60 @@ def projections_players():
             except Exception:
                 pass
 
-        # Compute heuristic ownership — Model D if team totals available, else C.
-        try:
-            from src.optimization.ownership import (
-                apply_ownership_calibration,
-                compute_heuristic_ownership,
-                load_ownership_calibrator,
-            )
-            from .pipeline import PipelineRunner
-            slate_path = _get_slate_file_path()
-            team_totals = PipelineRunner._load_team_totals(str(slate_path) if slate_path else "")
-            excl_mask = merged["player_id"].isin(both_excl_pids) if both_excl_pids else pd.Series(False, index=merged.index)
-            non_excl = merged[~excl_mask]
-            if non_excl.empty:
-                ow_pct = [0.0] * len(merged)
-            else:
-                hr_odds = PipelineRunner._load_hr_fair_odds(str(slate_path) if slate_path else "")
-                if hr_odds and "name" in non_excl.columns:
-                    import unicodedata as _ud, re as _re
-                    def _norm_hr(n: str) -> str:
-                        nfkd = _ud.normalize("NFKD", n)
-                        return _re.sub(r"[^a-z ]", "", nfkd.encode("ascii", "ignore").decode("ascii").lower()).strip()
-                    non_excl = non_excl.copy()
-                    non_excl["hr_prob"] = non_excl["name"].apply(lambda n: hr_odds.get(_norm_hr(str(n))))
-                from src.models.projection_calibration import restore_fitted_mean_scale
-                ow_sub = compute_heuristic_ownership(
-                    restore_fitted_mean_scale(non_excl), team_totals,
-                    team_ownership_reductions=_team_ownership_reductions or None,
+        # SaberSim source: ownership is pulled straight from the export's
+        # "Adj Own" column rather than computed by the heuristic model.
+        if "ownership" in merged.columns:
+            ow_pct = [
+                round(float(v) * 100, 1)
+                if pd.notna(v) and pid not in both_excl_pids else 0.0
+                for pid, v in zip(merged["player_id"], merged["ownership"])
+            ]
+        else:
+            # Compute heuristic ownership — Model D if team totals available, else C.
+            try:
+                from src.optimization.ownership import (
+                    apply_ownership_calibration,
+                    compute_heuristic_ownership,
+                    load_ownership_calibrator,
                 )
-                # Apply the same isotonic calibration (W_resid) the live pipeline
-                # uses, so the UI shows the same magnitude-corrected ownership the
-                # optimizer actually runs on. Loader returns None when the
-                # artifact is missing or stale against current model constants.
-                _calibrator = load_ownership_calibrator()
-                if _calibrator is not None:
-                    ow_sub = apply_ownership_calibration(
-                        ow_sub, non_excl["position"].values, _calibrator
+                from .pipeline import PipelineRunner
+                slate_path = _get_slate_file_path()
+                team_totals = PipelineRunner._load_team_totals(str(slate_path) if slate_path else "")
+                excl_mask = merged["player_id"].isin(both_excl_pids) if both_excl_pids else pd.Series(False, index=merged.index)
+                non_excl = merged[~excl_mask]
+                if non_excl.empty:
+                    ow_pct = [0.0] * len(merged)
+                else:
+                    hr_odds = PipelineRunner._load_hr_fair_odds(str(slate_path) if slate_path else "")
+                    if hr_odds and "name" in non_excl.columns:
+                        import unicodedata as _ud, re as _re
+                        def _norm_hr(n: str) -> str:
+                            nfkd = _ud.normalize("NFKD", n)
+                            return _re.sub(r"[^a-z ]", "", nfkd.encode("ascii", "ignore").decode("ascii").lower()).strip()
+                        non_excl = non_excl.copy()
+                        non_excl["hr_prob"] = non_excl["name"].apply(lambda n: hr_odds.get(_norm_hr(str(n))))
+                    from src.models.projection_calibration import restore_fitted_mean_scale
+                    ow_sub = compute_heuristic_ownership(
+                        restore_fitted_mean_scale(non_excl), team_totals,
+                        team_ownership_reductions=_team_ownership_reductions or None,
                     )
-                ow_pct = [0.0] * len(merged)
-                sub_i = 0
-                for i, is_excl in enumerate(excl_mask):
-                    if not is_excl:
-                        ow_pct[i] = round(float(ow_sub[sub_i]) * 100, 1)
-                        sub_i += 1
-        except Exception:
-            ow_pct = [None] * len(merged)
+                    # Apply the same isotonic calibration (W_resid) the live pipeline
+                    # uses, so the UI shows the same magnitude-corrected ownership the
+                    # optimizer actually runs on. Loader returns None when the
+                    # artifact is missing or stale against current model constants.
+                    _calibrator = load_ownership_calibrator()
+                    if _calibrator is not None:
+                        ow_sub = apply_ownership_calibration(
+                            ow_sub, non_excl["position"].values, _calibrator
+                        )
+                    ow_pct = [0.0] * len(merged)
+                    sub_i = 0
+                    for i, is_excl in enumerate(excl_mask):
+                        if not is_excl:
+                            ow_pct[i] = round(float(ow_sub[sub_i]) * 100, 1)
+                            sub_i += 1
+            except Exception:
+                ow_pct = [None] * len(merged)
 
         result = []
         for i, (_, row) in enumerate(merged.iterrows()):
@@ -1996,8 +2017,9 @@ async def projections_fetch(request: Request):
 
     async def _stream():
         source = (cfg.paths.projections_source or "rotowire").strip().lower()
-        is_dff_preferred    = source == "dailyfantasyfuel"
-        is_market_preferred = source == "market_odds"
+        is_dff_preferred      = source == "dailyfantasyfuel"
+        is_market_preferred   = source == "market_odds"
+        is_sabersim_preferred = source == "sabersim"
         if is_market_preferred:
             preferred_label = "Market Odds (CrazyNinjaOdds)"
             fallback_label  = "RotoWire"
@@ -2211,7 +2233,7 @@ async def projections_fetch(request: Request):
 
         # Helper: write final merged_df to proj_path, handling partial merge.
         def _write_proj(merged_df: "pd.DataFrame") -> "str | None":
-            out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+            out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed", "ownership"]
             result = merged_df[[c for c in out_cols if c in merged_df.columns]]
             if is_partial and proj_path.exists():
                 existing = pd.read_csv(proj_path)
@@ -2223,7 +2245,7 @@ async def projections_fetch(request: Request):
                     set(result["player_id"].tolist()) if "player_id" in result.columns else set()
                 )
                 other = existing[~existing["player_id"].isin(purge_ids)] if not existing.empty else pd.DataFrame()
-                out_cols2 = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed"]
+                out_cols2 = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed", "ownership"]
                 other = other[[c for c in out_cols2 if c in other.columns]]
                 result = pd.concat([other, result], ignore_index=True)
             # Filter out players no longer on the current slate (e.g. from games that
@@ -2498,6 +2520,54 @@ async def projections_fetch(request: Request):
                 merge_info_state_path.unlink(missing_ok=True)
             except Exception:
                 pass
+
+        # ---- SaberSim path (local file import, no network fetch) ------------
+        if is_sabersim_preferred:
+            returncode = 0
+            proj_written = False
+            result_event: str | None = None
+            try:
+                mlb_path = _find_mlb_order_projections_path()
+                if mlb_path is None:
+                    returncode = 1
+                    result_event = _log(
+                        f"No local SaberSim export found in data/raw "
+                        f"(expected a file matching {_MLB_ORDER_GLOB})."
+                    )
+                else:
+                    yield _log(f"--- Reading SaberSim export: {mlb_path.name} ---")
+                    from .external_pool import parse_sabersim_projections
+                    sabersim_df = parse_sabersim_projections(mlb_path, platform_val)
+                    if is_partial and included_pids:
+                        sabersim_df = sabersim_df[sabersim_df["player_id"].isin(included_pids)]
+                    if sabersim_df.empty:
+                        returncode = 1
+                        result_event = _log("SaberSim export produced no usable player rows.")
+                    else:
+                        warn_msg = _write_proj(sabersim_df)
+                        proj_written = True
+                        if warn_msg:
+                            yield _log(warn_msg)
+                        n_batters = int((sabersim_df["lineup_slot"] != 10).sum())
+                        n_pitchers = int((sabersim_df["lineup_slot"] == 10).sum())
+                        n_confirmed = int(sabersim_df["slot_confirmed"].sum())
+                        result_event = _log(
+                            f"SaberSim: {n_batters} batter(s), {n_pitchers} confirmed pitcher(s), "
+                            f"{n_confirmed} confirmed lineup slot(s) loaded from {mlb_path.name}."
+                        )
+            except Exception as exc:
+                returncode = 1
+                result_event = _log(f"Warning: SaberSim import error — {exc}")
+            finally:
+                if proj_written:
+                    try:
+                        record_fetch_from_csv(proj_path, "auto", _slate_path_for_meta)
+                    except Exception:
+                        pass
+            if result_event:
+                yield result_event
+            yield f"data: {json.dumps({'type': 'done', 'returncode': returncode, 'timestamp': int(time.time() * 1000)})}\n\n"
+            return
 
         # ---- Market Odds path -----------------------------------------------
         if is_market_preferred:

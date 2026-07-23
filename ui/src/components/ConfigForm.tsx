@@ -136,6 +136,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <option value="rotowire">RotoWire</option>
                 <option value="dailyfantasyfuel">Daily Fantasy Fuel</option>
                 <option value="market_odds">Market Odds</option>
+                <option value="sabersim">SaberSim</option>
               </select>
             </FieldRow>
           </section>

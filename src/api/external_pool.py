@@ -238,6 +238,46 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
     )
 
 
+def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.DataFrame:
+    """SaberSim per-player export -> canonical projections.csv frame, for use
+    as a first-class ``projections_source`` (as opposed to full external-pool
+    bypass mode, see ``parse_player_projections``/``build_external_players_df``
+    above). Columns: player_id, name, mean, std_dev, lineup_slot,
+    slot_confirmed, ownership (fraction, from "Adj Own").
+
+    A pitcher row is kept only when Status == "Confirmed" (the file lists the
+    whole rotation/bullpen, not just the day's starter). A batter row is kept
+    only when it carries an Order (its projected batting slot); Status ==
+    "Confirmed" then distinguishes an officially confirmed slot from a merely
+    projected one (slot_confirmed drives the UI's green/amber bubble + the
+    team lock icon exactly as it does for the RotoWire/DFF/Market-Odds
+    sources, so no separate UI plumbing is needed for SaberSim).
+    """
+    df = pd.read_csv(path)
+    mean_col = "fd_points" if platform == "fanduel" else "dk_points"
+    std_col = "fd_std" if platform == "fanduel" else "dk_std"
+    is_pitcher = df["Pos"].astype(str) == "P"
+    confirmed = df["Status"].astype(str) == "Confirmed"
+    order = pd.to_numeric(df.get("Order"), errors="coerce")
+    lineup_slot = pd.Series(np.nan, index=df.index, dtype=float)
+    lineup_slot.loc[is_pitcher] = 10
+    lineup_slot.loc[~is_pitcher] = order.loc[~is_pitcher]
+    out = pd.DataFrame({
+        "player_id": pd.to_numeric(df["DFS ID"], errors="coerce"),
+        "name": df["Name"],
+        "mean": pd.to_numeric(df[mean_col], errors="coerce"),
+        "std_dev": pd.to_numeric(df[std_col], errors="coerce"),
+        "lineup_slot": lineup_slot,
+        "slot_confirmed": confirmed,
+        "ownership": pd.to_numeric(df.get("Adj Own"), errors="coerce") / 100.0,
+    })
+    keep = (is_pitcher & confirmed) | (~is_pitcher & lineup_slot.notna())
+    out = out[keep].dropna(subset=["player_id", "mean", "std_dev"]).copy()
+    out["player_id"] = out["player_id"].astype(int)
+    out["lineup_slot"] = out["lineup_slot"].astype(int)
+    return out.drop_duplicates(subset=["player_id"], keep="first")
+
+
 def parse_player_projections(path: Path) -> pd.DataFrame:
     """Companion per-player CSV -> normalized frame."""
     df = pd.read_csv(path)

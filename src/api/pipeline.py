@@ -337,7 +337,12 @@ class PipelineRunner:
                 slate_df[["player_id", "name"]], on="player_id", how="left"
             )
 
-        players_df = self._apply_twitter_overrides(players_df, slate_path=slate_path)
+        # SaberSim is its own confirmed-lineup source of truth (Order +
+        # Status=="Confirmed" already encoded as slot/slot_confirmed) — Twitter/
+        # Underdog notifications must not supersede it for this source.
+        _is_sabersim_source = (paths.get("projections_source") or "rotowire").strip().lower() == "sabersim"
+        if not _is_sabersim_source:
+            players_df = self._apply_twitter_overrides(players_df, slate_path=slate_path)
         # sim_players_df: "both"-excluded removed — used for simulation + field generation
         # cand_players_df: "candidates"+"both"-excluded removed — used for lineup optimization
         sim_players_df, cand_players_df, excl_stats, game_ppd_pcts = self._apply_exclusions(
@@ -546,26 +551,38 @@ class PipelineRunner:
         # pre-calibration (hot) means; restore that input scale so predicted
         # ownership (and the dupe model's Σlog-own input) doesn't flatten.
         from src.models.projection_calibration import restore_fitted_mean_scale
-        ownership_vector = compute_heuristic_ownership(
-            restore_fitted_mean_scale(cand_players_df), team_totals,
-            team_ownership_reductions=_team_ownership_reductions or None,
-        )
-        # Post-hoc isotonic calibration (data/processed/ownership_calibrator.json,
-        # built by scripts/fit_ownership_calibrator.py).  Loader returns None when
-        # the artifact is missing or fitted under different model constants.
-        _calibrator = load_ownership_calibrator()
-        if _calibrator is not None:
-            ownership_vector = apply_ownership_calibration(
-                ownership_vector, cand_players_df["position"].values, _calibrator
+        # SaberSim source: ownership is pulled straight from the export's
+        # "Adj Own" column (see _build_players_df) rather than computed —
+        # skip the heuristic model and its isotonic calibration entirely.
+        _use_provided_ownership = "ownership" in cand_players_df.columns
+        if _use_provided_ownership:
+            ownership_vector = cand_players_df["ownership"].fillna(0.0).to_numpy(dtype=np.float64)
+            _calibrator = None
+            logger.info(
+                "Using SaberSim-provided ownership (Adj Own) — %d players",
+                len(ownership_vector),
             )
-        logger.info(
-            "Computed heuristic ownership — model %s%s%s%s, %d players",
-            "D" if team_totals else "C",
-            "+HR" if hr_odds else "",
-            f"+RED({len(_team_ownership_reductions)})" if _team_ownership_reductions else "",
-            f"+CAL({_calibrator.get('n_slates')})" if _calibrator is not None else "",
-            len(ownership_vector),
-        )
+        else:
+            ownership_vector = compute_heuristic_ownership(
+                restore_fitted_mean_scale(cand_players_df), team_totals,
+                team_ownership_reductions=_team_ownership_reductions or None,
+            )
+            # Post-hoc isotonic calibration (data/processed/ownership_calibrator.json,
+            # built by scripts/fit_ownership_calibrator.py).  Loader returns None when
+            # the artifact is missing or fitted under different model constants.
+            _calibrator = load_ownership_calibrator()
+            if _calibrator is not None:
+                ownership_vector = apply_ownership_calibration(
+                    ownership_vector, cand_players_df["position"].values, _calibrator
+                )
+            logger.info(
+                "Computed heuristic ownership — model %s%s%s%s, %d players",
+                "D" if team_totals else "C",
+                "+HR" if hr_odds else "",
+                f"+RED({len(_team_ownership_reductions)})" if _team_ownership_reductions else "",
+                f"+CAL({_calibrator.get('n_slates')})" if _calibrator is not None else "",
+                len(ownership_vector),
+            )
 
         # Store simulation artifacts for post-run operations (lineup replacement).
         self._sim_results = sim_results
@@ -1127,14 +1144,17 @@ class PipelineRunner:
             # manual reductions, then the same isotonic calibrator, so the
             # simulated opponent field isn't biased toward E_production's known
             # magnitude error or stale to a manual fade the user just set.
-            field_ownership_vector = compute_heuristic_ownership(
-                restore_fitted_mean_scale(sim_players_df), team_totals_gpp,
-                team_ownership_reductions=_team_ownership_reductions or None,
-            )
-            if _calibrator is not None:
-                field_ownership_vector = apply_ownership_calibration(
-                    field_ownership_vector, sim_players_df["position"].values, _calibrator
+            if _use_provided_ownership:
+                field_ownership_vector = sim_players_df["ownership"].fillna(0.0).to_numpy(dtype=np.float64)
+            else:
+                field_ownership_vector = compute_heuristic_ownership(
+                    restore_fitted_mean_scale(sim_players_df), team_totals_gpp,
+                    team_ownership_reductions=_team_ownership_reductions or None,
                 )
+                if _calibrator is not None:
+                    field_ownership_vector = apply_ownership_calibration(
+                        field_ownership_vector, sim_players_df["position"].values, _calibrator
+                    )
             from src.optimization.payout import load_payout_structure, payout_table_to_array
             _gpp_structure = load_payout_structure("dk_classic_gpp_5001")
             _gpp_payout_arr = payout_table_to_array(_gpp_structure).astype(np.float32)
@@ -2818,6 +2838,8 @@ class PipelineRunner:
                 proj_cols.append("lineup_slot")
             if "slot_confirmed" in proj.columns:
                 proj_cols.append("slot_confirmed")
+            if "ownership" in proj.columns:
+                proj_cols.append("ownership")
             df = df.merge(proj[proj_cols], on="player_id", how="left")
             if "lineup_slot" in df.columns:
                 before = len(df)
@@ -2840,6 +2862,8 @@ class PipelineRunner:
             base_cols.append("eligible_positions")
         if "slot_confirmed" in df.columns:
             base_cols.append("slot_confirmed")
+        if "ownership" in df.columns:
+            base_cols.append("ownership")
         return df[base_cols]
 
     @staticmethod

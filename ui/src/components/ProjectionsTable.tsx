@@ -11,9 +11,10 @@ interface Props {
   twitterLineups?: TwitterLineupRecord[]
   onLockToggle?: (team: string, locked: boolean) => void
   onRefresh?: (team: string) => void
+  isSaberSimSource?: boolean
 }
 
-export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChanged, twitterLineups = [], onLockToggle, onRefresh }: Props) {
+export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChanged, twitterLineups = [], onLockToggle, onRefresh, isSaberSimSource = false }: Props) {
   const [reductionSlateId, setReductionSlateId] = useState<string>('')
   const [teamReductions, setTeamReductions] = useState<Record<string, string>>({})
   const [reductionSaving, setReductionSaving] = useState(false)
@@ -141,7 +142,10 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
   }
   const teams = [...byTeam.keys()].sort()
 
-  const lockedTeamCount = teams.filter(team => twitterLineups.find(l => l.team === team && l.locked)).length
+  // SaberSim is its own confirmed-lineup source of truth — Twitter/Underdog
+  // locks (which can predate switching to this source, or go stale relative
+  // to a re-fetched CSV) must never supersede its data.
+  const lockedTeamCount = isSaberSimSource ? 0 : teams.filter(team => twitterLineups.find(l => l.team === team && l.locked)).length
   const unlockedTeamCount = teams.length - lockedTeamCount
 
   return (
@@ -158,7 +162,7 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
           const hasReduction = parseFloat(teamReductions[team] ?? '0') > 0
 
           const teamRecord = twitterLineups.find(l => l.team === team) ?? null
-          const isLocked = teamRecord?.locked ?? false
+          const isLocked = !isSaberSimSource && (teamRecord?.locked ?? false)
           const isRefreshing = refreshingTeam === team
 
           // For locked lineups, build the batter rows from the confirmed slot order.
@@ -298,7 +302,7 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
                 )
               })
 
-          const needsGameConfirmation = !isLocked && (teamRecord?.needs_game_confirmation ?? false)
+          const needsGameConfirmation = !isSaberSimSource && !isLocked && (teamRecord?.needs_game_confirmation ?? false)
 
           return (
             <div key={team} className={`lineup-card${hasReduction ? ' lineup-card--own-red' : ''}${isLocked ? ' lineup-card--locked' : ''}`}>
@@ -317,18 +321,29 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
                   <div className="lineup-lock-controls">
                     <button
                       className={`btn-lock${isLocked ? ' btn-lock--locked' : ' btn-lock--unlocked'}`}
-                      title={isLocked ? 'Lineup locked — click to unlock' : needsGameConfirmation ? 'Doubleheader — verify this lineup is for tonight\'s game, then click to lock anyway' : teamRecord ? 'Click to lock lineup' : 'No confirmed lineup to lock'}
-                      onClick={() => teamRecord && (isLocked ? onLockToggle?.(team, false) : handleLockTeam(team, teamRecord, batters))}
-                      disabled={!teamRecord}
+                      title={
+                        isSaberSimSource
+                          ? 'Twitter/Underdog lineup locks are disabled — SaberSim is the confirmed-lineup source of truth for this slate'
+                          : isLocked ? 'Lineup locked — click to unlock'
+                          : needsGameConfirmation ? 'Doubleheader — verify this lineup is for tonight\'s game, then click to lock anyway'
+                          : teamRecord ? 'Click to lock lineup' : 'No confirmed lineup to lock'
+                      }
+                      onClick={() => !isSaberSimSource && teamRecord && (isLocked ? onLockToggle?.(team, false) : handleLockTeam(team, teamRecord, batters))}
+                      disabled={isSaberSimSource || !teamRecord}
                       aria-label={isLocked ? `Unlock ${team} lineup` : `Lock ${team} lineup`}
                     >
                       {isLocked ? '🔒' : '🔓'}
                     </button>
                     <button
                       className={`btn-lineup-refresh${isLocked || isRefreshing ? ' btn-lineup-refresh--disabled' : ''}`}
-                      title={isLocked ? 'Unlock lineup first to refresh' : isRefreshing ? 'Refreshing…' : 'Refresh lineup from RotoWire'}
-                      onClick={() => !isLocked && !isRefreshing && handleRefreshTeam(team)}
-                      disabled={isLocked || isRefreshing}
+                      title={
+                        isSaberSimSource
+                          ? 'Refresh from RotoWire is disabled — SaberSim is the confirmed-lineup source of truth for this slate'
+                          : isLocked ? 'Unlock lineup first to refresh'
+                          : isRefreshing ? 'Refreshing…' : 'Refresh lineup from RotoWire'
+                      }
+                      onClick={() => !isSaberSimSource && !isLocked && !isRefreshing && handleRefreshTeam(team)}
+                      disabled={isSaberSimSource || isLocked || isRefreshing}
                       aria-label={`Refresh ${team} lineup`}
                     >
                       {isRefreshing ? '…' : '↻'}
