@@ -55,8 +55,9 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
       const cappedPlayers = (state.capped_players ?? []) as CappedPlayer[]
       const missingOptPlayers = (state.missing_opt_players ?? []) as MissingOptPlayer[]
       const heuristicPlayers = (state.heuristic_players ?? []) as HeuristicPlayer[]
+      const mlbOrderPlayers = (state.mlb_order_players ?? []) as HeuristicPlayer[]
       const teamNameWarnings = (state.team_name_warnings ?? []) as TeamNameWarning[]
-      if (players.length || cappedPlayers.length || missingOptPlayers.length || teamNameWarnings.length || heuristicPlayers.length) {
+      if (players.length || cappedPlayers.length || missingOptPlayers.length || teamNameWarnings.length || heuristicPlayers.length || mlbOrderPlayers.length) {
         const fallbackTeams = (state.fallback_teams ?? []) as FallbackTeam[]
         onMergeInfo({
           secondarySource: (state.secondary_source as string) || 'RotoWire',
@@ -65,6 +66,7 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
           cappedPlayers,
           missingOptPlayers,
           heuristicPlayers,
+          mlbOrderPlayers,
           fallbackTeams,
           teamNameWarnings,
         })
@@ -110,8 +112,9 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
         const fallbackTeams = (event.fallback_teams ?? []) as FallbackTeam[]
         const missingOptPlayers = (event.missing_opt_players ?? []) as MissingOptPlayer[]
         const heuristicPlayers = (event.heuristic_players ?? []) as HeuristicPlayer[]
+        const mlbOrderPlayers = (event.mlb_order_players ?? []) as HeuristicPlayer[]
         const teamNameWarnings = (event.team_name_warnings ?? []) as TeamNameWarning[]
-        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams, missingOptPlayers, heuristicPlayers, teamNameWarnings })
+        onMergeInfo({ secondarySource: event.secondary_source, count: event.count, players, cappedPlayers, lowTeamProjections, fallbackTeams, missingOptPlayers, heuristicPlayers, mlbOrderPlayers, teamNameWarnings })
         // Auto-exclude pitchers that fell back to a secondary source at 'candidates'
         // scope — their projections are lower quality but they still model the field.
         // Pitchers with partial_mean have only the wins market missing; they receive a
@@ -384,6 +387,31 @@ export function ProjectionsPanel({ disabled, onFetched, mergeInfo, onMergeInfo, 
           </div>
           <div style={{ marginTop: 6, fontSize: '0.8em', opacity: 0.85 }}>
             Verify these projections manually — they are salary-derived placeholders, not market- or source-based.
+          </div>
+        </div>
+      )}
+
+      {mergeInfo && status?.is_fresh !== false && (mergeInfo.mlbOrderPlayers ?? []).length > 0 && (
+        <div className="merge-info-callout merge-info-player-fallback-callout">
+          <strong>
+            ⚠ {mergeInfo.mlbOrderPlayers!.length} batter{mergeInfo.mlbOrderPlayers!.length !== 1 ? 's' : ''} filled from local MLB projections — RotoWire returned no lineup for their team
+          </strong>
+          <div className="merge-info-players">
+            {mergeInfo.mlbOrderPlayers!.map((p, i) => (
+              <span key={p.player_id} className="merge-info-team-group">
+                {i > 0 && ', '}
+                <span className="merge-info-team-label">{p.team || '—'}</span>
+                {' '}
+                {p.name}
+                <span
+                  className="merge-info-reason"
+                  title={`${p.mean.toFixed(2)} pts${p.reason ? ` · ${p.reason}` : ''}`}
+                > ⓘ</span>
+              </span>
+            ))}
+          </div>
+          <div style={{ marginTop: 6, fontSize: '0.8em', opacity: 0.85 }}>
+            RotoWire's slate detection missed this game (e.g. an early-slate game it attributed elsewhere) — lineup order came from data/raw/MLB_*_DK_*.csv instead. Verify against the confirmed lineup.
           </div>
         </div>
       )}

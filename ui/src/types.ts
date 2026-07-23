@@ -495,6 +495,7 @@ export interface MergeInfo {
   fallbackTeams?: FallbackTeam[]
   missingOptPlayers?: MissingOptPlayer[]
   heuristicPlayers?: HeuristicPlayer[]
+  mlbOrderPlayers?: HeuristicPlayer[]
   teamNameWarnings?: TeamNameWarning[]
 }
 

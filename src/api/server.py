@@ -2353,6 +2353,143 @@ async def projections_fetch(request: Request):
             new_df["player_id"] = new_df["player_id"].astype("Int64")
             return pd.concat([pool, new_df], ignore_index=True), injected
 
+        # Helper: RotoWire occasionally fails to associate a game with the
+        # correct DK slate (e.g. an early-slate game it thinks belongs to a
+        # different slate) and returns zero batters for both teams. Those
+        # players never get a lineup_slot and are silently dropped from
+        # players_df downstream. Fall back to the newest local SaberSim-style
+        # MLB_*_DK_*.csv export in data/raw (same file discover_external_files
+        # uses for external-pool mode) — it carries a projected batting-order
+        # "Order" column independent of RotoWire's own slate detection.
+        _MLB_ORDER_GLOB = "MLB_*_DK_*.csv"
+
+        def _find_mlb_order_projections_path() -> "Path | None":
+            raw_dir = PROJECT_ROOT / "data" / "raw"
+            candidates = sorted(
+                raw_dir.glob(_MLB_ORDER_GLOB), key=lambda p: p.stat().st_mtime
+            )
+            return candidates[-1] if candidates else None
+
+        def _inject_mlb_order_fallback() -> list[dict]:
+            """Detect DK teams with zero batters in the current rw_out and,
+            when found, inject those batters (lineup_slot from the local MLB
+            export's Order column) directly into rw_out so every downstream
+            consumer (Market Odds player-pool selection, the RW/DFF merge)
+            treats them exactly like any other RotoWire-sourced starter.
+            Returns the injected players for merge_info reporting.
+            """
+            if dk_path is None or not dk_path.exists() or not rw_out.exists():
+                return []
+            try:
+                rw_df = pd.read_csv(rw_out)
+            except Exception:
+                return []
+            try:
+                dk_df = pd.read_csv(
+                    dk_path, usecols=["ID", "Name", "Position", "TeamAbbrev", "Salary"]
+                )
+            except Exception:
+                return []
+            dk_df["_pos"] = dk_df["Position"].map(
+                lambda p: "P" if str(p) in ("SP", "RP") else str(p)
+            )
+            dk_batters = dk_df[dk_df["_pos"] != "P"].copy()
+            if dk_batters.empty:
+                return []
+
+            rw_batter_ids: set[int] = set()
+            if not rw_df.empty and "lineup_slot" in rw_df.columns and "player_id" in rw_df.columns:
+                rw_batter_ids = set(
+                    pd.to_numeric(
+                        rw_df.loc[rw_df["lineup_slot"] != 10, "player_id"], errors="coerce"
+                    ).dropna().astype(int).tolist()
+                )
+            dk_batters["ID"] = pd.to_numeric(dk_batters["ID"], errors="coerce")
+            dk_batters = dk_batters.dropna(subset=["ID"]).copy()
+            dk_batters["ID"] = dk_batters["ID"].astype(int)
+            dk_batters["_has_rw"] = dk_batters["ID"].isin(rw_batter_ids)
+            team_coverage = dk_batters.groupby("TeamAbbrev")["_has_rw"].any()
+            missing_teams = sorted(team_coverage[~team_coverage].index.tolist())
+            if not missing_teams:
+                return []
+
+            mlb_path = _find_mlb_order_projections_path()
+            if mlb_path is None:
+                _logging.getLogger(__name__).warning(
+                    "RotoWire returned zero batters for team(s) %s and no local "
+                    "MLB_*_DK_*.csv export was found in data/raw to fall back to.",
+                    ", ".join(missing_teams),
+                )
+                return []
+
+            from .external_pool import parse_player_projections
+            try:
+                mlb_df = parse_player_projections(mlb_path)
+            except Exception as exc:
+                _logging.getLogger(__name__).warning(
+                    "MLB order fallback: could not parse %s: %s", mlb_path, exc
+                )
+                return []
+            mlb_lookup = mlb_df.set_index("player_id")
+
+            missing_batters = dk_batters[dk_batters["TeamAbbrev"].isin(missing_teams)]
+            new_rows: list[dict] = []
+            injected: list[dict] = []
+            still_missing: list[str] = []
+            for _, row in missing_batters.iterrows():
+                pid = int(row["ID"])
+                mrow = mlb_lookup.loc[pid] if pid in mlb_lookup.index else None
+                order = mrow["order"] if mrow is not None else None
+                if mrow is None or pd.isna(order) or not (1 <= int(order) <= 9):
+                    still_missing.append(str(row["Name"]))
+                    continue
+                salary = float(row["Salary"])
+                mean = (
+                    float(mrow["mean"]) if pd.notna(mrow.get("mean"))
+                    else round(salary / 400.0, 2)
+                )
+                std_dev = (
+                    float(mrow["std_dev"]) if pd.notna(mrow.get("std_dev"))
+                    else round(max(4.0 + 0.4 * mean, 1.0), 2)
+                )
+                new_rows.append({
+                    "player_id": pid,
+                    "name": row["Name"],
+                    "team": row["TeamAbbrev"],
+                    "mean": mean,
+                    "std_dev": std_dev,
+                    "lineup_slot": int(order),
+                    "slot_confirmed": False,
+                })
+                injected.append({
+                    "player_id": pid,
+                    "name": row["Name"],
+                    "team": row["TeamAbbrev"],
+                    "salary": salary,
+                    "mean": mean,
+                    "source": "mlb_order_fallback",
+                    "reason": f"batting {int(order)}",
+                })
+            if still_missing:
+                _logging.getLogger(__name__).warning(
+                    "MLB order fallback: %d batter(s) for team(s) %s have no batting "
+                    "order in %s: %s",
+                    len(still_missing), ", ".join(missing_teams), mlb_path.name,
+                    ", ".join(still_missing[:20]),
+                )
+            if not new_rows:
+                return []
+            new_df = pd.DataFrame(new_rows)
+            combined = (
+                pd.concat([rw_df, new_df], ignore_index=True) if not rw_df.empty else new_df
+            )
+            combined.to_csv(rw_out, index=False)
+            _logging.getLogger(__name__).info(
+                "MLB order fallback: injected %d batter(s) for team(s) %s from %s.",
+                len(new_rows), ", ".join(missing_teams), mlb_path.name,
+            )
+            return injected
+
         # Clear stale merge-info state at the start of every full (non-partial)
         # fetch so that server restarts don't resurface banners from a prior slate.
         # Partial fetches preserve the file so the purge+accumulate logic works.
@@ -2417,6 +2554,14 @@ async def projections_fetch(request: Request):
                 if rw_rc != 0:
                     returncode = rw_rc
                 else:
+                    mlb_order_players = _inject_mlb_order_fallback()
+                    if mlb_order_players:
+                        _mlb_order_teams = sorted({p["team"] for p in mlb_order_players})
+                        yield _log(
+                            f"RotoWire returned no batters for {', '.join(_mlb_order_teams)} — "
+                            f"filled {len(mlb_order_players)} batter(s) from local MLB projections (Order column)."
+                        )
+
                     # Step 2: Market odds — pass --games filter when doing a partial fetch
                     yield _log("--- Fetching Market Odds (CrazyNinjaOdds) ---")
                     mo_cmd = [str(python), str(mo_script), "--output", str(mo_out),
@@ -2605,6 +2750,7 @@ async def projections_fetch(request: Request):
                             capped_players      = _purge(_prev.get("capped_players", []))  + capped_players
                             missing_opt_players = _purge(_prev.get("missing_opt_players", [])) + missing_opt_players
                             heuristic_players   = _purge(_prev.get("heuristic_players", [])) + heuristic_players
+                            mlb_order_players   = _purge(_prev.get("mlb_order_players", [])) + mlb_order_players
                             team_name_warnings  = _purge_warnings(_prev.get("team_name_warnings", [])) + team_name_warnings
 
                         _total_batters: dict[str, int] = {}
@@ -2620,13 +2766,14 @@ async def projections_fetch(request: Request):
                             "capped_players":      capped_players,
                             "missing_opt_players": missing_opt_players,
                             "heuristic_players":   heuristic_players,
+                            "mlb_order_players":   mlb_order_players,
                             "fallback_teams":      fallback_teams,
                             "team_name_warnings":  team_name_warnings,
                             "secondary_source":    "RotoWire",
                         })
 
-                        if fallback_players or capped_players or low_team_projs or missing_opt_players or team_name_warnings or heuristic_players:
-                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'heuristic_players': heuristic_players, 'team_name_warnings': team_name_warnings, 'included_teams': sorted(included_teams), 'timestamp': int(time.time() * 1000)})}\n\n"
+                        if fallback_players or capped_players or low_team_projs or missing_opt_players or team_name_warnings or heuristic_players or mlb_order_players:
+                            result_event = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': 'RotoWire', 'count': len(fallback_players), 'players': fallback_players, 'capped_players': capped_players, 'low_team_projections': low_team_projs, 'fallback_teams': fallback_teams, 'missing_opt_players': missing_opt_players, 'heuristic_players': heuristic_players, 'mlb_order_players': mlb_order_players, 'team_name_warnings': team_name_warnings, 'included_teams': sorted(included_teams), 'timestamp': int(time.time() * 1000)})}\n\n"
                         elif result_event is None:
                             result_event = _log("All player projections sourced from Market Odds (CrazyNinjaOdds).")
 
@@ -2696,6 +2843,14 @@ async def projections_fetch(request: Request):
                         break
                     yield _log(line.decode().rstrip())
                 await proc2.wait()
+
+                mlb_order_players2 = _inject_mlb_order_fallback()
+                if mlb_order_players2:
+                    _mlb_order_teams2 = sorted({p["team"] for p in mlb_order_players2})
+                    yield _log(
+                        f"RotoWire returned no batters for {', '.join(_mlb_order_teams2)} — "
+                        f"filled {len(mlb_order_players2)} batter(s) from local MLB projections (Order column)."
+                    )
 
                 # ---- Merge both outputs into final projections.csv (no yields) ---
                 dff_df = pd.read_csv(dff_out) if dff_out.exists() else pd.DataFrame()
@@ -2843,19 +2998,21 @@ async def projections_fetch(request: Request):
                             return [x for x in lst if x.get("team", "") not in included_teams]
                         fallback_players2 = _purge2(_prev2.get("players", [])) + fallback_players2
                         heuristic_players2 = _purge2(_prev2.get("heuristic_players", [])) + heuristic_players2
+                        mlb_order_players2 = _purge2(_prev2.get("mlb_order_players", [])) + mlb_order_players2
 
                     _save_merge_info_state({
                         "players":             fallback_players2,
                         "capped_players":      [],
                         "missing_opt_players": [],
                         "heuristic_players":   heuristic_players2,
+                        "mlb_order_players":   mlb_order_players2,
                         "fallback_teams":      fallback_teams2,
                         "team_name_warnings":  [],
                         "secondary_source":    fallback_label,
                     })
 
-                    if fallback_players2 or low_team_projs2 or heuristic_players2:
-                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'heuristic_players': heuristic_players2, 'included_teams': sorted(included_teams), 'timestamp': int(time.time() * 1000)})}\n\n"
+                    if fallback_players2 or low_team_projs2 or heuristic_players2 or mlb_order_players2:
+                        result_event2 = f"data: {json.dumps({'type': 'merge_info', 'secondary_source': fallback_label, 'count': len(fallback_players2), 'players': fallback_players2, 'low_team_projections': low_team_projs2, 'fallback_teams': fallback_teams2, 'heuristic_players': heuristic_players2, 'mlb_order_players': mlb_order_players2, 'included_teams': sorted(included_teams), 'timestamp': int(time.time() * 1000)})}\n\n"
                     else:
                         result_event2 = _log(f"All player projections sourced from {preferred_label}.")
 
