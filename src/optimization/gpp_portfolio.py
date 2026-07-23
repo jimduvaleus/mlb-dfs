@@ -31,6 +31,14 @@ logger = logging.getLogger(__name__)
 # with the first-stage seeds field_rng_seed + 0..K-1.
 _FRESH_FIELD_SEED_OFFSET = 100_003
 
+# DeterminantPortfolioSelector: fraction of the diversity weight (1-EVw)
+# carved out for the hedge bonus (see DEw/HedgeW split in __init__). Kept
+# well under 1 so a maxed-out hedge bonus (HedgeN capped at 1.0) can never
+# outscore a fully non-redundant candidate's guaranteed DEn=1 floor,
+# regardless of portfolio size -- this is a tie-breaker signal, not a
+# co-equal third objective.
+_HEDGE_WEIGHT_FRACTION = 0.1
+
 
 # ------------------------------------------------------------------ #
 #  Numba kernels (module-level, compiled once per process)            #
@@ -852,30 +860,65 @@ class DeterminantPortfolioSelector:
     """Greedy portfolio construction via incremental correlation-distance maximisation.
 
     At each step scores every remaining +EV candidate on a weighted combination of:
-      EVn — normalised mean dollar payout (robust_payout.mean(axis=1))
-      Dn  — normalised correlation distance between the candidate's payout and
-            the running portfolio's aggregate payout (the sum of the payout
-            vectors of the lineups already selected)
+      EVn     — normalised mean dollar payout (robust_payout.mean(axis=1))
+      Dn      — normalised "positive-redundancy" distance between the
+                candidate and the running portfolio (see below)
+      HedgeN  — small tie-breaker bonus for hedging the running portfolio
+                (see below); weighted well below Dn so it can only ever
+                break ties among non-redundant candidates, never rescue a
+                redundant one
 
-    For standardised (zero-mean, unit-variance) random variables X, Y:
-      E[(X-Y)^2] = 2(1 - corr(X,Y))
-    so (1 - r) / 2 is the natural, normalised [0, 1] distance implied by a
-    correlation — monotonically *decreasing* in r, not in |r|. A candidate
-    anti-correlated with the portfolio (r -> -1) is strictly farther
-    (Dn -> 1) than an uncorrelated one (r = 0, Dn = 0.5), which is strictly
-    farther than a co-correlated one (r -> 1, Dn -> 0). This is deliberately
-    different from a partial-variance/Schur-complement formulation (1 - r^2),
-    which is symmetric in the sign of r and treats a hedge as no better than
-    an equally-sized co-movement.
+    For a *single* reference lineup, standardised (zero-mean, unit-variance)
+    random variables X, Y satisfy E[(X-Y)^2] = 2(1 - corr(X,Y)), so (1-r)/2
+    is the natural, normalised [0, 1] distance implied by a correlation —
+    monotonically *decreasing* in r, not in |r|. A candidate anti-correlated
+    with a reference lineup (r -> -1) is strictly farther than an
+    uncorrelated one (r = 0), which is strictly farther than a co-correlated
+    one (r -> 1). This is deliberately different from a partial-variance/
+    Schur-complement formulation (1 - r^2), which is symmetric in the sign
+    of r and treats a hedge as no better than an equally-sized co-movement.
 
-    Generalising from a single reference lineup to a k-lineup running
-    portfolio: let P_k = sum of the k already-selected (standardised) payout
-    vectors. The candidate's correlation with the portfolio's aggregate
-    payout is
-      r_c = Cov(x_c, P_k) / sqrt(Var(P_k)) = (sum_i r_{c,i}) / sqrt(sum_{i,j} r_{i,j})
-    (sums over the selected set i, j; each x is standardised so Var(x_c) = 1).
-    Both the numerator and Var(P_k) update in O(k) per step as lineups are
-    added — no matrix inverse, no Schur complement.
+    Generalising to a k-lineup running portfolio, the per-step distance is
+      redundancy = sum_i max(r_{c,i}, 0)^2   (sum over the k already-selected i)
+      Dn = 1 - redundancy   (clipped to [0, 1])
+    Only *positive* (co-moving) correlations count toward redundancy —
+    negatives are floored to 0 before squaring and summing, so a strong
+    hedge to one already-selected lineup can never cancel out a near-
+    duplicate of another (a straight signed sum, or sum of signed squares,
+    both allow that cancellation; flooring first means a hedge simply never
+    enters the sum). Squaring is what correctly prefers one strong overlap
+    (r=0.6 to a single already-selected lineup) over several moderate ones
+    (r=0.5 to two of them) — true incremental coverage against an orthogonal
+    existing portfolio is 1 - sum(r^2), not 1 - sum(r) — and, unlike the
+    earlier Cov(x_c, sum of selected)/sqrt(Var(sum of selected)) formulation
+    this replaced, it never dilutes with portfolio size: an irrelevant
+    already-selected lineup contributes exactly 0 to the sum, not a
+    shrinking share of an average.
+
+    Flooring negatives out of redundancy means a hedge is no longer
+    rewarded above a merely-uncorrelated lineup (both floor to Dn=1) — a
+    real, deliberate loss versus the single-relationship case above. HedgeN
+    restores a bounded version of that credit as a *separate* term rather
+    than folding it back into Dn (which would reopen the cancellation hole
+    Dn was built to close):
+      hedge = min(sum_i max(-r_{c,i}, 0)^2, 1.0)   (same i as redundancy)
+      HedgeN = hedge
+    weighted by hedge_w = _HEDGE_WEIGHT_FRACTION * (1-EVw), with
+    dew = (1 - _HEDGE_WEIGHT_FRACTION) * (1-EVw), so EVw + dew + hedge_w == 1
+    at every risk level. The cap at 1.0 is load-bearing, not cosmetic:
+    unlike redundancy (which only accumulates from genuinely correlated
+    lineups), a raw sum of squared negative correlations grows with however
+    many already-selected lineups a candidate happens to hedge, so an
+    uncapped version would itself dilute^-1 (inflate) with portfolio size.
+    With the cap, and hedge_w <= dew by construction, the *maximum possible*
+    hedge bonus (hedge_w * 1.0) can never exceed a fully non-redundant
+    candidate's guaranteed floor (dew * 1.0) — so HedgeN can shift ranking
+    only among candidates that are already comparably non-redundant, never
+    pull a genuinely redundant one back into contention.
+
+    Still O(k) per step off the same per-candidate correlation row for both
+    terms — no matrix inverse, no Schur complement, no incremental
+    portfolio-variance state to maintain between steps.
 
     No fresh simulations, no hybrid fields, no correlation thresholds —
     the Phase-1 robust_payout matrix is the only input required.
@@ -917,7 +960,14 @@ class DeterminantPortfolioSelector:
         self._candidates = candidates
         self._portfolio_size = portfolio_size
         self._evw = self.evw_for_risk(risk, evw_base, evw_max)
-        self._dew = 1.0 - self._evw
+        # Diversity weight (1-EVw) splits into DEn's weight and a small
+        # HedgeN tie-breaker weight (see _HEDGE_WEIGHT_FRACTION) — both
+        # scale down together as EVw rises across the risk sweep, keeping
+        # their ratio (and so the safety margin against HedgeN rescuing a
+        # redundant candidate) constant at every risk level.
+        diversity_w = 1.0 - self._evw
+        self._hedge_w = _HEDGE_WEIGHT_FRACTION * diversity_w
+        self._dew = diversity_w - self._hedge_w
         self._ev_floor = ev_floor
         # Optional shared precompute from precompute_pool() — must have been
         # built from the same robust_payout/ev_floor. The risk sweep passes
@@ -1023,7 +1073,7 @@ class DeterminantPortfolioSelector:
         )
 
         M_pool = len(pool_idx)
-        evw, dew = self._evw, self._dew
+        evw, dew, hedge_w = self._evw, self._dew, self._hedge_w
 
         # Selection-EV basis per pick: mean dollar EV for the cash-anchor
         # block (and everywhere when no override), the override vector after.
@@ -1045,8 +1095,6 @@ class DeterminantPortfolioSelector:
         first = int(np.argmax(_sel_ev_vals(1)))
         selected_in_pool.append(first)
         remaining_mask[first] = False
-        # Var(P_1) in standardised units — a single lineup's self-correlation.
-        portfolio_var = 1.0
 
         if progress_cb is not None:
             progress_cb({
@@ -1072,16 +1120,34 @@ class DeterminantPortfolioSelector:
             # Correlation of each remaining candidate with each selected lineup
             R = corr_matrix[np.ix_(remaining_pool_idx, selected_in_pool)].astype(np.float64)  # (M_rem, k)
 
-            # Correlation-distance to the running portfolio's aggregate payout
-            # P_k = sum of the selected (standardised) payout vectors. Since
-            # each is unit-variance, Cov(x_c, P_k) = sum_i r_{c,i} and
-            # Var(P_k) = sum_{i,j} r_{i,j} = portfolio_var (maintained
-            # incrementally below), so r_c = Cov / sqrt(Var(P_k)) directly —
-            # no matrix inverse needed.
-            cov_to_portfolio = R.sum(axis=1)                         # (M_rem,)
-            r_to_portfolio = cov_to_portfolio / np.sqrt(portfolio_var)
-            r_to_portfolio = np.clip(r_to_portfolio, -1.0, 1.0)       # fp-noise guard
-            distance = (1.0 - r_to_portfolio) / 2.0                   # (M_rem,) in [0, 1]
+            # Positive-redundancy distance: sum the SQUARED correlation to
+            # each already-selected lineup, counting only positive
+            # (co-moving) correlations — floor negatives to 0 before summing
+            # so a hedge can never cancel real redundancy elsewhere (a
+            # straight signed sum, or sum of signed squares, lets a strong
+            # hedge to one lineup exactly offset a near-duplicate of
+            # another; flooring first means hedges simply don't enter the
+            # sum). Squaring (not summing raw r) is what correctly prefers
+            # one strong overlap (r=0.6 to one lineup) over several moderate
+            # ones (r=0.5 to two lineups) — true incremental coverage for an
+            # orthogonal existing portfolio is 1-sum(r^2), not 1-sum(r).
+            # Unlike Cov/sqrt(Var), this never dilutes with portfolio size:
+            # an irrelevant already-selected lineup contributes exactly 0,
+            # not a shrinking share of an average.
+            redundancy = np.sum(np.maximum(R, 0.0) ** 2, axis=1)      # (M_rem,)
+            distance = np.clip(1.0 - redundancy, 0.0, 1.0)             # (M_rem,) in [0, 1]
+
+            # Hedge bonus: the mirror image of redundancy, summing squared
+            # NEGATIVE correlations only, capped at 1.0. This is a separate
+            # term (not netted into distance) so a hedge can influence
+            # ranking as a tie-breaker among non-redundant candidates
+            # without being able to rescue a redundant one — capping at 1.0
+            # plus keeping _hedge_w <= _dew (see _HEDGE_WEIGHT_FRACTION)
+            # guarantees a maxed-out hedge bonus (hedge_w*1.0) can never
+            # exceed a fully clean candidate's guaranteed floor (dew*1.0),
+            # regardless of portfolio size — unlike redundancy, this isn't
+            # naturally bounded by anything, so the cap is load-bearing.
+            hedge_bonus = np.minimum(np.sum(np.maximum(-R, 0.0) ** 2, axis=1), 1.0)  # (M_rem,)
 
             # Normalised EV (relative to current remaining pool).
             # Shift up by |min_ev| when negatives are present so EVn stays in
@@ -1093,21 +1159,18 @@ class DeterminantPortfolioSelector:
             max_ev_shifted = ev_shifted.max()
             EVn = ev_shifted / max_ev_shifted if max_ev_shifted > 1e-12 else np.ones(M_rem)
 
-            # distance is already a bounded, self-normalised [0, 1] quantity
-            # (unlike partial_var, it needs no per-step max-rescaling).
+            # distance and hedge_bonus are already bounded, self-normalised
+            # [0, 1] quantities (unlike partial_var, neither needs per-step
+            # max-rescaling).
             DEn = distance
+            HedgeN = hedge_bonus
 
-            score = evw * EVn + dew * DEn
+            score = evw * EVn + dew * DEn + hedge_w * HedgeN
             best_in_rem = int(np.argmax(score))
             best_pool = int(remaining_pool_idx[best_in_rem])
 
             selected_in_pool.append(best_pool)
             remaining_mask[best_pool] = False
-
-            # Var(P_{k+1}) = Var(P_k) + Var(x_new) + 2*Cov(P_k, x_new)
-            #              = portfolio_var + 1 + 2*cov_to_portfolio[picked]
-            portfolio_var += 1.0 + 2.0 * float(cov_to_portfolio[best_in_rem])
-            portfolio_var = max(portfolio_var, 1e-10)  # clamp for numerical stability
 
             logger.debug(
                 "Det-EV step %d: pool_idx=%d  ev=$%.4f  distance=%.4f  score=%.4f",
