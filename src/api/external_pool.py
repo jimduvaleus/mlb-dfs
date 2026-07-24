@@ -245,12 +245,16 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     above). Columns: player_id, name, mean, std_dev, lineup_slot,
     slot_confirmed, ownership (fraction, from "Adj Own").
 
-    A pitcher row is kept only when Status == "Confirmed" (the file lists the
-    whole rotation/bullpen, not just the day's starter). A batter row is kept
-    only when it carries an Order (its projected batting slot); Status ==
-    "Confirmed" then distinguishes an officially confirmed slot from a merely
-    projected one (slot_confirmed drives the UI's green/amber bubble + the
-    team lock icon exactly as it does for the RotoWire/DFF/Market-Odds
+    A pitcher row is kept when Status == "Confirmed" (the file lists the
+    whole rotation/bullpen, not just the day's starter). For a team with no
+    Confirmed pitcher at all, the highest-projected-mean pitcher on that
+    team's roster is kept instead as the projected (unconfirmed) starter —
+    mirroring how an unconfirmed batter with an Order still shows as the
+    amber-bubble projected slot rather than being dropped. A batter row is
+    kept only when it carries an Order (its projected batting slot); Status
+    == "Confirmed" then distinguishes an officially confirmed slot from a
+    merely projected one (slot_confirmed drives the UI's green/amber bubble +
+    the team lock icon exactly as it does for the RotoWire/DFF/Market-Odds
     sources, so no separate UI plumbing is needed for SaberSim).
     """
     df = pd.read_csv(path)
@@ -259,19 +263,33 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     is_pitcher = df["Pos"].astype(str) == "P"
     confirmed = df["Status"].astype(str) == "Confirmed"
     order = pd.to_numeric(df.get("Order"), errors="coerce")
+    mean_raw = pd.to_numeric(df[mean_col], errors="coerce")
     lineup_slot = pd.Series(np.nan, index=df.index, dtype=float)
     lineup_slot.loc[is_pitcher] = 10
     lineup_slot.loc[~is_pitcher] = order.loc[~is_pitcher]
+
+    keep_pitcher = is_pitcher & confirmed
+    pitchers = pd.DataFrame({
+        "team": df["Team"], "mean": mean_raw, "confirmed": confirmed,
+    })[is_pitcher]
+    teams_with_confirmed = set(pitchers.loc[pitchers["confirmed"], "team"])
+    fallback_candidates = pitchers[
+        ~pitchers["team"].isin(teams_with_confirmed) & pitchers["mean"].notna()
+    ]
+    if not fallback_candidates.empty:
+        fallback_starter_idx = fallback_candidates.groupby("team")["mean"].idxmax()
+        keep_pitcher.loc[fallback_starter_idx] = True
+
     out = pd.DataFrame({
         "player_id": pd.to_numeric(df["DFS ID"], errors="coerce"),
         "name": df["Name"],
-        "mean": pd.to_numeric(df[mean_col], errors="coerce"),
+        "mean": mean_raw,
         "std_dev": pd.to_numeric(df[std_col], errors="coerce"),
         "lineup_slot": lineup_slot,
         "slot_confirmed": confirmed,
         "ownership": pd.to_numeric(df.get("Adj Own"), errors="coerce") / 100.0,
     })
-    keep = (is_pitcher & confirmed) | (~is_pitcher & lineup_slot.notna())
+    keep = keep_pitcher | (~is_pitcher & lineup_slot.notna())
     out = out[keep].dropna(subset=["player_id", "mean", "std_dev"]).copy()
     out["player_id"] = out["player_id"].astype(int)
     out["lineup_slot"] = out["lineup_slot"].astype(int)

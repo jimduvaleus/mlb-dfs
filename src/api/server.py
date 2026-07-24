@@ -2548,12 +2548,16 @@ async def projections_fetch(request: Request):
                         proj_written = True
                         if warn_msg:
                             yield _log(warn_msg)
-                        n_batters = int((sabersim_df["lineup_slot"] != 10).sum())
-                        n_pitchers = int((sabersim_df["lineup_slot"] == 10).sum())
+                        pitcher_rows = sabersim_df["lineup_slot"] == 10
+                        n_batters = int((~pitcher_rows).sum())
+                        n_pitchers_confirmed = int((pitcher_rows & sabersim_df["slot_confirmed"]).sum())
+                        n_pitchers_fallback = int((pitcher_rows & ~sabersim_df["slot_confirmed"]).sum())
                         n_confirmed = int(sabersim_df["slot_confirmed"].sum())
                         result_event = _log(
-                            f"SaberSim: {n_batters} batter(s), {n_pitchers} confirmed pitcher(s), "
-                            f"{n_confirmed} confirmed lineup slot(s) loaded from {mlb_path.name}."
+                            f"SaberSim: {n_batters} batter(s), {n_pitchers_confirmed} confirmed pitcher(s)"
+                            + (f", {n_pitchers_fallback} projected (unconfirmed) starter(s) by highest projection"
+                               if n_pitchers_fallback else "")
+                            + f", {n_confirmed} confirmed lineup slot(s) loaded from {mlb_path.name}."
                         )
             except Exception as exc:
                 returncode = 1
