@@ -148,9 +148,21 @@ export function ProjectionsTable({ players, teamTotals, onOwnershipSettingsChang
   const lockedTeamCount = isSaberSimSource ? 0 : teams.filter(team => twitterLineups.find(l => l.team === team && l.locked)).length
   const unlockedTeamCount = teams.length - lockedTeamCount
 
+  // "Locked" has no meaning for SaberSim (locks are disabled for this
+  // source), so the header instead surfaces how many teams don't yet have
+  // a fully confirmed batting order — a team counts as confirmed only when
+  // every one of its batters is slot_confirmed, mirroring the green/amber
+  // bubble shown per player below.
+  const unconfirmedTeamCount = teams.filter(team => {
+    const batters = byTeam.get(team)!.filter(p => p.position !== 'P')
+    return batters.length === 0 || !batters.every(p => p.slot_confirmed)
+  }).length
+
   return (
     <div className="projections-table-wrap">
-      <h3>Projections — {players.length} players, {teams.length} teams{unlockedTeamCount > 0 ? <span className="projections-unlocked-count"> · {unlockedTeamCount} unlocked</span> : null}</h3>
+      <h3>Projections — {players.length} players, {teams.length} teams{isSaberSimSource
+        ? (unconfirmedTeamCount > 0 ? <span className="projections-unlocked-count"> · {unconfirmedTeamCount} unconfirmed</span> : null)
+        : (unlockedTeamCount > 0 ? <span className="projections-unlocked-count"> · {unlockedTeamCount} unlocked</span> : null)}</h3>
       <div className="portfolio-cards">
         {teams.map(team => {
           const teamPlayers = byTeam.get(team)!
