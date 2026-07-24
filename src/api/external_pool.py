@@ -35,8 +35,23 @@ logger = logging.getLogger(__name__)
 _N_SLOT_COLS = 10
 _SINGLE_ENTRY_RE = re.compile(r"\[\s*single\s+entry\s*\]", re.IGNORECASE)
 _LINEUPS_GLOB = "lineups_*.csv"
-# 'lineups_dk_mlb_classic_7-17-2026_705pm.csv' -> ('7-17-2026', '705pm')
-_LINEUPS_TOKEN_RE = re.compile(r"lineups_.*?_(\d{1,2}-\d{1,2}-\d{4})_(\d{3,4}[ap]m)", re.IGNORECASE)
+# 'lineups_dk_mlb_classic_7-17-2026_705pm.csv' -> ('dk_mlb_classic', '7-17-2026', '705pm')
+_LINEUPS_TOKEN_RE = re.compile(r"lineups_(.*?)_(\d{1,2}-\d{1,2}-\d{4})_(\d{3,4}[ap]m)", re.IGNORECASE)
+
+
+def _lineup_slate_signature(name: str) -> Optional[tuple[str, str, str]]:
+    """(format_prefix, normalized_date, time) identifying which slate a
+    lineups_*.csv export belongs to. Two files with the same signature are
+    treated as separate exports of the same slate (e.g. a browser
+    re-download saved as '... (1).csv', or two separate optimizer runs); a
+    different format, date, or time is a different slate. None when the
+    filename doesn't carry the expected token."""
+    m = _LINEUPS_TOKEN_RE.search(name)
+    if not m:
+        return None
+    fmt, date_s, time_s = m.groups()
+    mo, dy, yr = date_s.split("-")
+    return (fmt.casefold(), f"{yr}-{int(mo):02d}-{int(dy):02d}", time_s.lower())
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +82,7 @@ class ExternalPool:
     contests: dict                # norm_name -> ExternalContest
     n_dropped_unknown_players: int
     n_dropped_duplicates: int
-    source_path: Path
+    source_paths: list            # list[Path], one or more lineups_*.csv for one slate
 
 
 @dataclass
@@ -94,23 +109,35 @@ class ExternalAllocation:
 # ---------------------------------------------------------------------------
 
 def discover_external_files(raw_dir: str) -> dict:
-    """Newest lineups_*.csv in raw_dir + its companion projections CSV.
+    """All lineups_*.csv in raw_dir sharing the newest file's slate signature
+    (see _lineup_slate_signature) + their companion projections CSV.
 
-    Pairing: the slate token from the lineups filename ('7-17-2026', '705pm')
-    must appear in the companion as 'YYYY-MM-DD-<time>' ('2026-07-17-705pm');
-    falls back to the newest MLB_*_DK_*.csv with paired_by_token=False.
+    Multiple exports of the same slate — a browser re-download saved as
+    '... (1).csv', or separate optimizer runs — are returned together as
+    ``lineups_paths`` so the caller can build one combined candidate pool.
+    A lineups_*.csv with a different format, date, or time token is a
+    different slate and is excluded. When the newest file's name doesn't
+    carry a recognizable token, it's returned alone (no grouping).
+
+    Pairing: the slate token from the reference lineups filename
+    ('7-17-2026', '705pm') must appear in the companion as
+    'YYYY-MM-DD-<time>' ('2026-07-17-705pm'); falls back to the newest
+    MLB_*_DK_*.csv with paired_by_token=False.
     """
     d = Path(raw_dir)
-    out = {"lineups_path": None, "projections_path": None, "paired_by_token": False}
+    out = {"lineups_paths": [], "projections_path": None, "paired_by_token": False}
     lineup_files = sorted(d.glob(_LINEUPS_GLOB), key=lambda p: p.stat().st_mtime)
     if not lineup_files:
         return out
-    lp = lineup_files[-1]
-    out["lineups_path"] = lp
-    m = _LINEUPS_TOKEN_RE.search(lp.name)
-    if m:
-        mo, dy, yr = m.group(1).split("-")
-        token = f"{yr}-{int(mo):02d}-{int(dy):02d}-{m.group(2).lower()}"
+    newest = lineup_files[-1]
+    sig = _lineup_slate_signature(newest.name)
+    if sig is None:
+        out["lineups_paths"] = [newest]
+    else:
+        matched = [p for p in lineup_files if _lineup_slate_signature(p.name) == sig]
+        out["lineups_paths"] = sorted(matched, key=lambda p: p.name)
+        _, date_norm, time_s = sig
+        token = f"{date_norm}-{time_s}"
         for cand in sorted(d.glob("MLB_*.csv"), key=lambda p: p.stat().st_mtime, reverse=True):
             if token in cand.name.lower():
                 out["projections_path"] = cand
@@ -121,7 +148,7 @@ def discover_external_files(raw_dir: str) -> dict:
         out["projections_path"] = fallback[-1]
         logger.warning(
             "External pool: no token-matched companion for %s — falling back to newest %s",
-            lp.name, out["projections_path"].name,
+            newest.name, out["projections_path"].name,
         )
     return out
 
@@ -134,16 +161,10 @@ def normalize_contest_name(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip().casefold()
 
 
-def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
-    """Parse the lineup export with csv.reader on the raw header (duplicate
-    'P'/'OF' slot headers and any duplicate contest names must be seen
-    verbatim — never pandas' '.1' mangling)."""
-    with open(path, newline="", encoding="utf-8-sig") as f:
-        rows = list(csv.reader(f))
-    if not rows:
-        raise ValueError(f"External lineup file is empty: {path}")
+def _parse_lineup_header(path: Path, rows: list) -> tuple:
+    """Identify a lineup file's contest ROI blocks. Returns
+    (contest_cols, stddev_cols): norm_name -> (raw prefix, col idx) / col idx."""
     header = rows[0]
-
     header_set = set(header)
     contest_cols: dict[str, tuple[str, int]] = {}  # norm_name -> (raw prefix, col idx)
     stddev_cols: dict[str, int] = {}  # norm_name -> col idx of "<prefix> ROI StDev", if present
@@ -155,7 +176,7 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
             continue  # generic bucket column, not a contest block
         norm = normalize_contest_name(prefix)
         if norm in contest_cols:
-            logger.warning("External pool: duplicate contest block %r — keeping first.", prefix)
+            logger.warning("External pool: duplicate contest block %r in %s — keeping first.", prefix, path.name)
             continue
         contest_cols[norm] = (prefix, idx)
         std_col = f"{prefix} ROI StDev"
@@ -166,6 +187,49 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
             f"External lineup file has no contest ROI blocks "
             f"(no '<name> ROI' column with a '<name> Sim Dupes' sibling): {path}"
         )
+    return contest_cols, stddev_cols
+
+
+def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
+    """Parse one or more lineup exports for the same slate (see
+    discover_external_files) with csv.reader on each raw header (duplicate
+    'P'/'OF' slot headers and any duplicate contest names must be seen
+    verbatim — never pandas' '.1' mangling).
+
+    Lineups are deduplicated by player-id set across *all* files combined —
+    a lineup appearing more than once (within one file or across files) is
+    kept only once, using the roi/roi_stddev from its first occurrence in
+    file order.
+
+    Contest ROI blocks are matched across files by normalized name (first
+    file to define a given contest wins its raw name / prize pool / single
+    entry metadata). A contest present in one file but not another leaves
+    NaN roi (and roi_stddev) for the lineups sourced from file(s) missing
+    that column — no different from any other blank ROI cell."""
+    if isinstance(paths, (str, Path)):
+        paths = [Path(paths)]
+    else:
+        paths = [Path(p) for p in paths]
+
+    per_file: list[tuple] = []  # (path, data_rows, contest_cols, stddev_cols)
+    contest_order: list[str] = []  # norm names, first-seen order across files
+    contest_meta: dict[str, tuple] = {}  # norm -> (raw_prefix, prize_pool_cents, single_entry)
+    any_stddev: set[str] = set()
+
+    for path in paths:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        if not rows:
+            raise ValueError(f"External lineup file is empty: {path}")
+        contest_cols, stddev_cols = _parse_lineup_header(path, rows)
+        for norm, (prefix, _) in contest_cols.items():
+            if norm not in contest_meta:
+                contest_order.append(norm)
+                contest_meta[norm] = (
+                    prefix, _parse_prize_pool_cents(prefix), bool(_SINGLE_ENTRY_RE.search(prefix)),
+                )
+        any_stddev.update(stddev_cols.keys())
+        per_file.append((path, rows[1:], contest_cols, stddev_cols))
 
     lineups: list[Lineup] = []
     roi_rows: list[list[float]] = []
@@ -173,68 +237,73 @@ def parse_lineup_pool(path: Path, valid_ids: set[int]) -> ExternalPool:
     seen: set[frozenset[int]] = set()
     n_unknown = 0
     n_dup = 0
-    norm_names = list(contest_cols.keys())
-    for r in rows[1:]:
-        if len(r) < _N_SLOT_COLS:
-            continue
-        try:
-            pids = [int(r[i]) for i in range(_N_SLOT_COLS)]
-        except ValueError:
-            continue
-        key = frozenset(pids)
-        if not key <= valid_ids:
-            n_unknown += 1
-            continue
-        if key in seen:
-            n_dup += 1
-            continue
-        seen.add(key)
-        lineups.append(Lineup(player_ids=pids))
-        vals = []
-        std_vals = []
-        for norm in norm_names:
-            _, idx = contest_cols[norm]
-            cell = r[idx] if idx < len(r) else ""
+    for path, data_rows, contest_cols, stddev_cols in per_file:
+        for r in data_rows:
+            if len(r) < _N_SLOT_COLS:
+                continue
             try:
-                vals.append(float(cell))
+                pids = [int(r[i]) for i in range(_N_SLOT_COLS)]
             except ValueError:
-                vals.append(np.nan)
-            std_idx = stddev_cols.get(norm)
-            cell = r[std_idx] if std_idx is not None and std_idx < len(r) else ""
-            try:
-                std_vals.append(float(cell))
-            except ValueError:
-                std_vals.append(np.nan)
-        roi_rows.append(vals)
-        stddev_rows.append(std_vals)
+                continue
+            key = frozenset(pids)
+            if not key <= valid_ids:
+                n_unknown += 1
+                continue
+            if key in seen:
+                n_dup += 1
+                continue
+            seen.add(key)
+            lineups.append(Lineup(player_ids=pids))
+            vals = []
+            std_vals = []
+            for norm in contest_order:
+                col = contest_cols.get(norm)
+                if col is None:
+                    vals.append(np.nan)
+                else:
+                    _, idx = col
+                    cell = r[idx] if idx < len(r) else ""
+                    try:
+                        vals.append(float(cell))
+                    except ValueError:
+                        vals.append(np.nan)
+                std_idx = stddev_cols.get(norm)
+                cell = r[std_idx] if std_idx is not None and std_idx < len(r) else ""
+                try:
+                    std_vals.append(float(cell))
+                except ValueError:
+                    std_vals.append(np.nan)
+            roi_rows.append(vals)
+            stddev_rows.append(std_vals)
 
-    roi_mat = np.array(roi_rows, dtype=np.float64) if roi_rows else np.zeros((0, len(norm_names)))
+    roi_mat = np.array(roi_rows, dtype=np.float64) if roi_rows else np.zeros((0, len(contest_order)))
     # See ExternalContest.roi_stddev: Saber's raw cell is already pct-pt
     # scaled like `roi * 100`, so /100 puts it on roi's own fraction scale.
     stddev_mat = (
         np.array(stddev_rows, dtype=np.float64) / 100.0
-        if stddev_rows else np.zeros((0, len(norm_names)))
+        if stddev_rows else np.zeros((0, len(contest_order)))
     )
     contests = {}
-    for j, norm in enumerate(norm_names):
-        raw, _ = contest_cols[norm]
+    for j, norm in enumerate(contest_order):
+        raw, prize_pool_cents, single_entry = contest_meta[norm]
         contests[norm] = ExternalContest(
             raw_name=raw,
             norm_name=norm,
             roi=roi_mat[:, j],
-            prize_pool_cents=_parse_prize_pool_cents(raw),
-            single_entry=bool(_SINGLE_ENTRY_RE.search(raw)),
-            roi_stddev=stddev_mat[:, j] if norm in stddev_cols else None,
+            prize_pool_cents=prize_pool_cents,
+            single_entry=single_entry,
+            roi_stddev=stddev_mat[:, j] if norm in any_stddev else None,
         )
     logger.info(
-        "External pool: %d lineups (%d dropped unknown-player, %d duplicate), %d contests: %s",
-        len(lineups), n_unknown, n_dup, len(contests),
+        "External pool: %d lineups from %d file(s) (%d dropped unknown-player, %d duplicate), "
+        "%d contests: %s",
+        len(lineups), len(paths), n_unknown, n_dup, len(contests),
         ", ".join(c.raw_name for c in contests.values()),
     )
     return ExternalPool(
         lineups=lineups, contests=contests,
         n_dropped_unknown_players=n_unknown, n_dropped_duplicates=n_dup,
-        source_path=path,
+        source_paths=paths,
     )
 
 
@@ -859,20 +928,22 @@ def allocate_contests(
 # ---------------------------------------------------------------------------
 
 def archive_external_inputs(
-    project_root: Path, slate_path: str, lineups_path: Path, proj_path: Path,
+    project_root: Path, slate_path: str, lineups_paths: list, proj_path: Path,
 ) -> Optional[Path]:
-    """Copy the two external CSVs (plus DKSalaries, mirroring the server's
+    """Copy the external CSVs (plus DKSalaries, mirroring the server's
     archive convention) into archive/MMDDYYYY derived from the slate's Game
     Info date. Best-effort: returns the archive dir or None.
 
     DKSalaries.csv is only copied once (the slate itself doesn't change
-    intra-day). lineups_*.csv and the MLB_*.csv projections companion are
-    always re-copied, overwriting whatever's already archived: SaberSim-style
-    exports get refreshed repeatedly as a slate firms up (scratches, lineup
-    confirmations), and post-slate analysis (analyze_external_pool.py) wants
-    the latest pre-lock snapshot, not whatever happened to be captured first
-    — an early snapshot can otherwise leave since-scratched players in the
-    archived pool with no way to resolve a real FPTS for them.
+    intra-day). Every lineups_*.csv for the slate (there may be more than
+    one — see discover_external_files) and the MLB_*.csv projections
+    companion are always re-copied, overwriting whatever's already archived:
+    SaberSim-style exports get refreshed repeatedly as a slate firms up
+    (scratches, lineup confirmations), and post-slate analysis
+    (analyze_external_pool.py) wants the latest pre-lock snapshot, not
+    whatever happened to be captured first — an early snapshot can otherwise
+    leave since-scratched players in the archived pool with no way to
+    resolve a real FPTS for them.
     """
     try:
         gi = pd.read_csv(slate_path, usecols=["Game Info"])
@@ -882,11 +953,10 @@ def archive_external_inputs(
         mo, dy, yr = m.groups()
         d = project_root / "archive" / f"{mo}{dy}{yr}"
         d.mkdir(parents=True, exist_ok=True)
-        for src, dst_name, always_refresh in [
-            (Path(slate_path), "DKSalaries.csv", False),
-            (lineups_path, lineups_path.name, True),
-            (proj_path, proj_path.name, True),
-        ]:
+        copies = [(Path(slate_path), "DKSalaries.csv", False)]
+        copies += [(Path(lp), Path(lp).name, True) for lp in lineups_paths]
+        copies.append((proj_path, proj_path.name, True))
+        for src, dst_name, always_refresh in copies:
             dst = d / dst_name
             if always_refresh or not dst.exists():
                 shutil.copy2(str(src), str(dst))

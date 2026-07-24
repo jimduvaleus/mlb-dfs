@@ -1,6 +1,7 @@
 """Tests for the external candidate pool mode (src/api/external_pool.py),
 run against the real 7/17 example export files when present."""
 import csv
+import os
 import numpy as np
 import pandas as pd
 import pytest
@@ -12,6 +13,7 @@ from src.api.external_pool import (
     ExternalContest,
     ExternalPool,
     allocate_contests,
+    archive_external_inputs,
     build_quantile_grids,
     compute_ceiling_ev,
     compute_pool_corr,
@@ -156,7 +158,7 @@ class TestAllocation:
             )
         return ExternalPool(lineups=lineups, contests=contests,
                             n_dropped_unknown_players=0, n_dropped_duplicates=0,
-                            source_path=Path("synthetic.csv"))
+                            source_paths=[Path("synthetic.csv")])
 
     def _groups(self, pool, sizes):
         groups = []
@@ -518,7 +520,7 @@ class TestComputePpdRoiAdjustment:
                 prize_pool_cents=None, single_entry=False,
                 roi_stddev=roi_stddev.copy() if roi_stddev is not None else None,
             )},
-            n_dropped_unknown_players=0, n_dropped_duplicates=0, source_path=Path("x"),
+            n_dropped_unknown_players=0, n_dropped_duplicates=0, source_paths=[Path("x")],
         )
 
     def _apply_real_ppd(self, sim_results, players_df, pcts, seed=7):
@@ -724,6 +726,116 @@ def test_discover_pairs_by_token(tmp_path):
     shutil.copy(PROJ_CSV, tmp_path / PROJ_CSV.name)
     (tmp_path / "MLB_2026-01-01-100pm_DK_Main.csv").write_text("DFS ID\n")
     out = discover_external_files(str(tmp_path))
-    assert out["lineups_path"].name == LINEUPS_CSV.name
+    assert [p.name for p in out["lineups_paths"]] == [LINEUPS_CSV.name]
     assert out["projections_path"].name == PROJ_CSV.name
     assert out["paired_by_token"]
+
+
+def test_discover_groups_multiple_files_same_slate_signature(tmp_path):
+    """Two exports of the same slate ('lineups_..._705pm.csv' and a browser
+    re-download '... (1).csv') are grouped together; a file for a different
+    date is excluded even though it shares the same time token."""
+    f_other_date = tmp_path / "lineups_dk_mlb_classic_7-23-2026_705pm.csv"
+    f_a = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm.csv"
+    f_b = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm (1).csv"
+    for i, f in enumerate([f_other_date, f_a, f_b]):
+        f.write_text("h\n")
+        os.utime(f, (1000 + i, 1000 + i))
+    (tmp_path / "MLB_2026-07-24-705pm_DK_Main.csv").write_text("DFS ID\n")
+    out = discover_external_files(str(tmp_path))
+    assert sorted(p.name for p in out["lineups_paths"]) == sorted([f_a.name, f_b.name])
+    assert out["projections_path"].name == "MLB_2026-07-24-705pm_DK_Main.csv"
+    assert out["paired_by_token"]
+
+
+def test_discover_different_format_prefix_not_grouped(tmp_path):
+    """A different format/type prefix (e.g. showdown vs classic) is a
+    different slate even with the same date/time token."""
+    f_classic = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm.csv"
+    f_showdown = tmp_path / "lineups_dk_mlb_showdown_7-24-2026_705pm.csv"
+    for i, f in enumerate([f_classic, f_showdown]):
+        f.write_text("h\n")
+        os.utime(f, (1000 + i, 1000 + i))
+    out = discover_external_files(str(tmp_path))
+    assert [p.name for p in out["lineups_paths"]] == [f_showdown.name]
+
+
+def test_parse_lineup_pool_multi_file_dedupe(tmp_path):
+    """Duplicate 10-player lineups across files are collapsed to one, using
+    the roi from the first file the lineup appears in."""
+    header = (
+        ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+        + ["MLB $1K Test ROI", "MLB $1K Test Sim Dupes"]
+    )
+    rows_a = [
+        [str(i) for i in range(1, 11)] + ["1.5", "0.02"],
+        [str(i) for i in range(11, 21)] + ["0.8", "0.03"],
+    ]
+    rows_b = [
+        [str(i) for i in range(1, 11)] + ["9.9", "0.02"],   # dup of rows_a[0]
+        [str(i) for i in range(21, 31)] + ["0.5", "0.01"],
+    ]
+    path_a = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm.csv"
+    path_b = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm (1).csv"
+    for path, rows in [(path_a, rows_a), (path_b, rows_b)]:
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(rows)
+    pool = parse_lineup_pool([path_a, path_b], valid_ids=set(range(1, 31)))
+    assert len(pool.lineups) == 3
+    assert pool.n_dropped_duplicates == 1
+    contest = pool.contests[normalize_contest_name("MLB $1K Test")]
+    assert contest.roi[0] == pytest.approx(1.5)
+
+
+def test_parse_lineup_pool_contest_union_across_files(tmp_path):
+    """A contest present in only one file leaves NaN roi for lineups sourced
+    from files that don't define it."""
+    header_a = (
+        ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+        + ["Contest A ROI", "Contest A Sim Dupes"]
+    )
+    header_b = (
+        ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+        + ["Contest B ROI", "Contest B Sim Dupes"]
+    )
+    row_a = [str(i) for i in range(1, 11)] + ["1.0", "0.01"]
+    row_b = [str(i) for i in range(11, 21)] + ["2.0", "0.02"]
+    path_a = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm.csv"
+    path_b = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm (1).csv"
+    with open(path_a, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header_a)
+        w.writerow(row_a)
+    with open(path_b, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header_b)
+        w.writerow(row_b)
+    pool = parse_lineup_pool([path_a, path_b], valid_ids=set(range(1, 21)))
+    assert set(pool.contests.keys()) == {
+        normalize_contest_name("Contest A"), normalize_contest_name("Contest B"),
+    }
+    a = pool.contests[normalize_contest_name("Contest A")]
+    b = pool.contests[normalize_contest_name("Contest B")]
+    assert a.roi[0] == pytest.approx(1.0)
+    assert np.isnan(b.roi[0])
+    assert np.isnan(a.roi[1])
+    assert b.roi[1] == pytest.approx(2.0)
+
+
+def test_archive_external_inputs_copies_all_lineup_files(tmp_path):
+    slate = tmp_path / "DKSalaries.csv"
+    slate.write_text('Game Info\n"NYY@BOS 07/24/2026 07:05PM ET"\n')
+    lp_a = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm.csv"
+    lp_b = tmp_path / "lineups_dk_mlb_classic_7-24-2026_705pm (1).csv"
+    lp_a.write_text("a\n")
+    lp_b.write_text("b\n")
+    proj = tmp_path / "MLB_2026-07-24-705pm_DK_Main.csv"
+    proj.write_text("p\n")
+    d = archive_external_inputs(tmp_path, str(slate), [lp_a, lp_b], proj)
+    assert d is not None
+    assert (d / lp_a.name).exists()
+    assert (d / lp_b.name).exists()
+    assert (d / proj.name).exists()
+    assert (d / "DKSalaries.csv").exists()

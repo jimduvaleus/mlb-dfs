@@ -26,6 +26,8 @@ const STAGE_LABELS: Record<string, string> = {
   simulate: 'Simulate',
   ppd_applied: 'PPD applied',
   external_ppd_applied: 'PPD applied',
+  external_load: 'External pool files',
+  external_pool: 'External pool',
   compute_target: 'Compute target',
   calibrate_beta: 'Calibrate beta',
   optimize_lineup: 'Optimize lineups',
@@ -621,6 +623,27 @@ function renderDetail(e: SSEEvent): string {
     case 'simulate': {
       const ev = e as unknown as { n_sims: number }
       return `${ev.n_sims.toLocaleString()} simulations`
+    }
+    case 'external_load': {
+      const ev = e as unknown as { lineups_files: string[]; projections_file: string; paired_by_token: boolean }
+      const filesLabel = ev.lineups_files.length > 1
+        ? `${ev.lineups_files.length} lineup files (${ev.lineups_files.join(', ')})`
+        : ev.lineups_files[0]
+      return `${filesLabel} + ${ev.projections_file}${ev.paired_by_token ? '' : ' (unpaired companion)'}`
+    }
+    case 'external_pool': {
+      const ev = e as unknown as {
+        n_lineups: number; n_files: number; n_contests_covered: number;
+        n_dropped_unknown: number; n_dropped_duplicates: number;
+      }
+      const fileNote = ev.n_files > 1 ? ` across ${ev.n_files} files` : ''
+      const dupNote = ev.n_dropped_duplicates > 0
+        ? `, ${ev.n_dropped_duplicates.toLocaleString()} duplicate${ev.n_dropped_duplicates !== 1 ? 's' : ''} removed`
+        : ''
+      const unkNote = ev.n_dropped_unknown > 0
+        ? `, ${ev.n_dropped_unknown.toLocaleString()} unknown-player row${ev.n_dropped_unknown !== 1 ? 's' : ''} dropped`
+        : ''
+      return `${ev.n_lineups.toLocaleString()} lineups imported${fileNote}${dupNote}${unkNote} · ${ev.n_contests_covered} contest${ev.n_contests_covered !== 1 ? 's' : ''} covered`
     }
     case 'ppd_applied':
     case 'external_ppd_applied': {

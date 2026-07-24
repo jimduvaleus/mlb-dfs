@@ -169,6 +169,8 @@ export type SSEStage =
   | 'simulate'
   | 'ppd_applied'
   | 'external_ppd_applied'
+  | 'external_load'
+  | 'external_pool'
   | 'compute_target'
   | 'optimize_lineup'
   | 'portfolio_stats'
@@ -416,7 +418,7 @@ export interface GppFieldInjectEvent extends SSEEvent {
 
 export interface ExternalPoolStatus {
   available: boolean
-  lineups_file: string | null
+  lineups_files: string[]
   projections_file: string | null
   n_lineups: number | null
   n_contests: number | null

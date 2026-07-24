@@ -53,7 +53,7 @@ export function RunOptionsDialog({ cacheStatus, onStart, onDismiss, fieldSource 
               <strong>External candidate pool (SaberSim)</strong>
               {extAvailable ? (
                 <span style={{ color: 'var(--color-text-muted)', fontSize: '0.85em' }}>
-                  {' '}— {ext!.lineups_file} + {ext!.projections_file} ({ext!.n_lineups?.toLocaleString()} lineups · {ext!.n_contests} contests{ext!.paired_by_token ? '' : ' · unpaired companion'})
+                  {' '}— {ext!.lineups_files.join(' + ')} + {ext!.projections_file} ({ext!.n_lineups?.toLocaleString()} lineups · {ext!.n_contests} contests{ext!.paired_by_token ? '' : ' · unpaired companion'})
                 </span>
               ) : (
                 <span style={{ color: 'var(--color-text-muted)', fontSize: '0.85em' }}>

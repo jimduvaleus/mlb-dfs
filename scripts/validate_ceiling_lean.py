@@ -62,6 +62,21 @@ from src.api.external_pool import (  # noqa: E402
 )
 from analyze_candidate_pool import _slate_sort_key  # noqa: E402
 
+
+def _discover_single_lineups_file(dirpath: str) -> dict:
+    """discover_external_files, but collapsed back to a single lineups_path
+    (the newest of the group) — this script's lineup_index alignment with
+    external_pool_eval.csv assumes exactly one archived lineups_*.csv per
+    day (see analyze_external_pool.py's own single-file load), so a second
+    export archived alongside it is not combined here."""
+    found = discover_external_files(dirpath)
+    paths = found["lineups_paths"]
+    found["lineups_path"] = paths[-1] if paths else None
+    if len(paths) > 1:
+        print(f"  ! {dirpath}: {len(paths)} lineup files found — using {found['lineups_path'].name} "
+              "only (multi-file combine not supported by this offline script)", file=sys.stderr)
+    return found
+
 ARCHIVE_ROOT = PROJECT_ROOT / "archive"
 OUT_PATH = PROJECT_ROOT / "outputs" / "ceiling_lean_validation.csv"
 DEFAULT_WEIGHTS = [0.0, 0.15, 0.25, 0.35, 0.5]
@@ -99,7 +114,7 @@ def find_days() -> list[Path]:
 
 def analyze_day(day_dir: Path, weights: list[float]) -> list[dict]:
     ev = pd.read_csv(day_dir / "external_pool_eval.csv")
-    found = discover_external_files(str(day_dir))
+    found = _discover_single_lineups_file(str(day_dir))
     if not found["lineups_path"]:
         print(f"  ! {day_dir.name}: no lineups_*.csv found — skipping", file=sys.stderr)
         return []

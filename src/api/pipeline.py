@@ -2344,7 +2344,7 @@ class PipelineRunner:
         gpp_cfg = cfg.get("gpp", {})
         raw_dir = os.path.dirname(slate_path) if slate_path else ""
         found = ep.discover_external_files(raw_dir)
-        if not found["lineups_path"] or not found["projections_path"]:
+        if not found["lineups_paths"] or not found["projections_path"]:
             raise ValueError(
                 "External pool mode: could not find a lineups_*.csv / "
                 "projections CSV pair in %s." % (raw_dir or "data/raw")
@@ -2355,7 +2355,7 @@ class PipelineRunner:
                 "directory — per-contest allocation has nothing to allocate to."
             )
         self._cb("external_load", {
-            "lineups_file": found["lineups_path"].name,
+            "lineups_files": [p.name for p in found["lineups_paths"]],
             "projections_file": found["projections_path"].name,
             "paired_by_token": found["paired_by_token"],
         })
@@ -2363,11 +2363,11 @@ class PipelineRunner:
         _config_root = _Path(self._config_path).resolve().parent
         _slate_fp = compute_file_fingerprint(_config_root / slate_path)
         ep.archive_external_inputs(
-            _config_root, slate_path, found["lineups_path"], found["projections_path"],
+            _config_root, slate_path, found["lineups_paths"], found["projections_path"],
         )
 
         valid_ids = set(slate_df["player_id"].astype(int))
-        pool = ep.parse_lineup_pool(found["lineups_path"], valid_ids)
+        pool = ep.parse_lineup_pool(found["lineups_paths"], valid_ids)
         if not pool.lineups:
             raise ValueError("External pool mode: every lineup in the file was dropped "
                              "(unknown player ids) — is the export for this slate?")
@@ -2415,6 +2415,7 @@ class PipelineRunner:
 
         self._cb("external_pool", {
             "n_lineups": len(pool.lineups),
+            "n_files": len(found["lineups_paths"]),
             "n_contests_covered": len(pool.contests),
             "n_dropped_unknown": pool.n_dropped_unknown_players,
             "n_dropped_duplicates": pool.n_dropped_duplicates,

@@ -2527,6 +2527,37 @@ async def projections_fetch(request: Request):
             proj_written = False
             result_event: str | None = None
             try:
+                import shutil as _shutil
+                from .external_pool import _LINEUPS_GLOB, parse_sabersim_projections
+
+                # Stage fresh exports: SaberSim downloads land in the
+                # browser's default ~/Downloads, but every other SaberSim
+                # code path (discover_external_files, _find_mlb_order_
+                # projections_path) only ever looks in data/raw. Move (not
+                # copy) so ~/Downloads doesn't accumulate stale duplicates
+                # the next fetch would otherwise re-stage.
+                downloads_dir = Path.home() / "Downloads"
+                raw_dir = PROJECT_ROOT / "data" / "raw"
+                if downloads_dir.is_dir():
+                    moved: list[str] = []
+                    for pattern in (_MLB_ORDER_GLOB, _LINEUPS_GLOB):
+                        for src in sorted(downloads_dir.glob(pattern)):
+                            if not src.is_file():
+                                continue
+                            dest = raw_dir / src.name
+                            overwrote = dest.exists()
+                            if overwrote:
+                                dest.unlink()
+                            _shutil.move(str(src), str(dest))
+                            moved.append(f"{src.name}{' (overwrote existing)' if overwrote else ''}")
+                    if moved:
+                        yield _log(
+                            f"--- Moved {len(moved)} file(s) from ~/Downloads to data/raw: "
+                            + ", ".join(moved) + " ---"
+                        )
+                    else:
+                        yield _log("--- No MLB_*.csv / lineups_*.csv files found in ~/Downloads ---")
+
                 mlb_path = _find_mlb_order_projections_path()
                 if mlb_path is None:
                     returncode = 1
@@ -2536,7 +2567,6 @@ async def projections_fetch(request: Request):
                     )
                 else:
                     yield _log(f"--- Reading SaberSim export: {mlb_path.name} ---")
-                    from .external_pool import parse_sabersim_projections
                     sabersim_df = parse_sabersim_projections(mlb_path, platform_val)
                     if is_partial and included_pids:
                         sabersim_df = sabersim_df[sabersim_df["player_id"].isin(included_pids)]
@@ -3176,7 +3206,7 @@ def run_cache_status():
         pass
 
     # External candidate pool availability (SaberSim import mode).
-    external_pool: dict = {"available": False, "lineups_file": None,
+    external_pool: dict = {"available": False, "lineups_files": [],
                            "projections_file": None, "n_lineups": None,
                            "n_contests": None, "paired_by_token": False,
                            "error": None}
@@ -3184,20 +3214,24 @@ def run_cache_status():
         from .external_pool import discover_external_files
         raw_dir = str((PROJECT_ROOT / slate_path).parent) if slate_path else ""
         found = discover_external_files(raw_dir) if raw_dir else {}
-        if found.get("lineups_path") and found.get("projections_path"):
+        if found.get("lineups_paths") and found.get("projections_path"):
             import csv as _csv
-            with open(found["lineups_path"], newline="", encoding="utf-8-sig") as _f:
-                _reader = _csv.reader(_f)
-                _header = next(_reader)
-                _n_lineups = sum(1 for _ in _reader)
-            _hset = set(_header)
-            _n_contests = sum(
-                1 for c in _header
-                if c.endswith(" ROI") and f"{c[:-4]} Sim Dupes" in _hset
-            )
+            _n_lineups = 0
+            _contest_names: set = set()
+            for _lp in found["lineups_paths"]:
+                with open(_lp, newline="", encoding="utf-8-sig") as _f:
+                    _reader = _csv.reader(_f)
+                    _header = next(_reader)
+                    _n_lineups += sum(1 for _ in _reader)
+                _hset = set(_header)
+                _contest_names.update(
+                    c for c in _header
+                    if c.endswith(" ROI") and f"{c[:-4]} Sim Dupes" in _hset
+                )
+            _n_contests = len(_contest_names)
             external_pool.update({
                 "available": _n_contests > 0,
-                "lineups_file": found["lineups_path"].name,
+                "lineups_files": [p.name for p in found["lineups_paths"]],
                 "projections_file": found["projections_path"].name,
                 "n_lineups": _n_lineups,
                 "n_contests": _n_contests,

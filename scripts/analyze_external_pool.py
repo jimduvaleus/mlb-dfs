@@ -78,6 +78,22 @@ from analyze_candidate_pool import (  # noqa: E402
 )
 from scipy.stats import spearmanr  # noqa: E402
 
+
+def _discover_single_lineups_file(dirpath: str) -> dict:
+    """discover_external_files, but collapsed back to a single lineups_path
+    (the newest of the group) — this script's per-row lineup_index and the
+    real-field join it feeds assume exactly one archived lineups_*.csv per
+    day, so a second export archived alongside it (see
+    src.api.external_pool.archive_external_inputs) is not combined here."""
+    found = discover_external_files(dirpath)
+    paths = found["lineups_paths"]
+    found["lineups_path"] = paths[-1] if paths else None
+    if len(paths) > 1:
+        print(f"  ! {dirpath}: {len(paths)} lineup files found — using {found['lineups_path'].name} "
+              "only (multi-file combine not supported by this offline script)", file=sys.stderr)
+    return found
+
+
 _DEFAULT_ROI_FLOOR = 0.0
 _N_SLOT_COLS = 10
 _ROI_SUFFIX = " ROI"
@@ -215,7 +231,7 @@ def top_candidates_table(lineup_df: pd.DataFrame, contest_norm: str, top_n: int)
 def run_top_candidates(archive_dirs: list[Path], top_n: int, contest_query: str | None) -> None:
     for d in archive_dirs:
         try:
-            found = discover_external_files(str(d))
+            found = _discover_single_lineups_file(str(d))
             if not found["lineups_path"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
             lineup_df, contest_blocks, n_dup = load_external_lineups(found["lineups_path"])
@@ -256,7 +272,7 @@ def run_roi_sweep(
 ) -> None:
     for d in archive_dirs:
         try:
-            found = discover_external_files(str(d))
+            found = _discover_single_lineups_file(str(d))
             if not found["lineups_path"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
             lineup_df, contest_blocks, _ = load_external_lineups(found["lineups_path"])
@@ -336,7 +352,7 @@ def evaluate_archive_dirs(
     rows = []
     for d in archive_dirs:
         try:
-            found = discover_external_files(str(d))
+            found = _discover_single_lineups_file(str(d))
             if not found["lineups_path"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
             lineup_df, contest_blocks, n_dup = load_external_lineups(found["lineups_path"])
@@ -447,7 +463,7 @@ def _find_recent_external_slates(n: int) -> list[Path]:
     for d in archive_root.iterdir():
         if not d.is_dir():
             continue
-        found = discover_external_files(str(d))
+        found = _discover_single_lineups_file(str(d))
         if found["lineups_path"] and (d / "contest_player_fpts.json").exists():
             candidates.append(d)
     return sorted(candidates, key=lambda d: _slate_sort_key(d.name))[-n:]
@@ -548,7 +564,7 @@ def main() -> None:
 
     if args.list_contests:
         for d in dirs:
-            found = discover_external_files(str(d))
+            found = _discover_single_lineups_file(str(d))
             if not found["lineups_path"]:
                 print(f"{d.name}: no lineups_*.csv found.")
                 continue
