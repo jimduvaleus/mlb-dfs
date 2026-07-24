@@ -2539,17 +2539,36 @@ async def projections_fetch(request: Request):
                 downloads_dir = Path.home() / "Downloads"
                 raw_dir = PROJECT_ROOT / "data" / "raw"
                 if downloads_dir.is_dir():
+                    incoming_mlb = sorted(downloads_dir.glob(_MLB_ORDER_GLOB))
+                    incoming_lineups = sorted(downloads_dir.glob(_LINEUPS_GLOB))
+
+                    if incoming_lineups:
+                        # At least one fresh lineups export in ~/Downloads means
+                        # the entire existing data/raw lineup pool is a stale
+                        # download batch — even files that don't share a name
+                        # with anything incoming (e.g. one fewer file this time,
+                        # or a prior slate's leftovers) — so clear it before
+                        # staging rather than only overwriting name collisions.
+                        stale_lineups = sorted(raw_dir.glob(_LINEUPS_GLOB))
+                        for stale in stale_lineups:
+                            stale.unlink()
+                        removed_stale = [p.name for p in stale_lineups]
+                        if removed_stale:
+                            yield _log(
+                                f"--- Removed {len(removed_stale)} stale lineup file(s) from "
+                                f"data/raw: " + ", ".join(removed_stale) + " ---"
+                            )
+
                     moved: list[str] = []
-                    for pattern in (_MLB_ORDER_GLOB, _LINEUPS_GLOB):
-                        for src in sorted(downloads_dir.glob(pattern)):
-                            if not src.is_file():
-                                continue
-                            dest = raw_dir / src.name
-                            overwrote = dest.exists()
-                            if overwrote:
-                                dest.unlink()
-                            _shutil.move(str(src), str(dest))
-                            moved.append(f"{src.name}{' (overwrote existing)' if overwrote else ''}")
+                    for src in incoming_mlb + incoming_lineups:
+                        if not src.is_file():
+                            continue
+                        dest = raw_dir / src.name
+                        overwrote = dest.exists()
+                        if overwrote:
+                            dest.unlink()
+                        _shutil.move(str(src), str(dest))
+                        moved.append(f"{src.name}{' (overwrote existing)' if overwrote else ''}")
                     if moved:
                         yield _log(
                             f"--- Moved {len(moved)} file(s) from ~/Downloads to data/raw: "
