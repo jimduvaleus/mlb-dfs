@@ -6,7 +6,13 @@ external-pool analogue of analyze_candidate_pool.py.
 Differences from the internal candidate-pool analyzer:
   - Loads lineups_*.csv (slot-ordered player-id lineups + per-contest ROI
     blocks, e.g. archive/07192026/lineups_dk_mlb_classic_7-19-2026_135pm.csv)
-    instead of candidate_pool_debug.csv. The companion MLB_*_DK_*.csv
+    instead of candidate_pool_debug.csv. When an archived day has more than
+    one lineups_*.csv for the same slate (see
+    src.api.external_pool.discover_external_files /
+    archive_external_inputs), they're concatenated in filename order and
+    treated as one combined pool, with exact-duplicate lineups (same 10
+    player ids) dropped across the combined set — the same behavior the
+    live pipeline's parse_lineup_pool applies. The companion MLB_*_DK_*.csv
     projections file is located the same way the live pipeline does
     (src.api.external_pool.discover_external_files) but isn't required here
     — actual scores come from contest_player_fpts.json, keyed directly by
@@ -79,21 +85,6 @@ from analyze_candidate_pool import (  # noqa: E402
 from scipy.stats import spearmanr  # noqa: E402
 
 
-def _discover_single_lineups_file(dirpath: str) -> dict:
-    """discover_external_files, but collapsed back to a single lineups_path
-    (the newest of the group) — this script's per-row lineup_index and the
-    real-field join it feeds assume exactly one archived lineups_*.csv per
-    day, so a second export archived alongside it (see
-    src.api.external_pool.archive_external_inputs) is not combined here."""
-    found = discover_external_files(dirpath)
-    paths = found["lineups_paths"]
-    found["lineups_path"] = paths[-1] if paths else None
-    if len(paths) > 1:
-        print(f"  ! {dirpath}: {len(paths)} lineup files found — using {found['lineups_path'].name} "
-              "only (multi-file combine not supported by this offline script)", file=sys.stderr)
-    return found
-
-
 _DEFAULT_ROI_FLOOR = 0.0
 _N_SLOT_COLS = 10
 _ROI_SUFFIX = " ROI"
@@ -127,26 +118,55 @@ def discover_contest_blocks(columns) -> dict:
     return blocks
 
 
-def load_external_lineups(lineups_path: Path) -> tuple[pd.DataFrame, dict, int]:
-    """Load the raw export into one row per lineup: lineup_index, player_ids
-    (list of 10 DK ids), proj_score, ownership, salary, and
-    roi__<contest>/win_rate__<contest>/cash_rate__<contest> for every
-    contest tier found. Exact-duplicate lineups (same 10 ids, order-
-    independent) are dropped, keeping the first occurrence.
+def load_combined_lineups_csv(lineups_paths: list[Path]) -> pd.DataFrame:
+    """Read one or more lineup export CSVs for the same slate (see
+    src.api.external_pool.discover_external_files) and concatenate them, in
+    the given order, into a single raw frame. Row position in the result is
+    what lineup_index is assigned against in load_external_lineups — a
+    caller re-aligning an already-graded external_pool_eval.csv (see
+    scripts/validate_ceiling_lean.py) must pass the exact same paths in the
+    exact same order (discover_external_files already returns
+    lineups_paths sorted by filename) to reproduce the same positions.
+
+    Files for one slate normally carry identical headers (confirmed against
+    a real two-file same-slate export); if a contest column exists in only
+    one file, pandas' outer column join on concat leaves the other file's
+    rows NaN for it — the same "blank ROI always culls" behavior the live
+    pipeline (src.api.external_pool.parse_lineup_pool) relies on.
     """
-    df = pd.read_csv(lineups_path)
-    if len(df.columns) < _N_SLOT_COLS:
-        raise ValueError(
-            f"{lineups_path} does not look like a lineup export "
-            f"(fewer than {_N_SLOT_COLS} columns)"
-        )
+    if not lineups_paths:
+        raise ValueError("no lineup files given")
+    frames = []
+    for p in lineups_paths:
+        df = pd.read_csv(p)
+        if len(df.columns) < _N_SLOT_COLS:
+            raise ValueError(
+                f"{p} does not look like a lineup export "
+                f"(fewer than {_N_SLOT_COLS} columns)"
+            )
+        frames.append(df)
+    return pd.concat(frames, ignore_index=True, sort=False) if len(frames) > 1 else frames[0]
+
+
+def load_external_lineups(lineups_paths: list[Path]) -> tuple[pd.DataFrame, dict, int]:
+    """Load one or more raw exports for the same slate (see
+    load_combined_lineups_csv) into one row per lineup: lineup_index
+    (position in the paths-order concatenated raw frame), player_ids (list
+    of 10 DK ids), proj_score, ownership, salary, and
+    roi__<contest>/win_rate__<contest>/cash_rate__<contest> for every
+    contest tier found (unioned by name across files). Exact-duplicate
+    lineups (same 10 ids, order-independent) are dropped across the
+    combined set, keeping the first occurrence.
+    """
+    df = load_combined_lineups_csv(lineups_paths)
     id_cols = list(df.columns[:_N_SLOT_COLS])
     player_ids = df[id_cols].astype("int64").values.tolist()
 
     contest_blocks = discover_contest_blocks(df.columns)
     if not contest_blocks:
+        names = ", ".join(p.name for p in lineups_paths)
         raise ValueError(
-            f"{lineups_path}: no contest ROI blocks found (no '<name> ROI' column "
+            f"{names}: no contest ROI blocks found (no '<name> ROI' column "
             "with a matching '<name> Sim Dupes' sibling)"
         )
 
@@ -231,10 +251,10 @@ def top_candidates_table(lineup_df: pd.DataFrame, contest_norm: str, top_n: int)
 def run_top_candidates(archive_dirs: list[Path], top_n: int, contest_query: str | None) -> None:
     for d in archive_dirs:
         try:
-            found = _discover_single_lineups_file(str(d))
-            if not found["lineups_path"]:
+            found = discover_external_files(str(d))
+            if not found["lineups_paths"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
-            lineup_df, contest_blocks, n_dup = load_external_lineups(found["lineups_path"])
+            lineup_df, contest_blocks, n_dup = load_external_lineups(found["lineups_paths"])
             fpts_map = load_contest_player_fpts(d)
         except (FileNotFoundError, ValueError) as exc:
             print(f"Skipping {d.name}: {exc}")
@@ -272,10 +292,10 @@ def run_roi_sweep(
 ) -> None:
     for d in archive_dirs:
         try:
-            found = _discover_single_lineups_file(str(d))
-            if not found["lineups_path"]:
+            found = discover_external_files(str(d))
+            if not found["lineups_paths"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
-            lineup_df, contest_blocks, _ = load_external_lineups(found["lineups_path"])
+            lineup_df, contest_blocks, _ = load_external_lineups(found["lineups_paths"])
             fpts_map = load_contest_player_fpts(d)
             field_points = load_real_field_points(d)
         except (FileNotFoundError, ValueError) as exc:
@@ -352,10 +372,10 @@ def evaluate_archive_dirs(
     rows = []
     for d in archive_dirs:
         try:
-            found = _discover_single_lineups_file(str(d))
-            if not found["lineups_path"]:
+            found = discover_external_files(str(d))
+            if not found["lineups_paths"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
-            lineup_df, contest_blocks, n_dup = load_external_lineups(found["lineups_path"])
+            lineup_df, contest_blocks, n_dup = load_external_lineups(found["lineups_paths"])
             fpts_map = load_contest_player_fpts(d)
         except (FileNotFoundError, ValueError) as exc:
             print(f"Skipping {d.name}: {exc}")
@@ -463,8 +483,8 @@ def _find_recent_external_slates(n: int) -> list[Path]:
     for d in archive_root.iterdir():
         if not d.is_dir():
             continue
-        found = _discover_single_lineups_file(str(d))
-        if found["lineups_path"] and (d / "contest_player_fpts.json").exists():
+        found = discover_external_files(str(d))
+        if found["lineups_paths"] and (d / "contest_player_fpts.json").exists():
             candidates.append(d)
     return sorted(candidates, key=lambda d: _slate_sort_key(d.name))[-n:]
 
@@ -564,11 +584,11 @@ def main() -> None:
 
     if args.list_contests:
         for d in dirs:
-            found = _discover_single_lineups_file(str(d))
-            if not found["lineups_path"]:
+            found = discover_external_files(str(d))
+            if not found["lineups_paths"]:
                 print(f"{d.name}: no lineups_*.csv found.")
                 continue
-            lineup_df, contest_blocks, _ = load_external_lineups(found["lineups_path"])
+            lineup_df, contest_blocks, _ = load_external_lineups(found["lineups_paths"])
             print(f"\n=== {d.name} ===")
             print_contest_list(contest_blocks, lineup_df)
         return

@@ -61,21 +61,7 @@ from src.api.external_pool import (  # noqa: E402
     _MIN_CEILING_FIT_N, compute_ceiling_ev, discover_external_files,
 )
 from analyze_candidate_pool import _slate_sort_key  # noqa: E402
-
-
-def _discover_single_lineups_file(dirpath: str) -> dict:
-    """discover_external_files, but collapsed back to a single lineups_path
-    (the newest of the group) — this script's lineup_index alignment with
-    external_pool_eval.csv assumes exactly one archived lineups_*.csv per
-    day (see analyze_external_pool.py's own single-file load), so a second
-    export archived alongside it is not combined here."""
-    found = discover_external_files(dirpath)
-    paths = found["lineups_paths"]
-    found["lineups_path"] = paths[-1] if paths else None
-    if len(paths) > 1:
-        print(f"  ! {dirpath}: {len(paths)} lineup files found — using {found['lineups_path'].name} "
-              "only (multi-file combine not supported by this offline script)", file=sys.stderr)
-    return found
+from analyze_external_pool import load_combined_lineups_csv  # noqa: E402
 
 ARCHIVE_ROOT = PROJECT_ROOT / "archive"
 OUT_PATH = PROJECT_ROOT / "outputs" / "ceiling_lean_validation.csv"
@@ -114,19 +100,21 @@ def find_days() -> list[Path]:
 
 def analyze_day(day_dir: Path, weights: list[float]) -> list[dict]:
     ev = pd.read_csv(day_dir / "external_pool_eval.csv")
-    found = _discover_single_lineups_file(str(day_dir))
-    if not found["lineups_path"]:
+    found = discover_external_files(str(day_dir))
+    if not found["lineups_paths"]:
         print(f"  ! {day_dir.name}: no lineups_*.csv found — skipping", file=sys.stderr)
         return []
-    lu = pd.read_csv(found["lineups_path"])
+    # external_pool_eval.csv's own lineup_index always points back to row
+    # positions in the ORIGINAL raw lineup file(s) concatenated in the same
+    # filename order analyze_external_pool.py used (assigned before its
+    # exact-duplicate-lineup dedup — see load_combined_lineups_csv /
+    # load_external_lineups), so this stays correctly aligned even on days
+    # where duplicates were dropped and ev is shorter than lu.
+    lu = load_combined_lineups_csv(found["lineups_paths"])
 
-    # external_pool_eval.csv's own lineup_index always points back to rows
-    # in the ORIGINAL raw lineups_*.csv (assigned before analyze_external_
-    # pool.py's exact-duplicate-lineup dedup), so this stays correctly
-    # aligned even on days where duplicates were dropped and ev is shorter
-    # than lu.
     if "lineup_index" not in ev.columns or ev["lineup_index"].max() >= len(lu):
-        print(f"  ! {day_dir.name}: lineup_index doesn't align with {found['lineups_path'].name} — skipping",
+        names = ", ".join(p.name for p in found["lineups_paths"])
+        print(f"  ! {day_dir.name}: lineup_index doesn't align with {names} — skipping",
               file=sys.stderr)
         return []
     lu_aligned = lu.iloc[ev["lineup_index"].to_numpy()].reset_index(drop=True)
