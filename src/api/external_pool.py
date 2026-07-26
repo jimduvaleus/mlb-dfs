@@ -204,9 +204,13 @@ def _pick_primary_contest_index(contest_order: list, contest_meta: dict) -> int:
     return max(range(len(contest_order)), key=_size)
 
 
-def _find_near_duplicate_removals(lineups: list, primary_roi: np.ndarray) -> set:
+def _find_near_duplicate_removals(player_ids_list: list, primary_roi: np.ndarray) -> set:
     """Indices to drop so no two surviving lineups' 10-player sets
-    intersect in exactly 9 players (a single swapped player).
+    intersect in exactly 9 players (a single swapped player). Takes plain
+    per-lineup player-id sequences (not Lineup objects) so callers outside
+    the live pipeline — e.g. scripts/analyze_external_pool.py, flagging
+    which archived lineups this pass *would* have removed — can reuse it
+    directly against a DataFrame column of id lists.
 
     This overlap relation isn't transitive across different 9-player
     cores -- e.g. lineups A and B can each 9/10-overlap a shared lineup C
@@ -222,14 +226,14 @@ def _find_near_duplicate_removals(lineups: list, primary_roi: np.ndarray) -> set
     neither survives to violate anything.
     """
     order = sorted(
-        range(len(lineups)),
+        range(len(player_ids_list)),
         key=lambda i: primary_roi[i] if np.isfinite(primary_roi[i]) else float("-inf"),
         reverse=True,
     )
     kept_cores: dict = {}  # frozenset(9 player ids) -> kept lineup index
     removed: set = set()
     for i in order:
-        ids = lineups[i].player_ids
+        ids = player_ids_list[i]
         cores = [frozenset(ids[:k] + ids[k + 1:]) for k in range(len(ids))]
         if any(c in kept_cores for c in cores):
             removed.add(i)
@@ -336,7 +340,7 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
     if len(lineups) > 1:
         primary_j = _pick_primary_contest_index(contest_order, contest_meta)
         primary_roi = np.array([row[primary_j] for row in roi_rows], dtype=np.float64)
-        removed = _find_near_duplicate_removals(lineups, primary_roi)
+        removed = _find_near_duplicate_removals([lu.player_ids for lu in lineups], primary_roi)
         if removed:
             keep = [i not in removed for i in range(len(lineups))]
             lineups = [lu for lu, k in zip(lineups, keep) if k]

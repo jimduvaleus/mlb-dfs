@@ -12,7 +12,13 @@ Differences from the internal candidate-pool analyzer:
     archive_external_inputs), they're concatenated in filename order and
     treated as one combined pool, with exact-duplicate lineups (same 10
     player ids) dropped across the combined set — the same behavior the
-    live pipeline's parse_lineup_pool applies. The companion MLB_*_DK_*.csv
+    live pipeline's parse_lineup_pool applies. parse_lineup_pool also drops
+    near-duplicates (10-player set overlapping a higher-ROI surviving
+    lineup's in exactly 9) — this script does NOT drop those (an offline
+    analysis tool shouldn't silently hide what a stricter dedup would have
+    discarded), but flags them via a would_dedupe_9of10 column (in
+    external_pool_eval.csv and the --top table) using the exact same
+    tie-break logic. The companion MLB_*_DK_*.csv
     projections file is located the same way the live pipeline does
     (src.api.external_pool.discover_external_files) but isn't required here
     — actual scores come from contest_player_fpts.json, keyed directly by
@@ -65,7 +71,13 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.api.external_pool import discover_external_files, normalize_contest_name  # noqa: E402
+from src.api.dk_entries import _parse_prize_pool_cents  # noqa: E402
+from src.api.external_pool import (  # noqa: E402
+    _find_near_duplicate_removals,
+    _pick_primary_contest_index,
+    discover_external_files,
+    normalize_contest_name,
+)
 
 # analyze_candidate_pool.py lives alongside this script — reuse its real-field /
 # floor-sweep / decile machinery rather than re-deriving it (it's column-name
@@ -148,15 +160,28 @@ def load_combined_lineups_csv(lineups_paths: list[Path]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True, sort=False) if len(frames) > 1 else frames[0]
 
 
-def load_external_lineups(lineups_paths: list[Path]) -> tuple[pd.DataFrame, dict, int]:
+def load_external_lineups(lineups_paths: list[Path]) -> tuple[pd.DataFrame, dict, int, int]:
     """Load one or more raw exports for the same slate (see
     load_combined_lineups_csv) into one row per lineup: lineup_index
     (position in the paths-order concatenated raw frame), player_ids (list
-    of 10 DK ids), proj_score, ownership, salary, and
+    of 10 DK ids), proj_score, ownership, salary,
     roi__<contest>/win_rate__<contest>/cash_rate__<contest> for every
-    contest tier found (unioned by name across files). Exact-duplicate
-    lineups (same 10 ids, order-independent) are dropped across the
-    combined set, keeping the first occurrence.
+    contest tier found (unioned by name across files), and
+    would_dedupe_9of10. Exact-duplicate lineups (same 10 ids, order-
+    independent) are dropped across the combined set, keeping the first
+    occurrence.
+
+    would_dedupe_9of10 flags lineups that the live pipeline's
+    src.api.external_pool.parse_lineup_pool would *additionally* remove as
+    near-duplicates (10-player set overlapping a higher-ROI surviving
+    lineup's in exactly 9 players — a single swapped player), using the
+    exact same tie-break logic (_pick_primary_contest_index /
+    _find_near_duplicate_removals: ROI in the largest contest by parsed
+    prize pool). This script does NOT drop those rows — it's an offline
+    analysis tool and dropping them would silently hide what real-money
+    lineups a stricter dedup would have discarded — so the flag is purely
+    informational, letting --top / the eval CSV show whether a given
+    lineup's real result would even have been reachable in production.
     """
     df = load_combined_lineups_csv(lineups_paths)
     id_cols = list(df.columns[:_N_SLOT_COLS])
@@ -189,7 +214,28 @@ def load_external_lineups(lineups_paths: list[Path]) -> tuple[pd.DataFrame, dict
     n_before = len(out)
     out = out.loc[~key.duplicated()].reset_index(drop=True)
     n_dup = n_before - len(out)
-    return out, contest_blocks, n_dup
+
+    # contest_meta shape expected by _pick_primary_contest_index: norm ->
+    # (raw_name, prize_pool_cents, single_entry) -- single_entry is unused
+    # by that function, so it's not worth deriving here.
+    contest_order = list(contest_blocks.keys())
+    contest_meta = {
+        norm: (block["raw_name"], _parse_prize_pool_cents(block["raw_name"]), False)
+        for norm, block in contest_blocks.items()
+    }
+    primary_norm = contest_order[_pick_primary_contest_index(contest_order, contest_meta)]
+    # roi__<norm> is already x100 percentage points (see above) rather than
+    # parse_lineup_pool's raw fraction, but the near-dup pass only compares
+    # relative order, which a uniform positive scaling never changes.
+    primary_roi = out[f"roi__{primary_norm}"].to_numpy()
+    removed = _find_near_duplicate_removals(out["player_ids"].tolist(), primary_roi) if len(out) > 1 else set()
+    would_dedupe = np.zeros(len(out), dtype=bool)
+    if removed:
+        would_dedupe[list(removed)] = True
+    out["would_dedupe_9of10"] = would_dedupe
+    n_near_dup = int(would_dedupe.sum())
+
+    return out, contest_blocks, n_dup, n_near_dup
 
 
 def add_actual_score(lineup_df: pd.DataFrame, fpts_map: dict) -> pd.DataFrame:
@@ -243,6 +289,7 @@ def top_candidates_table(lineup_df: pd.DataFrame, contest_norm: str, top_n: int)
     df = lineup_df.dropna(subset=["actual_score"]).sort_values("actual_score", ascending=False).head(top_n)
     return df[[
         "lineup_index", "actual_score", "salary", "proj_score", "ownership", roi_col, win_col, cash_col,
+        "would_dedupe_9of10",
     ]].rename(columns={
         "proj_score": "mean", roi_col: "roi", win_col: "win_rate", cash_col: "cash_rate",
     }).reset_index(drop=True)
@@ -254,7 +301,7 @@ def run_top_candidates(archive_dirs: list[Path], top_n: int, contest_query: str 
             found = discover_external_files(str(d))
             if not found["lineups_paths"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
-            lineup_df, contest_blocks, n_dup = load_external_lineups(found["lineups_paths"])
+            lineup_df, contest_blocks, n_dup, n_near_dup = load_external_lineups(found["lineups_paths"])
             fpts_map = load_contest_player_fpts(d)
         except (FileNotFoundError, ValueError) as exc:
             print(f"Skipping {d.name}: {exc}")
@@ -269,10 +316,14 @@ def run_top_candidates(archive_dirs: list[Path], top_n: int, contest_query: str 
         lineup_df = add_actual_score(lineup_df, fpts_map)
         table = top_candidates_table(lineup_df, contest_norm, top_n)
 
-        dup_note = f"  ({n_dup} duplicate lineups dropped)" if n_dup else ""
+        dup_note = f"  ({n_dup} exact duplicates dropped)" if n_dup else ""
+        near_dup_note = (
+            f"  ({n_near_dup} near-duplicates [9/10 overlap] flagged via would_dedupe_9of10, not dropped)"
+            if n_near_dup else ""
+        )
         print(
             f"\n=== {d.name} === top {len(table)} lineups by actual_score "
-            f"[contest={contest_blocks[contest_norm]['raw_name']!r}]{dup_note}"
+            f"[contest={contest_blocks[contest_norm]['raw_name']!r}]{dup_note}{near_dup_note}"
         )
         # roi is already in percentage points (see load_external_lineups) — format
         # it as "+71.5%" for the printed table, matching the portfolio-panel UI's
@@ -295,7 +346,7 @@ def run_roi_sweep(
             found = discover_external_files(str(d))
             if not found["lineups_paths"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
-            lineup_df, contest_blocks, _ = load_external_lineups(found["lineups_paths"])
+            lineup_df, contest_blocks, _, _ = load_external_lineups(found["lineups_paths"])
             fpts_map = load_contest_player_fpts(d)
             field_points = load_real_field_points(d)
         except (FileNotFoundError, ValueError) as exc:
@@ -375,7 +426,7 @@ def evaluate_archive_dirs(
             found = discover_external_files(str(d))
             if not found["lineups_paths"]:
                 raise FileNotFoundError(f"no lineups_*.csv in {d}")
-            lineup_df, contest_blocks, n_dup = load_external_lineups(found["lineups_paths"])
+            lineup_df, contest_blocks, n_dup, n_near_dup = load_external_lineups(found["lineups_paths"])
             fpts_map = load_contest_player_fpts(d)
         except (FileNotFoundError, ValueError) as exc:
             print(f"Skipping {d.name}: {exc}")
@@ -588,7 +639,7 @@ def main() -> None:
             if not found["lineups_paths"]:
                 print(f"{d.name}: no lineups_*.csv found.")
                 continue
-            lineup_df, contest_blocks, _ = load_external_lineups(found["lineups_paths"])
+            lineup_df, contest_blocks, _, _ = load_external_lineups(found["lineups_paths"])
             print(f"\n=== {d.name} ===")
             print_contest_list(contest_blocks, lineup_df)
         return
