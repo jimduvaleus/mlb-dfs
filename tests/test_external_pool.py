@@ -158,6 +158,7 @@ class TestAllocation:
             )
         return ExternalPool(lineups=lineups, contests=contests,
                             n_dropped_unknown_players=0, n_dropped_duplicates=0,
+                            n_dropped_near_duplicates=0,
                             source_paths=[Path("synthetic.csv")])
 
     def _groups(self, pool, sizes):
@@ -520,7 +521,8 @@ class TestComputePpdRoiAdjustment:
                 prize_pool_cents=None, single_entry=False,
                 roi_stddev=roi_stddev.copy() if roi_stddev is not None else None,
             )},
-            n_dropped_unknown_players=0, n_dropped_duplicates=0, source_paths=[Path("x")],
+            n_dropped_unknown_players=0, n_dropped_duplicates=0,
+            n_dropped_near_duplicates=0, source_paths=[Path("x")],
         )
 
     def _apply_real_ppd(self, sim_results, players_df, pcts, seed=7):
@@ -717,6 +719,86 @@ def test_parse_lineup_pool_missing_roi_stddev_column(tmp_path):
     pool = parse_lineup_pool(path, valid_ids=set(range(1, 11)))
     contest = pool.contests[normalize_contest_name("MLB $1K Test")]
     assert contest.roi_stddev is None
+
+
+def _write_lineup_csv(path: Path, contest_names: list[str], rows: list[list]) -> None:
+    header = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+    for name in contest_names:
+        header += [f"{name} ROI", f"{name} Sim Dupes"]
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def test_near_duplicate_removed_keeps_higher_roi(tmp_path):
+    """Two lineups differing by exactly one swapped player (9/10 overlap)
+    collapse to one, keeping the higher-ROI lineup."""
+    path = tmp_path / "lineups_test.csv"
+    _write_lineup_csv(path, ["MLB $1K Test"], [
+        [str(i) for i in range(1, 11)] + ["1.5", "0.02"],       # ids 1-10, higher roi
+        [str(i) for i in range(1, 10)] + ["11"] + ["0.8", "0.02"],  # ids 1-9,11, lower roi
+    ])
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 12)))
+    assert pool.n_dropped_near_duplicates == 1
+    assert pool.n_dropped_duplicates == 0
+    assert len(pool.lineups) == 1
+    assert set(pool.lineups[0].player_ids) == set(range(1, 11))
+
+
+def test_near_duplicate_tiebreak_uses_largest_prize_pool_contest(tmp_path):
+    """The tie-break ROI column is the contest with the largest parsed
+    prize pool, not simply the first contest in file order."""
+    path = tmp_path / "lineups_test.csv"
+    # "Small" ranks lineup A higher; "Big" (bigger prize pool) ranks B
+    # higher -- Big's ranking must win.
+    _write_lineup_csv(path, ["MLB $1K Small", "MLB $50K Big"], [
+        [str(i) for i in range(1, 11)] + ["9.0", "0.02", "1.0", "0.02"],       # A: ids 1-10
+        [str(i) for i in range(1, 10)] + ["11"] + ["1.0", "0.02", "9.0", "0.02"],  # B: ids 1-9,11
+    ])
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 12)))
+    assert pool.n_dropped_near_duplicates == 1
+    assert len(pool.lineups) == 1
+    # B (higher ROI in the bigger contest) survives, not A.
+    assert set(pool.lineups[0].player_ids) == {1, 2, 3, 4, 5, 6, 7, 8, 9, 11}
+
+
+def test_near_duplicate_no_conflict_kept(tmp_path):
+    """Lineups that don't share a 9-player core are unaffected."""
+    path = tmp_path / "lineups_test.csv"
+    _write_lineup_csv(path, ["MLB $1K Test"], [
+        [str(i) for i in range(1, 11)] + ["1.0", "0.02"],
+        [str(i) for i in range(21, 31)] + ["1.0", "0.02"],
+    ])
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 31)))
+    assert pool.n_dropped_near_duplicates == 0
+    assert len(pool.lineups) == 2
+
+
+def test_near_duplicate_chain_is_not_transitively_collapsed(tmp_path):
+    """L1={1..10}, L2={1..9,11} shares L1's full 9-core {1..9} (conflicts
+    with L1); L3={1..8,10,12} shares a *different* 9-core {1..8,10} with L1
+    (conflicts with L1) but shares only 8 players with L2 (no conflict).
+    With L2 ranked highest, L1 loses its head-to-head with L2 and is
+    dropped -- but L3 never directly conflicts with L2, so it survives even
+    though it would have conflicted with the now-dropped L1. This is the
+    non-transitive case _find_near_duplicate_removals exists for."""
+    path = tmp_path / "lineups_test.csv"
+    l1 = [str(i) for i in range(1, 11)]                      # 1..10
+    l2 = [str(i) for i in range(1, 10)] + ["11"]              # 1..9, 11
+    l3 = [str(i) for i in range(1, 9)] + ["10", "12"]         # 1..8, 10, 12
+    _write_lineup_csv(path, ["MLB $1K Test"], [
+        l1 + ["8.0", "0.02"],
+        l2 + ["10.0", "0.02"],
+        l3 + ["5.0", "0.02"],
+    ])
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 13)))
+    assert pool.n_dropped_near_duplicates == 1
+    surviving = {frozenset(lu.player_ids) for lu in pool.lineups}
+    assert surviving == {
+        frozenset(int(x) for x in l2),
+        frozenset(int(x) for x in l3),
+    }
 
 
 @needs_files

@@ -2419,6 +2419,7 @@ class PipelineRunner:
             "n_contests_covered": len(pool.contests),
             "n_dropped_unknown": pool.n_dropped_unknown_players,
             "n_dropped_duplicates": pool.n_dropped_duplicates,
+            "n_dropped_near_duplicates": pool.n_dropped_near_duplicates,
         })
 
         # --- Contest grouping + ROI matching ------------------------------

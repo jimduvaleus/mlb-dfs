@@ -634,16 +634,19 @@ function renderDetail(e: SSEEvent): string {
     case 'external_pool': {
       const ev = e as unknown as {
         n_lineups: number; n_files: number; n_contests_covered: number;
-        n_dropped_unknown: number; n_dropped_duplicates: number;
+        n_dropped_unknown: number; n_dropped_duplicates: number; n_dropped_near_duplicates: number;
       }
       const fileNote = ev.n_files > 1 ? ` across ${ev.n_files} files` : ''
       const dupNote = ev.n_dropped_duplicates > 0
         ? `, ${ev.n_dropped_duplicates.toLocaleString()} duplicate${ev.n_dropped_duplicates !== 1 ? 's' : ''} removed`
         : ''
+      const nearDupNote = ev.n_dropped_near_duplicates > 0
+        ? `, ${ev.n_dropped_near_duplicates.toLocaleString()} near-duplicate${ev.n_dropped_near_duplicates !== 1 ? 's' : ''} (9/10 overlap) removed`
+        : ''
       const unkNote = ev.n_dropped_unknown > 0
         ? `, ${ev.n_dropped_unknown.toLocaleString()} unknown-player row${ev.n_dropped_unknown !== 1 ? 's' : ''} dropped`
         : ''
-      return `${ev.n_lineups.toLocaleString()} lineups imported${fileNote}${dupNote}${unkNote} · ${ev.n_contests_covered} contest${ev.n_contests_covered !== 1 ? 's' : ''} covered`
+      return `${ev.n_lineups.toLocaleString()} lineups imported${fileNote}${dupNote}${nearDupNote}${unkNote} · ${ev.n_contests_covered} contest${ev.n_contests_covered !== 1 ? 's' : ''} covered`
     }
     case 'ppd_applied':
     case 'external_ppd_applied': {

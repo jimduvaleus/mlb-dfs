@@ -82,6 +82,7 @@ class ExternalPool:
     contests: dict                # norm_name -> ExternalContest
     n_dropped_unknown_players: int
     n_dropped_duplicates: int
+    n_dropped_near_duplicates: int  # 9/10-player-overlap lineups (see _find_near_duplicate_removals)
     source_paths: list            # list[Path], one or more lineups_*.csv for one slate
 
 
@@ -190,6 +191,54 @@ def _parse_lineup_header(path: Path, rows: list) -> tuple:
     return contest_cols, stddev_cols
 
 
+def _pick_primary_contest_index(contest_order: list, contest_meta: dict) -> int:
+    """Index into contest_order/roi_rows of the largest contest by parsed
+    prize pool -- the same size proxy group_and_match_contests uses when a
+    contest has no exact ROI-block match -- used as the single reference
+    ROI column for near-duplicate tie-breaking (see
+    _find_near_duplicate_removals). Falls back to the first contest in
+    file order when none has a parseable prize pool."""
+    def _size(j: int) -> int:
+        prize = contest_meta[contest_order[j]][1]
+        return prize if prize is not None else -1
+    return max(range(len(contest_order)), key=_size)
+
+
+def _find_near_duplicate_removals(lineups: list, primary_roi: np.ndarray) -> set:
+    """Indices to drop so no two surviving lineups' 10-player sets
+    intersect in exactly 9 players (a single swapped player).
+
+    This overlap relation isn't transitive across different 9-player
+    cores -- e.g. lineups A and B can each 9/10-overlap a shared lineup C
+    (via two different 9-player cores) without overlapping each other --
+    so a simple equivalence-class dedup (like the exact-duplicate pass)
+    isn't well-defined here. Processing lineups by primary_roi descending
+    and dropping one only when it conflicts with an already-kept lineup
+    guarantees: every dropped lineup lost a real head-to-head to a
+    higher-or-equal-ROI survivor (the pairwise rule asked for), and the
+    final kept set has no conflicting pair left at all -- a violating pair
+    would always be caught when its later-processed member is checked,
+    unless both were already dropped for other conflicts, in which case
+    neither survives to violate anything.
+    """
+    order = sorted(
+        range(len(lineups)),
+        key=lambda i: primary_roi[i] if np.isfinite(primary_roi[i]) else float("-inf"),
+        reverse=True,
+    )
+    kept_cores: dict = {}  # frozenset(9 player ids) -> kept lineup index
+    removed: set = set()
+    for i in order:
+        ids = lineups[i].player_ids
+        cores = [frozenset(ids[:k] + ids[k + 1:]) for k in range(len(ids))]
+        if any(c in kept_cores for c in cores):
+            removed.add(i)
+            continue
+        for c in cores:
+            kept_cores[c] = i
+    return removed
+
+
 def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
     """Parse one or more lineup exports for the same slate (see
     discover_external_files) with csv.reader on each raw header (duplicate
@@ -199,7 +248,13 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
     Lineups are deduplicated by player-id set across *all* files combined —
     a lineup appearing more than once (within one file or across files) is
     kept only once, using the roi/roi_stddev from its first occurrence in
-    file order.
+    file order. A second pass then also drops near-duplicates: lineups
+    whose 10-player set overlaps another surviving lineup's in exactly 9
+    players (a single swapped player). Conflicts are resolved by ROI in
+    the largest contest by parsed prize pool (see
+    _pick_primary_contest_index) — the lower-ROI lineup of any conflicting
+    pair is dropped (see _find_near_duplicate_removals for why this needs
+    a priority pass rather than simple equivalence-class grouping).
 
     Contest ROI blocks are matched across files by normalized name (first
     file to define a given contest wins its raw name / prize pool / single
@@ -276,6 +331,19 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
             roi_rows.append(vals)
             stddev_rows.append(std_vals)
 
+    # --- Near-duplicate removal (9/10 player overlap) --------------------
+    n_near_dup = 0
+    if len(lineups) > 1:
+        primary_j = _pick_primary_contest_index(contest_order, contest_meta)
+        primary_roi = np.array([row[primary_j] for row in roi_rows], dtype=np.float64)
+        removed = _find_near_duplicate_removals(lineups, primary_roi)
+        if removed:
+            keep = [i not in removed for i in range(len(lineups))]
+            lineups = [lu for lu, k in zip(lineups, keep) if k]
+            roi_rows = [row for row, k in zip(roi_rows, keep) if k]
+            stddev_rows = [row for row, k in zip(stddev_rows, keep) if k]
+            n_near_dup = len(removed)
+
     roi_mat = np.array(roi_rows, dtype=np.float64) if roi_rows else np.zeros((0, len(contest_order)))
     # See ExternalContest.roi_stddev: Saber's raw cell is already pct-pt
     # scaled like `roi * 100`, so /100 puts it on roi's own fraction scale.
@@ -295,14 +363,15 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
             roi_stddev=stddev_mat[:, j] if norm in any_stddev else None,
         )
     logger.info(
-        "External pool: %d lineups from %d file(s) (%d dropped unknown-player, %d duplicate), "
-        "%d contests: %s",
-        len(lineups), len(paths), n_unknown, n_dup, len(contests),
+        "External pool: %d lineups from %d file(s) (%d dropped unknown-player, %d duplicate, "
+        "%d near-duplicate [9/10 overlap]), %d contests: %s",
+        len(lineups), len(paths), n_unknown, n_dup, n_near_dup, len(contests),
         ", ".join(c.raw_name for c in contests.values()),
     )
     return ExternalPool(
         lineups=lineups, contests=contests,
         n_dropped_unknown_players=n_unknown, n_dropped_duplicates=n_dup,
+        n_dropped_near_duplicates=n_near_dup,
         source_paths=paths,
     )
 
