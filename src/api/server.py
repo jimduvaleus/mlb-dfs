@@ -3496,7 +3496,7 @@ def get_portfolio_sweep():
             return {"sweep": [], "active_risk": 1}
 
         return {"sweep": data.get("sweep", []), "active_risk": data.get("active_risk", 1),
-                "mode": data.get("mode")}
+                "mode": data.get("mode"), "ev_type": data.get("ev_type")}
     except Exception:
         return {"sweep": [], "active_risk": 1}
 

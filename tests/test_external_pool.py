@@ -14,15 +14,25 @@ from src.api.external_pool import (
     ExternalPool,
     allocate_contests,
     archive_external_inputs,
+    build_external_players_df,
     build_quantile_grids,
     compute_ceiling_ev,
+    compute_lineup_scores,
+    compute_p_win,
     compute_pool_corr,
+    compute_pool_ownership,
+    compute_pool_proj_scores,
     compute_ppd_roi_adjustment,
+    compute_prj_own_ev,
     discover_external_files,
+    implied_field_size,
     group_and_match_contests,
     normalize_contest_name,
     parse_lineup_pool,
     parse_player_projections,
+    pwin_field_size,
+    pwin_implied_entries,
+    _field_percentiles,
     _pava,
 )
 from src.optimization.lineup import Lineup
@@ -161,13 +171,18 @@ class TestAllocation:
                             n_dropped_near_duplicates=0,
                             source_paths=[Path("synthetic.csv")])
 
-    def _groups(self, pool, sizes):
+    def _groups(self, pool, sizes, prize_pool_cents=100_000, entry_fee_cents=None):
+        """`prize_pool_cents`/`entry_fee_cents` set the implied field size
+        (prize/fee) that the prj_own EV currency scales its ownership penalty
+        by; the defaults (100_000 / 1000-j) give ~100 implied entries, i.e. a
+        negligible penalty, which is what the ROI-mode tests want."""
         groups = []
         keys = list(pool.contests.keys())
         for j, size in enumerate(sizes):
             g = ContestGroup(
                 contest_id=f"c{j}", contest_name=pool.contests[keys[j % len(keys)]].raw_name,
-                entry_fee_cents=1000 - j, prize_pool_cents=100_000,
+                entry_fee_cents=entry_fee_cents if entry_fee_cents is not None else 1000 - j,
+                prize_pool_cents=prize_pool_cents,
                 single_entry_tag=size == 1,
                 entries=[(Path("x/Entries.csv"), _rec(f"c{j}", "n", 1000 - j, f"e{j}-{i}"))
                          for i in range(size)],
@@ -284,6 +299,265 @@ class TestAllocation:
         alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
         assert len(alloc.portfolio) == 3
         assert not alloc.unfilled
+
+    def test_proj_score_floor_culls_pool_wide_across_contests(self):
+        """proj_score_floor_percentile is a single pool-wide cull applied
+        once up front (unlike the per-contest ROI floor): a lineup that
+        fails it must be absent from *every* contest's allocation, even
+        one whose own ROI column would otherwise pick it first."""
+        pool = self._pool(M=10, n_contests=2)
+        keys = list(pool.contests.keys())
+        for key in keys:
+            pool.contests[key].roi = np.arange(10, dtype=np.float64)  # higher index = better ROI
+        proj_scores = np.arange(10, dtype=np.float64)  # same order: index 0..3 are the bottom 40%
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [10])
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            roi_floor_percentile=0.0,  # isolate the proj-score cull
+            proj_scores=proj_scores, proj_score_floor_percentile=40.0,
+        )
+        picked = {id(lu) for lu, _ in alloc.portfolio}
+        for i in range(4):
+            assert id(pool.lineups[i]) not in picked
+        assert len(alloc.portfolio) == 6
+        assert len(alloc.unfilled) == 4
+
+    def test_proj_score_floor_disabled_by_default(self):
+        """proj_score_floor_percentile=0.0 (the default) is a no-op even
+        when a proj_scores array is supplied."""
+        pool = self._pool(M=10, n_contests=1)
+        key = next(iter(pool.contests))
+        pool.contests[key].roi = np.abs(pool.contests[key].roi) + 0.01
+        proj_scores = np.arange(10, dtype=np.float64)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [10])
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            roi_floor_percentile=0.0,  # isolate the proj-score cull
+            proj_scores=proj_scores,
+        )
+        assert len(alloc.portfolio) == 10
+        assert not alloc.unfilled
+
+    # --- ev_type="prj_own" ------------------------------------------------
+
+    def test_prj_own_ignores_roi_entirely(self):
+        """Under prj_own, Saber's ROI column — including the absolute
+        ROI>=0.0 guard that would cull most of this pool in roi mode — has no
+        say at all: the pick is the best projected-minus-ownership lineup even
+        though it has the *worst* ROI in the contest."""
+        pool = self._pool(M=10, n_contests=1)
+        key = next(iter(pool.contests))
+        pool.contests[key].roi = -np.arange(10, dtype=np.float64)  # index 0 best (0.0), 9 worst
+        proj_scores = np.arange(10, dtype=np.float64)              # index 9 best
+        own_scores = np.zeros(10)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [1])
+
+        roi_alloc = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        assert id(roi_alloc.portfolio[0][0]) == id(pool.lineups[0])
+
+        prj_alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="prj_own", proj_scores=proj_scores, own_scores=own_scores,
+        )
+        assert id(prj_alloc.portfolio[0][0]) == id(pool.lineups[9])
+        # Reported EV is the prj_own value (proj 9.0, negligible ownership
+        # penalty at ~100 implied entries), not the lineup's -9.0 ROI.
+        assert prj_alloc.portfolio[0][1] == pytest.approx(9.0)
+
+    def test_prj_own_still_respects_pool_wide_proj_score_floor(self):
+        """The pool-wide projected-score cull is the one cull that survives
+        into prj_own mode."""
+        pool = self._pool(M=10, n_contests=2)
+        proj_scores = np.arange(10, dtype=np.float64)  # index 0..3 = bottom 40%
+        own_scores = np.zeros(10)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [10])
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="prj_own", proj_scores=proj_scores, own_scores=own_scores,
+            proj_score_floor_percentile=40.0,
+        )
+        picked = {id(lu) for lu, _ in alloc.portfolio}
+        for i in range(4):
+            assert id(pool.lineups[i]) not in picked
+        assert len(alloc.portfolio) == 6
+        assert len(alloc.unfilled) == 4
+
+    def test_prj_own_field_size_scales_the_ownership_penalty(self):
+        """Same pool, same two lineups: the high-projection/high-ownership one
+        wins a small contest and the low-owned one wins a large contest,
+        purely through the field_size = prize_pool/entry_fee multiplier."""
+        pool = self._pool(M=2, n_contests=1)
+        proj_scores = np.array([110.0, 100.0])   # 0 = higher projection
+        own_scores = np.array([150.0, 10.0])     # 0 = chalk, 1 = leverage
+        corr = np.eye(2, dtype=np.float32)
+
+        # $1K prize pool / $10 entry = 100 implied entries -> penalty x1/300
+        small = self._groups(pool, [1], prize_pool_cents=100_000, entry_fee_cents=1000)
+        alloc_small = allocate_contests(
+            pool, corr, small, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="prj_own", proj_scores=proj_scores, own_scores=own_scores,
+        )
+        assert id(alloc_small.portfolio[0][0]) == id(pool.lineups[0])
+
+        # $100K prize pool / $4 entry = 25,000 implied entries -> penalty x5/6
+        large = self._groups(pool, [1], prize_pool_cents=100_000_00, entry_fee_cents=400)
+        alloc_large = allocate_contests(
+            pool, corr, large, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="prj_own", proj_scores=proj_scores, own_scores=own_scores,
+        )
+        assert id(alloc_large.portfolio[0][0]) == id(pool.lineups[1])
+
+    def test_prj_own_unknown_field_size_falls_back_to_projection(self):
+        """An unparseable prize pool zeroes the ownership penalty rather than
+        guessing a field size — the chalk lineup wins on projection alone."""
+        pool = self._pool(M=2, n_contests=1)
+        corr = np.eye(2, dtype=np.float32)
+        groups = self._groups(pool, [1], prize_pool_cents=None)
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="prj_own",
+            proj_scores=np.array([110.0, 100.0]), own_scores=np.array([150.0, 10.0]),
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[0])
+        assert alloc.portfolio[0][1] == pytest.approx(110.0)
+
+    def test_prj_own_requires_own_scores(self):
+        pool = self._pool(M=4, n_contests=1)
+        corr = np.eye(4, dtype=np.float32)
+        groups = self._groups(pool, [1])
+        with pytest.raises(ValueError, match="own_scores"):
+            allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+                              ev_type="prj_own", proj_scores=np.arange(4, dtype=float))
+
+    def test_unknown_ev_type_raises(self):
+        pool = self._pool(M=4, n_contests=1)
+        corr = np.eye(4, dtype=np.float32)
+        groups = self._groups(pool, [1])
+        with pytest.raises(ValueError, match="ev_type"):
+            allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+                              ev_type="nonsense")
+
+    def test_roi_mode_unaffected_by_prj_own_inputs(self):
+        """Regression guard: the default ev_type still ranks on ROI and is
+        byte-identical whether or not the prj_own inputs are supplied."""
+        pool = self._pool(M=40, n_contests=2)
+        corr = np.eye(40, dtype=np.float32)
+        groups = self._groups(pool, [10, 10])
+        rng = np.random.default_rng(7)
+        baseline = allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4)
+        with_inputs = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            proj_scores=rng.uniform(80, 120, 40), own_scores=rng.uniform(10, 170, 40),
+        )
+        assert [id(lu) for lu, _ in baseline.portfolio] == [id(lu) for lu, _ in with_inputs.portfolio]
+        assert [ev for _, ev in baseline.portfolio] == [ev for _, ev in with_inputs.portfolio]
+
+    # --- ev_type="p_win" ----------------------------------------------
+
+    def test_p_win_picks_highest_select_value_first(self):
+        pool = self._pool(M=10, n_contests=1)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [1])
+        select = {"c0": np.arange(10, dtype=np.float64)}  # index 9 highest
+        cull = {"c0": np.arange(10, dtype=np.float64)}
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[9])
+        assert alloc.portfolio[0][1] == pytest.approx(9.0)
+
+    def test_p_win_ignores_roi_entirely(self):
+        pool = self._pool(M=10, n_contests=1)
+        key = next(iter(pool.contests))
+        pool.contests[key].roi = -np.arange(10, dtype=np.float64)  # index 0 best ROI
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [1])
+        select = {"c0": np.arange(10, dtype=np.float64)}  # index 9 best p_win
+        cull = {"c0": np.arange(10, dtype=np.float64)}
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[9])
+
+    def test_p_win_stage_a_cull_is_independent_of_stage_b_ranking(self):
+        """A lineup that ranks top by p_win_select but bottom by p_win_cull
+        must be excluded once admit_n culls it — proving the two stages
+        genuinely use separate information rather than one overriding the
+        other."""
+        pool = self._pool(M=10, n_contests=1)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [5])
+        select = {"c0": np.arange(10, dtype=np.float64)}       # index 9 best select
+        cull = {"c0": -np.arange(10, dtype=np.float64)}        # index 9 WORST cull
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+            p_win_admit_n=5,  # keeps indices 0..4 (best cull), excludes 9
+        )
+        picked = {id(lu) for lu, _ in alloc.portfolio}
+        assert id(pool.lineups[9]) not in picked
+        assert len(alloc.portfolio) == 5
+
+    def test_p_win_admit_n_zero_disables_the_cull(self):
+        pool = self._pool(M=10, n_contests=1)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [1])
+        select = {"c0": np.arange(10, dtype=np.float64)}
+        cull = {"c0": -np.arange(10, dtype=np.float64)}  # would exclude index 9 if applied
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select, p_win_admit_n=0,
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[9])
+
+    def test_p_win_still_respects_pool_wide_proj_score_floor(self):
+        pool = self._pool(M=10, n_contests=2)
+        proj_scores = np.arange(10, dtype=np.float64)  # index 0..3 = bottom 40%
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [10])
+        select = {"c0": np.arange(10, dtype=np.float64)}
+        cull = {"c0": np.arange(10, dtype=np.float64)}
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+            proj_scores=proj_scores, proj_score_floor_percentile=40.0,
+        )
+        picked = {id(lu) for lu, _ in alloc.portfolio}
+        for i in range(4):
+            assert id(pool.lineups[i]) not in picked
+        assert len(alloc.portfolio) == 6
+        assert len(alloc.unfilled) == 4
+
+    def test_p_win_requires_both_cull_and_select(self):
+        pool = self._pool(M=4, n_contests=1)
+        corr = np.eye(4, dtype=np.float32)
+        groups = self._groups(pool, [1])
+        select = {"c0": np.arange(4, dtype=np.float64)}
+        with pytest.raises(ValueError, match="p_win_cull"):
+            allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+                              ev_type="p_win", p_win_select=select)
+        with pytest.raises(ValueError, match="p_win_cull"):
+            allocate_contests(pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+                              ev_type="p_win", p_win_cull=select)
+
+    def test_p_win_missing_contest_key_leaves_it_unfilled(self):
+        """A contest_id absent from p_win_select (e.g. a field/sim failure
+        for just that contest) is left unfilled rather than crashing."""
+        pool = self._pool(M=10, n_contests=1)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [3])
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull={}, p_win_select={},
+        )
+        assert len(alloc.portfolio) == 0
+        assert len(alloc.unfilled) == 3
 
     def test_ceiling_weight_noop_without_stddev_data(self):
         """ceiling_weight has no effect when the pool's ExternalContest has
@@ -467,6 +741,329 @@ class TestComputePoolCorr:
         ]
         corr = compute_pool_corr(lineups, sim_results)
         assert corr[0, 1] > corr[0, 2] > corr[0, 3]
+
+
+class TestComputeLineupScores:
+    def test_matches_manual_indicator_sum(self):
+        sim_results = SimulationResults(
+            player_ids=list(range(1, 21)),
+            results_matrix=np.arange(1.0, 1.0 + 5 * 20).reshape(5, 20).astype(np.float32),
+        )
+        lineups = [Lineup(player_ids=list(range(1, 11))), Lineup(player_ids=list(range(11, 21)))]
+        scores = compute_lineup_scores(lineups, sim_results)
+        assert scores.shape == (2, 5)
+        expected0 = sim_results.results_matrix[:, :10].sum(axis=1)
+        np.testing.assert_allclose(scores[0], expected0, rtol=1e-5)
+
+    def test_compute_pool_corr_agrees_with_and_without_precomputed_scores(self):
+        """compute_pool_corr(scores=...) must be identical to letting it
+        compute compute_lineup_scores internally — the whole point of
+        splitting the two functions is that callers needing both the raw
+        score matrix (p_win) and the correlation can share one matmul."""
+        rng = np.random.default_rng(5)
+        sim_results = SimulationResults(
+            player_ids=list(range(1, 51)),
+            results_matrix=rng.normal(10, 3, size=(300, 50)).astype(np.float32),
+        )
+        lineups = [
+            Lineup(player_ids=list(rng.choice(range(1, 51), size=10, replace=False)))
+            for _ in range(30)
+        ]
+        scores = compute_lineup_scores(lineups, sim_results)
+        corr_a = compute_pool_corr(lineups, sim_results)
+        corr_b = compute_pool_corr(lineups, sim_results, scores=scores)
+        np.testing.assert_allclose(corr_a, corr_b)
+
+
+class TestFieldPercentiles:
+    def test_dominant_lineup_percentile_near_but_not_exactly_one(self):
+        rng = np.random.default_rng(0)
+        field_scores = rng.normal(100, 10, size=(50, 200))  # (S, F)
+        pool_scores = np.full((1, 50), 1000.0)  # always beats the whole field
+        q = _field_percentiles(pool_scores, field_scores)
+        assert np.all(q < 1.0)
+        assert np.all(q > 0.99)
+
+    def test_dominated_lineup_percentile_near_but_not_exactly_zero(self):
+        rng = np.random.default_rng(1)
+        field_scores = rng.normal(100, 10, size=(50, 200))
+        pool_scores = np.full((1, 50), -1000.0)
+        q = _field_percentiles(pool_scores, field_scores)
+        assert np.all(q > 0.0)
+        assert np.all(q < 0.01)
+
+    def test_monotone_in_pool_score(self):
+        rng = np.random.default_rng(2)
+        field_scores = rng.normal(100, 10, size=(20, 200))
+        pool_scores = np.array([[50.0] * 20, [100.0] * 20, [150.0] * 20])
+        q = _field_percentiles(pool_scores, field_scores)
+        assert np.all(q[0] <= q[1]) and np.all(q[1] <= q[2])
+
+
+class TestComputePWin:
+    def _field(self, S=400, F=500, mean=100.0, sd=10.0, seed=0):
+        rng = np.random.default_rng(seed)
+        return rng.normal(mean, sd, size=(S, F)).astype(np.float32)
+
+    def test_dominant_lineup_p_win_near_one(self):
+        field_scores = self._field()
+        pool_scores = np.full((1, 400), 1000.0)
+        out = compute_p_win(pool_scores, field_scores, {"c1": 1.0})
+        assert out["c1"][0] == pytest.approx(1.0, abs=1e-2)
+
+    def test_dominated_lineup_p_win_near_zero(self):
+        field_scores = self._field()
+        pool_scores = np.full((1, 400), -1000.0)
+        out = compute_p_win(pool_scores, field_scores, {"c1": 1.0})
+        assert out["c1"][0] == pytest.approx(0.0, abs=1e-2)
+
+    def test_higher_exponent_lowers_p_win_for_subcertain_lineup(self):
+        """A lineup that's good-but-not-dominant (q < 1 most worlds) sees a
+        strictly lower P(win) at a larger exponent — q**n is decreasing in n
+        for q<1, which is the whole mechanism behind sharpness/field-size
+        scaling the win requirement."""
+        field_scores = self._field(seed=3)
+        rng = np.random.default_rng(4)
+        pool_scores = rng.normal(115, 10, size=(1, 400)).astype(np.float32)  # above field mean, not dominant
+        out = compute_p_win(pool_scores, field_scores, {"small": 2.0, "big": 500.0})
+        assert out["big"][0] < out["small"][0]
+
+    def test_multiple_exponents_in_one_call_match_separate_calls(self):
+        field_scores = self._field(seed=5)
+        rng = np.random.default_rng(6)
+        pool_scores = rng.normal(105, 12, size=(20, 400)).astype(np.float32)
+        combined = compute_p_win(pool_scores, field_scores, {"a": 10.0, "b": 5000.0})
+        sep_a = compute_p_win(pool_scores, field_scores, {"a": 10.0})
+        sep_b = compute_p_win(pool_scores, field_scores, {"b": 5000.0})
+        np.testing.assert_allclose(combined["a"], sep_a["a"])
+        np.testing.assert_allclose(combined["b"], sep_b["b"])
+
+    def test_chunking_does_not_change_the_result(self):
+        field_scores = self._field(S=1000, seed=7)
+        rng = np.random.default_rng(8)
+        pool_scores = rng.normal(105, 12, size=(15, 1000)).astype(np.float32)
+        whole = compute_p_win(pool_scores, field_scores, {"c": 50.0}, chunk=1000)
+        chunked = compute_p_win(pool_scores, field_scores, {"c": 50.0}, chunk=137)
+        np.testing.assert_allclose(whole["c"], chunked["c"], rtol=1e-5)
+
+    def test_stop_check_normalizes_by_worlds_actually_processed(self):
+        """An interruption must not silently under-divide the running sum by
+        the full world count — the mean over whatever was processed should
+        still land close to the mean over everything (same distribution)."""
+        field_scores = self._field(S=2000, seed=9)
+        rng = np.random.default_rng(10)
+        pool_scores = rng.normal(105, 12, size=(5, 2000)).astype(np.float32)
+        calls = {"n": 0}
+
+        def stop_after_a_few():
+            calls["n"] += 1
+            return calls["n"] > 3
+
+        partial = compute_p_win(pool_scores, field_scores, {"c": 20.0}, chunk=100,
+                                stop_check=stop_after_a_few)
+        full = compute_p_win(pool_scores, field_scores, {"c": 20.0}, chunk=100)
+        # Both are unbiased estimates of the same expectation — not equal,
+        # but not wildly different either (loose bound, this is a sanity
+        # check that partial isn't e.g. 10x too small from a bad divisor).
+        np.testing.assert_allclose(partial["c"], full["c"], atol=0.15)
+
+    def test_progress_cb_called_once_per_chunk(self):
+        field_scores = self._field(S=500, seed=11)
+        pool_scores = np.full((3, 500), 100.0)
+        calls = []
+        compute_p_win(pool_scores, field_scores, {"c": 1.0}, chunk=100,
+                      progress_cb=lambda done, total: calls.append((done, total)))
+        assert calls == [(1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]
+
+
+class TestPwinFieldSizing:
+    def _group(self, contest_id, prize_pool_cents, entry_fee_cents):
+        return ContestGroup(
+            contest_id=contest_id, contest_name="x", entry_fee_cents=entry_fee_cents,
+            prize_pool_cents=prize_pool_cents, single_entry_tag=False, roi_key="x",
+        )
+
+    def test_implied_entries_borrows_median_for_unparseable_prize_pool(self):
+        groups = [
+            self._group("a", 100_000_00, 400),   # 25,000
+            self._group("b", 20_000_00, 400),    # 5,000
+            self._group("c", None, 400),          # unparseable -> median of [25000, 5000] = 15000
+        ]
+        sizes = pwin_implied_entries(groups)
+        assert sizes["a"] == pytest.approx(25_000.0)
+        assert sizes["b"] == pytest.approx(5_000.0)
+        assert sizes["c"] == pytest.approx(15_000.0)
+
+    def test_implied_entries_falls_back_to_default_when_nothing_parses(self):
+        groups = [self._group("a", None, 400)]
+        sizes = pwin_implied_entries(groups)
+        assert sizes["a"] == pytest.approx(10_000.0)
+
+    def test_field_size_respects_floor_and_cap(self):
+        groups = [self._group("a", 100_00, 400)]  # 25 implied entries — tiny
+        assert pwin_field_size(groups, floor=5_000) == 5_000
+        groups_huge = [self._group("a", 100_000_000_00, 100)]  # 1,000,000,000 implied
+        assert pwin_field_size(groups_huge, floor=5_000, cap=25_000) == 25_000
+
+
+class TestComputePoolProjScores:
+    def _players_df(self, n_players=20, seed=0):
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame({
+            "player_id": list(range(1, n_players + 1)),
+            "mean": rng.uniform(5, 15, n_players),
+        })
+
+    def test_matches_manual_sum(self):
+        players_df = self._players_df()
+        rng = np.random.default_rng(1)
+        lineups = [
+            Lineup(player_ids=list(rng.choice(range(1, 21), size=10, replace=False)))
+            for _ in range(15)
+        ]
+        scores = compute_pool_proj_scores(lineups, players_df)
+        mean_by_id = dict(zip(players_df["player_id"], players_df["mean"]))
+        expected = np.array([sum(mean_by_id[p] for p in lu.player_ids) for lu in lineups])
+        np.testing.assert_allclose(scores, expected, atol=1e-3)
+
+    def test_shape_matches_lineup_count(self):
+        players_df = self._players_df()
+        lineups = [Lineup(player_ids=list(range(1, 11)))] * 3
+        scores = compute_pool_proj_scores(lineups, players_df)
+        assert scores.shape == (3,)
+
+
+class TestComputePoolOwnership:
+    def _players_df(self, n_players=20, seed=0):
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame({
+            "player_id": list(range(1, n_players + 1)),
+            "ownership": rng.uniform(1.0, 30.0, n_players),
+        })
+
+    def test_matches_manual_sum(self):
+        players_df = self._players_df()
+        rng = np.random.default_rng(1)
+        lineups = [
+            Lineup(player_ids=list(rng.choice(range(1, 21), size=10, replace=False)))
+            for _ in range(15)
+        ]
+        own = compute_pool_ownership(lineups, players_df)
+        own_by_id = dict(zip(players_df["player_id"], players_df["ownership"]))
+        expected = np.array([sum(own_by_id[p] for p in lu.player_ids) for lu in lineups])
+        np.testing.assert_allclose(own, expected, atol=1e-3)
+
+    def test_shape_matches_lineup_count(self):
+        players_df = self._players_df()
+        lineups = [Lineup(player_ids=list(range(1, 11)))] * 3
+        assert compute_pool_ownership(lineups, players_df).shape == (3,)
+
+
+class TestBuildExternalPlayersDfOwnership:
+    """build_external_players_df must carry projected ownership through — it
+    is the per-player input compute_pool_ownership sums for the prj_own EV
+    currency, and it stays on the file's percentage-point scale."""
+
+    def _frames(self):
+        slate_df = pd.DataFrame({
+            "player_id": [1, 2, 3],
+            "position": ["P", "OF", "OF"],
+            "team": ["NYY", "NYY", "BOS"],
+            "game": ["NYY@BOS"] * 3,
+            "salary": [10000, 5000, 4000],
+        })
+        proj_ext = pd.DataFrame({
+            "player_id": [1, 2],           # 3 is pool-only, unknown to the file
+            "order": [np.nan, 3.0],
+            "mean": [18.0, 9.0],
+            "std_dev": [6.0, 4.0],
+            "ownership": [22.5, 11.25],
+        })
+        return slate_df, proj_ext
+
+    def test_ownership_column_present_and_unscaled(self):
+        slate_df, proj_ext = self._frames()
+        df = build_external_players_df(
+            slate_df, proj_ext, pool_pids={1, 2, 3},
+            derive_opponent=lambda team, game: "BOS" if team == "NYY" else "NYY",
+        )
+        own = dict(zip(df["player_id"], df["ownership"]))
+        assert own[1] == pytest.approx(22.5)   # percentage points, not /100
+        assert own[2] == pytest.approx(11.25)
+
+    def test_players_missing_from_projections_get_a_small_positive_floor(self):
+        """Not 0.0: ContestSimulator normalizes ownership into a sampling
+        weight, so a hard zero would make the player impossible to draw into
+        a simulated opponent field (see the p_win EV currency)."""
+        slate_df, proj_ext = self._frames()
+        df = build_external_players_df(
+            slate_df, proj_ext, pool_pids={1, 2, 3},
+            derive_opponent=lambda team, game: "BOS" if team == "NYY" else "NYY",
+        )
+        own = dict(zip(df["player_id"], df["ownership"]))
+        assert 0.0 < own[3] <= 0.1
+
+
+class TestImpliedFieldSize:
+    def _group(self, prize_pool_cents, entry_fee_cents):
+        return ContestGroup(
+            contest_id="c0", contest_name="MLB $100K Test",
+            entry_fee_cents=entry_fee_cents, prize_pool_cents=prize_pool_cents,
+            single_entry_tag=False, roi_key="mlb $100k test",
+        )
+
+    def test_prize_pool_over_entry_fee(self):
+        # $100K prize pool at a $4 entry fee -> 25,000 implied entries.
+        assert implied_field_size(self._group(100_000_00, 400)) == 25_000.0
+
+    def test_missing_prize_pool_is_zero(self):
+        assert implied_field_size(self._group(None, 400)) == 0.0
+
+    def test_missing_or_zero_entry_fee_is_zero(self):
+        assert implied_field_size(self._group(100_000_00, 0)) == 0.0
+
+
+class TestComputePrjOwnEv:
+    def test_formula(self):
+        proj = np.array([100.0, 90.0])
+        own = np.array([120.0, 40.0])
+        ev = compute_prj_own_ev(proj, own, field_size=30_000.0)
+        # penalty multiplier = 30000/30000 = 1.0
+        np.testing.assert_allclose(ev, [100.0 - 120.0, 90.0 - 40.0])
+
+    def test_zero_field_size_is_plain_projected_score(self):
+        proj = np.array([100.0, 90.0])
+        own = np.array([120.0, 40.0])
+        np.testing.assert_allclose(compute_prj_own_ev(proj, own, 0.0), proj)
+
+    def test_calibration_anchor_10k_indifference(self):
+        """Calibration anchor: at ~10,000 entries a 95-point projection with
+        60 ownership must be worth the same as a 105-point projection with
+        90 ownership (10 projected points per 30 ownership points)."""
+        ev = compute_prj_own_ev(
+            np.array([95.0, 105.0]), np.array([60.0, 90.0]), field_size=10_000.0,
+        )
+        assert ev[0] == pytest.approx(ev[1])
+        assert ev[0] == pytest.approx(75.0)
+
+    def test_calibration_anchor_1k_is_ten_times_weaker(self):
+        """Second anchor: at 1,000 entries ownership carries a tenth of the
+        weight it does at 10,000 — which linear field-size scaling gives for
+        free, so both anchors are satisfied by the one own_scale constant."""
+        own = np.array([60.0, 90.0])
+        proj = np.zeros(2)
+        big = compute_prj_own_ev(proj, own, field_size=10_000.0)
+        small = compute_prj_own_ev(proj, own, field_size=1_000.0)
+        np.testing.assert_allclose(small, big / 10.0)
+
+    def test_own_scale_dials_the_tradeoff(self):
+        """Halving own_scale doubles the ownership penalty at a given field
+        size (it is the field size at which 1 ownership pt == 1 proj pt)."""
+        proj, own = np.array([100.0]), np.array([60.0])
+        base = compute_prj_own_ev(proj, own, 15_000.0, own_scale=30_000.0)
+        steep = compute_prj_own_ev(proj, own, 15_000.0, own_scale=15_000.0)
+        assert base[0] == pytest.approx(100.0 - 30.0)
+        assert steep[0] == pytest.approx(100.0 - 60.0)
 
 
 def test_pava_produces_monotone_nondecreasing_fit():
@@ -676,6 +1273,72 @@ class TestRiskSweepDifferentiation:
             f"risk=1 and risk=5 portfolios share {overlap}/150 lineups — "
             "the diversity term is not differentiating the risk sweep."
         )
+
+
+class TestPWinIntegrationWithRealSimMatrix:
+    """End-to-end p_win through allocate_contests against a REAL sim/corr
+    matrix (compute_pool_corr, not np.eye) — TestAllocation's p_win tests
+    all use identity correlation to isolate the EV branch; this is the one
+    that exercises the actual diversity term alongside it, closing the gap
+    noted in the plan (no existing test drove allocate_contests off a real
+    sim matrix at all, for any ev_type)."""
+
+    def test_full_pipeline_end_to_end(self):
+        sim_results, lineups, _roi = TestRiskSweepDifferentiation()._stacked_pool(
+            n_sims=4000, M=300, seed=11,
+        )
+        n_players = len(sim_results.player_ids)
+        pool_scores = compute_lineup_scores(lineups, sim_results)   # (M, n_sims)
+        corr = compute_pool_corr(lineups, sim_results, scores=pool_scores)
+
+        # Synthetic opponent field: random 10-player draws over the same
+        # player universe, scored the same way and transposed to the
+        # (n_sims, F) shape compute_p_win/score_field expect.
+        rng = np.random.default_rng(12)
+        field_lineups = [
+            Lineup(player_ids=[int(p) + 1 for p in
+                               rng.choice(n_players, size=10, replace=False)])
+            for _ in range(200)
+        ]
+        field_scores = compute_lineup_scores(field_lineups, sim_results).T  # (n_sims, F)
+
+        n_half = 2000
+        pool_A, pool_B = pool_scores[:, :n_half], pool_scores[:, n_half:]
+        field_A, field_B = field_scores[:n_half], field_scores[n_half:]
+        exponents = {"c0": 50.0}
+        p_win_cull = compute_p_win(pool_A, field_A, exponents)
+        p_win_select = compute_p_win(pool_B, field_B, exponents)
+
+        pool = ExternalPool(
+            lineups=lineups, contests={}, n_dropped_unknown_players=0,
+            n_dropped_duplicates=0, n_dropped_near_duplicates=0,
+            source_paths=[Path("synthetic.csv")],
+        )
+        k = 20
+        group = ContestGroup(
+            contest_id="c0", contest_name="synthetic", entry_fee_cents=400,
+            prize_pool_cents=1_000_000_00, single_entry_tag=False, roi_key="",
+            entries=[(Path("x/Entries.csv"), _rec("c0", "n", 400, f"e{i}")) for i in range(k)],
+        )
+        alloc = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=p_win_cull, p_win_select=p_win_select,
+            p_win_admit_n=100,
+        )
+        assert len(alloc.portfolio) == k
+        assert not alloc.unfilled
+        picked_ids = {id(lu) for lu, _ in alloc.portfolio}
+        assert len(picked_ids) == k  # shared-removal mask: no duplicate picks
+
+        # The top pick must be within the top-100-by-cull admitted set and
+        # must be the single highest p_win_select value among admissible
+        # candidates (k>1 so this is the selector's step-1 pure-EV argmax).
+        admitted = set(np.argsort(-p_win_cull["c0"])[:100])
+        idx_of = {id(lu): i for i, lu in enumerate(lineups)}
+        top_idx = idx_of[id(alloc.portfolio[0][0])]
+        assert top_idx in admitted
+        best_admitted = max(admitted, key=lambda i: p_win_select["c0"][i])
+        assert top_idx == best_admitted
 
 
 def test_parse_lineup_pool_roi_stddev(tmp_path):

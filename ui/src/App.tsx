@@ -39,7 +39,6 @@ interface State {
   unconfirmedPlayerIds: number[]
   notifications: TwitterNotification[]
   twitterLineups: TwitterLineupRecord[]
-  externalMode: boolean
 }
 
 type Action =
@@ -53,7 +52,6 @@ type Action =
   | { type: 'set_unconfirmed'; ids: number[] }
   | { type: 'set_notifications'; notifications: TwitterNotification[] }
   | { type: 'set_twitter_lineups'; lineups: TwitterLineupRecord[] }
-  | { type: 'set_external_mode'; external: boolean }
 
 function reducer(state: State, action: Action): State {
   switch (action.type) {
@@ -77,8 +75,6 @@ function reducer(state: State, action: Action): State {
       return { ...state, notifications: action.notifications }
     case 'set_twitter_lineups':
       return { ...state, twitterLineups: action.lineups }
-    case 'set_external_mode':
-      return { ...state, externalMode: action.external }
   }
 }
 
@@ -93,7 +89,6 @@ const initial: State = {
   unconfirmedPlayerIds: [],
   notifications: [],
   twitterLineups: [],
-  externalMode: false,
 }
 
 export default function App() {
@@ -201,7 +196,6 @@ export default function App() {
       .then(([portfolio, optimalLineups, sweepData]) => {
         const sweep: PortfolioSweepEntry[] = sweepData.sweep ?? []
         const activeRisk: number = sweepData.active_risk ?? 1
-        dispatch({ type: 'set_external_mode', external: sweepData.mode === 'external' })
         if (sweep.length > 0) {
           dispatch({ type: 'set_portfolio_sweep', sweep })
           const activeEntry = sweep.find(e => e.risk === activeRisk) ?? sweep[0]
@@ -313,7 +307,6 @@ export default function App() {
     for (const event of events) {
       if (event.stage === 'complete') {
         const ce = event as CompleteEvent
-        dispatch({ type: 'set_external_mode', external: !!(ce as unknown as { external?: boolean }).external })
         const sweep = ce.portfolio_sweep ?? []
         const defaultEntry = sweep.find(e => e.risk === 1) ?? sweep[0]
         // ce.portfolio is the canonical active portfolio: reordered by diversity and with entry meta.
@@ -644,7 +637,6 @@ export default function App() {
             platform={state.config?.platform}
             evwBase={state.config?.gpp.evw_base}
             evwMax={state.config?.gpp.evw_max}
-            externalMode={state.externalMode}
           />
         )}
         {replaceError && state.activeTab === 'portfolio' && (

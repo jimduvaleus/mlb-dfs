@@ -26,8 +26,12 @@ const STAGE_LABELS: Record<string, string> = {
   simulate: 'Simulate',
   ppd_applied: 'PPD applied',
   external_ppd_applied: 'PPD applied',
+  external_proj_score_floor: 'Proj-score floor',
   external_load: 'External pool files',
   external_pool: 'External pool',
+  external_pwin: 'P(win) scoring',
+  external_pwin_field: 'P(win) opponent field',
+  external_pwin_score: 'P(win) scoring',
   compute_target: 'Compute target',
   calibrate_beta: 'Calibrate beta',
   optimize_lineup: 'Optimize lineups',
@@ -101,7 +105,8 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_mv_select_progress' ||
       last?.stage === 'gpp_hybrid_select_progress' ||
       last?.stage === 'gpp_det_select_progress' ||
-      last?.stage === 'gpp_det_risk_start'
+      last?.stage === 'gpp_det_risk_start' ||
+      (typeof last?.stage === 'string' && last.stage.startsWith('external_'))
     if (!isLiveProgressEvent) return
 
     const ts = Date.now()
@@ -211,6 +216,25 @@ export function ProgressPanel({ events, running }: Props) {
     return { pct, isComplete, isActive }
   }) : []
 
+  // --- External pool: p_win field generation + scoring (runs before the
+  // Det-EV risk sweep, in this fixed order: field-gen A, field-gen B,
+  // score A, score B). `isGpp` only flips true once an actual gpp_* stage
+  // event fires (the risk sweep, later) — until then this is the one part
+  // of an external-pool run with genuine chunked progress data to build an
+  // ETA from, so it gets its own substep tracker mirroring the Det-EV
+  // current-step + avg-per-completed-step pattern above.
+  type PwinProgEvent = { phase: 'A' | 'B'; n_done: number; n_total: number; timestamp: number }
+  const pwinSubsteps = ([
+    ['external_pwin_field', 'A'], ['external_pwin_field', 'B'],
+    ['external_pwin_score', 'A'], ['external_pwin_score', 'B'],
+  ] as const).map(([stage, phase]) => ({
+    stage, phase,
+    evs: events.filter(e => e.stage === stage && (e as unknown as { phase?: string }).phase === phase) as unknown as PwinProgEvent[],
+  }))
+  const isExternalPwin = events.some(e => e.stage === 'external_pwin' || e.stage === 'external_pwin_field' || e.stage === 'external_pwin_score')
+  const pwinNonEmptyIdxs = pwinSubsteps.map((s, i) => (s.evs.length > 0 ? i : -1)).filter(i => i >= 0)
+  const pwinCurrentIdx = pwinNonEmptyIdxs.length ? pwinNonEmptyIdxs[pwinNonEmptyIdxs.length - 1] : -1
+
   let gppPct = 0
   let gppLabel = ''
   if (isGpp) {
@@ -289,7 +313,58 @@ export function ProgressPanel({ events, running }: Props) {
 
   // --- ETA ---
   let etaMs: number | null = null
-  if (isGpp) {
+  if (running && isExternalPwin && !isGpp && pwinCurrentIdx >= 0) {
+    // Current substep: remaining time from its own recent (done, total) rate.
+    let currentRemainingMs: number | null = null
+    const curEvs = pwinSubsteps[pwinCurrentIdx].evs
+    const curLatest = curEvs[curEvs.length - 1]
+    if (curLatest.n_done < curLatest.n_total) {
+      const recent = curEvs.slice(-4)
+      if (recent.length >= 2) {
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const recentDone = recent[recent.length - 1].n_done - recent[0].n_done
+        if (recentDone > 0) {
+          currentRemainingMs = (recentElapsed / recentDone) * (curLatest.n_total - curLatest.n_done)
+        }
+      }
+    } else {
+      currentRemainingMs = 0 // this substep finished; the next just hasn't emitted yet
+    }
+
+    // Average wall time per FULLY completed substep (every non-empty
+    // substep before the current one is complete by construction, since
+    // they run strictly in this fixed order) — same idea as the Det-EV
+    // avg-per-risk estimate above.
+    const completedDurations = pwinNonEmptyIdxs.slice(0, -1).map(i => {
+      const evs = pwinSubsteps[i].evs
+      return evs[evs.length - 1].timestamp - evs[0].timestamp
+    }).filter(d => d > 0)
+    let avgMsPerSubstep: number | null = completedDurations.length > 0
+      ? completedDurations.reduce((a, b) => a + b, 0) / completedDurations.length
+      : null
+    // No completed substep yet (still in the first one, field-gen A):
+    // estimate this substep's own total time from its rate and assume the
+    // rest take similarly — a rough first guess that firms up once a
+    // substep actually finishes.
+    if (avgMsPerSubstep === null && curLatest.n_done > 0) {
+      const recent = curEvs.slice(-4)
+      if (recent.length >= 2) {
+        const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const recentDone = recent[recent.length - 1].n_done - recent[0].n_done
+        if (recentDone > 0) avgMsPerSubstep = (recentElapsed / recentDone) * curLatest.n_total
+      }
+    }
+
+    const remainingSubsteps = pwinSubsteps.length - 1 - pwinCurrentIdx
+    if (currentRemainingMs !== null) {
+      // Without a completed-substep average yet, this understates the true
+      // total (silent on the still-unknown remaining substeps) rather than
+      // guessing — it firms up once the first substep finishes.
+      etaMs = avgMsPerSubstep !== null
+        ? currentRemainingMs + avgMsPerSubstep * remainingSubsteps
+        : currentRemainingMs
+    }
+  } else if (isGpp) {
     if (running && latestOptimalProgress && !optimalDone) {
       const elapsed = latestOptimalProgress.timestamp - optimalProgressEvents[0].timestamp
       const n = latestOptimalProgress.n
@@ -380,7 +455,12 @@ export function ProgressPanel({ events, running }: Props) {
     }
   }
 
-  const liveElapsedMs = running && first && (current > 0 || isGpp) ? now - first.timestamp : null
+  // isExternalRun covers the whole external-pool lifecycle (file discovery,
+  // sim, p_win field/scoring, the risk sweep) so elapsed ticks from the
+  // start of the run rather than only once isGpp flips true partway
+  // through (which for external mode doesn't happen until the risk sweep).
+  const isExternalRun = events.some(e => typeof e.stage === 'string' && e.stage.startsWith('external_'))
+  const liveElapsedMs = running && first && (current > 0 || isGpp || isExternalRun) ? now - first.timestamp : null
 
   return (
     <div className="progress-panel">
@@ -574,6 +654,11 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
   for (const e of events) {
     if (e.stage === 'optimize_lineup' || e.stage === 'upload_files') continue
     if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress' || e.stage === 'gpp_rescore_field_progress') continue
+    // Per-chunk p_win progress (many events per stage, A and B) — no live
+    // counter surface exists for it yet, same treatment as the gpp_*
+    // _progress events above; the one-shot 'external_pwin' summary row
+    // below is what's shown.
+    if (e.stage === 'external_pwin_field' || e.stage === 'external_pwin_score') continue
     // Skip start event once done event is present (collapse into one row)
     if (e.stage === 'gpp_optimal_start' && hasEvent('gpp_optimal_done')) continue
     if (e.stage === 'gpp_sim_optimal_start' && hasEvent('gpp_sim_optimal_done')) continue
@@ -647,6 +732,19 @@ function renderDetail(e: SSEEvent): string {
         ? `, ${ev.n_dropped_unknown.toLocaleString()} unknown-player row${ev.n_dropped_unknown !== 1 ? 's' : ''} dropped`
         : ''
       return `${ev.n_lineups.toLocaleString()} lineups imported${fileNote}${dupNote}${nearDupNote}${unkNote} · ${ev.n_contests_covered} contest${ev.n_contests_covered !== 1 ? 's' : ''} covered`
+    }
+    case 'external_proj_score_floor': {
+      const ev = e as unknown as { cutoff: number; n_culled: number; percentile: number; pool_size: number }
+      return `Bottom ${ev.percentile}% culled — ${ev.n_culled.toLocaleString()} of ${ev.pool_size.toLocaleString()} lineups below ${ev.cutoff.toFixed(1)} projected points`
+    }
+    case 'external_pwin': {
+      const ev = e as unknown as {
+        n_sims_per_stage: number; field_size: number; n_contests: number;
+        admit_n: number; sharpness: number;
+      }
+      const admitNote = ev.admit_n > 0 ? `, stage-A admit ${ev.admit_n.toLocaleString()}` : ''
+      return `${ev.n_sims_per_stage.toLocaleString()} sims/stage vs a ${ev.field_size.toLocaleString()}-lineup simulated field ` +
+        `· ${ev.n_contests} contest${ev.n_contests !== 1 ? 's' : ''} · sharpness ${ev.sharpness}${admitNote}`
     }
     case 'ppd_applied':
     case 'external_ppd_applied': {

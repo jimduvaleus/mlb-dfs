@@ -388,6 +388,117 @@ def run_roi_sweep(
         print(f"Sweep written -> {sweep_path}")
 
 
+def _selection_metrics(label: str, picks: pd.DataFrame) -> dict:
+    """Realized outcome of one selected set of lineups. `max_pct` is the
+    headline GPP number — a GPP portfolio's value is dominated by its single
+    best entry, not the average — with mean_pct/hit95/hit99/cash as the
+    supporting distribution."""
+    scored = picks.dropna(subset=["real_percentile"])
+    if scored.empty:
+        return {"rule": label, "n": len(picks), "n_scored": 0}
+    pct = scored["real_percentile"]
+    return {
+        "rule": label,
+        "n": len(picks),
+        "n_scored": len(scored),
+        "max_pct": float(pct.max()),
+        "mean_pct": float(pct.mean()),
+        "hit95": float((pct >= 0.95).mean()),
+        "hit99": float((pct >= 0.99).mean()),
+        "cash": float(scored["would_cash"].mean()),
+        "best_actual": float(scored["actual_score"].max()),
+        "mean_proj": float(picks["proj_score"].mean()),
+        "mean_own": float(picks["ownership"].mean()),
+    }
+
+
+def run_own_scale_sweep(
+    archive_dirs: list[Path], contest_query: str | None, grid: list[float], n_entries: int,
+    proj_score_pct: float, cash_threshold: float, top_percentile: float,
+) -> None:
+    """Sweep the prj_own EV currency's `own_scale` calibration constant
+    (gpp.external_pool_own_scale, see compute_prj_own_ev in
+    src/api/external_pool.py) against what actually happened.
+
+    Per slate: apply production's pool-wide projected-score cull, rank the
+    survivors by `proj_score - ownership * (n_field / own_scale)` using the
+    *archived contest's real entry count* as the field size, take the top
+    `n_entries`, and grade them against the real standings. Reference rows
+    rank the same culled pool by projected score alone (own_scale -> inf)
+    and by the export's own SaberSim ROI column.
+
+    Caveat, stated rather than corrected: this grades the EV *ranking*, not
+    a finished portfolio — the live selector's diversity/hedge terms spread
+    the picks apart, so a straight top-N is more concentrated (and its
+    max_pct correspondingly more pessimistic) than what actually ships.
+    own_scale doesn't touch those terms, so the comparison across the grid
+    is still like-for-like; the absolute levels are not."""
+    all_rows: list[dict] = []
+    for d in archive_dirs:
+        try:
+            found = discover_external_files(str(d))
+            if not found["lineups_paths"]:
+                raise FileNotFoundError(f"no lineups_*.csv in {d}")
+            lineup_df, contest_blocks, _, _ = load_external_lineups(found["lineups_paths"])
+            fpts_map = load_contest_player_fpts(d)
+            field_points = load_real_field_points(d)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Skipping {d.name}: {exc}")
+            continue
+        try:
+            contest_norm = resolve_contest(contest_blocks, contest_query)
+        except ValueError as exc:
+            print(f"{d.name}: {exc}")
+            continue
+
+        n_field = len(field_points)
+        lineup_df = add_actual_score(lineup_df, fpts_map)
+        lineup_df = add_real_percentile(lineup_df, field_points, cash_threshold, top_percentile)
+
+        cutoff = float(np.percentile(lineup_df["proj_score"].dropna(), proj_score_pct))
+        pool = lineup_df[lineup_df["proj_score"] >= cutoff].copy()
+        n = min(n_entries, len(pool))
+
+        rows = [
+            _selection_metrics("pool (all)", pool),
+            _selection_metrics("proj only", pool.nlargest(n, "proj_score")),
+            _selection_metrics("saber ROI", pool.nlargest(n, f"roi__{contest_norm}")),
+        ]
+        for own_scale in grid:
+            k = n_field / own_scale
+            ev = pool["proj_score"] - k * pool["ownership"]
+            picks = pool.loc[ev.nlargest(n).index]
+            row = _selection_metrics(f"own_scale {own_scale:,.0f}", picks)
+            row["k"] = k
+            rows.append(row)
+
+        table = pd.DataFrame(rows)
+        print(
+            f"\n=== {d.name} ===  n_field={n_field:,}  pool={len(pool):,} of {len(lineup_df):,} "
+            f"(proj cull {proj_score_pct:.0f}% -> {cutoff:.1f} pts)  top-N={n}  "
+            f"contest={contest_blocks[contest_norm]['raw_name']!r}"
+        )
+        print(table.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+        for r in rows:
+            all_rows.append({"slate": d.name, "n_field": n_field, **r})
+
+    if not all_rows:
+        print("No slates with both a lineups_*.csv export and contest_player_fpts.json found.")
+        return
+
+    agg = pd.DataFrame(all_rows)
+    n_slates = agg["slate"].nunique()
+    if n_slates > 1:
+        print(f"\n=== Pooled across {n_slates} slates (mean per rule) ===")
+        cols = ["max_pct", "mean_pct", "hit95", "hit99", "cash", "mean_proj", "mean_own"]
+        pooled = agg.groupby("rule", sort=False)[cols].mean()
+        pooled["n_slates"] = agg.groupby("rule", sort=False)["slate"].nunique()
+        print(pooled.to_string(float_format=lambda x: f"{x:.3f}"))
+    out = PROJECT_ROOT / "archive" / "external_own_scale_sweep.csv"
+    agg.to_csv(out, index=False)
+    print(f"\nSweep written -> {out}")
+
+
 def compute_slate_metrics(lineup_df: pd.DataFrame, contest_norm: str) -> dict:
     roi_col = f"roi__{contest_norm}"
     complete = lineup_df.dropna(subset=["actual_score"])
@@ -596,6 +707,31 @@ def main() -> None:
         help="Increment between --sweep grid points, in ROI percentage points (default: 10.0).",
     )
     parser.add_argument(
+        "--own-sweep", action="store_true",
+        help="Instead of the standard report, sweep the prj_own EV currency's own_scale "
+             "calibration constant (gpp.external_pool_own_scale): rank the projection-culled "
+             "pool by proj_score - ownership*(n_field/own_scale) at each grid point, take the "
+             "top --n-entries, and grade them against the real standings. Reference rows use "
+             "projected score alone and the export's SaberSim ROI. Writes "
+             "archive/external_own_scale_sweep.csv.",
+    )
+    parser.add_argument(
+        "--own-scale-grid", type=str, default="10000,15000,20000,30000,45000,60000,100000",
+        metavar="CSV",
+        help="Comma-separated own_scale values for --own-sweep (default: "
+             "10000,15000,20000,30000,45000,60000,100000). Higher = more projection-driven.",
+    )
+    parser.add_argument(
+        "--n-entries", type=int, default=20, metavar="N",
+        help="How many lineups each --own-sweep rule selects, i.e. the entry count the "
+             "calibration is judged at (default: 20).",
+    )
+    parser.add_argument(
+        "--proj-score-pct", type=float, default=25.0, metavar="PCT",
+        help="Pool-wide projected-score percentile cull applied before the --own-sweep ranking, "
+             "matching gpp.external_pool_proj_score_pct (default: 25.0).",
+    )
+    parser.add_argument(
         "--cash-threshold", type=float, default=None, metavar="FRACTION",
         help="Fraction of the real field a lineup must beat to count as an approximate cash "
              "(default: derived from data/payout_structures/dk_classic_gpp.json, falls back to 0.74).",
@@ -609,8 +745,8 @@ def main() -> None:
 
     if args.recent and args.archive_dirs:
         parser.error("--recent and positional ARCHIVE_DIR arguments are mutually exclusive.")
-    if args.top and args.sweep:
-        parser.error("--top and --sweep are mutually exclusive.")
+    if sum(bool(x) for x in (args.top, args.sweep, args.own_sweep)) > 1:
+        parser.error("--top, --sweep and --own-sweep are mutually exclusive.")
 
     if args.recent:
         dirs = _find_recent_external_slates(args.recent)
@@ -647,6 +783,13 @@ def main() -> None:
     cash_threshold = args.cash_threshold if args.cash_threshold is not None else default_cash_threshold()
     if args.top:
         run_top_candidates(dirs, top_n=args.top, contest_query=args.contest)
+    elif args.own_sweep:
+        grid = [float(v) for v in args.own_scale_grid.split(",") if v.strip()]
+        run_own_scale_sweep(
+            dirs, contest_query=args.contest, grid=grid, n_entries=args.n_entries,
+            proj_score_pct=args.proj_score_pct, cash_threshold=cash_threshold,
+            top_percentile=args.top_percentile,
+        )
     elif args.sweep:
         run_roi_sweep(
             dirs, contest_query=args.contest, start=args.roi_floor, end=args.sweep_end,

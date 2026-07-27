@@ -92,6 +92,12 @@ gpp:
   dupe_salary_coef: 0.095
   dupe_stack_coef: -0.102
   dupe_min_gross_payout: 15.0
+  external_pool_ev_type: roi        # roi | prj_own | p_win
+  external_pool_own_scale: 30000.0  # prj_own: field size where 1 ownership pt == 1 proj pt
+  external_pool_pwin_sharpness: 1.0 # p_win: exponent multiplier on implied entries (1.0 = literal P(win))
+  external_pool_pwin_admit_n: 2000  # p_win: stage-A cull size per contest (0 disables the two-stage guard)
+  external_pool_pwin_field_size: 0  # p_win: simulated opponent field size (0 = auto via pwin_field_size)
   external_pool_roi_floor_pct: 40.0
+  external_pool_proj_score_pct: 0.0
   external_pool_ceiling_weight: 0.25
   external_pool_cash_anchor_fraction: 0.25

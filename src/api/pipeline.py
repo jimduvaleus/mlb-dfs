@@ -586,6 +586,15 @@ class PipelineRunner:
 
         # Store simulation artifacts for post-run operations (lineup replacement).
         self._sim_results = sim_results
+        # player_id -> ownership in percentage points, for the portfolio
+        # readout. Both internal branches above produce a fraction (the
+        # heuristic model normalizes each position to its slot count, so the
+        # slate sums to 10; the SaberSim path divides "Adj Own" by 100), so
+        # both scale up by 100 here — see _serialize_portfolio.
+        self._ownership_pct = {
+            int(pid): float(o) * 100.0
+            for pid, o in zip(cand_players_df["player_id"], ownership_vector)
+        }
         self._players_df = cand_players_df
 
         # --- Construct portfolio ----------------------------------------
@@ -1976,7 +1985,8 @@ class PipelineRunner:
                             {
                                 "risk": r,
                                 "lineups": self._serialize_portfolio(
-                                    p, players_df, mean_ev_from_score=True
+                                    p, players_df, mean_ev_from_score=True,
+                                    ownership_by_id=getattr(self, "_ownership_pct", None),
                                 ),
                             }
                             for r, p in _portfolio_sweep_raw
@@ -2213,7 +2223,10 @@ class PipelineRunner:
         self._platform = platform
 
         # --- Serialize --------------------------------------------------
-        result = self._serialize_portfolio(portfolio, players_df, mean_ev_from_score=_portfolio_has_dollar_ev)
+        result = self._serialize_portfolio(
+            portfolio, players_df, mean_ev_from_score=_portfolio_has_dollar_ev,
+            ownership_by_id=getattr(self, "_ownership_pct", None),
+        )
 
         was_stopped = self._stop_check is not None and self._stop_check()
 
@@ -2245,7 +2258,8 @@ class PipelineRunner:
         # --- Notify (after entry augmentation so SSE payload is complete) -
         _optimal_result = (
             self._serialize_portfolio(
-                [(lu, 0.0) for lu in self._optimal_lineups], players_df
+                [(lu, 0.0) for lu in self._optimal_lineups], players_df,
+                ownership_by_id=getattr(self, "_ownership_pct", None),
             )
             if getattr(self, "_optimal_lineups", None)
             else []
@@ -2266,7 +2280,10 @@ class PipelineRunner:
             _stopped_sweep_payload = [
                 {
                     "risk": r,
-                    "lineups": self._serialize_portfolio(p, players_df, mean_ev_from_score=True),
+                    "lineups": self._serialize_portfolio(
+                        p, players_df, mean_ev_from_score=True,
+                        ownership_by_id=getattr(self, "_ownership_pct", None),
+                    ),
                 }
                 for r, p in _portfolio_sweep_raw
             ] if _portfolio_sweep_raw else []
@@ -2280,7 +2297,10 @@ class PipelineRunner:
             _sweep_payload = [
                 {
                     "risk": r,
-                    "lineups": self._serialize_portfolio(p, players_df, mean_ev_from_score=True),
+                    "lineups": self._serialize_portfolio(
+                        p, players_df, mean_ev_from_score=True,
+                        ownership_by_id=getattr(self, "_ownership_pct", None),
+                    ),
                 }
                 for r, p in _portfolio_sweep_raw
             ] if _portfolio_sweep_raw else []
@@ -2390,21 +2410,82 @@ class PipelineRunner:
             copula, players_df, batter_pca_model=None, score_grid=None,
             quantile_grids=grids,
         )
-        sim_results = engine.simulate(n_sims)
-        corr = ep.compute_pool_corr(pool.lineups, sim_results)
+        sim_results = None
+        if self._sim_cache_path and os.path.exists(self._sim_cache_path):
+            try:
+                with np.load(self._sim_cache_path) as _sim_npz:
+                    sim_results = SimulationResults(
+                        [int(p) for p in _sim_npz["player_ids"]],
+                        _sim_npz["results_matrix"].astype(np.float64),
+                    )
+                logger.info("External pool: simulation loaded from cache %s", self._sim_cache_path)
+            except Exception as exc:
+                logger.warning(
+                    "External pool: sim cache %s unreadable (%s) — re-simulating.",
+                    self._sim_cache_path, exc,
+                )
+                sim_results = None
+        if sim_results is None:
+            sim_results = engine.simulate(n_sims)
+            if self._sim_cache_path:
+                os.makedirs(os.path.dirname(self._sim_cache_path), exist_ok=True)
+                np.savez_compressed(
+                    self._sim_cache_path,
+                    player_ids=np.asarray(sim_results.player_ids, dtype=np.int64),
+                    results_matrix=sim_results.results_matrix.astype(np.float32),
+                )
+                logger.info("External pool: simulation saved to cache %s", self._sim_cache_path)
+        lineup_scores = ep.compute_lineup_scores(pool.lineups, sim_results)
+        corr = ep.compute_pool_corr(pool.lineups, sim_results, scores=lineup_scores)
+        proj_scores = ep.compute_pool_proj_scores(pool.lineups, players_df)
+        own_scores = ep.compute_pool_ownership(pool.lineups, players_df)
+        # Already percentage points here ("My Own" is not divided by 100 in
+        # parse_player_projections), unlike the internal pipeline's fractions.
+        self._ownership_pct = {
+            int(pid): float(o)
+            for pid, o in zip(players_df["player_id"], players_df["ownership"])
+        }
+        _ev_type = str(gpp_cfg.get("external_pool_ev_type", "roi")).strip().lower()
+        if _ev_type not in ("roi", "prj_own", "p_win"):
+            logger.warning(
+                "External pool: unknown external_pool_ev_type %r — falling back to 'roi'.",
+                _ev_type,
+            )
+            _ev_type = "roi"
+        _own_scale = float(gpp_cfg.get("external_pool_own_scale", 30_000.0)) or 30_000.0
+        _proj_score_floor_pct = float(gpp_cfg.get("external_pool_proj_score_pct", 0.0))
+        _proj_floor = ep.compute_proj_score_floor(proj_scores, _proj_score_floor_pct)
+        if _proj_floor is not None:
+            _proj_cutoff, _proj_n_culled = _proj_floor
+            self._cb("external_proj_score_floor", {
+                "cutoff": _proj_cutoff,
+                "n_culled": _proj_n_culled,
+                "percentile": _proj_score_floor_pct,
+                "pool_size": len(pool.lineups),
+            })
 
         # --- PPD risk: haircut ROI/ROI StdDev for lineups exposed to an
         # at-risk game, using the same per-game zeroing the internal pipeline
-        # uses (see _apply_ppd_to_simulation / compute_ppd_roi_adjustment) ---
+        # uses (see _apply_ppd_to_simulation / compute_ppd_roi_adjustment).
+        # The PPD-zeroed sim also becomes the p_win EV currency's world
+        # matrix below (sim_results_pwin/lineup_scores_pwin) — p_win's mean
+        # over worlds needs the same independent per-world zeroing as ROI,
+        # or it silently assumes 0% PPD regardless of the slate panel's
+        # setting. Diversity corr and prj_own stay on the raw (no-PPD) sim,
+        # matching the ROI path (only the EV currency itself is haircut) ---
         current_games = [g for g in players_df["game"].dropna().unique().tolist() if g]
         stored_excl = read_exclusions(compute_slate_id(current_games), _slate_fp) if current_games else {}
         game_ppd_pcts = {k: v for k, v in stored_excl.get("game_ppd_pcts", {}).items() if v and v > 0}
+        sim_results_pwin = sim_results
+        lineup_scores_pwin = lineup_scores
         if game_ppd_pcts:
             sim_results_ppd, ppd_stats = self._apply_ppd_to_simulation(
                 sim_results, players_df, game_ppd_pcts,
                 rng_seed=int(gpp_cfg.get("rng_seed") or 42),
             )
             ep.compute_ppd_roi_adjustment(pool, sim_results, sim_results_ppd)
+            sim_results_pwin = sim_results_ppd
+            lineup_scores_pwin = ep.compute_lineup_scores(pool.lineups, sim_results_ppd)
             self._cb("external_ppd_applied", {
                 "games": [
                     {"game": g, "ppd_pct": s["ppd_pct"], "n_sims_zeroed": s["n_sims_zeroed"]}
@@ -2433,17 +2514,111 @@ class PipelineRunner:
                     "n_entries": len(g.entries),
                     "roi_source": pool.contests[g.roi_key].raw_name,
                     "fallback": g.roi_fallback,
+                    "field_size": ep.implied_field_size(g),
                 }
                 for g in groups
             ],
             "total_entries": total_entries,
             "pool_size": len(pool.lineups),
+            "ev_type": _ev_type,
         })
         if total_entries > len(pool.lineups):
             logger.warning(
                 "External pool: %d entries but only %d lineups — later "
                 "contests will be left unfilled.", total_entries, len(pool.lineups),
             )
+
+        # --- p_win EV currency: simulated P(win) against an ownership-
+        # sampled opponent field, two-stage to guard the winner's curse ----
+        # Risk-invariant (like corr/proj_floor above), so computed once and
+        # handed to every allocate_contests call in the sweep below.
+        _p_win_cull = None
+        _p_win_select = None
+        _p_win_admit_n = int(gpp_cfg.get("external_pool_pwin_admit_n", 2000))
+        if _ev_type == "p_win":
+            try:
+                from src.optimization.contest import ContestSimulator
+
+                _sharpness = float(gpp_cfg.get("external_pool_pwin_sharpness", 1.0))
+                _field_size_cfg = int(gpp_cfg.get("external_pool_pwin_field_size", 0))
+                _field_n = _field_size_cfg if _field_size_cfg > 0 else ep.pwin_field_size(
+                    groups, floor=int(gpp_cfg.get("n_field_lineups", 5_000)),
+                )
+                _own_vec = players_df["ownership"].astype(float).to_numpy()
+                _col_map = {int(p): i for i, p in enumerate(sim_results_pwin.player_ids)}
+                _n_half = n_sims // 2
+                if _n_half < 500:
+                    raise ValueError(
+                        f"p_win needs a disjoint A/B sim split (>=500 sims each); "
+                        f"n_sims={n_sims} is too small."
+                    )
+                # PPD-zeroed matrix/scores (sim_results_pwin/lineup_scores_pwin)
+                # when game_ppd_pcts is set, so an at-risk game's players are
+                # independently zeroed in the same fraction of worlds for both
+                # the pool's candidate lineups and the sampled opponent field
+                # (field lineups draw from the same player columns) — the
+                # per-world mean P(win) then reflects the configured PPD risk
+                # instead of assuming 0% PPD.
+                _sims_A = sim_results_pwin.results_matrix[:_n_half]
+                _sims_B = sim_results_pwin.results_matrix[_n_half:2 * _n_half]
+                _scores_A = lineup_scores_pwin[:, :_n_half]
+                _scores_B = lineup_scores_pwin[:, _n_half:2 * _n_half]
+
+                _cs = ContestSimulator()
+                _rng_seed = int(gpp_cfg.get("rng_seed") or 42)
+                _field_A = _cs.generate_field(
+                    players_df, _own_vec, n_lineups=_field_n, rng_seed=_rng_seed,
+                    progress_cb=lambda done, total: self._cb(
+                        "external_pwin_field", {"phase": "A", "n_done": done, "n_total": total},
+                    ),
+                )
+                _field_B = _cs.generate_field(
+                    players_df, _own_vec, n_lineups=_field_n, rng_seed=_rng_seed + 1,
+                    progress_cb=lambda done, total: self._cb(
+                        "external_pwin_field", {"phase": "B", "n_done": done, "n_total": total},
+                    ),
+                )
+                _min_field = max(100, _field_n // 10)
+                if len(_field_A) < _min_field or len(_field_B) < _min_field:
+                    raise ValueError(
+                        f"field generation produced only {len(_field_A)}/{len(_field_B)} "
+                        f"lineups (wanted {_field_n})"
+                    )
+
+                _field_scores_A = _cs.score_field(_field_A, _sims_A, _col_map)
+                _field_scores_B = _cs.score_field(_field_B, _sims_B, _col_map)
+                _sizes = ep.pwin_implied_entries(groups)
+                _exponents = {cid: max(1.0, _sharpness * sz) for cid, sz in _sizes.items()}
+
+                self._cb("external_pwin", {
+                    "n_sims_per_stage": _n_half, "field_size": _field_n,
+                    "n_contests": len(_exponents), "admit_n": _p_win_admit_n,
+                    "sharpness": _sharpness,
+                })
+                _p_win_cull = ep.compute_p_win(
+                    _scores_A, _field_scores_A, _exponents,
+                    stop_check=self._stop_check,
+                    progress_cb=lambda done, total: self._cb(
+                        "external_pwin_score", {"phase": "A", "n_done": done, "n_total": total},
+                    ),
+                )
+                _p_win_select = ep.compute_p_win(
+                    _scores_B, _field_scores_B, _exponents,
+                    stop_check=self._stop_check,
+                    progress_cb=lambda done, total: self._cb(
+                        "external_pwin_score", {"phase": "B", "n_done": done, "n_total": total},
+                    ),
+                )
+                # compute_p_win is keyed by whatever `_exponents` is keyed
+                # by — contest_id here — so both dicts already match the
+                # {contest_id: (M,) array} shape allocate_contests expects.
+            except Exception as _pe:
+                logger.warning(
+                    "External pool: p_win scoring failed (%s) — falling back to prj_own.", _pe,
+                )
+                _ev_type = "prj_own"
+                _p_win_cull = None
+                _p_win_select = None
 
         # --- 5-risk sweep: independent per-contest allocations -------------
         _evw_base = float(gpp_cfg.get("evw_base", 0.10))
@@ -2463,6 +2638,14 @@ class PipelineRunner:
                 pool, corr, groups, risk=_risk,
                 evw_base=_evw_base, evw_max=_evw_max,
                 roi_floor_percentile=_roi_floor_pct,
+                proj_scores=proj_scores,
+                proj_score_floor_percentile=_proj_score_floor_pct,
+                ev_type=_ev_type,
+                own_scores=own_scores,
+                own_scale=_own_scale,
+                p_win_cull=_p_win_cull,
+                p_win_select=_p_win_select,
+                p_win_admit_n=_p_win_admit_n,
                 ceiling_weight=_ceiling_weight,
                 cash_anchor_fraction=_cash_anchor,
                 stop_check=self._stop_check,
@@ -2511,7 +2694,10 @@ class PipelineRunner:
         self._sim_results = None  # replace_lineup is unsupported in this mode
 
         entry_map = self._build_external_entry_map()
-        result = self._serialize_portfolio(portfolio, players_df, mean_ev_from_score=True)
+        result = self._serialize_portfolio(
+            portfolio, players_df, mean_ev_from_score=True,
+            ownership_by_id=getattr(self, "_ownership_pct", None),
+        )
         for lr in result:
             info = entry_map.get(lr["lineup_index"])
             if info:
@@ -2525,7 +2711,10 @@ class PipelineRunner:
 
         _sweep_payload = []
         for r, p in _portfolio_sweep_raw:
-            lineups = self._serialize_portfolio(p, players_df, mean_ev_from_score=True)
+            lineups = self._serialize_portfolio(
+                p, players_df, mean_ev_from_score=True,
+                ownership_by_id=getattr(self, "_ownership_pct", None),
+            )
             for lr in lineups:
                 info = entry_map.get(lr["lineup_index"])
                 if info:
@@ -2538,6 +2727,7 @@ class PipelineRunner:
                     "slate_fingerprint": _slate_fp or "",
                     "active_risk": _first_risk,
                     "mode": "external",
+                    "ev_type": _ev_type,
                     "sweep": _sweep_payload,
                 }, _f)
         except Exception as _e:
@@ -2561,6 +2751,7 @@ class PipelineRunner:
             "optimal_lineups": [],
             "portfolio_sweep": _sweep_payload,
             "external": True,
+            "ev_type": _ev_type,
         })
         return result
 
@@ -2613,7 +2804,10 @@ class PipelineRunner:
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Activated risk=%.0f portfolio; saved to %s", risk, output_path)
 
-        result = self._serialize_portfolio(portfolio, self._players_df, mean_ev_from_score=True)
+        result = self._serialize_portfolio(
+            portfolio, self._players_df, mean_ev_from_score=True,
+            ownership_by_id=getattr(self, "_ownership_pct", None),
+        )
 
         if self._all_file_entries:
             self.write_upload_files()
@@ -2751,7 +2945,10 @@ class PipelineRunner:
         _has_ev = getattr(self, "_portfolio_has_dollar_ev", False)
         _fees_re = PipelineRunner._extract_sorted_fees(self._all_file_entries)
         self._raw_portfolio = PipelineRunner._reorder_by_diversity(remaining + [(new_lineup, full_score)], _fees_re)
-        result = self._serialize_portfolio(self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev)
+        result = self._serialize_portfolio(
+            self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev,
+            ownership_by_id=getattr(self, "_ownership_pct", None),
+        )
 
         os.makedirs(self._output_dir, exist_ok=True)
         portfolio_df = self._format_portfolio_df(self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev)
@@ -3392,7 +3589,14 @@ class PipelineRunner:
         portfolio: list,
         players_df: pd.DataFrame,
         mean_ev_from_score: bool = False,
+        ownership_by_id: Optional[dict] = None,
     ) -> list[dict]:
+        """`ownership_by_id` maps player_id -> projected ownership in
+        *percentage points*. The two pipelines carry ownership on different
+        scales — the internal one as a fraction summing to 10 across the
+        slate (compute_heuristic_ownership, and the SaberSim "Adj Own"/100
+        path), external mode as raw "My Own" percentage points — so callers
+        normalize rather than having this guess from magnitudes."""
         from src.optimization.optimizer import _build_player_meta
         id_to_name = dict(zip(players_df["player_id"], players_df.get("name", players_df["player_id"])))
         id_to_salary = dict(zip(players_df["player_id"], players_df["salary"]))
@@ -3423,17 +3627,29 @@ class PipelineRunner:
                     "team": id_to_team.get(pid, ""),
                     "salary": id_to_salary.get(pid, 0),
                     "mean": float(id_to_mean[pid]) if pid in id_to_mean else None,
+                    "ownership": (
+                        float(ownership_by_id[pid])
+                        if ownership_by_id is not None and pid in ownership_by_id
+                        else None
+                    ),
                     "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
                     "slot_confirmed": bool(id_to_confirmed[pid]) if pid in id_to_confirmed else False,
                 }
                 for pid in ordered_ids
             ]
             mean_ev: Optional[float] = round(float(score), 4) if mean_ev_from_score else None
+            _means = [p["mean"] for p in players if p["mean"] is not None]
+            _owns = [p["ownership"] for p in players if p["ownership"] is not None]
             result.append({
                 "lineup_index": i,
                 "p_hit_target": round(score, 4),
                 "lineup_salary": total_salary,
                 "mean_ev": mean_ev,
+                # Lineup totals, summed here rather than in the UI so a
+                # player missing a projection/ownership can't silently read
+                # as a zero contribution.
+                "lineup_mean": round(sum(_means), 2) if len(_means) == len(players) else None,
+                "lineup_ownership": round(sum(_owns), 1) if len(_owns) == len(players) else None,
                 "players": players,
             })
         return result

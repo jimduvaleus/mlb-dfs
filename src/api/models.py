@@ -141,12 +141,59 @@ class GppConfig(BaseModel):
     dupe_salary_coef: float = 0.089
     dupe_stack_coef: float = 0.024
     dupe_min_gross_payout: float = 15.0
+    # External pool mode: which EV currency the greedy selector ranks on.
+    #   "roi"     — the contest's SaberSim-simulated ROI column (default).
+    #   "prj_own" — our own projected score minus projected ownership, the
+    #               ownership penalty scaled by the contest's implied field
+    #               size (prize pool / entry fee):
+    #                   EV = proj_score - proj_ownership * (field_size / own_scale)
+    #               See compute_prj_own_ev in src/api/external_pool.py.
+    #   "p_win"   — simulated P(win): mean_over_worlds(percentile ** n)
+    #               against an ownership-sampled opponent field, n = sharpness
+    #               * implied field size. See compute_p_win in
+    #               src/api/external_pool.py. Falls back to "prj_own" at
+    #               runtime if field/sim generation fails.
+    # Under "prj_own"/"p_win" Saber's ROI is not consulted at all, so
+    # external_pool_roi_floor_pct, external_pool_ceiling_weight and
+    # external_pool_cash_anchor_fraction are all inert; the pool-wide
+    # external_pool_proj_score_pct cull still applies.
+    external_pool_ev_type: str = "roi"
+    # prj_own calibration constant: the field size at which one point of
+    # summed lineup ownership costs one projected point. Calibrated
+    # 2026-07-27 to 30,000 from two indifference anchors — at ~10,000
+    # entries (proj 95, own 60) ties (proj 105, own 90), i.e. 10 projected
+    # points per 30 ownership points; and 1,000 entries weighs ownership 10x
+    # less, which the linear field-size scaling gives for free. Lower it to
+    # make every contest more leverage-driven, raise it for more
+    # projection-driven. See compute_prj_own_ev in external_pool.py.
+    external_pool_own_scale: float = 30_000.0
+    # p_win exponent multiplier: n = sharpness * implied_field_size. 1.0 is
+    # literal P(win); lower values soften toward P(top X%), which has more
+    # effective events per lineup at a fixed sim budget. See compute_p_win.
+    external_pool_pwin_sharpness: float = 1.0
+    # p_win two-stage winner's-curse guard: each contest's post-floor pool
+    # is culled to the top N by a p_win estimate on one sim/field draw
+    # BEFORE a second, independent draw ranks the survivors — a lineup that
+    # only looks good on the draw used to pick it can't reach the draw used
+    # to rank it (mirrors the internal pipeline's fresh-rescore pattern).
+    # <= 0 disables the cull (rank the whole pool on the second draw alone).
+    external_pool_pwin_admit_n: int = 2000
+    # p_win simulated opponent field size. 0 = auto (ep.pwin_field_size:
+    # grows gpp.n_field_lineups to the largest contest's implied entry
+    # count, capped for memory).
+    external_pool_pwin_field_size: int = 0
     # External pool mode: per-contest ROI percentile floor for the pre-Det
     # cull (see allocate_contests in src/api/external_pool.py). A raw ROI
     # cutoff doesn't generalize across contests of different sizes/payout
     # structures, so the floor is expressed as "cull the bottom N% of this
     # contest's own ROI distribution" — computed independently per contest.
     external_pool_roi_floor_pct: float = 40.0
+    # Pool-wide floor (distinct from the per-contest ROI floor above): culls
+    # the bottom N% of *projected score* (sum of each lineup's rostered
+    # players' projected mean) once across the entire pool, before any
+    # per-contest allocation runs — see compute_pool_proj_scores /
+    # allocate_contests in external_pool.py. 0 disables the cull.
+    external_pool_proj_score_pct: float = 0.0
     # Ceiling lean: ranks the post-floor pool by roi + weight * (residualized,
     # normalized ROI StDev) instead of plain roi (see compute_ceiling_ev in
     # external_pool.py) — no-ops when the export has no ROI StDev column.
@@ -176,6 +223,9 @@ class PlayerRow(BaseModel):
     team: str
     salary: int
     mean: Optional[float] = None
+    # Projected ownership in percentage points (see _serialize_portfolio,
+    # which normalizes the internal pipeline's fraction convention).
+    ownership: Optional[float] = None
 
 
 class LineupResult(BaseModel):
@@ -183,6 +233,10 @@ class LineupResult(BaseModel):
     p_hit_target: float
     lineup_salary: int
     mean_ev: Optional[float] = None
+    # Lineup totals: summed projected score, and summed ownership in
+    # percentage points. None when any rostered player lacks the input.
+    lineup_mean: Optional[float] = None
+    lineup_ownership: Optional[float] = None
     players: list[PlayerRow]
     upload_tag: Optional[str] = None
     entry_fee: Optional[str] = None

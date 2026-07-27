@@ -270,6 +270,44 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                   disabled={disabled} />
               </FieldRow>
             )}
+            <FieldRow label="External pool EV type">
+              <select value={draft.gpp.external_pool_ev_type ?? 'roi'}
+                onChange={e => setGpp('external_pool_ev_type', e.target.value)} disabled={disabled}>
+                <option value="roi">ROI</option>
+                <option value="prj_own">PRJ/OWN</option>
+                <option value="p_win">P(WIN)</option>
+              </select>
+            </FieldRow>
+            {draft.gpp.external_pool_ev_type === 'prj_own' && (
+              <FieldRow label="Ownership scale (entries)">
+                <input type="number" step={1000} min={1000}
+                  value={draft.gpp.external_pool_own_scale ?? 30000}
+                  onChange={e => setGpp('external_pool_own_scale', Number(e.target.value))}
+                  disabled={disabled} />
+              </FieldRow>
+            )}
+            {draft.gpp.external_pool_ev_type === 'p_win' && (
+              <>
+                <FieldRow label="P(win) sharpness">
+                  <input type="number" step={0.05} min={0}
+                    value={draft.gpp.external_pool_pwin_sharpness ?? 1.0}
+                    onChange={e => setGpp('external_pool_pwin_sharpness', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="P(win) stage-A admit N">
+                  <input type="number" step={100} min={0}
+                    value={draft.gpp.external_pool_pwin_admit_n ?? 2000}
+                    onChange={e => setGpp('external_pool_pwin_admit_n', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="P(win) field size (0 = auto)">
+                  <input type="number" step={1000} min={0}
+                    value={draft.gpp.external_pool_pwin_field_size ?? 0}
+                    onChange={e => setGpp('external_pool_pwin_field_size', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+              </>
+            )}
           </section>
         </div>
       </div>

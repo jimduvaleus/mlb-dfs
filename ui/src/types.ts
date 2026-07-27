@@ -38,6 +38,10 @@ export interface PortfolioConfig {
   target_score: number | null
 }
 
+// External-pool EV currency: Saber's per-contest ROI, our own projected
+// score minus ownership scaled by implied field size, or simulated P(win).
+export type ExternalEvType = 'roi' | 'prj_own' | 'p_win'
+
 export interface GppConfig {
   n_candidates: number
   n_field_lineups: number
@@ -89,7 +93,13 @@ export interface GppConfig {
   dupe_salary_coef: number
   dupe_stack_coef: number
   dupe_min_gross_payout: number
+  external_pool_ev_type: ExternalEvType
+  external_pool_own_scale: number
+  external_pool_pwin_sharpness: number
+  external_pool_pwin_admit_n: number
+  external_pool_pwin_field_size: number
   external_pool_roi_floor_pct: number
+  external_pool_proj_score_pct: number
   external_pool_ceiling_weight: number
   external_pool_cash_anchor_fraction: number
 }
@@ -111,6 +121,7 @@ export interface PlayerRow {
   team: string
   salary: number
   mean?: number | null
+  ownership?: number | null
   slot?: number | null
   slot_confirmed?: boolean
 }
@@ -133,6 +144,8 @@ export interface LineupResult {
   p_hit_target: number
   lineup_salary: number
   mean_ev?: number | null
+  lineup_mean?: number | null
+  lineup_ownership?: number | null
   players: PlayerRow[]
   upload_tag?: string | null
   entry_fee?: string | null
@@ -169,8 +182,12 @@ export type SSEStage =
   | 'simulate'
   | 'ppd_applied'
   | 'external_ppd_applied'
+  | 'external_proj_score_floor'
   | 'external_load'
   | 'external_pool'
+  | 'external_pwin'
+  | 'external_pwin_field'
+  | 'external_pwin_score'
   | 'compute_target'
   | 'optimize_lineup'
   | 'portfolio_stats'

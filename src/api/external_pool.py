@@ -485,6 +485,7 @@ def build_external_players_df(
     df["ext_order"] = df["player_id"].map(ext["order"])
     df["ext_mean"] = df["player_id"].map(ext["mean"])
     df["ext_std"] = df["player_id"].map(ext["std_dev"])
+    df["ext_own"] = df["player_id"].map(ext["ownership"])
     df["in_ext"] = df["player_id"].isin(ext.index)
     df["in_pool"] = df["player_id"].isin(pool_pids)
 
@@ -526,9 +527,19 @@ def build_external_players_df(
     # GaussianMarginal requires sigma > 0; zero-variance rows (injured or
     # zeroed-out players in the export) get a nominal floor.
     df["std_dev"] = df["ext_std"].fillna(0.85 * df["mean"]).clip(lower=0.1)
+    # Projected ownership, in percentage points (the file's "My Own" scale —
+    # see parse_player_projections, which deliberately does not /100 it).
+    # Pool players the companion file doesn't know get a small positive
+    # floor rather than 0.0: ContestSimulator._build_pos_pools normalizes
+    # ownership into a per-position sampling weight, so a hard 0 makes a
+    # player mathematically impossible to draw into a simulated opponent
+    # field (see generate_field / the p_win EV currency) — silently wrong
+    # rather than merely imprecise, unlike the analogous mean fallback above.
+    df["ownership"] = df["ext_own"].fillna(0.1).clip(lower=0.01)
 
     cols = ["player_id", "team", "opponent", "slot", "mean", "std_dev",
-            "position", "salary", "game", "name", "eligible_positions"]
+            "position", "salary", "game", "name", "eligible_positions",
+            "ownership"]
     return df[[c for c in cols if c in df.columns]].reset_index(drop=True)
 
 
@@ -837,8 +848,25 @@ def compute_ppd_roi_adjustment(
                 contest.roi_stddev = np.maximum(contest.roi_stddev + std_delta, 0.0)
 
 
-def compute_pool_corr(lineups: list, sim_results) -> np.ndarray:
+def compute_lineup_scores(lineups: list, sim_results) -> np.ndarray:
+    """(M, n_sims) float32 simulated lineup scores: each lineup's score in a
+    sim is the sum of its 10 players' simulated points (indicator matmul).
+    Every pool player is guaranteed present in sim_results (players_df
+    includes all pool players), so no -1/missing handling is needed. Split
+    out of compute_pool_corr so the p_win EV currency (compute_p_win) and
+    the diversity correlation can share one score matrix instead of two."""
+    I = _lineup_indicator_matrix(lineups, sim_results.player_ids)
+    return (sim_results.results_matrix.astype(np.float32) @ I).T
+
+
+def compute_pool_corr(
+    lineups: list, sim_results, scores: Optional[np.ndarray] = None,
+) -> np.ndarray:
     """(M, M) float32 correlation of simulated lineup scores (points-space).
+
+    `scores` may be passed precomputed (compute_lineup_scores) to avoid
+    repeating the indicator matmul when the caller also needs the raw
+    per-sim score matrix (the p_win EV currency does).
 
     A within-pool-rank payout transform (round-12's winning lambda=0
     construction: rank each sim's scores within the pool, map through the
@@ -869,11 +897,245 @@ def compute_pool_corr(lineups: list, sim_results) -> np.ndarray:
     from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
 
     M = len(lineups)
-    I = _lineup_indicator_matrix(lineups, sim_results.player_ids)
-    scores = (sim_results.results_matrix.astype(np.float32) @ I).T  # (M, n_sims)
+    if scores is None:
+        scores = compute_lineup_scores(lineups, sim_results)
     pre = DeterminantPortfolioSelector.precompute_pool(scores, float("-inf"))
     assert pre is not None and len(pre[0]) == M
     return pre[2]
+
+
+def compute_proj_score_floor(
+    proj_scores: np.ndarray, floor_percentile: float,
+) -> Optional[tuple[float, int]]:
+    """(cutoff, n_culled) for a `proj_score_floor_percentile` cull of
+    `proj_scores`, or None when disabled (`floor_percentile <= 0`) or there
+    are no finite scores to compute a percentile from. Shared by
+    `allocate_contests` (applying the cull to `mask`) and the pipeline
+    (reporting it once via SSE before the risk sweep — the cull is
+    risk-invariant, so the cutoff/count are identical on every risk
+    iteration and only need to be computed/reported a single time)."""
+    if floor_percentile <= 0:
+        return None
+    finite = proj_scores[np.isfinite(proj_scores)]
+    if finite.size == 0:
+        return None
+    cutoff = float(np.percentile(finite, floor_percentile))
+    n_culled = int(np.sum(~np.isfinite(proj_scores) | (proj_scores < cutoff)))
+    return cutoff, n_culled
+
+
+def compute_pool_proj_scores(lineups: list, players_df: pd.DataFrame) -> np.ndarray:
+    """(M,) float64 sum of each lineup's rostered players' projected mean
+    (`players_df["mean"]`), for the pool-wide `proj_score_floor_percentile`
+    cull in allocate_contests. Every pool player is guaranteed present in
+    players_df (build_external_players_df keeps every pool player), so the
+    indicator matmul needs no -1 handling."""
+    I = _lineup_indicator_matrix(lineups, players_df["player_id"].tolist())
+    means = players_df["mean"].to_numpy(dtype=np.float32)
+    return (means @ I).astype(np.float64)
+
+
+def compute_pool_ownership(lineups: list, players_df: pd.DataFrame) -> np.ndarray:
+    """(M,) float64 sum of each lineup's rostered players' projected ownership
+    (`players_df["ownership"]`, in *percentage points* — see
+    build_external_players_df), the ownership half of the `prj_own` EV
+    currency. Exact mirror of compute_pool_proj_scores, and it reproduces the
+    lineups export's own "Ownership" column, which is likewise the plain sum
+    of the 10 players' "My Own" values (verified against a real 7/26 export).
+    Computing it here rather than parsing that column keeps `prj_own` working
+    for exports that lack it and keeps it on the same footing as
+    compute_pool_proj_scores, which reproduces the export's "Proj Score"."""
+    I = _lineup_indicator_matrix(lineups, players_df["player_id"].tolist())
+    own = players_df["ownership"].to_numpy(dtype=np.float32)
+    return (own @ I).astype(np.float64)
+
+
+def implied_field_size(group: "ContestGroup") -> float:
+    """Implied entrant count for a contest: prize pool / entry fee. DK contest
+    names carry no entrant count (the `[150 Entry Max]` tag is a per-user entry
+    cap, not a field size), so the parsed prize pool
+    (`dk_entries._parse_prize_pool_cents`, including its `Qualifier` divisor)
+    over the entry fee is the size proxy — the same ratio `dk_entries._sort_ratio`
+    uses to order entries, and the same prize-pool proxy already used for
+    contest matching and fill order here.
+
+    Returns 0.0 when either side is missing or non-positive, which
+    deliberately zeroes the ownership penalty in `compute_prj_own_ev` — an
+    unparseable prize pool degrades that EV to pure projected score rather
+    than reshaping a portfolio around a guessed field size."""
+    prize = group.prize_pool_cents
+    fee = group.entry_fee_cents
+    if not prize or not fee or prize <= 0 or fee <= 0:
+        return 0.0
+    return float(prize) / float(fee)
+
+
+_DEFAULT_OWN_SCALE = 30_000.0
+
+
+def compute_prj_own_ev(
+    proj_scores: np.ndarray, own_scores: np.ndarray, field_size: float,
+    own_scale: float = _DEFAULT_OWN_SCALE,
+) -> np.ndarray:
+    """The `prj_own` EV currency: projected score minus projected ownership,
+    with the ownership penalty scaled by contest size.
+
+        EV = proj_score - own_score * (field_size / own_scale)
+
+    Both inputs are lineup sums: projected score in fantasy points (~70-115
+    on a real pool), ownership in percentage points (~10-170). `own_scale`
+    is therefore readable as *the field size at which one point of summed
+    ownership costs one projected point*.
+
+    Calibrated 2026-07-27 to own_scale=30,000 from two stated indifference
+    anchors, which a single linear-in-field-size coefficient satisfies
+    exactly:
+
+      * at ~10,000 entries, (proj 95, own 60) should tie (proj 105, own 90)
+        — i.e. 10 projected points trade for 30 ownership points, so the
+        coefficient there is 1/3 = 10_000/30_000;
+      * at 1,000 entries ownership should matter ~10x less, which linear
+        scaling gives for free: 1_000/30_000 = 1/30.
+
+    `field_size=0` (unparseable prize pool) reduces this to plain projected
+    score.
+
+    Note on where the projection constraint actually binds: a real pool's
+    ownership sums span a far wider range (~125 points) than its projected
+    scores (~20), so past roughly 5,000 entries the argmax of this EV is
+    essentially the least-owned lineup that cleared the projection floor.
+    At large fields `external_pool_proj_score_pct` is the projection lever,
+    and this coefficient governs the small/mid-field contests where the two
+    terms genuinely trade off."""
+    return np.asarray(proj_scores, dtype=np.float64) - (
+        np.asarray(own_scores, dtype=np.float64) * (float(field_size) / float(own_scale))
+    )
+
+
+# ---------------------------------------------------------------------------
+# p_win EV currency: simulated P(win) against an ownership-sampled field
+# ---------------------------------------------------------------------------
+
+_DEFAULT_IMPLIED_ENTRIES = 10_000.0
+# Memory guard for the p_win opponent-field sample: field_scores is
+# (n_sims, F) float32 plus a sorted copy, so 25k lineups at 25k sims is
+# ~2.5 GB each — cap keeps that bounded regardless of contest size.
+_PWIN_FIELD_CAP = 25_000
+
+
+def pwin_implied_entries(groups: list[ContestGroup]) -> dict[str, float]:
+    """Per contest_id implied entry count (prize_pool / entry_fee — the same
+    inference dk_entries' assignment sort uses), with contests lacking a
+    parsable prize pool borrowing the median of those that have one. Used to
+    build the p_win exponent per contest (sharpness * size) and to size the
+    shared opponent-field sample (pwin_field_size).
+
+    Deliberately different from implied_field_size (used by prj_own), which
+    returns 0.0 on a missing prize pool: there, 0.0 fails safe by degrading
+    the EV to plain projected score. Here, a p_win exponent of
+    sharpness * 0 = 0 would make every lineup's q**0 == 1 for that contest —
+    a constant EV that hands the whole ranking to noise — so an unknown
+    field size needs a real (borrowed) estimate rather than a safe zero."""
+    sizes: dict[str, float] = {}
+    known = []
+    for g in groups:
+        if g.prize_pool_cents and g.entry_fee_cents:
+            sizes[g.contest_id] = g.prize_pool_cents / g.entry_fee_cents
+            known.append(sizes[g.contest_id])
+    default = float(np.median(known)) if known else _DEFAULT_IMPLIED_ENTRIES
+    for g in groups:
+        sizes.setdefault(g.contest_id, default)
+    return sizes
+
+
+def pwin_field_size(groups: list[ContestGroup], floor: int = 5_000,
+                    cap: int = _PWIN_FIELD_CAP) -> int:
+    """Opponent-field sample size for the p_win percentile estimate: at
+    least `floor` (gpp.n_field_lineups), grown to the largest contest's
+    implied entry count so q resolves "beats the whole contest" without
+    hitting the percentile clip for the biggest field, capped for memory.
+    Contest-size differences are the per-contest exponent's job
+    (p = q**n_contest); the shared sample only needs enough resolution for
+    the largest n — an exactly contest-sized sample would estimate the same
+    expectation with a noisy 0/1 indicator per world."""
+    sizes = pwin_implied_entries(groups)
+    largest = max(sizes.values()) if sizes else float(floor)
+    return int(min(max(float(floor), largest), float(cap)))
+
+
+def _field_percentiles(pool_scores: np.ndarray, field_scores: np.ndarray) -> np.ndarray:
+    """(M, S) float32 percentile of each pool lineup's per-world score within
+    the simulated opponent field's score distribution for that world.
+    `field_scores` is (S, F) as returned by ContestSimulator.score_field.
+    Clipped half a field slot away from exact 0/1 so p = q**n stays
+    sub-certain under field-sampling noise."""
+    S, F = field_scores.shape
+    M = pool_scores.shape[0]
+    q = np.empty((M, S), dtype=np.float32)
+    fs = np.sort(field_scores, axis=1)
+    for s in range(S):
+        q[:, s] = np.searchsorted(fs[s], pool_scores[:, s], side="left") / F
+    np.clip(q, 0.5 / (F + 1), 1.0 - 0.5 / (F + 1), out=q)
+    return q
+
+
+def compute_p_win(
+    pool_scores: np.ndarray,
+    field_scores: np.ndarray,
+    exponents: dict[str, float],
+    chunk: int = 1000,
+    stop_check: Optional[Callable[[], bool]] = None,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> dict[str, np.ndarray]:
+    """The `p_win` EV currency: `{key: (M,) float64}` of
+    `mean_over_worlds(percentile ** exponents[key])` for every requested
+    exponent, computed in one pass over the simulated worlds.
+
+    `pool_scores` is (M, S) — S simulated worlds, M pool lineups (see
+    compute_lineup_scores). `field_scores` is (S, F), the same S worlds
+    scored against an ownership-sampled opponent field
+    (ContestSimulator.score_field). Per world, `q` = the candidate's
+    percentile against the field that world; averaging `q ** n` over worlds
+    with `n = sharpness * implied_entries` gives literal P(win an n-entry
+    contest under the field model) at sharpness=1.0, sliding toward
+    P(top X%) as sharpness drops. One call serves every contest at once —
+    `exponents` is keyed by whatever the caller wants back (contest_id).
+
+    Chunked over worlds (not built as one (M, S) percentile matrix like
+    `_field_percentiles`): at S=25k, M=10k that intermediate alone is
+    ~1 GB, before a same-sized field_scores copy. Per chunk this holds
+    (M, C) pool scores, (C, F) sorted field scores and (M, C) percentiles —
+    tens of MB — accumulating mean(q**n) per exponent into one (M,) float64
+    each, mirroring ContestScorer's rule that tail metrics stay reduced
+    accumulators, never a second (M, n_sims) matrix."""
+    M, S = pool_scores.shape
+    F = field_scores.shape[1]
+    acc = {k: np.zeros(M, dtype=np.float64) for k in exponents}
+    n_chunks = (S + chunk - 1) // chunk
+    n_done = 0
+    for ci, s0 in enumerate(range(0, S, chunk)):
+        if stop_check is not None and stop_check():
+            break
+        s1 = min(s0 + chunk, S)
+        fs_chunk = np.sort(field_scores[s0:s1], axis=1)          # (c, F)
+        c = s1 - s0
+        q = np.empty((M, c), dtype=np.float32)
+        for j in range(c):
+            q[:, j] = np.searchsorted(fs_chunk[j], pool_scores[:, s0 + j], side="left") / F
+        np.clip(q, 0.5 / (F + 1), 1.0 - 0.5 / (F + 1), out=q)
+        qd = q.astype(np.float64)
+        for key, n_exp in exponents.items():
+            acc[key] += np.power(qd, n_exp).sum(axis=1)
+        n_done += c
+        if progress_cb is not None:
+            progress_cb(ci + 1, n_chunks)
+    # Divide by worlds actually processed, not S — a stop_check interruption
+    # then still yields a correct (if lower-precision) mean rather than a
+    # sum silently under-divided by the full world count.
+    if n_done > 0:
+        for key in acc:
+            acc[key] /= n_done
+    return acc
 
 
 def allocate_contests(
@@ -884,16 +1146,67 @@ def allocate_contests(
     evw_base: float,
     evw_max: float,
     roi_floor_percentile: float = 40.0,
+    proj_scores: Optional[np.ndarray] = None,
+    proj_score_floor_percentile: float = 0.0,
+    ev_type: str = "roi",
+    own_scores: Optional[np.ndarray] = None,
+    own_scale: float = _DEFAULT_OWN_SCALE,
+    p_win_cull: Optional[dict[str, np.ndarray]] = None,
+    p_win_select: Optional[dict[str, np.ndarray]] = None,
+    p_win_admit_n: int = 0,
     ceiling_weight: float = 0.0,
     cash_anchor_fraction: float = 0.0,
     stop_check: Optional[Callable[[], bool]] = None,
     progress_cb: Optional[Callable[[dict], None]] = None,
 ) -> ExternalAllocation:
     """One risk universe: per-contest greedy selection with shared removal.
-    EV currency = the contest's ROI column. The candidate pool is culled
-    per contest *before* the Det/ROI math runs — no legacy dollar-EV floor
-    applies here (`ev_floor` is passed as -inf/unused since `precomputed`
-    is supplied pre-culled).
+    The candidate pool is culled per contest *before* the Det math runs — no
+    legacy dollar-EV floor applies here (`ev_floor` is passed as -inf/unused
+    since `precomputed` is supplied pre-culled).
+
+    `ev_type` picks the EV currency:
+
+    * `"roi"` (default) — the contest's SaberSim ROI column, with the
+      per-contest ROI percentile floor and the ROI-StDev ceiling lean
+      described below.
+    * `"prj_own"` — `compute_prj_own_ev(proj_scores, own_scores,
+      implied_field_size(g), own_scale)`: our own projected score minus
+      projected ownership, the penalty scaled by the contest's implied field
+      size against the `own_scale` calibration constant.
+      Saber's ROI is not consulted at all in this mode, so
+      `roi_floor_percentile` and the ceiling lean are both inert (a contest's
+      ROI column being blank or unmatched is likewise no longer a reason to
+      leave entries unfilled). The pool-wide `proj_score_floor_percentile`
+      cull below still applies, and the reported per-lineup EV is the
+      prj_own value rather than an ROI. Requires both `proj_scores` and
+      `own_scores`.
+    * `"p_win"` — `compute_p_win`'s simulated P(win) against an
+      ownership-sampled opponent field, `p_win_select[g.contest_id]`. Like
+      `prj_own`, Saber's ROI plays no part, so `roi_floor_percentile` and the
+      ceiling lean are inert; the pool-wide `proj_score_floor_percentile`
+      cull still applies. Two-stage winner's-curse guard, mirroring the
+      internal pipeline's fresh-rescore pattern: `p_win_cull[g.contest_id]`
+      (estimated on one sim/field draw) trims each contest's candidates to
+      the top `p_win_admit_n` *before* `p_win_select[g.contest_id]`
+      (estimated on an independent draw) ranks the survivors — a lineup
+      that only looks good on the draw used to pick it can't reach the draw
+      used to rank it. `p_win_admit_n <= 0` skips the cull (rank the whole
+      post-floor pool on p_win_select alone). Requires both `p_win_cull` and
+      `p_win_select`, each `{contest_id: (M,) array}`, built from the same
+      underlying sims via two calls to compute_p_win.
+
+    Everything downstream of the EV vector is currency-agnostic: the greedy
+    selection, the diversity/hedge terms, the shared-removal `mask` and the
+    returned `(lineup, ev)` pairs all work off whichever vector was built.
+
+    `proj_score_floor_percentile` (with `proj_scores`, a `(M,)` per-lineup
+    summed-projected-mean array from `compute_pool_proj_scores`) is a
+    second, pool-wide floor distinct from the per-contest ROI floor below:
+    it culls the bottom N% of projected score once, across the *entire*
+    pool, before any contest is processed, by seeding the shared-removal
+    `mask` with the exclusion up front — so a lineup that fails it is
+    unavailable to every contest, not just the one currently being filled.
+    No-op when `proj_score_floor_percentile <= 0` or `proj_scores` is None.
 
     ceiling_weight > 0 (with cash_anchor_fraction, mirroring the internal
     pipeline's ceiling-first `selector_score: tail` pattern) leans the
@@ -925,8 +1238,26 @@ def allocate_contests(
     though the percentile alone would have let it through."""
     from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
 
+    if ev_type not in ("roi", "prj_own", "p_win"):
+        raise ValueError(f"Unknown ev_type {ev_type!r} (expected 'roi', 'prj_own', or 'p_win')")
+    if ev_type == "prj_own" and (proj_scores is None or own_scores is None):
+        raise ValueError(
+            "ev_type='prj_own' requires both proj_scores and own_scores "
+            "(see compute_pool_proj_scores / compute_pool_ownership)"
+        )
+    if ev_type == "p_win" and (p_win_cull is None or p_win_select is None):
+        raise ValueError(
+            "ev_type='p_win' requires both p_win_cull and p_win_select "
+            "(see compute_p_win)"
+        )
+
     M = len(pool.lineups)
     mask = np.ones(M, dtype=bool)
+    if proj_scores is not None:
+        floor = compute_proj_score_floor(proj_scores, proj_score_floor_percentile)
+        if floor is not None:
+            proj_floor, _ = floor
+            mask &= np.isfinite(proj_scores) & (proj_scores >= proj_floor)
     idx_of = {id(lu): i for i, lu in enumerate(pool.lineups)}
     portfolio: list = []
     entry_plan: list = []
@@ -935,36 +1266,64 @@ def allocate_contests(
     for g in groups:
         if stop_check is not None and stop_check():
             break
-        contest = pool.contests[g.roi_key]
-        roi = contest.roi
-        finite_roi = roi[np.isfinite(roi)]
-        if finite_roi.size == 0:
-            unfilled.extend(g.entries)
-            continue
-        roi_floor = max(float(np.percentile(finite_roi, roi_floor_percentile)), 0.0)
-        fill_value = float(finite_roi.min() - 1.0)
-        roi = np.nan_to_num(roi, nan=fill_value)
         rem_all = np.where(mask)[0]
-        rem = rem_all[roi[rem_all] >= roi_floor]
+        if ev_type == "prj_own":
+            # No ROI anywhere in this branch: the currency is ours, so a
+            # blank/unmatched ROI column can't strand a contest and the ROI
+            # floor has nothing to floor. The pool-wide projected-score cull
+            # already seeded `mask` above and is the only cull that applies.
+            ev_vals = compute_prj_own_ev(
+                proj_scores, own_scores, implied_field_size(g), own_scale,
+            )
+            rem = rem_all[np.isfinite(ev_vals[rem_all])]
+        elif ev_type == "p_win":
+            ev_vals = p_win_select.get(g.contest_id)
+            if ev_vals is None:
+                unfilled.extend(g.entries)
+                continue
+            rem = rem_all[np.isfinite(ev_vals[rem_all])]
+            cull_for_contest = p_win_cull.get(g.contest_id)
+            if (p_win_admit_n and p_win_admit_n > 0 and cull_for_contest is not None
+                    and len(rem) > p_win_admit_n):
+                # Stage-A cull on the INDEPENDENT p_win_cull draw — a lineup
+                # that only ranks well on the draw used to select it (rem)
+                # cannot also be the reason it survives this cull.
+                keep = rem[np.argsort(-cull_for_contest[rem])[:p_win_admit_n]]
+                rem = np.sort(keep)
+        else:
+            contest = pool.contests.get(g.roi_key)
+            if contest is None:
+                unfilled.extend(g.entries)
+                continue
+            roi = contest.roi
+            finite_roi = roi[np.isfinite(roi)]
+            if finite_roi.size == 0:
+                unfilled.extend(g.entries)
+                continue
+            roi_floor = max(float(np.percentile(finite_roi, roi_floor_percentile)), 0.0)
+            fill_value = float(finite_roi.min() - 1.0)
+            ev_vals = np.nan_to_num(roi, nan=fill_value)
+            rem = rem_all[ev_vals[rem_all] >= roi_floor]
         k = min(len(g.entries), len(rem))
         if k < len(g.entries):
             unfilled.extend(g.entries[k:])
         if k == 0:
             continue
         if k == 1:
-            picks = [int(rem[int(np.argmax(roi[rem]))])]
-            pairs = [(pool.lineups[picks[0]], float(roi[picks[0]]))]
+            picks = [int(rem[int(np.argmax(ev_vals[rem]))])]
+            pairs = [(pool.lineups[picks[0]], float(ev_vals[picks[0]]))]
         else:
             ev_override = None
             eff_cash_anchor = 0.0
-            stddev = contest.roi_stddev
-            ceiling = compute_ceiling_ev(
-                roi[rem], stddev[rem] if stddev is not None else None, ceiling_weight,
-            )
-            if ceiling is not None:
-                ev_override = np.full(M, np.nan)
-                ev_override[rem] = ceiling
-                eff_cash_anchor = cash_anchor_fraction
+            if ev_type == "roi":
+                stddev = contest.roi_stddev
+                ceiling = compute_ceiling_ev(
+                    ev_vals[rem], stddev[rem] if stddev is not None else None, ceiling_weight,
+                )
+                if ceiling is not None:
+                    ev_override = np.full(M, np.nan)
+                    ev_override[rem] = ceiling
+                    eff_cash_anchor = cash_anchor_fraction
             sel = DeterminantPortfolioSelector(
                 robust_payout=None,
                 candidates=pool.lineups,
@@ -975,7 +1334,7 @@ def allocate_contests(
                 ev_floor=float("-inf"),
                 precomputed=(
                     rem,
-                    roi[rem].astype(np.float64),
+                    ev_vals[rem].astype(np.float64),
                     np.ascontiguousarray(corr_matrix[np.ix_(rem, rem)]),
                 ),
                 ev_override=ev_override,
