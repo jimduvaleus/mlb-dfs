@@ -2539,7 +2539,7 @@ class PipelineRunner:
             try:
                 from src.optimization.contest import ContestSimulator
 
-                _sharpness = float(gpp_cfg.get("external_pool_pwin_sharpness", 1.0))
+                _sharpness = float(gpp_cfg.get("external_pool_pwin_sharpness", 0.05))
                 _field_size_cfg = int(gpp_cfg.get("external_pool_pwin_field_size", 0))
                 _field_n = _field_size_cfg if _field_size_cfg > 0 else ep.pwin_field_size(
                     groups, floor=int(gpp_cfg.get("n_field_lineups", 5_000)),

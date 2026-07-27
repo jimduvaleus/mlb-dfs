@@ -170,7 +170,16 @@ class GppConfig(BaseModel):
     # p_win exponent multiplier: n = sharpness * implied_field_size. 1.0 is
     # literal P(win); lower values soften toward P(top X%), which has more
     # effective events per lineup at a fixed sim budget. See compute_p_win.
-    external_pool_pwin_sharpness: float = 1.0
+    # Calibrated 2026-07-27: a sharpness grid (0.05/0.1/0.3/0.5/1.0) over 4
+    # settled slates showed top1_rate monotonically decreasing as sharpness
+    # rises, in every slate individually — 1.0's aggressive "beat basically
+    # the whole field" target amplifies the percentile-estimation noise near
+    # q=1 (q^n is exponentially sensitive to small errors in q as n grows).
+    # 0.05 was the best of the tested points (t=+5.78 vs 1.0, 4/4 slates) and
+    # is monotonic through the whole tested range, so lower may do better
+    # still — not yet tested below 0.05. See scripts/sim_evaluate_portfolios.py
+    # --build --sharpness.
+    external_pool_pwin_sharpness: float = 0.05
     # p_win two-stage winner's-curse guard: each contest's post-floor pool
     # is culled to the top N by a p_win estimate on one sim/field draw
     # BEFORE a second, independent draw ranks the survivors — a lineup that
