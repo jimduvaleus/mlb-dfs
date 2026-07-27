@@ -182,7 +182,9 @@ def _maybe_commit_notification(str_args: list[str]) -> None:
 
         # Scratch alerts are time-critical from 10 min before slate lock onward —
         # email the full notification text in addition to the in-app entry above.
-        if _SCRATCH_RE.search(summary + ' ' + body) and _slate_first_pitch_started():
+        # When SaberSim is the active source, its lineups are confirmed well
+        # ahead of that window, so any scratch mention is worth flagging any time.
+        if _SCRATCH_RE.search(summary + ' ' + body) and (_slate_first_pitch_started() or _is_sabersim_source()):
             from .email_notify import send_notification_email
             full_text = f"{summary}\n\n{body}" if body else summary
             threading.Thread(
@@ -312,6 +314,7 @@ def _load_portfolio_from_csv(platform_val: str) -> list[dict] | None:
                     "mean": float(row["mean"]) if "mean" in row and pd.notna(row["mean"]) else None,
                     "slot": int(row["slot"]) if "slot" in row and pd.notna(row["slot"]) else None,
                     "slot_confirmed": bool(row["slot_confirmed"]) if "slot_confirmed" in row and pd.notna(row["slot_confirmed"]) else False,
+                    "assigned_position": str(row["assigned_position"]) if "assigned_position" in row and pd.notna(row["assigned_position"]) else None,
                 }
                 for _, row in group.iterrows()
             ]
@@ -513,16 +516,16 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
             is_updated=False,
         )
 
-    # Load all slate hitters for that team (include excluded players — exclusion ≠ slot confirmation)
+    # Load all slate players for that team, batters and pitcher alike (include
+    # excluded players — exclusion ≠ slot confirmation), so a parsed pitcher
+    # line (slot 10) can resolve to a player_id the same way batters do.
     slate_df = _load_slate_df()
-    team_hitters: list[dict] = []
+    team_players: list[dict] = []
     team_in_slate = False
     if slate_df is not None:
-        rows = slate_df[
-            (slate_df["team"] == team) & (slate_df["position"] != "P")
-        ]
+        rows = slate_df[slate_df["team"] == team]
         team_in_slate = not rows.empty
-        team_hitters = [
+        team_players = [
             {
                 "player_id": int(r["player_id"]),
                 "name": str(r["name"]),
@@ -539,7 +542,7 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
 
     parsed_slots: list[ParsedSlot] = []
     for raw in raw_slots:
-        candidate_dicts = match_player_name(raw["name"], team_hitters)
+        candidate_dicts = match_player_name(raw["name"], team_players)
         matches = [
             PlayerMatch(
                 player_id=c["player_id"],
@@ -584,7 +587,7 @@ def _emit_lineup_diff_notification(
     old_slots: list[dict],
     new_slots: list[TwitterLineupSlot],
 ) -> None:
-    """Post an In/Out notification for the batter diff between two slot lists."""
+    """Post an In/Out notification for the batter+pitcher diff between two slot lists."""
     old_ids = {s["player_id"] for s in old_slots if s.get("player_id") is not None}
     new_ids = {s.player_id for s in new_slots if s.player_id is not None}
     added_ids = new_ids - old_ids
@@ -607,11 +610,28 @@ def _emit_lineup_diff_notification(
         if pid is not None and pid not in name_map:
             name_map[pid] = s.get("name", str(pid))
 
+    # Slot 10 is the pitcher (see parse_notification_body/_best_guess_lineup_slots) —
+    # call it out on its own line rather than burying it in the batter In/Out list,
+    # since a pitcher swap is usually the most fantasy-relevant part of the diff.
+    old_slot_by_id = {s["player_id"]: s.get("slot") for s in old_slots if s.get("player_id") is not None}
+    new_slot_by_id = {s.player_id: s.slot for s in new_slots if s.player_id is not None}
+    pitcher_added = {p for p in added_ids if new_slot_by_id.get(p) == 10}
+    pitcher_removed = {p for p in removed_ids if old_slot_by_id.get(p) == 10}
+    batter_added = added_ids - pitcher_added
+    batter_removed = removed_ids - pitcher_removed
+
     parts: list[str] = []
-    if added_ids:
-        parts.append("In: " + ", ".join(name_map.get(p, str(p)) for p in sorted(added_ids)))
-    if removed_ids:
-        parts.append("Out: " + ", ".join(name_map.get(p, str(p)) for p in sorted(removed_ids)))
+    if pitcher_added or pitcher_removed:
+        pitcher_bits: list[str] = []
+        if pitcher_removed:
+            pitcher_bits.append("Out " + ", ".join(name_map.get(p, str(p)) for p in sorted(pitcher_removed)))
+        if pitcher_added:
+            pitcher_bits.append("In " + ", ".join(name_map.get(p, str(p)) for p in sorted(pitcher_added)))
+        parts.append("Pitcher: " + " / ".join(pitcher_bits))
+    if batter_added:
+        parts.append("In: " + ", ".join(name_map.get(p, str(p)) for p in sorted(batter_added)))
+    if batter_removed:
+        parts.append("Out: " + ", ".join(name_map.get(p, str(p)) for p in sorted(batter_removed)))
 
     diff_notif = {
         "id": str(uuid.uuid4()),
@@ -633,6 +653,11 @@ def _emit_lineup_diff_notification(
 _LINEUP_DIFF_WINDOW = timedelta(minutes=10)
 
 
+def _is_sabersim_source(cfg: AppConfig | None = None) -> bool:
+    cfg = cfg or read_config()
+    return (cfg.paths.projections_source or "").strip().lower() == "sabersim"
+
+
 def _slate_first_pitch_started() -> bool:
     """True from 10 minutes before the slate's earliest game start onward.
 
@@ -651,13 +676,18 @@ def _slate_first_pitch_started() -> bool:
 
 
 def _best_guess_lineup_slots(team: str) -> list[dict] | None:
-    """Return the current best-guess (pre-confirmation) starting batters for a team.
+    """Return the current best-guess (pre-confirmation) starting batters + pitcher for a team.
 
-    Sourced from the projections CSV's `lineup_slot` column, which holds the
-    most recent RW/DFF-fetched lineup — this hasn't been overwritten yet when
-    a Twitter/Underdog notification is first being saved for the team, so it
-    reflects what the pipeline was using right up until this confirmation.
-    Returns None if there's no projections file or no slotted batters.
+    Sourced from the projections CSV's `lineup_slot` column (1-9 for batters,
+    10 for the starting pitcher), which holds the most recent fetched lineup —
+    this hasn't been overwritten yet when a Twitter/Underdog notification is
+    first being saved for the team, so it reflects what the pipeline was using
+    right up until this confirmation. When SaberSim is the active source, this
+    doubles as the live "SaberSim-confirmed" baseline for diffing (see
+    save_twitter_lineup) — in that case rows are restricted to `slot_confirmed`
+    so a merely-projected (not yet confirmed) player doesn't look like a
+    contradiction. Returns None if there's no projections file or no slotted
+    players.
     """
     import pandas as pd
     cfg = read_config()
@@ -670,25 +700,25 @@ def _best_guess_lineup_slots(team: str) -> list[dict] | None:
         return None
     if "lineup_slot" not in proj_df.columns or "player_id" not in proj_df.columns:
         return None
+    if "slot_confirmed" in proj_df.columns and _is_sabersim_source(cfg):
+        proj_df = proj_df[proj_df["slot_confirmed"] == True]  # noqa: E712
 
     slate_df = _load_slate_df()
     if slate_df is None:
         return None
-    team_pids = set(
-        slate_df.loc[(slate_df["team"] == team) & (slate_df["position"] != "P"), "player_id"]
-    )
+    team_pids = set(slate_df.loc[slate_df["team"] == team, "player_id"])
     if not team_pids:
         return None
 
     starters = proj_df[
         proj_df["player_id"].isin(team_pids)
         & proj_df["lineup_slot"].notna()
-        & proj_df["lineup_slot"].between(1, 9)
+        & proj_df["lineup_slot"].between(1, 10)
     ]
     if starters.empty:
         return None
     return [
-        {"player_id": int(r["player_id"]), "name": str(r.get("name", ""))}
+        {"player_id": int(r["player_id"]), "name": str(r.get("name", "")), "slot": int(r["lineup_slot"])}
         for _, r in starters.iterrows()
     ]
 
@@ -699,7 +729,16 @@ def save_twitter_lineup(req: TwitterLineupSaveRequest) -> TwitterLineupRecord:
 
     existing_lineups = load_twitter_lineups(fp)
     existing = next((l for l in existing_lineups if l.get("team") == req.team), None)
-    if existing and existing.get("locked"):
+    sabersim_baseline = _best_guess_lineup_slots(req.team) if _is_sabersim_source() else None
+    if sabersim_baseline is not None:
+        # SaberSim is authoritative for this team: always diff against its current
+        # confirmed lineup/pitcher, not against a possibly-stale or silently-wrong
+        # previously-locked Twitter record — this also self-heals after a fresh
+        # SaberSim re-fetch, and doesn't wait on the first-pitch timing window.
+        _emit_lineup_diff_notification(
+            req.team, f"{req.team} lineup update", sabersim_baseline, req.slots
+        )
+    elif existing and existing.get("locked"):
         # Updating an already-locked lineup — diff against what was locked in.
         _emit_lineup_diff_notification(
             req.team, f"{req.team} lineup update", existing.get("slots", []), req.slots

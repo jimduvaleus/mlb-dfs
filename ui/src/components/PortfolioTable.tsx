@@ -54,9 +54,12 @@ const SLOT_ELIGIBILITY: Record<string, ReadonlySet<string>> = {
 // Compute a canonical slot assignment for display, guaranteeing each DK/FD
 // roster slot appears exactly once and in the correct order.
 //
-// We parse eligible positions from p.position (the slash-joined display string,
-// e.g. "2B/SS") and run a bipartite-matching DFS with most-constrained-first
-// ordering so single-position players always claim their natural slot first.
+// The backend already computes the true per-player roster slot during
+// optimization (the same assignment used for the upload CSV / late swap) and
+// serializes it as `assigned_position`. We use that directly when present so
+// the Portfolio panel can't diverge from the upload file. The bipartite-match
+// recompute below (parsing eligible positions from p.position, e.g. "2B/SS")
+// is only a fallback for older cached data that predates `assigned_position`.
 function sortAndAssignPositions(
   players: PlayerRow[],
   platform?: PlatformType,
@@ -67,6 +70,34 @@ function sortAndAssignPositions(
   const posOrder = platform === 'fanduel'
     ? ['C/1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF', 'UTIL']
     : ['C', '1B', '2B', '3B', 'SS', 'OF', 'OF', 'OF']
+
+  // assigned_position is computed backend-side in DK slot space (P/C/1B/2B/3B/SS/OF)
+  // — it doesn't speak FanDuel's compound slot labels (C/1B, UTIL), which come from
+  // a separate matching pass in fd_entries.py. Only trust it for DraftKings.
+  if (platform !== 'fanduel' && batters.every(p => !!p.assigned_position)) {
+    const byPos = new Map<string, PlayerRow[]>()
+    for (const p of batters) {
+      const key = p.assigned_position!
+      const arr = byPos.get(key)
+      if (arr) arr.push(p)
+      else byPos.set(key, [p])
+    }
+    const result: Array<{ player: PlayerRow; displayPos: string }> = [
+      ...pitchers.map(p => ({ player: p, displayPos: 'P' })),
+    ]
+    // Walk the canonical slot order so cards always render P, C, 1B, 2B, 3B,
+    // SS, OF, OF, OF regardless of the players' original array order.
+    for (const slot of posOrder) {
+      const player = byPos.get(slot)?.shift()
+      if (player) result.push({ player, displayPos: slot })
+    }
+    // Safety valve: any player whose assigned_position wasn't in posOrder
+    // (shouldn't occur) still gets rendered instead of silently dropped.
+    for (const leftover of byPos.values()) {
+      for (const player of leftover) result.push({ player, displayPos: player.assigned_position! })
+    }
+    return alphabetizeDuplicateGroups(result, r => r.displayPos, r => r.player.name)
+  }
 
   // Most-constrained first → canonical, stable assignment
   const sortedBatters = [...batters].sort(

@@ -94,7 +94,10 @@ def parse_notification_body(body: str) -> tuple[Optional[str], list[dict], bool]
     """Parse an Underdog MLB notification body into (team_abbrev, slots, is_updated).
 
     Returns (None, [], False) if the team name cannot be resolved.
-    slots is a list of {"slot": int, "name": str, "position": str} for the 9 batters.
+    slots is a list of {"slot": int, "name": str, "position": str} for the 9 batters,
+    plus one {"slot": 10, ...} entry for the probable/confirmed pitcher if a
+    pitcher-position line is present (SP preferred over RP/P when both appear,
+    e.g. opener games).
     is_updated is True when the team header line started with "Updated".
 
     Handles notification bodies that may contain Twitter metadata before the
@@ -130,17 +133,25 @@ def parse_notification_body(body: str) -> tuple[Optional[str], list[dict], bool]
         return None, [], False
 
     slots: list[dict] = []
+    pitcher_slot: Optional[dict] = None
     for line in lines[header_idx + 1:]:
         m = _SLOT_LINE_RE.match(line)
         if not m:
             continue
         name_part, pos = m.group(1).strip(), m.group(2)
         if pos in _PITCHER_POSITIONS:
+            # Keep the first pitcher line seen, but an SP always wins over an
+            # RP/opener if both appear — the SP is the meaningful confirmed starter.
+            if pitcher_slot is None or pos == "SP":
+                pitcher_slot = {"slot": 10, "name": name_part, "position": pos}
             continue
         slot_num = len(slots) + 1
         if slot_num > 9:
             break
         slots.append({"slot": slot_num, "name": name_part, "position": pos})
+
+    if pitcher_slot is not None:
+        slots.append(pitcher_slot)
 
     return team_abbrev, slots, is_updated
 

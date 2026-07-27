@@ -1,6 +1,6 @@
 import { useMemo, useState, useEffect, useRef } from 'react'
 import type { AppConfig, GppConfig, PlatformType } from '../types'
-import { saveConfig } from '../api'
+import { fetchConfig, saveConfig } from '../api'
 
 interface Props {
   config: AppConfig
@@ -35,6 +35,18 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
   const lastSyncedJson = useRef(configJson)
   const isDirty = JSON.stringify(draft) !== lastSyncedJson.current
 
+  // `draft` is cloned from `config` once (on mount / next clean sync) and this
+  // form only ever renders inputs for a subset of AppConfig/GppConfig fields.
+  // Every other field just rides along in `draft` at whatever value it had
+  // at that snapshot. If we POSTed `draft` wholesale, saving a change to any
+  // rendered field would silently overwrite every un-rendered field (e.g.
+  // gpp.external_pool_ceiling_weight, which has no UI control here) back to
+  // that stale snapshot value — clobbering any out-of-band edit (direct
+  // config.yaml edit, another tab) made after this page loaded. So we track
+  // exactly which "section.key" paths the user actually touched, and at
+  // submit time apply only those onto a freshly-fetched server config.
+  const touchedPaths = useRef<Set<string>>(new Set())
+
   // Sync draft when the external config changes (e.g. after a reselect save).
   // Only resets if the user has no unsaved edits.
   useEffect(() => {
@@ -45,11 +57,13 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
   }, [configJson])
 
   const setGpp = (key: keyof GppConfig, value: unknown) => {
+    touchedPaths.current.add(`gpp.${key}`)
     setDraft(d => ({ ...d, gpp: { ...d.gpp, [key]: value } }))
     setSaved(false)
   }
 
   const set = (section: keyof AppConfig, key: string, value: unknown) => {
+    touchedPaths.current.add(`${section}.${key}`)
     setDraft(d => ({
       ...d,
       [section]: { ...(d[section] as object), [key]: value },
@@ -58,6 +72,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
   }
 
   const handlePlatformChange = (p: PlatformType) => {
+    touchedPaths.current.add('platform')
     setDraft(d => {
       const floor = d.optimizer.salary_floor
       // Auto-adjust salary floor when the current value is invalid or clearly wrong for the target platform
@@ -67,6 +82,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
       } else if (p === 'draftkings' && floor != null && floor <= 35000) {
         newFloor = 48500
       }
+      if (newFloor !== floor) touchedPaths.current.add('optimizer.salary_floor')
       return { ...d, platform: p, optimizer: { ...d.optimizer, salary_floor: newFloor } }
     })
     setSaved(false)
@@ -80,8 +96,26 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
     setSaving(true)
     setError(null)
     try {
-      const saved = await saveConfig(draft)
+      // Base the payload on the server's current config, not the possibly
+      // stale `draft` clone, then layer in only the fields the user actually
+      // edited through this form. See the touchedPaths comment above.
+      const fresh = await fetchConfig()
+      const payload: AppConfig = JSON.parse(JSON.stringify(fresh))
+      for (const path of touchedPaths.current) {
+        const [section, key] = path.split('.') as [keyof AppConfig, string | undefined]
+        if (key === undefined) {
+          ;(payload as unknown as Record<string, unknown>)[section] =
+            (draft as unknown as Record<string, unknown>)[section]
+        } else {
+          const draftSection = draft[section] as unknown as Record<string, unknown>
+          const payloadSection = payload[section] as unknown as Record<string, unknown>
+          payloadSection[key] = draftSection[key]
+        }
+      }
+      const saved = await saveConfig(payload)
+      touchedPaths.current.clear()
       lastSyncedJson.current = JSON.stringify(saved)
+      setDraft(saved)
       onSaved(saved)
       setSaved(true)
     } catch (err) {

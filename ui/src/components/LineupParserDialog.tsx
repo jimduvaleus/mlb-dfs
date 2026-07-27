@@ -79,7 +79,7 @@ export function LineupParserDialog({ parseResult, onConfirm, onCancel }: Props) 
 
             return (
               <div key={slot.slot} className="lp-slot-row">
-                <span className="lp-slot-num">{slot.slot}</span>
+                <span className="lp-slot-num">{slot.slot <= 9 ? slot.slot : 'P'}</span>
                 <span className="lp-raw-name">
                   {slot.raw_name} <span className="lp-pos-chip">{slot.position}</span>
                 </span>
