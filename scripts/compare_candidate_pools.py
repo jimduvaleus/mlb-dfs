@@ -1,55 +1,73 @@
 """
-Round 1: external (SaberSim) candidate pool vs. an internally-generated
-candidate pool of the same theoretical construction, size-matched, on a
-settled slate.
+Round 1 (v3): does augmenting the external (SaberSim) candidate pool with a
+TIME-BOXED batch of internally-generated ceiling lineups help, hurt, or do
+nothing -- on a settled slate. Two generation methods:
 
-Motivation
-----------
-The external pool is advertised as drawn from a larger pool of lineups each
-of which won at least one simulated world, subject to three generation
-rules: (1) a minimum stack size, (2) no pitcher rostered against an opposing
-hitter, (3) a salary floor. We already have an ILP that produces exactly
-that kind of lineup (`generate_sim_optimal_lineups`, one exact roster-ILP
-solve per simulated world) and already enforces all three rules natively:
+  ilp         per-simulated-world exact ILP optimum
+              (generate_sim_optimal_lineups). Tested first; the diagnostic
+              (scripts/diagnose_ilp_supplement_pwin.py) found these
+              lineups' own p_win_select systematically LOWER than the
+              external pool's at every percentile across all 7 test
+              slates, and literally 0 of them ever landed in the combined
+              pool's top 1% (106.2 expected under random placement). An
+              exact per-world argmax over-concentrates on whatever players
+              happened to score huge in that one world -- optimal for that
+              world, not for the distribution p_win integrates over.
 
-  rule                          | already-existing enforcement
-  ------------------------------|--------------------------------------
-  1. min_stack batters, 1 team  | min_stack param (default 4)
-  2. no pitcher-vs-opp-hitter   | constraint C5 in generate_optimal_lineups,
-                                 | always on, not configurable off
-  3. salary floor               | salary_floor param
+  sim_winner  CandidateGenerator.generate_sim_winners: samples through the
+              normal stack-construction machinery with per-world
+              rank-softmax weights instead of solving each world's exact
+              argmax -- explicitly built as "the scaled, sampling-based
+              successor to per-sim exact ILP seeding" for this reason. This
+              round tests whether that softer objective actually produces
+              lineups with better p_win/selection properties than the ILP
+              did, or whether the same failure mode reappears.
 
-So round 1 needs no new ILP-constraint work — just: (a) size the internal
-pool to match the external pool's *raw pre-dedup* candidate count (so the
-comparison isn't skewed by SaberSim's own dedup step), (b) pick a salary
-floor (this script infers it per-slate from the external pool's own
-observed minimum lineup salary — no universal number is assumed), and
-(c) run enough simulated worlds to have a shot at that many *unique*
-per-sim-optimal lineups.
+Why time-boxed rather than a target count
+------------------------------------------
+An earlier version of this script sized the internal pool to match the
+external pool's raw pre-dedup count and measured how long that took (the
+07/26 pilot: ~28 minutes for ~12,000 unique lineups). That's backwards for
+how this would actually be used: the real constraint is wall-clock time
+between late-breaking slate news and lock (realistically ~10 minutes, most
+of which the rest of the pipeline needs too), not a target lineup count --
+and different slates' player pools generate at different speeds, so a
+fixed N doesn't map to a fixed time cost anyway. This version generates as
+many unique lineups as fit in a fixed time budget (default 3 minutes) and
+reports how many that turned out to be, rather than the reverse.
 
-Known open risk, not resolved by design: it is not known in advance
-whether a given sim budget can produce `target_n` UNIQUE per-sim-optimal
-lineups — many worlds can converge on the same optimal roster. This script
-grows the sim sample in batches and stops either at target_n unique
-lineups or at --max-sims, whichever comes first, and always reports which
-one it hit rather than silently padding to the target.
+Mechanism: both `generate_sim_optimal_lineups` and `generate_sim_winners`
+check a `stop_check` callable from inside their sim loop (per-solve for the
+ILP; every 200 worlds for sim_winner, which is cheap per-world so the
+coarser check doesn't meaningfully overshoot). Submitting a generous
+oversupply of sim indices up front and passing a time-based stop_check
+lets already in-flight work finish while not-yet-started work returns
+instantly once the budget is spent -- no batch-size tuning needed.
 
-Resumability
-------------
-The unit of resumability is the SLATE, not the batch: a slate's internal
-pool is only ever written to disk (outputs/pool_compare/<slate>/) once
-finished (target reached or --max-sims exhausted), with a manifest
-recording the outcome. Re-running the script skips any slate whose
-manifest already exists. In-flight batch progress for a slate that gets
-interrupted mid-run is NOT preserved -- that slate simply restarts from
-sim 0 next time, per instruction (only completed slates need to survive
-a pause).
+The comparison itself
+----------------------
+This tests AUGMENTATION, not a competing rival pool: does external +
+(whatever the generator found in the time budget) score better, the same,
+or worse than external alone? Four numbers per pool, pre- and
+post-pipeline: mean real score, max real score, and p99 hit rate (pool)
+--> mean/max/hit99 of the SELECTED portfolio (post-pipeline, same p_win
+selector run on both). "Post" uses a disjoint later sim slice from
+"pre"/generation, so selection never reuses the exact sims the supplement
+was built against.
+
+Resumability: the unit of resumability is the slate. A slate's generated
+supplement is cached to outputs/pool_compare/<slate>/<method>/ once the
+time budget is spent; re-running reuses it unless --time-budget-minutes or
+--seed changed. In-flight progress within a still-running slate is not
+preserved.
 
 Usage
 -----
-    python scripts/compare_candidate_pools.py --slate 07262026
-    python scripts/compare_candidate_pools.py --recent 8
-    python scripts/compare_candidate_pools.py --slate 07262026 --max-sims 150000
+    python scripts/compare_candidate_pools.py --slate 07262026 --method ilp
+    python scripts/compare_candidate_pools.py --slate 07262026 --method sim_winner
+    python scripts/compare_candidate_pools.py --slate 07192026 --slate 07202026 \\
+        --slate 07212026 --slate 07222026 --slate 07242026 --slate 07252026 --slate 07262026 \\
+        --method sim_winner
 """
 import argparse
 import json
@@ -68,7 +86,9 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 from src.api import external_pool as ep  # noqa: E402
 from src.models.copula import EmpiricalCopula  # noqa: E402
 from src.simulation.engine import SimulationEngine  # noqa: E402
+from src.simulation.results import SimulationResults  # noqa: E402
 from src.optimization.contest import ContestSimulator  # noqa: E402
+from src.optimization.candidate_generator import CandidateGenerator  # noqa: E402
 from src.optimization.optimal_lineups import (  # noqa: E402
     generate_sim_optimal_lineups, stratified_sim_sample,
 )
@@ -76,6 +96,8 @@ from src.optimization.lineup import Lineup  # noqa: E402
 from analyze_candidate_pool import load_contest_player_fpts, load_real_field_points  # noqa: E402
 
 OUT_ROOT = PROJECT_ROOT / "outputs" / "pool_compare"
+_SIM_WINNER_TEMP = 0.15       # matches gpp.sim_winner_temp production default
+_SIM_WINNER_OWN_BLEND = 0.25  # matches gpp.sim_winner_own_blend production default
 
 _POSITION_MAP = {"SP": "P", "RP": "P"}
 
@@ -132,105 +154,150 @@ def build_players_df(archive_dir: Path) -> tuple[pd.DataFrame, dict, dict]:
     players_df = ep.build_external_players_df(
         slate_df, proj_ext, set(slate_df["player_id"]), _derive_opponent,
     )
-    # build_external_players_df keeps only pool players + confirmed
-    # batters + all pitchers -- eligible_positions/opponent/game survive
-    # the merge since they're carried on slate_df, but re-verify here since
-    # a silently-missing column is exactly the kind of bug this file exists
-    # to avoid repeating.
     for col in ("eligible_positions", "opponent", "game", "salary", "team", "position"):
         if col not in players_df.columns:
             raise RuntimeError(f"players_df missing required ILP column {col!r}")
     return players_df, ep.build_quantile_grids(proj_ext), name_to_id
 
 
-def load_pool_and_target(archive_dir: Path, players_df: pd.DataFrame) -> tuple:
-    """(pool, target_n, salary_floor). target_n is the external pool's raw
-    row count BEFORE our own parse_lineup_pool dropped exact/near
-    duplicates -- the size SaberSim's own generator actually produced,
-    which is the fair count to match rather than the post-dedup one.
-    salary_floor is inferred from the pool's own observed minimum lineup
-    salary (no universal number assumed)."""
-    found = ep.discover_external_files(str(archive_dir))
-    valid_ids = set(players_df["player_id"].astype(int))
-    pool = ep.parse_lineup_pool(found["lineups_paths"], valid_ids)
-    target_n = len(pool.lineups) + pool.n_dropped_duplicates + pool.n_dropped_near_duplicates
-
+def salary_floor_from_pool(pool, players_df: pd.DataFrame) -> float:
+    """Salary floor inferred from the external pool's own observed minimum
+    lineup salary -- no universal number assumed."""
     sal_by_id = dict(zip(players_df["player_id"], players_df["salary"]))
     pool_salaries = np.array([
         sum(sal_by_id.get(int(p), 0) for p in lu.player_ids) for lu in pool.lineups
     ])
-    salary_floor = float(pool_salaries.min())
-    return pool, target_n, salary_floor
+    return float(pool_salaries.min())
 
 
-def generate_internal_pool(
-    players_df: pd.DataFrame, sim_results, target_n: int, salary_floor: float,
-    max_sims: int, batch_size: int, seed: int,
+def generate_ilp_supplement_timeboxed(
+    players_df: pd.DataFrame, sim_results, salary_floor: float,
+    time_budget_s: float, seed: int,
 ) -> tuple[list[Lineup], dict]:
-    """Grow the per-sim-optimal pool in batches of stratified sim draws
-    until target_n unique lineups are found or max_sims sim-solves have
-    been spent, whichever comes first. Returns (lineups, stats) where
-    stats always records which stopping condition actually fired --
-    reaching target_n is not guaranteed and must never be assumed."""
+    """Per-sim-optimal ILP lineups (generate_sim_optimal_lineups), spending
+    up to time_budget_s wall-clock seconds rather than targeting a lineup
+    count. Submits every available sim index up front (oversupply -- the
+    07/26 pilot ran at ~100% unique yield per sim, ~0.14s/lineup, so
+    n_sims_available should comfortably outlast any reasonable time
+    budget) and lets the time-based stop_check cut generation off from
+    inside the thread pool once the budget is spent.
+    """
+    n_sims_available = sim_results.results_matrix.shape[0]
     rng = np.random.default_rng(seed)
-    unique: list[Lineup] = []
-    seen: set = set()
-    total_sims_used = 0
+    sampled = stratified_sim_sample(sim_results.results_matrix, n_sims_available, rng)
+    sim_indices = [s for s, _ in sampled]
+
     t0 = time.perf_counter()
 
-    while len(unique) < target_n and total_sims_used < max_sims:
-        this_batch = min(batch_size, max_sims - total_sims_used)
-        sampled = stratified_sim_sample(sim_results.results_matrix, this_batch, rng)
-        new = generate_sim_optimal_lineups(
-            players_df, sim_results.results_matrix, sim_results.player_ids,
-            [s for s, _ in sampled], min_stack=4, salary_floor=salary_floor,
-            seen=seen,
-        )
-        unique.extend(new)
-        total_sims_used += this_batch
-        print(f"    sims used {total_sims_used:,}/{max_sims:,}  "
-              f"unique lineups {len(unique):,}/{target_n:,}  "
-              f"({time.perf_counter() - t0:.0f}s elapsed)")
+    def _stop_check() -> bool:
+        return (time.perf_counter() - t0) >= time_budget_s
 
-    hit_target = len(unique) >= target_n
-    return unique[:target_n], {
-        "target_n": target_n, "achieved_n": len(unique), "hit_target": hit_target,
-        "sims_used": total_sims_used, "max_sims": max_sims,
-        "salary_floor": salary_floor, "elapsed_s": time.perf_counter() - t0,
+    def _progress(n_done: int) -> None:
+        if n_done % 250 == 0:
+            print(f"    {n_done:,} sim-solves resolved, "
+                  f"{time.perf_counter() - t0:.0f}s / {time_budget_s:.0f}s budget")
+
+    lineups = generate_sim_optimal_lineups(
+        players_df, sim_results.results_matrix, sim_results.player_ids,
+        sim_indices, min_stack=4, salary_floor=salary_floor,
+        progress_cb=_progress, stop_check=_stop_check,
+    )
+    elapsed = time.perf_counter() - t0
+    return lineups, {
+        "method": "ilp", "time_budget_s": time_budget_s, "elapsed_s": elapsed,
+        "achieved_n": len(lineups), "sims_available": n_sims_available,
+        "salary_floor": salary_floor,
     }
 
 
-def _slate_cache_dir(slate: str) -> Path:
-    d = OUT_ROOT / slate
+def _primary_stack_size(lineup: Lineup, players_df: pd.DataFrame) -> int:
+    team_of = dict(zip(players_df["player_id"], players_df["team"]))
+    pos_of = dict(zip(players_df["player_id"], players_df["position"]))
+    teams = [team_of.get(int(p)) for p in lineup.player_ids if pos_of.get(int(p)) != "P"]
+    if not teams:
+        return 0
+    return int(pd.Series(teams).value_counts().iloc[0])
+
+
+def generate_sim_winner_supplement_timeboxed(
+    players_df: pd.DataFrame, sim_results, salary_floor: float,
+    time_budget_s: float, seed: int,
+) -> tuple[list[Lineup], dict]:
+    """CandidateGenerator.generate_sim_winners, time-boxed the same way as
+    the ILP path: submit every available sim index up front, let a
+    time-based stop_check cut sampling off (checked every 200 worlds inside
+    generate_sim_winners -- cheap per-world sampling, so the coarser check
+    doesn't meaningfully overshoot the budget).
+
+    Unlike the ILP path, generate_sim_winners samples across a 5/4/3-batter
+    stack-size MIX (CandidateGenerator.GROUP_FRACTIONS, ~62/31/7%) rather
+    than enforcing a hard minimum -- so a post-filter drops anything below
+    a 4-man primary stack to match the same min_stack=4 rule the ILP path
+    enforces natively, keeping the three generation rules identical across
+    both methods being compared.
+    """
+    n_sims_available = sim_results.results_matrix.shape[0]
+    rng = np.random.default_rng(seed)
+    sampled = stratified_sim_sample(sim_results.results_matrix, n_sims_available, rng)
+    sim_indices = [s for s, _ in sampled]
+
+    own_vec = players_df["ownership"].astype(float).to_numpy()
+    gen = CandidateGenerator(players_df, own_vec, rng_seed=seed, salary_floor=salary_floor)
+
+    t0 = time.perf_counter()
+
+    def _stop_check() -> bool:
+        return (time.perf_counter() - t0) >= time_budget_s
+
+    def _progress(n_done: int) -> None:
+        print(f"    {n_done:,} lineups sampled, "
+              f"{time.perf_counter() - t0:.0f}s / {time_budget_s:.0f}s budget")
+
+    raw = gen.generate_sim_winners(
+        sim_results.results_matrix, sim_results.player_ids, sim_indices,
+        per_world=1, temp=_SIM_WINNER_TEMP, own_blend=_SIM_WINNER_OWN_BLEND,
+        progress_cb=_progress, stop_check=_stop_check,
+    )
+    lineups = [lu for lu in raw if _primary_stack_size(lu, players_df) >= 4]
+    elapsed = time.perf_counter() - t0
+    return lineups, {
+        "method": "sim_winner", "time_budget_s": time_budget_s, "elapsed_s": elapsed,
+        "achieved_n": len(lineups), "raw_n_before_stack_filter": len(raw),
+        "sims_available": n_sims_available, "salary_floor": salary_floor,
+    }
+
+
+def _slate_cache_dir(slate: str, method: str) -> Path:
+    d = OUT_ROOT / slate / method
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def load_or_generate_internal_pool(
-    slate: str, players_df: pd.DataFrame, sim_results, target_n: int,
-    salary_floor: float, max_sims: int, batch_size: int, seed: int,
+def load_or_generate_supplement(
+    slate: str, method: str, players_df: pd.DataFrame, sim_results, salary_floor: float,
+    time_budget_s: float, seed: int,
 ) -> tuple[list[Lineup], dict]:
-    d = _slate_cache_dir(slate)
+    d = _slate_cache_dir(slate, method)
     manifest_path = d / "manifest.json"
-    pool_path = d / "internal_pool.json"
+    pool_path = d / "supplement.json"
     if manifest_path.exists() and pool_path.exists():
         manifest = json.loads(manifest_path.read_text())
-        if manifest.get("target_n") == target_n and manifest.get("salary_floor") == salary_floor:
+        if (manifest.get("time_budget_s") == time_budget_s
+                and manifest.get("salary_floor") == salary_floor):
             lineups = [Lineup(player_ids=ids) for ids in json.loads(pool_path.read_text())]
-            print(f"  [{slate}] cached internal pool: {len(lineups):,} lineups "
-                  f"(hit_target={manifest.get('hit_target')}, reusing -- delete "
-                  f"{d} to force regeneration)")
+            print(f"  [{slate}/{method}] cached supplement: {len(lineups):,} lineups "
+                  f"(reusing -- delete {d} to force regeneration)")
             return lineups, manifest
-        print(f"  [{slate}] cached pool params changed (target/floor) -- regenerating")
+        print(f"  [{slate}/{method}] cached params changed (time budget/floor) -- regenerating")
 
-    lineups, manifest = generate_internal_pool(
-        players_df, sim_results, target_n, salary_floor, max_sims, batch_size, seed,
-    )
+    generator_fn = (generate_ilp_supplement_timeboxed if method == "ilp"
+                    else generate_sim_winner_supplement_timeboxed)
+    lineups, manifest = generator_fn(players_df, sim_results, salary_floor, time_budget_s, seed)
     pool_path.write_text(json.dumps([list(map(int, lu.player_ids)) for lu in lineups]))
     manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"  [{slate}] internal pool complete: {manifest['achieved_n']:,}/{manifest['target_n']:,} "
-          f"unique lineups (hit_target={manifest['hit_target']}), "
-          f"{manifest['sims_used']:,} sims, {manifest['elapsed_s']:.0f}s -- cached to {d}")
+    print(f"  [{slate}/{method}] supplement complete: {manifest['achieved_n']:,} unique lineups "
+          f"in {manifest['elapsed_s']:.0f}s (budget {manifest['time_budget_s']:.0f}s) "
+          f"-- cached to {d}")
     return lineups, manifest
 
 
@@ -253,15 +320,29 @@ def pool_metrics(lineups: list, fpts: dict, field_pts: np.ndarray) -> dict:
     }
 
 
+def augment_pool(base_lineups: list, supplement: list[Lineup]) -> list:
+    """base_lineups + supplement, dropping any supplement lineup that
+    exactly duplicates one already in base_lineups (cheap safety net --
+    the ILP draws from a >5,000-candidate space, so an accidental exact
+    match is unlikely, but silently double-counting one would bias the
+    pool-size-dependent metrics)."""
+    seen = {frozenset(int(p) for p in lu.player_ids) for lu in base_lineups}
+    added = []
+    for lu in supplement:
+        key = frozenset(int(p) for p in lu.player_ids)
+        if key not in seen:
+            seen.add(key)
+            added.append(lu)
+    return list(base_lineups) + added
+
+
 def select_portfolio(
-    lineups: list, own_by_id: dict, proj_by_id: dict, players_df: pd.DataFrame,
-    sim_results, portfolio_size: int, ev_type: str, sharpness: float, admit_n: int,
+    lineups: list, players_df: pd.DataFrame, sim_results,
+    portfolio_size: int, sharpness: float, admit_n: int, admit_multiplier: float,
 ) -> list:
     """Run `lineups` through the same production p_win selection path
     (allocate_contests) used for external pools, so 'after our pipeline'
-    means the identical selector for both pool sources."""
-    from src.optimization.gpp_portfolio import DeterminantPortfolioSelector  # noqa: F401
-
+    means the identical selector regardless of which pool fed it."""
     pool = ep.ExternalPool(
         lineups=[Lineup(player_ids=list(lu.player_ids) if hasattr(lu, "player_ids") else list(lu))
                 for lu in lineups],
@@ -269,111 +350,111 @@ def select_portfolio(
         n_dropped_near_duplicates=0, source_paths=[],
     )
     corr = ep.compute_pool_corr(pool.lineups, sim_results)
-    proj_scores = ep.compute_pool_proj_scores(pool.lineups, players_df)
-    own_scores = ep.compute_pool_ownership(pool.lineups, players_df)
 
     group = ep.ContestGroup(
         contest_id="c0", contest_name="pool-compare", entry_fee_cents=400,
         prize_pool_cents=int(10_000 * 400), single_entry_tag=False, roi_key="",
         entries=[(Path("x"), None)] * portfolio_size,
     )
-    if ev_type == "p_win":
-        n_third = sim_results.results_matrix.shape[0] // 2
-        lineup_scores = ep.compute_lineup_scores(pool.lineups, sim_results)
-        scores_A, scores_B = lineup_scores[:, :n_third], lineup_scores[:, n_third:2 * n_third]
-        cs = ContestSimulator()
-        own_vec = players_df["ownership"].astype(float).to_numpy()
-        field_A = cs.score_field(cs.generate_field(players_df, own_vec, 10_000, rng_seed=100),
-                                 sim_results.results_matrix[:n_third], {int(p): i for i, p in enumerate(sim_results.player_ids)})
-        field_B = cs.score_field(cs.generate_field(players_df, own_vec, 10_000, rng_seed=101),
-                                 sim_results.results_matrix[n_third:2 * n_third], {int(p): i for i, p in enumerate(sim_results.player_ids)})
-        exponent = max(1.0, sharpness * 10_000.0)
-        p_win_cull = ep.compute_p_win(scores_A, field_A, {"c0": exponent})
-        p_win_select = ep.compute_p_win(scores_B, field_B, {"c0": exponent})
-        alloc = ep.allocate_contests(
-            pool, corr, [group], risk=3.0, evw_base=0.10, evw_max=0.40,
-            ev_type="p_win", p_win_cull=p_win_cull, p_win_select=p_win_select,
-            p_win_admit_n=admit_n,
-        )
-    else:
-        alloc = ep.allocate_contests(
-            pool, corr, [group], risk=3.0, evw_base=0.10, evw_max=0.40,
-            ev_type="prj_own", proj_scores=proj_scores, own_scores=own_scores,
-        )
+    n_half = sim_results.results_matrix.shape[0] // 2
+    lineup_scores = ep.compute_lineup_scores(pool.lineups, sim_results)
+    scores_A, scores_B = lineup_scores[:, :n_half], lineup_scores[:, n_half:2 * n_half]
+    col_map = {int(p): i for i, p in enumerate(sim_results.player_ids)}
+    cs = ContestSimulator()
+    own_vec = players_df["ownership"].astype(float).to_numpy()
+    field_A = cs.score_field(cs.generate_field(players_df, own_vec, 10_000, rng_seed=100),
+                             sim_results.results_matrix[:n_half], col_map)
+    field_B = cs.score_field(cs.generate_field(players_df, own_vec, 10_000, rng_seed=101),
+                             sim_results.results_matrix[n_half:2 * n_half], col_map)
+    exponent = max(1.0, sharpness * 10_000.0)
+    p_win_cull = ep.compute_p_win(scores_A, field_A, {"c0": exponent})
+    p_win_select = ep.compute_p_win(scores_B, field_B, {"c0": exponent})
+    alloc = ep.allocate_contests(
+        pool, corr, [group], risk=3.0, evw_base=0.10, evw_max=0.40,
+        ev_type="p_win", p_win_cull=p_win_cull, p_win_select=p_win_select,
+        p_win_admit_n=admit_n, p_win_admit_multiplier=admit_multiplier,
+    )
     return [lu for lu, _ in alloc.portfolio]
 
 
 def run_slate(
-    slate: str, portfolio_size: int, max_sims: int, batch_size: int, seed: int,
-    sharpness: float, admit_n: int,
+    slate: str, method: str, portfolio_size: int, time_budget_s: float, n_sims: int, seed: int,
+    sharpness: float, admit_n: int, admit_multiplier: float,
 ) -> dict:
     d = PROJECT_ROOT / "archive" / slate
-    print(f"\n=== {slate} ===")
+    print(f"\n=== {slate} ({method}) ===")
     players_df, grids, name_to_id = build_players_df(d)
-    pool, target_n, salary_floor = load_pool_and_target(d, players_df)
-    print(f"  external pool: {len(pool.lineups):,} post-dedup "
-          f"(+{pool.n_dropped_duplicates} dup +{pool.n_dropped_near_duplicates} near-dup "
-          f"= {target_n:,} raw target)  salary_floor={salary_floor:.0f}")
+
+    found = ep.discover_external_files(str(d))
+    valid_ids = set(players_df["player_id"].astype(int))
+    pool = ep.parse_lineup_pool(found["lineups_paths"], valid_ids)
+    salary_floor = salary_floor_from_pool(pool, players_df)
+    print(f"  external pool: {len(pool.lineups):,} lineups  salary_floor={salary_floor:.0f}")
 
     cfg = yaml.safe_load(open(PROJECT_ROOT / "config.yaml"))
     copula = EmpiricalCopula(str(PROJECT_ROOT / cfg["paths"]["copula"]))
     engine = SimulationEngine(copula, players_df, batter_pca_model=None,
                               score_grid=None, quantile_grids=grids)
     np.random.seed(seed)
-    n_sims_for_selection = 25_000
-    sim_results = engine.simulate(max(max_sims, n_sims_for_selection) + n_sims_for_selection)
-    # First slice funds internal-pool generation; a disjoint later slice
-    # funds both pools' "after our pipeline" p_win selection, so selection
-    # never reuses the exact sims the internal pool was built from.
-    from src.simulation.results import SimulationResults
-    gen_sims = SimulationResults(sim_results.player_ids, sim_results.results_matrix[:max_sims])
-    select_sims = SimulationResults(sim_results.player_ids,
-                                    sim_results.results_matrix[max_sims:max_sims + n_sims_for_selection])
+    # One simulation draw funds generation AND (a disjoint later slice)
+    # "after our pipeline" p_win selection -- generation and selection never
+    # share sims, so the supplement isn't graded on the exact worlds it was
+    # built against.
+    sim_results = engine.simulate(n_sims + n_sims)
+    gen_sims = SimulationResults(sim_results.player_ids, sim_results.results_matrix[:n_sims])
+    select_sims = SimulationResults(sim_results.player_ids, sim_results.results_matrix[n_sims:])
 
-    internal_lineups, manifest = load_or_generate_internal_pool(
-        slate, players_df, gen_sims, target_n, salary_floor, max_sims, batch_size, seed,
+    supplement, manifest = load_or_generate_supplement(
+        slate, method, players_df, gen_sims, salary_floor, time_budget_s, seed,
     )
+    augmented = augment_pool(pool.lineups, supplement)
+    n_added = len(augmented) - len(pool.lineups)
+    print(f"  augmented pool: {len(pool.lineups):,} + {n_added:,} new "
+          f"(of {manifest['achieved_n']:,} generated) = {len(augmented):,}")
 
     fpts = load_contest_player_fpts(d)
     field_pts = load_real_field_points(d)
 
     ext_before = pool_metrics(pool.lineups, fpts, field_pts)
-    int_before = pool_metrics(internal_lineups, fpts, field_pts)
+    aug_before = pool_metrics(augmented, fpts, field_pts)
 
-    own_by_id = dict(zip(players_df["player_id"], players_df["ownership"]))
-    proj_by_id = dict(zip(players_df["player_id"], players_df["mean"]))
-    ext_portfolio = select_portfolio(pool.lineups, own_by_id, proj_by_id, players_df,
-                                     select_sims, portfolio_size, "p_win", sharpness, admit_n)
-    int_portfolio = select_portfolio(internal_lineups, own_by_id, proj_by_id, players_df,
-                                     select_sims, portfolio_size, "p_win", sharpness, admit_n)
+    ext_portfolio = select_portfolio(pool.lineups, players_df, select_sims,
+                                     portfolio_size, sharpness, admit_n, admit_multiplier)
+    aug_portfolio = select_portfolio(augmented, players_df, select_sims,
+                                     portfolio_size, sharpness, admit_n, admit_multiplier)
     ext_after = pool_metrics(ext_portfolio, fpts, field_pts)
-    int_after = pool_metrics(int_portfolio, fpts, field_pts)
+    aug_after = pool_metrics(aug_portfolio, fpts, field_pts)
 
-    print(f"\n  {'':22s} {'n':>6s} {'mean':>8s} {'max':>8s} {'p99_hit':>9s}")
-    for label, m in (("external, before", ext_before), ("internal, before", int_before),
-                     ("external, after", ext_after), ("internal, after", int_after)):
-        print(f"  {label:22s} {m['n']:6d} {m['mean']:8.2f} {m['max']:8.2f} {m['p99_hit_rate']:9.4f}")
+    print(f"\n  {'':26s} {'n':>6s} {'mean':>8s} {'max':>8s} {'p99_hit':>9s}")
+    for label, m in (("external, pre-pipeline", ext_before), ("augmented, pre-pipeline", aug_before),
+                     ("external, post-pipeline", ext_after), ("augmented, post-pipeline", aug_after)):
+        print(f"  {label:26s} {m['n']:6d} {m['mean']:8.2f} {m['max']:8.2f} {m['p99_hit_rate']:9.4f}")
 
-    return {"slate": slate, "manifest": manifest, "ext_before": ext_before,
-            "int_before": int_before, "ext_after": ext_after, "int_after": int_after}
+    return {"slate": slate, "manifest": manifest, "n_added": n_added,
+            "ext_before": ext_before, "aug_before": aug_before,
+            "ext_after": ext_after, "aug_after": aug_after}
 
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Round 1: external SaberSim pool vs. an internally ILP-generated "
-                    "pool of the same theoretical construction, size-matched.",
+        description="Does augmenting the external pool with a time-boxed batch of "
+                    "internally ILP-generated ceiling lineups help, hurt, or do nothing?",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     p.add_argument("--slate", action="append", default=[], help="Archive dir name; repeatable.")
     p.add_argument("--recent", type=int, default=0)
+    p.add_argument("--method", choices=["ilp", "sim_winner"], default="ilp",
+                   help="Generation method for the supplement (default: ilp).")
     p.add_argument("--portfolio-size", type=int, default=150)
-    p.add_argument("--max-sims", type=int, default=100_000,
-                   help="Sim-solve budget cap for the internal pool (default: 100,000). "
-                        "Reaching target_n unique lineups is not guaranteed within this "
-                        "budget -- the manifest records which stopping condition fired.")
-    p.add_argument("--batch-size", type=int, default=5_000,
-                   help="Sim indices sampled per batch while growing toward target_n.")
+    p.add_argument("--time-budget-minutes", type=float, default=3.0,
+                   help="Wall-clock budget for supplement generation per slate (default: 3.0). "
+                        "The actual number of lineups this buys varies by slate -- that's "
+                        "the point; report what it turns out to be rather than assume it.")
+    p.add_argument("--n-sims", type=int, default=10_000,
+                   help="Sims per stage (generation and, separately, selection) -- "
+                        "simulation itself is cheap, this isn't the constrained resource.")
     p.add_argument("--sharpness", type=float, default=0.05)
-    p.add_argument("--admit-n", type=int, default=1000)
+    p.add_argument("--admit-n", type=int, default=250)
+    p.add_argument("--admit-multiplier", type=float, default=12.0)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -393,18 +474,24 @@ def main() -> None:
         print("No slates given (use --slate or --recent N).")
         sys.exit(1)
 
-    results = [run_slate(s, args.portfolio_size, args.max_sims, args.batch_size,
-                         args.seed, args.sharpness, args.admit_n) for s in slates]
+    time_budget_s = args.time_budget_minutes * 60.0
+    results = [run_slate(s, args.method, args.portfolio_size, time_budget_s, args.n_sims, args.seed,
+                         args.sharpness, args.admit_n, args.admit_multiplier) for s in slates]
 
     print("\n\n=== Summary across all slates ===")
     rows = []
     for r in results:
-        for source in ("ext", "int"):
+        for source in ("ext", "aug"):
             for stage in ("before", "after"):
                 m = r[f"{source}_{stage}"]
-                rows.append({"slate": r["slate"], "source": source, "stage": stage, **m})
+                rows.append({"slate": r["slate"], "source": source, "stage": stage,
+                            "n_added": r["n_added"], **m})
     df = pd.DataFrame(rows)
     print(df.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
+
+    print("\n=== Mean across slates, external vs. augmented ===")
+    print(df.groupby(["source", "stage"])[["mean", "max", "p99_hit_rate"]].mean()
+          .to_string(float_format=lambda x: f"{x:.4f}"))
 
 
 if __name__ == "__main__":

@@ -2638,14 +2638,12 @@ async def projections_fetch(request: Request):
                             yield _log(warn_msg)
                         pitcher_rows = sabersim_df["lineup_slot"] == 10
                         n_batters = int((~pitcher_rows).sum())
-                        n_pitchers_confirmed = int((pitcher_rows & sabersim_df["slot_confirmed"]).sum())
-                        n_pitchers_fallback = int((pitcher_rows & ~sabersim_df["slot_confirmed"]).sum())
+                        n_pitchers = int(pitcher_rows.sum())
                         n_confirmed = int(sabersim_df["slot_confirmed"].sum())
                         result_event = _log(
-                            f"SaberSim: {n_batters} batter(s), {n_pitchers_confirmed} confirmed pitcher(s)"
-                            + (f", {n_pitchers_fallback} projected (unconfirmed) starter(s) by highest projection"
-                               if n_pitchers_fallback else "")
-                            + f", {n_confirmed} confirmed lineup slot(s) loaded from {mlb_path.name}."
+                            f"SaberSim: {n_batters} batter(s), {n_pitchers} pitcher(s) "
+                            f"(highest projected per team), {n_confirmed} confirmed lineup "
+                            f"slot(s) loaded from {mlb_path.name}."
                         )
             except Exception as exc:
                 returncode = 1
@@ -3270,6 +3268,8 @@ def run_cache_status():
                            "error": None}
     try:
         from .external_pool import discover_external_files
+        _ev_type = str(getattr(cfg.gpp, "external_pool_ev_type", "roi") or "roi").strip().lower()
+        _roi_required = _ev_type not in ("prj_own", "p_win")
         raw_dir = str((PROJECT_ROOT / slate_path).parent) if slate_path else ""
         found = discover_external_files(raw_dir) if raw_dir else {}
         if found.get("lineups_paths") and found.get("projections_path"):
@@ -3287,14 +3287,24 @@ def run_cache_status():
                     if c.endswith(" ROI") and f"{c[:-4]} Sim Dupes" in _hset
                 )
             _n_contests = len(_contest_names)
+            # ROI blocks are only structurally required for ev_type="roi" —
+            # "prj_own"/"p_win" source contest identity from the DK entries
+            # file and EV from internal sim/projections (see
+            # allocate_contests / parse_lineup_pool's require_roi_blocks).
+            _available = _n_lineups > 0 and (_n_contests > 0 or not _roi_required)
+            _error = None
+            if _n_lineups == 0:
+                _error = "lineup file has no rows"
+            elif _roi_required and _n_contests == 0:
+                _error = "no contest ROI blocks found"
             external_pool.update({
-                "available": _n_contests > 0,
+                "available": _available,
                 "lineups_files": [p.name for p in found["lineups_paths"]],
                 "projections_file": found["projections_path"].name,
                 "n_lineups": _n_lineups,
                 "n_contests": _n_contests,
                 "paired_by_token": bool(found.get("paired_by_token")),
-                "error": None if _n_contests > 0 else "no contest ROI blocks found",
+                "error": _error,
             })
         else:
             external_pool["error"] = "no lineups_*.csv / projections pair in data/raw"

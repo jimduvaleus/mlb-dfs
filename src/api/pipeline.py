@@ -2362,6 +2362,13 @@ class PipelineRunner:
         from .slate_exclusions import compute_file_fingerprint, compute_slate_id, read_exclusions
 
         gpp_cfg = cfg.get("gpp", {})
+        _ev_type = str(gpp_cfg.get("external_pool_ev_type", "roi")).strip().lower()
+        if _ev_type not in ("roi", "prj_own", "p_win"):
+            logger.warning(
+                "External pool: unknown external_pool_ev_type %r — falling back to 'roi'.",
+                _ev_type,
+            )
+            _ev_type = "roi"
         raw_dir = os.path.dirname(slate_path) if slate_path else ""
         found = ep.discover_external_files(raw_dir)
         if not found["lineups_paths"] or not found["projections_path"]:
@@ -2387,7 +2394,9 @@ class PipelineRunner:
         )
 
         valid_ids = set(slate_df["player_id"].astype(int))
-        pool = ep.parse_lineup_pool(found["lineups_paths"], valid_ids)
+        pool = ep.parse_lineup_pool(
+            found["lineups_paths"], valid_ids, require_roi_blocks=(_ev_type == "roi"),
+        )
         if not pool.lineups:
             raise ValueError("External pool mode: every lineup in the file was dropped "
                              "(unknown player ids) — is the export for this slate?")
@@ -2445,13 +2454,15 @@ class PipelineRunner:
             int(pid): float(o)
             for pid, o in zip(players_df["player_id"], players_df["ownership"])
         }
-        _ev_type = str(gpp_cfg.get("external_pool_ev_type", "roi")).strip().lower()
-        if _ev_type not in ("roi", "prj_own", "p_win"):
-            logger.warning(
-                "External pool: unknown external_pool_ev_type %r — falling back to 'roi'.",
-                _ev_type,
-            )
-            _ev_type = "roi"
+        self._cb("external_pool", {
+            "n_lineups": len(pool.lineups),
+            "n_files": len(found["lineups_paths"]),
+            "n_contests_covered": len(pool.contests),
+            "n_dropped_unknown": pool.n_dropped_unknown_players,
+            "n_dropped_duplicates": pool.n_dropped_duplicates,
+            "n_dropped_near_duplicates": pool.n_dropped_near_duplicates,
+        })
+
         _own_scale = float(gpp_cfg.get("external_pool_own_scale", 30_000.0)) or 30_000.0
         _proj_score_floor_pct = float(gpp_cfg.get("external_pool_proj_score_pct", 0.0))
         _proj_floor = ep.compute_proj_score_floor(proj_scores, _proj_score_floor_pct)
@@ -2494,15 +2505,6 @@ class PipelineRunner:
                 "n_sims_total": n_sims,
             })
 
-        self._cb("external_pool", {
-            "n_lineups": len(pool.lineups),
-            "n_files": len(found["lineups_paths"]),
-            "n_contests_covered": len(pool.contests),
-            "n_dropped_unknown": pool.n_dropped_unknown_players,
-            "n_dropped_duplicates": pool.n_dropped_duplicates,
-            "n_dropped_near_duplicates": pool.n_dropped_near_duplicates,
-        })
-
         # --- Contest grouping + ROI matching ------------------------------
         groups = ep.group_and_match_contests(all_file_entries, pool)
         total_entries = sum(len(g.entries) for g in groups)
@@ -2512,7 +2514,9 @@ class PipelineRunner:
                     "contest_name": g.contest_name,
                     "entry_fee": g.entry_fee_cents / 100.0,
                     "n_entries": len(g.entries),
-                    "roi_source": pool.contests[g.roi_key].raw_name,
+                    "roi_source": (
+                        pool.contests[g.roi_key].raw_name if g.roi_key in pool.contests else None
+                    ),
                     "fallback": g.roi_fallback,
                     "field_size": ep.implied_field_size(g),
                 }

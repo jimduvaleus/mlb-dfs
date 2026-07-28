@@ -162,9 +162,17 @@ def normalize_contest_name(name: str) -> str:
     return re.sub(r"\s+", " ", name).strip().casefold()
 
 
-def _parse_lineup_header(path: Path, rows: list) -> tuple:
+def _parse_lineup_header(path: Path, rows: list, require_contest_blocks: bool = True) -> tuple:
     """Identify a lineup file's contest ROI blocks. Returns
-    (contest_cols, stddev_cols): norm_name -> (raw prefix, col idx) / col idx."""
+    (contest_cols, stddev_cols, proj_score_idx): norm_name -> (raw prefix,
+    col idx) / col idx / the file's "Proj Score" column index (None if
+    absent) — the near-duplicate tie-break fallback when there's no ROI
+    block to rank by (see parse_lineup_pool).
+
+    ROI blocks are only structurally required for ev_type="roi" (contest
+    identity/sizing for "prj_own"/"p_win" comes entirely from the DK entries
+    file — see group_and_match_contests) — `require_contest_blocks=False`
+    lets a file with none through with empty (contest_cols, stddev_cols)."""
     header = rows[0]
     header_set = set(header)
     contest_cols: dict[str, tuple[str, int]] = {}  # norm_name -> (raw prefix, col idx)
@@ -183,12 +191,13 @@ def _parse_lineup_header(path: Path, rows: list) -> tuple:
         std_col = f"{prefix} ROI StDev"
         if std_col in header_set:
             stddev_cols[norm] = header.index(std_col)
-    if not contest_cols:
+    if not contest_cols and require_contest_blocks:
         raise ValueError(
             f"External lineup file has no contest ROI blocks "
             f"(no '<name> ROI' column with a '<name> Sim Dupes' sibling): {path}"
         )
-    return contest_cols, stddev_cols
+    proj_score_idx = header.index("Proj Score") if "Proj Score" in header_set else None
+    return contest_cols, stddev_cols, proj_score_idx
 
 
 def _pick_primary_contest_index(contest_order: list, contest_meta: dict) -> int:
@@ -243,11 +252,17 @@ def _find_near_duplicate_removals(player_ids_list: list, primary_roi: np.ndarray
     return removed
 
 
-def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
+def parse_lineup_pool(paths, valid_ids: set[int], require_roi_blocks: bool = True) -> ExternalPool:
     """Parse one or more lineup exports for the same slate (see
     discover_external_files) with csv.reader on each raw header (duplicate
     'P'/'OF' slot headers and any duplicate contest names must be seen
     verbatim — never pandas' '.1' mangling).
+
+    `require_roi_blocks=False` (pass when the configured external_pool_ev_type
+    is "prj_own"/"p_win", which never read contest.roi — see allocate_contests)
+    lets a file through with zero contest ROI blocks; the resulting pool just
+    has an empty `contests` dict, which group_and_match_contests and the
+    non-roi allocation branches already tolerate.
 
     Lineups are deduplicated by player-id set across *all* files combined —
     a lineup appearing more than once (within one file or across files) is
@@ -258,7 +273,11 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
     the largest contest by parsed prize pool (see
     _pick_primary_contest_index) — the lower-ROI lineup of any conflicting
     pair is dropped (see _find_near_duplicate_removals for why this needs
-    a priority pass rather than simple equivalence-class grouping).
+    a priority pass rather than simple equivalence-class grouping). When
+    the pool has no ROI blocks at all (require_roi_blocks=False), the same
+    conflict resolution instead ranks by each file's own "Proj Score"
+    column (falling back further to file order wherever that's also
+    missing/unparseable) rather than an arbitrary first-in-file keep.
 
     Contest ROI blocks are matched across files by normalized name (first
     file to define a given contest wins its raw name / prize pool / single
@@ -270,7 +289,7 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
     else:
         paths = [Path(p) for p in paths]
 
-    per_file: list[tuple] = []  # (path, data_rows, contest_cols, stddev_cols)
+    per_file: list[tuple] = []  # (path, data_rows, contest_cols, stddev_cols, proj_score_idx)
     contest_order: list[str] = []  # norm names, first-seen order across files
     contest_meta: dict[str, tuple] = {}  # norm -> (raw_prefix, prize_pool_cents, single_entry)
     any_stddev: set[str] = set()
@@ -280,7 +299,9 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
             rows = list(csv.reader(f))
         if not rows:
             raise ValueError(f"External lineup file is empty: {path}")
-        contest_cols, stddev_cols = _parse_lineup_header(path, rows)
+        contest_cols, stddev_cols, proj_score_idx = _parse_lineup_header(
+            path, rows, require_contest_blocks=require_roi_blocks,
+        )
         for norm, (prefix, _) in contest_cols.items():
             if norm not in contest_meta:
                 contest_order.append(norm)
@@ -288,15 +309,16 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
                     prefix, _parse_prize_pool_cents(prefix), bool(_SINGLE_ENTRY_RE.search(prefix)),
                 )
         any_stddev.update(stddev_cols.keys())
-        per_file.append((path, rows[1:], contest_cols, stddev_cols))
+        per_file.append((path, rows[1:], contest_cols, stddev_cols, proj_score_idx))
 
     lineups: list[Lineup] = []
     roi_rows: list[list[float]] = []
     stddev_rows: list[list[float]] = []
+    proj_score_rows: list[float] = []
     seen: set[frozenset[int]] = set()
     n_unknown = 0
     n_dup = 0
-    for path, data_rows, contest_cols, stddev_cols in per_file:
+    for path, data_rows, contest_cols, stddev_cols, proj_score_idx in per_file:
         for r in data_rows:
             if len(r) < _N_SLOT_COLS:
                 continue
@@ -334,12 +356,26 @@ def parse_lineup_pool(paths, valid_ids: set[int]) -> ExternalPool:
                     std_vals.append(np.nan)
             roi_rows.append(vals)
             stddev_rows.append(std_vals)
+            proj_cell = r[proj_score_idx] if proj_score_idx is not None and proj_score_idx < len(r) else ""
+            try:
+                proj_score_rows.append(float(proj_cell))
+            except ValueError:
+                proj_score_rows.append(np.nan)
 
     # --- Near-duplicate removal (9/10 player overlap) --------------------
     n_near_dup = 0
     if len(lineups) > 1:
-        primary_j = _pick_primary_contest_index(contest_order, contest_meta)
-        primary_roi = np.array([row[primary_j] for row in roi_rows], dtype=np.float64)
+        if contest_order:
+            primary_j = _pick_primary_contest_index(contest_order, contest_meta)
+            primary_roi = np.array([row[primary_j] for row in roi_rows], dtype=np.float64)
+        else:
+            # No ROI blocks at all (require_roi_blocks=False, prj_own/p_win
+            # ev_type) -- nothing to rank conflicts by from a contest block,
+            # so fall back to the file's own "Proj Score" column instead of
+            # an arbitrary first-in-file keep. Still NaN (-> file order via
+            # _find_near_duplicate_removals's stable sort) wherever "Proj
+            # Score" is itself absent/unparseable.
+            primary_roi = np.array(proj_score_rows, dtype=np.float64)
         removed = _find_near_duplicate_removals([lu.player_ids for lu in lineups], primary_roi)
         if removed:
             keep = [i not in removed for i in range(len(lineups))]
@@ -387,22 +423,26 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     above). Columns: player_id, name, mean, std_dev, lineup_slot,
     slot_confirmed, ownership (fraction, from "Adj Own").
 
-    A pitcher row is kept when Status == "Confirmed" (the file lists the
-    whole rotation/bullpen, not just the day's starter). For a team with no
-    Confirmed pitcher at all, the highest-projected-mean pitcher on that
-    team's roster is kept instead as the projected (unconfirmed) starter —
-    mirroring how an unconfirmed batter with an Order still shows as the
-    amber-bubble projected slot rather than being dropped. A batter row is
-    kept only when it carries an Order (its projected batting slot); Status
-    == "Confirmed" then distinguishes an officially confirmed slot from a
-    merely projected one (slot_confirmed drives the UI's green/amber bubble +
-    the team lock icon exactly as it does for the RotoWire/DFF/Market-Odds
-    sources, so no separate UI plumbing is needed for SaberSim).
+    Unlike hitters, a pitcher row's Status column is ignored entirely — the
+    file lists the whole rotation/bullpen, and Status on those rows isn't a
+    reliable confirmed-starter signal. Instead, the pitcher with the highest
+    projected mean on each team's roster is kept as that team's starter,
+    and always treated as confirmed (slot_confirmed=True) for downstream
+    checks — including the portfolio panel's unconfirmed-slot count, which
+    must not flag an external-projection pitcher as unconfirmed. A batter
+    row is kept only when it carries an Order (its projected batting slot);
+    Status == "Confirmed" then distinguishes an officially confirmed slot
+    from a merely projected one (slot_confirmed drives the UI's green/amber
+    bubble + the team lock icon exactly as it does for the
+    RotoWire/DFF/Market-Odds sources, so no separate UI plumbing is needed
+    for SaberSim).
     """
     df = pd.read_csv(path)
     mean_col = "fd_points" if platform == "fanduel" else "dk_points"
     std_col = "fd_std" if platform == "fanduel" else "dk_std"
-    is_pitcher = df["Pos"].astype(str) == "P"
+    # SaberSim's Pos column uses "SP"/"RP", never bare "P" (unlike the DK
+    # slate's ingested `position`, which DraftKingsSlateIngestor maps to "P").
+    is_pitcher = df["Pos"].astype(str).isin(["SP", "RP"])
     confirmed = df["Status"].astype(str) == "Confirmed"
     order = pd.to_numeric(df.get("Order"), errors="coerce")
     mean_raw = pd.to_numeric(df[mean_col], errors="coerce")
@@ -410,17 +450,15 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     lineup_slot.loc[is_pitcher] = 10
     lineup_slot.loc[~is_pitcher] = order.loc[~is_pitcher]
 
-    keep_pitcher = is_pitcher & confirmed
-    pitchers = pd.DataFrame({
-        "team": df["Team"], "mean": mean_raw, "confirmed": confirmed,
-    })[is_pitcher]
-    teams_with_confirmed = set(pitchers.loc[pitchers["confirmed"], "team"])
-    fallback_candidates = pitchers[
-        ~pitchers["team"].isin(teams_with_confirmed) & pitchers["mean"].notna()
-    ]
-    if not fallback_candidates.empty:
-        fallback_starter_idx = fallback_candidates.groupby("team")["mean"].idxmax()
-        keep_pitcher.loc[fallback_starter_idx] = True
+    pitchers = pd.DataFrame({"team": df["Team"], "mean": mean_raw})[is_pitcher]
+    keep_pitcher = pd.Series(False, index=df.index)
+    starter_candidates = pitchers[pitchers["mean"].notna()]
+    if not starter_candidates.empty:
+        starter_idx = starter_candidates.groupby("team")["mean"].idxmax()
+        keep_pitcher.loc[starter_idx] = True
+
+    slot_confirmed = confirmed.copy()
+    slot_confirmed.loc[is_pitcher] = True
 
     out = pd.DataFrame({
         "player_id": pd.to_numeric(df["DFS ID"], errors="coerce"),
@@ -428,7 +466,7 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
         "mean": mean_raw,
         "std_dev": pd.to_numeric(df[std_col], errors="coerce"),
         "lineup_slot": lineup_slot,
-        "slot_confirmed": confirmed,
+        "slot_confirmed": slot_confirmed,
         "ownership": pd.to_numeric(df.get("Adj Own"), errors="coerce") / 100.0,
     })
     keep = keep_pitcher | (~is_pitcher & lineup_slot.notna())
@@ -609,6 +647,13 @@ def group_and_match_contests(
         if norm in pool.contests:
             g.roi_key = norm
             g.roi_fallback = False
+            continue
+        if not covered:
+            # No ROI blocks at all in the pool (ev_type prj_own/p_win with
+            # require_roi_blocks=False) -- roi_key stays "" so the roi
+            # allocation branch's pool.contests.get(g.roi_key) misses and
+            # leaves the group unfilled, which only matters if ev_type=="roi".
+            g.roi_fallback = True
             continue
         # Nearest assumed size by prize pool; sides without a parseable pool
         # sort last; ties prefer the same single/multi-entry tag, then the
@@ -950,14 +995,26 @@ def compute_pool_ownership(lineups: list, players_df: pd.DataFrame) -> np.ndarra
     return (own @ I).astype(np.float64)
 
 
+_DK_RAKE = 0.16
+"""DK's fixed take across contest sizes: prize_pool = entries * entry_fee *
+(1 - _DK_RAKE), i.e. the prize pool is only ~84% of collected entry fees
+(confirmed against data/payout_structures/dk_classic_gpp.json: $59,452
+collected vs $50,000 paid = 15.9% rake). Any estimate of a contest's true
+entry count from its parsed prize pool must divide by entry_fee * (1 -
+_DK_RAKE), not entry_fee alone, or it undercounts by ~16% (e.g. a real
+23,809-entry contest's prize_pool/entry_fee ratio alone reads as 20,000)."""
+
+
 def implied_field_size(group: "ContestGroup") -> float:
-    """Implied entrant count for a contest: prize pool / entry fee. DK contest
-    names carry no entrant count (the `[150 Entry Max]` tag is a per-user entry
-    cap, not a field size), so the parsed prize pool
-    (`dk_entries._parse_prize_pool_cents`, including its `Qualifier` divisor)
-    over the entry fee is the size proxy — the same ratio `dk_entries._sort_ratio`
-    uses to order entries, and the same prize-pool proxy already used for
-    contest matching and fill order here.
+    """Implied entrant count for a contest: prize pool / (entry fee * (1 -
+    _DK_RAKE)). DK contest names carry no entrant count (the `[150 Entry
+    Max]` tag is a per-user entry cap, not a field size), so the parsed
+    prize pool (`dk_entries._parse_prize_pool_cents`, including its
+    `Qualifier` divisor) over the rake-adjusted entry fee is the size proxy.
+    Note this differs from the *unadjusted* ratio `dk_entries._sort_ratio`
+    uses to order entries — that usage only needs relative ordering across
+    contests, which the constant rake factor doesn't change, so it's left
+    as the raw ratio there.
 
     Returns 0.0 when either side is missing or non-positive, which
     deliberately zeroes the ownership penalty in `compute_prj_own_ev` — an
@@ -967,7 +1024,7 @@ def implied_field_size(group: "ContestGroup") -> float:
     fee = group.entry_fee_cents
     if not prize or not fee or prize <= 0 or fee <= 0:
         return 0.0
-    return float(prize) / float(fee)
+    return float(prize) / (float(fee) * (1.0 - _DK_RAKE))
 
 
 _DEFAULT_OWN_SCALE = 30_000.0
@@ -997,6 +1054,15 @@ def compute_prj_own_ev(
       * at 1,000 entries ownership should matter ~10x less, which linear
         scaling gives for free: 1_000/30_000 = 1/30.
 
+    NOTE (2026-07-28): `field_size` is now `implied_field_size(group)`
+    rake-adjusted (see _DK_RAKE) -- it reads ~19% higher than it did at
+    calibration time for the same contest (dividing by entry_fee*0.84
+    instead of entry_fee), so the effective ownership-penalty coefficient
+    is now somewhat stronger than the two anchors above intended. Left
+    uncorrected for now since ownership itself is externally sourced
+    (SaberSim's Adj Own), not our own projection -- revisit own_scale if/
+    when prj_own's behavior is recalibrated.
+
     `field_size=0` (unparseable prize pool) reduces this to plain projected
     score.
 
@@ -1024,11 +1090,12 @@ _PWIN_FIELD_CAP = 25_000
 
 
 def pwin_implied_entries(groups: list[ContestGroup]) -> dict[str, float]:
-    """Per contest_id implied entry count (prize_pool / entry_fee — the same
-    inference dk_entries' assignment sort uses), with contests lacking a
-    parsable prize pool borrowing the median of those that have one. Used to
-    build the p_win exponent per contest (sharpness * size) and to size the
-    shared opponent-field sample (pwin_field_size).
+    """Per contest_id implied entry count (prize_pool / (entry_fee * (1 -
+    _DK_RAKE)) — see implied_field_size for the rake-adjustment reasoning),
+    with contests lacking a parsable prize pool borrowing the median of
+    those that have one. Used to build the p_win exponent per contest
+    (sharpness * size) and to size the shared opponent-field sample
+    (pwin_field_size).
 
     Deliberately different from implied_field_size (used by prj_own), which
     returns 0.0 on a missing prize pool: there, 0.0 fails safe by degrading
@@ -1040,7 +1107,7 @@ def pwin_implied_entries(groups: list[ContestGroup]) -> dict[str, float]:
     known = []
     for g in groups:
         if g.prize_pool_cents and g.entry_fee_cents:
-            sizes[g.contest_id] = g.prize_pool_cents / g.entry_fee_cents
+            sizes[g.contest_id] = g.prize_pool_cents / (g.entry_fee_cents * (1.0 - _DK_RAKE))
             known.append(sizes[g.contest_id])
     default = float(np.median(known)) if known else _DEFAULT_IMPLIED_ENTRIES
     for g in groups:

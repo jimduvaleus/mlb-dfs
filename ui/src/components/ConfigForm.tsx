@@ -181,14 +181,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
               <input type="number" step={500} value={str(draft.optimizer.salary_floor)}
                 onChange={e => set('optimizer', 'salary_floor', num(e.target.value))} disabled={disabled} />
             </FieldRow>
-            <FieldRow label="Min pitcher value (blank = off)">
-              <input type="number" step={0.1} min={0} value={str(draft.optimizer.min_pitcher_value)}
-                onChange={e => set('optimizer', 'min_pitcher_value', num(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Min batter value (blank = off)">
-              <input type="number" step={0.1} min={0} value={str(draft.optimizer.min_batter_value)}
-                onChange={e => set('optimizer', 'min_batter_value', num(e.target.value))} disabled={disabled} />
-            </FieldRow>
             <FieldRow label="RNG seed (blank = random)">
               <input type="number" value={str(draft.optimizer.rng_seed)}
                 onChange={e => set('optimizer', 'rng_seed', num(e.target.value))} disabled={disabled} />
@@ -207,42 +199,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
 
           <section>
             <h3>GPP</h3>
-            <FieldRow label="Candidates">
-              <input type="number" min={100} value={draft.gpp.n_candidates}
-                onChange={e => setGpp('n_candidates', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Field lineups">
-              <input type="number" min={100} value={draft.gpp.n_field_lineups}
-                onChange={e => setGpp('n_field_lineups', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Field samples">
-              <input type="number" min={1} max={10} value={draft.gpp.n_field_samples}
-                onChange={e => setGpp('n_field_samples', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Candidate floor relief ($)">
-              <input type="number" step={500} min={0} max={10000} value={draft.gpp.candidate_floor_relief}
-                onChange={e => setGpp('candidate_floor_relief', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Refine rounds (0 = off)">
-              <input type="number" step={1} min={0} max={10} value={draft.gpp.refine_rounds ?? 2}
-                onChange={e => setGpp('refine_rounds', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Refine parents per round">
-              <input type="number" step={10} min={10} value={draft.gpp.refine_top ?? 150}
-                onChange={e => setGpp('refine_top', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Mutants per parent">
-              <input type="number" step={1} min={1} max={50} value={draft.gpp.refine_mutants ?? 8}
-                onChange={e => setGpp('refine_mutants', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Final rescore samples (0 = off)">
-              <input type="number" step={1} min={0} max={20} value={draft.gpp.final_n_field_samples ?? 5}
-                onChange={e => setGpp('final_n_field_samples', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Rescore pool (top M by EV)">
-              <input type="number" step={100} min={100} value={draft.gpp.final_rescore_top ?? 2000}
-                onChange={e => setGpp('final_rescore_top', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
             <FieldRow label="Base EVw (risk 1)">
               <input type="number" step={0.01} min={0} max={1} value={draft.gpp.evw_base ?? 0.10}
                 onChange={e => setGpp('evw_base', Number(e.target.value))} disabled={disabled} />
@@ -250,17 +206,6 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
             <FieldRow label="Max EVw (risk 5)">
               <input type="number" step={0.01} min={0} max={1} value={draft.gpp.evw_max ?? 0.40}
                 onChange={e => setGpp('evw_max', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="EV floor ($)">
-              <input type="number" step={0.01} value={draft.gpp.ev_floor ?? 0.20}
-                onChange={e => setGpp('ev_floor', Number(e.target.value))} disabled={disabled} />
-            </FieldRow>
-            <FieldRow label="Field source">
-              <select value={draft.gpp.field_source ?? 'simulated'}
-                onChange={e => setGpp('field_source', e.target.value)} disabled={disabled}>
-                <option value="simulated">Simulated</option>
-                <option value="historical">Historical</option>
-              </select>
             </FieldRow>
             {(draft.gpp.field_source ?? 'simulated') === 'historical' && (
               <FieldRow label="Historical slates (N)">
@@ -300,10 +245,10 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                     onChange={e => setGpp('external_pool_pwin_admit_n', Number(e.target.value))}
                     disabled={disabled} />
                 </FieldRow>
-                <FieldRow label="P(win) field size (0 = auto)">
-                  <input type="number" step={1000} min={0}
-                    value={draft.gpp.external_pool_pwin_field_size ?? 0}
-                    onChange={e => setGpp('external_pool_pwin_field_size', Number(e.target.value))}
+                <FieldRow label="P(win) admit scaling (× entries)">
+                  <input type="number" step={1} min={0}
+                    value={draft.gpp.external_pool_pwin_admit_multiplier ?? 12.0}
+                    onChange={e => setGpp('external_pool_pwin_admit_multiplier', Number(e.target.value))}
                     disabled={disabled} />
                 </FieldRow>
               </>

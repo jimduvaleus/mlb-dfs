@@ -137,6 +137,21 @@ class TestContestMatching:
         # not the $20K mini-MAX or the $10K contests.
         assert groups[0].roi_key == normalize_contest_name("MLB $7.5K Chin Music [Single Entry]")
 
+    def test_empty_pool_contests_falls_back_without_crashing(self):
+        """A pool with zero ROI blocks (prj_own/p_win ev_type, see
+        parse_lineup_pool's require_roi_blocks=False) must not crash
+        group_and_match_contests's nearest-size fallback -- roi_key/roi
+        just go unused downstream for those ev_types."""
+        empty_pool = ExternalPool(
+            lineups=[], contests={}, n_dropped_unknown_players=0,
+            n_dropped_duplicates=0, n_dropped_near_duplicates=0, source_paths=[],
+        )
+        entries = [(Path("x/Entries.csv"), [_rec("c1", "MLB $1K Test", 400)])]
+        groups = group_and_match_contests(entries, empty_pool)
+        assert len(groups) == 1
+        assert groups[0].roi_fallback
+        assert groups[0].roi_key == ""
+
     def test_ordering_fee_desc_then_pool_asc(self, pool):
         names = list(pool.contests.values())
         entries = [(Path("x/Entries.csv"), [
@@ -946,15 +961,16 @@ class TestPwinFieldSizing:
         )
 
     def test_implied_entries_borrows_median_for_unparseable_prize_pool(self):
+        # Rake-adjusted: prize_pool / (entry_fee * 0.84), not the raw ratio.
         groups = [
-            self._group("a", 100_000_00, 400),   # 25,000
-            self._group("b", 20_000_00, 400),    # 5,000
-            self._group("c", None, 400),          # unparseable -> median of [25000, 5000] = 15000
+            self._group("a", 100_000_00, 400),   # 100,000 / (4 * 0.84) ≈ 29,761.90
+            self._group("b", 20_000_00, 400),    # 20,000 / (4 * 0.84) ≈ 5,952.38
+            self._group("c", None, 400),          # unparseable -> median of a, b
         ]
         sizes = pwin_implied_entries(groups)
-        assert sizes["a"] == pytest.approx(25_000.0)
-        assert sizes["b"] == pytest.approx(5_000.0)
-        assert sizes["c"] == pytest.approx(15_000.0)
+        assert sizes["a"] == pytest.approx(100_000 / (4 * 0.84))
+        assert sizes["b"] == pytest.approx(20_000 / (4 * 0.84))
+        assert sizes["c"] == pytest.approx((sizes["a"] + sizes["b"]) / 2)
 
     def test_implied_entries_falls_back_to_default_when_nothing_parses(self):
         groups = [self._group("a", None, 400)]
@@ -962,7 +978,7 @@ class TestPwinFieldSizing:
         assert sizes["a"] == pytest.approx(10_000.0)
 
     def test_field_size_respects_floor_and_cap(self):
-        groups = [self._group("a", 100_00, 400)]  # 25 implied entries — tiny
+        groups = [self._group("a", 100_00, 400)]  # ~29.8 implied entries — tiny
         assert pwin_field_size(groups, floor=5_000) == 5_000
         groups_huge = [self._group("a", 100_000_000_00, 100)]  # 1,000,000,000 implied
         assert pwin_field_size(groups_huge, floor=5_000, cap=25_000) == 25_000
@@ -1075,8 +1091,10 @@ class TestImpliedFieldSize:
         )
 
     def test_prize_pool_over_entry_fee(self):
-        # $100K prize pool at a $4 entry fee -> 25,000 implied entries.
-        assert implied_field_size(self._group(100_000_00, 400)) == 25_000.0
+        # $100K prize pool at a $4 entry fee, rake-adjusted (DK pays out
+        # only ~84% of collected fees) -> 100_000 / (4 * 0.84) ≈ 29,761.9
+        # implied entries, not the raw 25,000 prize/fee ratio.
+        assert implied_field_size(self._group(100_000_00, 400)) == pytest.approx(100_000 / (4 * 0.84))
 
     def test_missing_prize_pool_is_zero(self):
         assert implied_field_size(self._group(None, 400)) == 0.0
@@ -1444,6 +1462,64 @@ def test_parse_lineup_pool_missing_roi_stddev_column(tmp_path):
     pool = parse_lineup_pool(path, valid_ids=set(range(1, 11)))
     contest = pool.contests[normalize_contest_name("MLB $1K Test")]
     assert contest.roi_stddev is None
+
+
+def test_parse_lineup_pool_no_roi_blocks_requires_flag(tmp_path):
+    """A file with no '<name> ROI'/'<name> Sim Dupes' pair is rejected by
+    default (ev_type='roi'), but accepted with require_roi_blocks=False
+    (ev_type='prj_own'/'p_win', which never read contest.roi)."""
+    header = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+    rows = [[str(i) for i in range(1, 11)]]
+    path = tmp_path / "lineups_test.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    with pytest.raises(ValueError, match="no contest ROI blocks"):
+        parse_lineup_pool(path, valid_ids=set(range(1, 11)))
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 11)), require_roi_blocks=False)
+    assert len(pool.lineups) == 1
+    assert pool.contests == {}
+
+
+def test_parse_lineup_pool_no_roi_blocks_multi_lineup_near_dup_check(tmp_path):
+    """Regression: with >1 lineup and zero ROI blocks, the near-duplicate
+    (9/10 overlap) pass used to call max() on an empty contest_order range
+    via _pick_primary_contest_index, crashing with "max() iterable argument
+    is empty". Two non-conflicting lineups must parse fine and keep both."""
+    header = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF"]
+    rows = [
+        [str(i) for i in range(1, 11)],
+        [str(i) for i in range(11, 21)],
+    ]
+    path = tmp_path / "lineups_test.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 21)), require_roi_blocks=False)
+    assert len(pool.lineups) == 2
+    assert pool.contests == {}
+
+
+def test_parse_lineup_pool_no_roi_blocks_near_dup_tiebreak_uses_proj_score(tmp_path):
+    """With zero ROI blocks, a 9/10-overlap conflict is resolved by each
+    lineup's own "Proj Score" column (higher wins), not first-in-file."""
+    header = ["P", "P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF", "Proj Score"]
+    rows = [
+        [str(i) for i in range(1, 11)] + ["80.0"],              # ids 1-10, lower proj score, listed first
+        [str(i) for i in range(1, 10)] + ["11"] + ["95.0"],     # ids 1-9,11, higher proj score
+    ]
+    path = tmp_path / "lineups_test.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+    pool = parse_lineup_pool(path, valid_ids=set(range(1, 12)), require_roi_blocks=False)
+    assert pool.n_dropped_near_duplicates == 1
+    assert len(pool.lineups) == 1
+    # Higher Proj Score (95.0, ids 1-9,11) survives despite arriving second.
+    assert set(pool.lineups[0].player_ids) == {1, 2, 3, 4, 5, 6, 7, 8, 9, 11}
 
 
 def _write_lineup_csv(path: Path, contest_names: list[str], rows: list[list]) -> None:
