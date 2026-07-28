@@ -1154,6 +1154,7 @@ def allocate_contests(
     p_win_cull: Optional[dict[str, np.ndarray]] = None,
     p_win_select: Optional[dict[str, np.ndarray]] = None,
     p_win_admit_n: int = 0,
+    p_win_admit_multiplier: float = 0.0,
     ceiling_weight: float = 0.0,
     cash_anchor_fraction: float = 0.0,
     stop_check: Optional[Callable[[], bool]] = None,
@@ -1194,6 +1195,18 @@ def allocate_contests(
       post-floor pool on p_win_select alone). Requires both `p_win_cull` and
       `p_win_select`, each `{contest_id: (M,) array}`, built from the same
       underlying sims via two calls to compute_p_win.
+
+      `p_win_admit_multiplier > 0` scales the cull by each contest's own
+      entry count instead of using one flat number across every contest:
+      effective_admit_n = max(p_win_admit_n, round(p_win_admit_multiplier *
+      len(g.entries))), i.e. `p_win_admit_n` becomes a floor rather than the
+      literal cull size. A flat admit_n gives a large contest a much
+      *tighter relative* reservoir than a small one (e.g. 250 candidates
+      for 72 needed picks vs. 250 for 14) -- confirmed in production data as
+      a real cost: the biggest-fill contest on two live slates landed
+      hit99=0 while every smaller contest on the same slate caught at least
+      one, despite having the most entries (most chances) of any of them.
+      Default 0.0 disables scaling -- byte-identical to a flat p_win_admit_n.
 
     Everything downstream of the EV vector is currency-agnostic: the greedy
     selection, the diversity/hedge terms, the shared-removal `mask` and the
@@ -1283,12 +1296,17 @@ def allocate_contests(
                 continue
             rem = rem_all[np.isfinite(ev_vals[rem_all])]
             cull_for_contest = p_win_cull.get(g.contest_id)
-            if (p_win_admit_n and p_win_admit_n > 0 and cull_for_contest is not None
-                    and len(rem) > p_win_admit_n):
+            effective_admit_n = p_win_admit_n
+            if p_win_admit_multiplier > 0:
+                effective_admit_n = max(
+                    p_win_admit_n, int(round(p_win_admit_multiplier * len(g.entries))),
+                )
+            if (effective_admit_n and effective_admit_n > 0 and cull_for_contest is not None
+                    and len(rem) > effective_admit_n):
                 # Stage-A cull on the INDEPENDENT p_win_cull draw — a lineup
                 # that only ranks well on the draw used to select it (rem)
                 # cannot also be the reason it survives this cull.
-                keep = rem[np.argsort(-cull_for_contest[rem])[:p_win_admit_n]]
+                keep = rem[np.argsort(-cull_for_contest[rem])[:effective_admit_n]]
                 rem = np.sort(keep)
         else:
             contest = pool.contests.get(g.roi_key)

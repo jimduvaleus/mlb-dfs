@@ -2534,7 +2534,8 @@ class PipelineRunner:
         # handed to every allocate_contests call in the sweep below.
         _p_win_cull = None
         _p_win_select = None
-        _p_win_admit_n = int(gpp_cfg.get("external_pool_pwin_admit_n", 2000))
+        _p_win_admit_n = int(gpp_cfg.get("external_pool_pwin_admit_n", 250))
+        _p_win_admit_multiplier = float(gpp_cfg.get("external_pool_pwin_admit_multiplier", 12.0))
         if _ev_type == "p_win":
             try:
                 from src.optimization.contest import ContestSimulator
@@ -2646,6 +2647,7 @@ class PipelineRunner:
                 p_win_cull=_p_win_cull,
                 p_win_select=_p_win_select,
                 p_win_admit_n=_p_win_admit_n,
+                p_win_admit_multiplier=_p_win_admit_multiplier,
                 ceiling_weight=_ceiling_weight,
                 cash_anchor_fraction=_cash_anchor,
                 stop_check=self._stop_check,

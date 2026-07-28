@@ -516,6 +516,68 @@ class TestAllocation:
         )
         assert id(alloc.portfolio[0][0]) == id(pool.lineups[9])
 
+    def test_p_win_admit_multiplier_zero_matches_flat_admit_n(self):
+        """Default multiplier=0.0 must be byte-identical to a flat admit_n —
+        the whole point of making it opt-in."""
+        pool = self._pool(M=10, n_contests=1)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [5])
+        select = {"c0": np.arange(10, dtype=np.float64)}
+        cull = {"c0": -np.arange(10, dtype=np.float64)}
+        flat = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+            p_win_admit_n=5, p_win_admit_multiplier=0.0,
+        )
+        scaled = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+            p_win_admit_n=5,
+        )
+        ids_flat = [id(lu) for lu, _ in flat.portfolio]
+        ids_scaled = [id(lu) for lu, _ in scaled.portfolio]
+        assert ids_flat == ids_scaled
+
+    def test_p_win_admit_multiplier_scales_up_for_a_large_contest(self):
+        """A large-fill contest gets a bigger effective admit_n than the
+        flat floor once the multiplier is set — proving the per-contest
+        formula actually engages, not just documented."""
+        pool = self._pool(M=20, n_contests=1)
+        corr = np.eye(20, dtype=np.float32)
+        # A lineup ranked worst by both cull and select, at index 19 -- a
+        # flat floor of 5 always excludes it; multiplier * 15 entries = 30
+        # should admit it once the contest needs 15 picks.
+        groups = self._groups(pool, [15])
+        select = {"c0": np.arange(20, dtype=np.float64)}
+        cull = {"c0": np.arange(20, dtype=np.float64)}
+        floor_only = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+            p_win_admit_n=5, p_win_admit_multiplier=0.0,
+        )
+        scaled = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+            p_win_admit_n=5, p_win_admit_multiplier=2.0,  # max(5, 2*15) = 30 -> whole pool
+        )
+        assert len(floor_only.portfolio) == 5   # flat floor of 5 admits only 5 candidates
+        assert len(scaled.portfolio) == 15       # scaled admit_n (30) covers the full ask
+
+    def test_p_win_admit_multiplier_never_shrinks_below_the_floor(self):
+        """A tiny contest must not get an effective admit_n below the flat
+        floor even though multiplier * n_entries is small for it."""
+        pool = self._pool(M=10, n_contests=1)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [1])
+        select = {"c0": np.arange(10, dtype=np.float64)}
+        cull = {"c0": -np.arange(10, dtype=np.float64)}  # would exclude index 9 at admit_n<10
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="p_win", p_win_cull=cull, p_win_select=select,
+            p_win_admit_n=10, p_win_admit_multiplier=0.5,  # max(10, 0.5*1)=10 -> whole pool
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[9])
+
     def test_p_win_still_respects_pool_wide_proj_score_floor(self):
         pool = self._pool(M=10, n_contests=2)
         proj_scores = np.arange(10, dtype=np.float64)  # index 0..3 = bottom 40%

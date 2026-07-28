@@ -186,7 +186,43 @@ class GppConfig(BaseModel):
     # only looks good on the draw used to pick it can't reach the draw used
     # to rank it (mirrors the internal pipeline's fresh-rescore pattern).
     # <= 0 disables the cull (rank the whole pool on the second draw alone).
-    external_pool_pwin_admit_n: int = 2000
+    # With external_pool_pwin_admit_multiplier below, this value is a FLOOR,
+    # not the literal cull size -- see that field for the full calibration
+    # history, including a correction: an earlier flat-admit_n sweep (run
+    # with scripts/sim_evaluate_portfolios.py --build, a single synthetic
+    # 150-entry contest group) found flat 250 beating 1000/2000. That result
+    # didn't survive a more faithful test (scripts/sweep_admit_n_scaling.py,
+    # each slate's REAL multi-contest entry-count breakdown, 7 settled
+    # slates, 07/27 excluded for an unrelated postponement confound): under
+    # real conditions flat 250 was the WORST option tested, not the best --
+    # every alternative (no cull, flat 500-5000, the scaled formula) beat it,
+    # most with real significance. The single-contest test couldn't see this
+    # because it has no cross-contest shared-pool depletion to get wrong.
+    external_pool_pwin_admit_n: int = 250
+    # Scales the p_win cull by each contest's OWN entry count -- the number
+    # of OUR entries actually uploaded to that contest (ContestGroup.entries,
+    # from the parsed DK Entries CSV), not the contest's field size or any
+    # entry-max cap -- instead of applying one flat number everywhere:
+    # effective_admit_n = max(external_pool_pwin_admit_n, round(multiplier *
+    # n_entries)). Motivated by production data: a flat admit_n gives a
+    # large-fill contest (e.g. 72 entries) a much tighter *relative*
+    # reservoir than a small one (e.g. 14), and on two live slates the
+    # single biggest-entry contest landed hit99=0 both times while every
+    # smaller contest on the same slate caught at least one -- despite
+    # having the most entries (most chances) of any of them.
+    #
+    # Calibrated 2026-07-28 (sweep_admit_n_scaling.py, 7 settled slates,
+    # real per-contest entry counts, 07/27 excluded): floor=250/multiplier=12
+    # was the only rule to beat the flat-250 baseline on every single slate
+    # (7/7, t=+3.50 on mean real-field percentile) -- several flat values
+    # (1500, 2000, 5000) scored a higher raw mean on this sample, but each
+    # lost on 1-2 individual slates, and none was distinguishable from "no
+    # cull at all" with any confidence (|t|<1.6 in every case). The scaled
+    # rule was preferred over a bigger flat number specifically for that
+    # consistency -- a flat number tuned to one sample's contest-size mix is
+    # a bet that the mix doesn't shift; the scaled rule adapts by
+    # construction. 0.0 disables scaling (flat admit_n).
+    external_pool_pwin_admit_multiplier: float = 12.0
     # p_win simulated opponent field size. 0 = auto (ep.pwin_field_size:
     # grows gpp.n_field_lineups to the largest contest's implied entry
     # count, capped for memory).
