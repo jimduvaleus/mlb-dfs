@@ -436,6 +436,14 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     bubble + the team lock icon exactly as it does for the
     RotoWire/DFF/Market-Odds sources, so no separate UI plumbing is needed
     for SaberSim).
+
+    ``status_confirmed`` separately preserves the real (non-overridden)
+    Status=="Confirmed" reading for every kept row, pitchers included. Consumers
+    that need to distinguish "we assumed this pitcher is starting because he's
+    the highest-projected arm" from "SaberSim has actually confirmed this
+    pitcher" (e.g. the Twitter/Underdog notification diff, which shouldn't flag
+    a contradiction against a pitcher we only assumed) should use this column
+    instead of ``slot_confirmed`` for pitcher rows.
     """
     df = pd.read_csv(path)
     mean_col = "fd_points" if platform == "fanduel" else "dk_points"
@@ -467,6 +475,7 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
         "std_dev": pd.to_numeric(df[std_col], errors="coerce"),
         "lineup_slot": lineup_slot,
         "slot_confirmed": slot_confirmed,
+        "status_confirmed": confirmed,
         "ownership": pd.to_numeric(df.get("Adj Own"), errors="coerce") / 100.0,
     })
     keep = keep_pitcher | (~is_pitcher & lineup_slot.notna())

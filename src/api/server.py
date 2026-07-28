@@ -587,13 +587,35 @@ def _emit_lineup_diff_notification(
     old_slots: list[dict],
     new_slots: list[TwitterLineupSlot],
 ) -> None:
-    """Post an In/Out notification for the batter+pitcher diff between two slot lists."""
-    old_ids = {s["player_id"] for s in old_slots if s.get("player_id") is not None}
-    new_ids = {s.player_id for s in new_slots if s.player_id is not None}
-    added_ids = new_ids - old_ids
-    removed_ids = old_ids - new_ids
-    if not (added_ids or removed_ids):
+    """Post an In/Out notification for the batter+pitcher diff between two slot lists.
+
+    `old_slots` may be a SaberSim confirmed-only baseline (see `_best_guess_lineup_slots`)
+    that hasn't caught up yet for one side of the roster — e.g. the pitcher is confirmed
+    but no batter is. Diffing a fully-unconfirmed category against an incoming lineup
+    would flag every player in it as "In", which isn't a contradiction, just SaberSim
+    being behind. So batters and the pitcher are gated independently: a category only
+    produces a diff when `old_slots` actually has a confirmed entry for it. A
+    non-SaberSim baseline (a previously-locked Twitter record) always has a full
+    batter+pitcher set, so this gating is a no-op there.
+    """
+    old_batter_ids = {s["player_id"] for s in old_slots if s.get("player_id") is not None and s.get("slot") != 10}
+    old_pitcher_ids = {s["player_id"] for s in old_slots if s.get("player_id") is not None and s.get("slot") == 10}
+    new_batter_ids = {s.player_id for s in new_slots if s.player_id is not None and s.slot != 10}
+    new_pitcher_ids = {s.player_id for s in new_slots if s.player_id is not None and s.slot == 10}
+
+    batter_added = new_batter_ids - old_batter_ids if old_batter_ids else set()
+    batter_removed = old_batter_ids - new_batter_ids if old_batter_ids else set()
+    # Also require the incoming notification to actually state a pitcher — an
+    # Underdog lineup post that omits the SP line shouldn't read as "pitcher removed".
+    pitcher_diff_applicable = bool(old_pitcher_ids) and bool(new_pitcher_ids)
+    pitcher_added = new_pitcher_ids - old_pitcher_ids if pitcher_diff_applicable else set()
+    pitcher_removed = old_pitcher_ids - new_pitcher_ids if pitcher_diff_applicable else set()
+
+    if not (batter_added or batter_removed or pitcher_added or pitcher_removed):
         return
+
+    added_ids = batter_added | pitcher_added
+    removed_ids = batter_removed | pitcher_removed
 
     name_map: dict[int, str] = {}
     slate_df = _load_slate_df()
@@ -613,13 +635,6 @@ def _emit_lineup_diff_notification(
     # Slot 10 is the pitcher (see parse_notification_body/_best_guess_lineup_slots) —
     # call it out on its own line rather than burying it in the batter In/Out list,
     # since a pitcher swap is usually the most fantasy-relevant part of the diff.
-    old_slot_by_id = {s["player_id"]: s.get("slot") for s in old_slots if s.get("player_id") is not None}
-    new_slot_by_id = {s.player_id: s.slot for s in new_slots if s.player_id is not None}
-    pitcher_added = {p for p in added_ids if new_slot_by_id.get(p) == 10}
-    pitcher_removed = {p for p in removed_ids if old_slot_by_id.get(p) == 10}
-    batter_added = added_ids - pitcher_added
-    batter_removed = removed_ids - pitcher_removed
-
     parts: list[str] = []
     if pitcher_added or pitcher_removed:
         pitcher_bits: list[str] = []
@@ -686,8 +701,14 @@ def _best_guess_lineup_slots(team: str) -> list[dict] | None:
     doubles as the live "SaberSim-confirmed" baseline for diffing (see
     save_twitter_lineup) — in that case rows are restricted to `slot_confirmed`
     so a merely-projected (not yet confirmed) player doesn't look like a
-    contradiction. Returns None if there's no projections file or no slotted
-    players.
+    contradiction. For the pitcher slot specifically, `slot_confirmed` is always
+    True for a SaberSim-sourced row (parse_sabersim_projections assumes the
+    highest-projected arm is starting, regardless of the real Status column) —
+    so when `status_confirmed` is available, the pitcher row is additionally
+    required to have it True, otherwise the pitcher slot is dropped from the
+    baseline entirely (an assumed starter isn't a genuine confirmation to diff
+    an incoming lineup against). Returns None if there's no projections file or
+    no slotted players.
     """
     import pandas as pd
     cfg = read_config()
@@ -702,6 +723,8 @@ def _best_guess_lineup_slots(team: str) -> list[dict] | None:
         return None
     if "slot_confirmed" in proj_df.columns and _is_sabersim_source(cfg):
         proj_df = proj_df[proj_df["slot_confirmed"] == True]  # noqa: E712
+        if "status_confirmed" in proj_df.columns:
+            proj_df = proj_df[(proj_df["lineup_slot"] != 10) | (proj_df["status_confirmed"] == True)]  # noqa: E712
 
     slate_df = _load_slate_df()
     if slate_df is None:
@@ -2272,7 +2295,7 @@ async def projections_fetch(request: Request):
 
         # Helper: write final merged_df to proj_path, handling partial merge.
         def _write_proj(merged_df: "pd.DataFrame") -> "str | None":
-            out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed", "ownership"]
+            out_cols = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed", "status_confirmed", "ownership"]
             result = merged_df[[c for c in out_cols if c in merged_df.columns]]
             if is_partial and proj_path.exists():
                 existing = pd.read_csv(proj_path)
@@ -2284,7 +2307,7 @@ async def projections_fetch(request: Request):
                     set(result["player_id"].tolist()) if "player_id" in result.columns else set()
                 )
                 other = existing[~existing["player_id"].isin(purge_ids)] if not existing.empty else pd.DataFrame()
-                out_cols2 = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed", "ownership"]
+                out_cols2 = ["player_id", "name", "mean", "std_dev", "lineup_slot", "slot_confirmed", "status_confirmed", "ownership"]
                 other = other[[c for c in out_cols2 if c in other.columns]]
                 result = pd.concat([other, result], ignore_index=True)
             # Filter out players no longer on the current slate (e.g. from games that
