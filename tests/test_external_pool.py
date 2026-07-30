@@ -16,6 +16,8 @@ from src.api.external_pool import (
     archive_external_inputs,
     build_external_players_df,
     build_quantile_grids,
+    batter_blank_probability,
+    _zero_inflate_grid,
     compute_ceiling_ev,
     compute_lineup_scores,
     compute_p_win,
@@ -106,6 +108,135 @@ class TestQuantileGrids:
         broken.loc[broken.index[0], "p50"] = np.nan
         grids = build_quantile_grids(broken)
         assert int(broken.iloc[0]["player_id"]) not in grids
+
+    def test_zero_inflate_off_by_default(self, proj_ext):
+        base = build_quantile_grids(proj_ext)
+        again = build_quantile_grids(proj_ext, zero_inflate=False)
+        assert set(base) == set(again)
+        for pid in list(base)[:25]:
+            assert np.array_equal(base[pid], again[pid])
+
+    def test_mean_calibration_scales_batters_only(self, proj_ext):
+        base = build_quantile_grids(proj_ext)
+        cal = build_quantile_grids(proj_ext, mean_calib_batter=0.88)
+        pos = dict(zip(proj_ext["player_id"].astype(int), proj_ext["position"].astype(str)))
+        n_bat = 0
+        for pid, g in cal.items():
+            if pos.get(pid) == "P":
+                assert np.array_equal(g, base[pid])
+            else:
+                n_bat += 1
+                assert g.mean() == pytest.approx(0.88 * base[pid].mean(), rel=1e-9)
+        assert n_bat > 0
+
+    def test_calibration_composes_with_zero_inflation(self, proj_ext):
+        base = build_quantile_grids(proj_ext)
+        both = build_quantile_grids(proj_ext, zero_inflate=True, mean_calib_batter=0.88)
+        pos = dict(zip(proj_ext["player_id"].astype(int), proj_ext["position"].astype(str)))
+        for pid, g in list(both.items())[:60]:
+            if pos.get(pid) == "P":
+                continue
+            # zero-inflation holds the mean, so the only mean change is the calibration
+            assert g.mean() == pytest.approx(0.88 * base[pid].mean(), rel=1e-6)
+            assert np.all(np.diff(g) >= -1e-12)
+
+    def test_calibration_does_not_change_gaussian_fallback_membership(self, proj_ext):
+        # the +-20% grid-vs-file-mean check must run on the RAW grid, so an
+        # aggressive calibration constant cannot add or drop players
+        assert set(build_quantile_grids(proj_ext)) == set(
+            build_quantile_grids(proj_ext, mean_calib_batter=0.5, mean_calib_pitcher=0.5)
+        )
+
+    def test_zero_inflate_touches_batters_only_and_holds_the_mean(self, proj_ext):
+        base = build_quantile_grids(proj_ext)
+        inf = build_quantile_grids(proj_ext, zero_inflate=True)
+        pos = dict(zip(proj_ext["player_id"].astype(int), proj_ext["position"].astype(str)))
+        changed_bat = changed_pit = 0
+        for pid, g in inf.items():
+            if pid not in base:
+                continue
+            if not np.array_equal(base[pid], g):
+                if pos.get(pid) == "P":
+                    changed_pit += 1
+                else:
+                    changed_bat += 1
+            # the projected mean is SaberSim's and must survive untouched
+            assert g.mean() == pytest.approx(base[pid].mean(), rel=1e-6)
+        assert changed_bat > 0
+        assert changed_pit == 0
+
+
+class TestBatterBlankProbability:
+    def test_two_component_mixture(self):
+        # scratch floor applies even to a batter who never blanks in play
+        assert batter_blank_probability(4.2, 4.2, 0.0, scratch_prob=0.02) == pytest.approx(
+            0.02 + 0.98 * (1 - 0.70) ** 4.2, rel=1e-6
+        )
+
+    def test_decreasing_in_obp(self):
+        good = batter_blank_probability(4.2, 1.4, 0.6)
+        weak = batter_blank_probability(4.2, 0.7, 0.2)
+        assert good < weak
+
+    def test_decreasing_in_pa(self):
+        assert batter_blank_probability(4.5, 1.2, 0.5) < batter_blank_probability(3.0, 0.8, 0.33)
+
+    def test_missing_rate_stats_fall_back_to_population_default(self):
+        p = batter_blank_probability(np.nan, np.nan, np.nan, scratch_prob=0.0)
+        assert p == pytest.approx(0.19, abs=1e-9)
+
+    def test_zero_pa_falls_back(self):
+        assert batter_blank_probability(0.0, 0.0, 0.0, scratch_prob=0.0) == pytest.approx(0.19)
+
+    def test_bounded(self):
+        assert 0.01 <= batter_blank_probability(1.0, 0.0, 0.0) <= 0.60
+        assert 0.01 <= batter_blank_probability(9.9, 9.9, 9.9) <= 0.60
+
+    def test_matches_measured_population_rate(self):
+        # 10-slate sample: mechanistic term 19.3%, +2% scratch -> ~20.9%,
+        # against a realized 20.6%. A league-average batter should land there.
+        p = batter_blank_probability(4.2, 1.10, 0.42, scratch_prob=0.02)
+        assert 0.15 < p < 0.27
+
+
+class TestZeroInflation:
+    @staticmethod
+    def _grid(mean=10.0):
+        q = np.linspace(0.0, 1.0, 101)
+        return np.interp(q, [0.0, 0.5, 1.0], [0.0, mean * 0.8, mean * 3.0])
+
+    def test_preserves_mean(self):
+        q = np.linspace(0.0, 1.0, 101)
+        g = self._grid()
+        out = _zero_inflate_grid(g, q, 0.25)
+        assert out.mean() == pytest.approx(g.mean(), rel=1e-9)
+
+    def test_adds_mass_at_zero(self):
+        q = np.linspace(0.0, 1.0, 101)
+        g = self._grid()
+        before = float((g <= 1e-9).mean())
+        out = _zero_inflate_grid(g, q, 0.25)
+        assert float((out <= 1e-9).mean()) > before
+        assert float((out <= 1e-9).mean()) == pytest.approx(0.25, abs=0.02)
+
+    def test_stays_monotone(self):
+        q = np.linspace(0.0, 1.0, 101)
+        out = _zero_inflate_grid(self._grid(), q, 0.3)
+        assert np.all(np.diff(out) >= 0)
+
+    def test_raises_the_surviving_ceiling(self):
+        # mass moved to 0 must be compensated in the non-blank part, so the
+        # conditional-on-playing distribution shifts UP
+        q = np.linspace(0.0, 1.0, 101)
+        g = self._grid()
+        out = _zero_inflate_grid(g, q, 0.25)
+        assert out[99] > g[99]
+
+    def test_noop_when_target_below_existing_mass(self):
+        q = np.linspace(0.0, 1.0, 101)
+        g = np.concatenate([np.zeros(40), np.linspace(0.1, 20.0, 61)])
+        out = _zero_inflate_grid(g, q, 0.10)
+        assert np.array_equal(out, g)
 
 
 def _rec(contest_id, name, fee_cents, entry_id="e1"):

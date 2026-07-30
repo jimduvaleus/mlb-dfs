@@ -504,6 +504,13 @@ def parse_player_projections(path: Path) -> pd.DataFrame:
         "p85": pd.to_numeric(df.get("dk_85_percentile"), errors="coerce"),
         "p95": pd.to_numeric(df.get("dk_95_percentile"), errors="coerce"),
         "p99": pd.to_numeric(df.get("dk_99_percentile"), errors="coerce"),
+        # Projected per-game rate stats, used only by build_quantile_grids'
+        # zero-inflation to derive a per-batter blank probability
+        # ((1 - OBP)^PA). NaN when the export omits them — the grid builder
+        # then falls back to the population default.
+        "pa": pd.to_numeric(df.get("PA"), errors="coerce"),
+        "h": pd.to_numeric(df.get("H"), errors="coerce"),
+        "bb": pd.to_numeric(df.get("BB"), errors="coerce"),
     })
     out = out.dropna(subset=["player_id"]).copy()
     out["player_id"] = out["player_id"].astype(int)
@@ -590,14 +597,152 @@ def build_external_players_df(
     return df[[c for c in cols if c in df.columns]].reset_index(drop=True)
 
 
-def build_quantile_grids(proj_ext: pd.DataFrame, n_points: int = 101) -> dict[int, np.ndarray]:
+_DEFAULT_SCRATCH_PROB = 0.02
+"""Flat, projection-independent probability that a confirmed batter does not
+play at all (late scratch after lineup confirmation). Measured 2026-07-30 across
+10 archived slates: an upper bound of 3.0% of confirmed starters, via the
+heuristic "confirmed batter scores 0 while an unconfirmed team-mate posts >= 5
+points". Deliberately kept separate from the per-player blank probability below
+because scratch risk is INDEPENDENT of projection — it takes out studs at the
+same rate as punts, and a p99 world requires the best bat in the lineup to
+actually play. Folding it into the projection-correlated term would
+under-penalise exactly the players a ceiling depends on."""
+
+_BLANK_PROB_FLOOR = 0.01
+_BLANK_PROB_CEIL = 0.60
+_DEFAULT_BLANK_PROB = 0.19
+"""Population fallback when the export omits PA/H/BB (mean of the mechanistic
+estimate across the 10-slate sample)."""
+
+_MEAN_CALIB_BATTER_SS = 0.88
+"""Empirical mean calibration for SaberSim BATTER projections, fitted
+2026-07-30 over 10 archived slates (rostered players only, usage-weighted, PPD
+games excluded): realized/grid-mean = 0.878 per-slate mean (sd 0.116, pooled
+0.858), t=-3.32 vs 1.0, p=0.009. Convergent check: the market-odds fetcher's
+independent `_MEAN_CALIB_BATTER` is 0.867 — two unrelated projection sources
+both running ~13% hot on hitters.
+
+Deliberately SEPARATE from the zero-inflation above. Zero-inflation is a pure
+shape fix and holds the projected mean; this is the location fix. Keeping them
+apart means each can be re-fitted or disabled on its own, and neither silently
+absorbs the other's error."""
+
+_MEAN_CALIB_PITCHER_SS = 1.0
+"""No calibration for SaberSim PITCHER projections: the same fit gives 0.935
+(sd 0.185) but t=-1.11, p=0.30 — not distinguishable from 1.0, so applying a
+haircut would be fitting noise. Re-check as the archive grows. (Note an earlier
+0.953 estimate was contaminated: it averaged over ALL export pitchers including
+bullpen arms who never appear and score 0. Rostered pitchers are starters.)"""
+
+
+def batter_blank_probability(
+    pa: float, h: float, bb: float, scratch_prob: float = _DEFAULT_SCRATCH_PROB,
+) -> float:
+    """P(a rostered batter scores exactly 0 DK points), as a two-component
+    mixture:  scratch_prob + (1 - scratch_prob) * (1 - OBP)^PA.
+
+    A DK hitter scores nothing only if he never reaches base and drives nobody
+    in — reaching at all already pays (a single is 3 pts). So the natural
+    estimate is P(no times on base over his projected PA), with OBP proxied by
+    the export's projected (H + BB) / PA.
+
+    Validated 2026-07-30 on 10 archived slates (505,920 usage-weighted rostered
+    batter-slates, PPD games excluded, all batters `Status == "Confirmed"`):
+    the mechanistic term alone predicts 19.3% against a realized 20.6%, and
+    0.02 + 0.98 * 0.193 = 20.9% — i.e. the two-component form lands on the
+    observed rate with NO fitted multiplier. It is also monotone across
+    predicted-blank sextiles (predicted 14.1% -> 28.5%, actual 15.8% -> 36.6%),
+    though the realized slope is somewhat steeper than predicted, so the very
+    highest-blank batters are still under-penalised.
+
+    Why this matters: the simulation assigns only ~2.19% probability to a blank
+    game, so a p99 lineup world (all 8 batters producing) is modelled at
+    0.98^8 = 85% when reality is nearer 0.80^8 = 17%. That ~5x overstatement of
+    the ceiling's precondition compounds multiplicatively and is why per-player
+    upper tails calibrate almost exactly while the lineup aggregate does not.
+    """
+    if not all(np.isfinite([pa, h, bb])) or pa <= 0:
+        play_blank = _DEFAULT_BLANK_PROB
+    else:
+        obp = float(np.clip((h + bb) / pa, 0.01, 0.70))
+        play_blank = float((1.0 - obp) ** pa)
+    p = scratch_prob + (1.0 - scratch_prob) * play_blank
+    return float(np.clip(p, _BLANK_PROB_FLOOR, _BLANK_PROB_CEIL))
+
+
+def _zero_inflate_grid(
+    grid: np.ndarray, grid_q: np.ndarray, p_zero: float, eps: float = 1e-9,
+) -> np.ndarray:
+    """Insert `p_zero` total probability mass at exactly 0, preserving the
+    grid's mean by rescaling the surviving mass.
+
+    The grid already carries a little near-zero mass, so only the shortfall is
+    added: `p_add = (p_zero - p_existing) / (1 - p_existing)`. The old
+    distribution is then compressed into the upper `1 - p_add` of quantile
+    space and multiplied by `1 / (1 - p_add)` so the mean is unchanged — the
+    projected mean is SaberSim's and is not ours to move here. (Any residual
+    mean bias is a separate calibration, deliberately not smuggled in.)
+
+    Scaling the survivors up is what the data shows: conditional on not
+    blanking, realized/simulated mean is 1.145 across the sample.
+    """
+    p_exist = float((grid <= eps).mean())
+    if p_zero <= p_exist:
+        return grid
+    p_add = (p_zero - p_exist) / (1.0 - p_exist)
+    if p_add >= 1.0 - 1e-6:
+        return grid
+    mean_before = float(grid.mean())
+    remapped = np.where(
+        grid_q < p_add, 0.0,
+        np.interp(np.clip((grid_q - p_add) / (1.0 - p_add), 0.0, 1.0), grid_q, grid),
+    )
+    mean_after = float(remapped.mean())
+    if mean_after > eps:
+        remapped *= mean_before / mean_after
+    return np.maximum.accumulate(remapped)
+
+
+def build_quantile_grids(
+    proj_ext: pd.DataFrame,
+    n_points: int = 101,
+    zero_inflate: bool = False,
+    scratch_prob: float = _DEFAULT_SCRATCH_PROB,
+    mean_calib_batter: float = 1.0,
+    mean_calib_pitcher: float = 1.0,
+) -> dict[int, np.ndarray]:
     """Per-player evenly spaced quantile grids for EmpiricalQuantileMarginal,
     resampled from the file's irregular percentiles. Skips a player (engine
     falls back to Gaussian) on missing/non-monotone knots or a >20% mismatch
-    between the grid-implied mean and the file mean."""
+    between the grid-implied mean and the file mean.
+
+    `zero_inflate` adds a point mass at 0 for **batters** (see
+    batter_blank_probability / _zero_inflate_grid), correcting a measured ~9x
+    understatement of blank games. Off by default so existing callers and
+    replay scripts are byte-identical unless they opt in. Pitchers are left
+    alone: rostered starters blank only 1.1% of the time, which the raw grids
+    already price about right (a 17% figure over *all* export pitchers is a
+    bullpen-population artifact — relievers who never appear).
+
+    `mean_calib_batter` / `mean_calib_pitcher` scale the finished grid — the
+    location fix, applied AFTER (and independently of) the shape fix above.
+    Defaults are 1.0 here so nothing changes for callers that don't opt in; the
+    fitted values live in `_MEAN_CALIB_BATTER_SS` / `_MEAN_CALIB_PITCHER_SS`
+    and the pipeline passes them from config. Applied to the grids only, not to
+    `players_df["mean"]`: that column feeds the projected-score percentile floor,
+    which is a relative ranking a uniform scalar barely moves, and leaving it
+    alone keeps reported projections matching the SaberSim export. Players
+    without a grid (Gaussian fallback) are therefore uncalibrated — a small
+    minority whose means are salary-heuristic anyway.
+
+    Order is load-bearing: the +-20% grid-vs-file-mean sanity check runs against
+    the RAW grid, before either correction, so a calibration constant can never
+    push a player into or out of the Gaussian fallback.
+    """
     q_levels = np.array([0.25, 0.50, 0.75, 0.85, 0.95, 0.99])
     grid_q = np.linspace(0.0, 1.0, n_points)
     grids: dict[int, np.ndarray] = {}
+    n_inflated = n_calibrated = 0
     for r in proj_ext.itertuples(index=False):
         knots = np.array([r.p25, r.p50, r.p75, r.p85, r.p95, r.p99], dtype=np.float64)
         if np.any(~np.isfinite(knots)) or not np.isfinite(r.mean) or r.mean <= 0:
@@ -619,8 +764,33 @@ def build_quantile_grids(proj_ext: pd.DataFrame, n_points: int = 101) -> dict[in
                 grid_mean, r.mean, r.name,
             )
             continue
+        is_pitcher = str(r.position) == "P"
+        if zero_inflate and not is_pitcher:
+            p_zero = batter_blank_probability(
+                getattr(r, "pa", np.nan), getattr(r, "h", np.nan),
+                getattr(r, "bb", np.nan), scratch_prob,
+            )
+            inflated = _zero_inflate_grid(grid, grid_q, p_zero)
+            if inflated is not grid:
+                n_inflated += 1
+            grid = inflated
+        calib = mean_calib_pitcher if is_pitcher else mean_calib_batter
+        if calib != 1.0:
+            grid = grid * float(calib)
+            n_calibrated += 1
         grids[int(r.player_id)] = grid
-    logger.info("External pool: quantile grids built for %d/%d players.", len(grids), len(proj_ext))
+    if zero_inflate or n_calibrated:
+        logger.info(
+            "External pool: quantile grids built for %d/%d players "
+            "(%d batters zero-inflated at scratch_prob=%.3f; %d mean-calibrated, "
+            "batter x%.3f / pitcher x%.3f).",
+            len(grids), len(proj_ext), n_inflated, scratch_prob, n_calibrated,
+            mean_calib_batter, mean_calib_pitcher,
+        )
+    else:
+        logger.info(
+            "External pool: quantile grids built for %d/%d players.", len(grids), len(proj_ext),
+        )
     return grids
 
 

@@ -251,6 +251,28 @@ class GppConfig(BaseModel):
     external_pool_ceiling_weight: float = 0.25
     external_pool_cash_anchor_fraction: float = 0.25
 
+    # Zero-inflate the SaberSim quantile grids for batters: a DK hitter scores
+    # exactly 0 when he never reaches base and drives nobody in, which happened
+    # to 20.6% of rostered batters across 10 archived slates while the grids
+    # priced it at 2.19% — a ~9x understatement that compounds into the lineup
+    # ceiling (all 8 batters producing: modelled 0.98^8 = 85%, real 0.80^8
+    # = 17%). See batter_blank_probability / _zero_inflate_grid in
+    # external_pool.py. scratch_prob is the flat, projection-INDEPENDENT
+    # component (late scratch after lineup confirmation); it is kept separate
+    # because it takes out studs at the same rate as punts.
+    external_pool_zero_inflate: bool = False
+    external_pool_scratch_prob: float = 0.02
+
+    # Empirical mean calibration for the SaberSim grids — the location fix,
+    # kept separate from the zero-inflation shape fix above. Fitted 2026-07-30
+    # over 10 archived slates (rostered players, usage-weighted, PPD excluded):
+    # batters 0.878 (t=-3.32, p=0.009); pitchers 0.935 but p=0.30, i.e. not
+    # distinguishable from 1.0, so pitchers default to no correction rather
+    # than a fitted-on-noise haircut. Applied to the grids only, not to
+    # players_df["mean"]. See _MEAN_CALIB_BATTER_SS in external_pool.py.
+    external_pool_mean_calib_batter: float = 1.0
+    external_pool_mean_calib_pitcher: float = 1.0
+
 
 class AppConfig(BaseModel):
     platform: Platform = Platform.DRAFTKINGS

@@ -2412,7 +2412,13 @@ class PipelineRunner:
 
         # --- Player-level sim for the diversity correlation ---------------
         copula = EmpiricalCopula(paths["copula"])
-        grids = ep.build_quantile_grids(proj_ext)
+        grids = ep.build_quantile_grids(
+            proj_ext,
+            zero_inflate=bool(gpp_cfg.get("external_pool_zero_inflate", False)),
+            scratch_prob=float(gpp_cfg.get("external_pool_scratch_prob", 0.02)),
+            mean_calib_batter=float(gpp_cfg.get("external_pool_mean_calib_batter", 1.0)),
+            mean_calib_pitcher=float(gpp_cfg.get("external_pool_mean_calib_pitcher", 1.0)),
+        )
         n_sims = int(sim_cfg.get("n_sims", 10_000))
         self._cb("simulate", {"n_sims": n_sims})
         engine = SimulationEngine(

@@ -95,10 +95,25 @@ gpp:
   external_pool_ev_type: roi        # roi | prj_own | p_win
   external_pool_own_scale: 30000.0  # prj_own: field size where 1 ownership pt == 1 proj pt
   external_pool_pwin_sharpness: 0.05 # p_win: exponent multiplier on implied entries (1.0 = literal P(win); calibrated lower, see models.py)
-  external_pool_pwin_admit_n: 250  # p_win: stage-A cull floor per contest (0 disables the two-stage guard)
+  external_pool_pwin_admit_n: 1000  # p_win: stage-A cull floor per contest (0 disables the two-stage guard)
   external_pool_pwin_admit_multiplier: 12.0  # p_win: scales the cull by our own entry count per contest (0 = flat admit_n)
   external_pool_pwin_field_size: 0  # p_win: simulated opponent field size (0 = auto via pwin_field_size)
   external_pool_roi_floor_pct: 40.0
   external_pool_proj_score_pct: 0.0
   external_pool_ceiling_weight: 0.25
   external_pool_cash_anchor_fraction: 0.25
+  # SaberSim grid calibration (see build_quantile_grids in external_pool.py).
+  # Two independent corrections, deliberately not merged:
+  #   zero_inflate  SHAPE — a DK hitter scores exactly 0 when he never reaches
+  #                 base and drives nobody in. Measured 20.6% of rostered
+  #                 batters across 10 archived slates vs 2.19% in the raw
+  #                 grids. Per-batter probability from (1-OBP)^PA, mean-preserving.
+  #   mean_calib    LOCATION — realized/grid mean 0.878 for batters (p=0.009);
+  #                 pitchers 0.935 but p=0.30, so left at 1.0 rather than fit noise.
+  # They only work together: zero-inflation alone makes the tail WORSE, because
+  # holding the mean forces the surviving mass up ~22%. Both on moves lineup
+  # mean PIT from 0.405 to 0.497 (calibrated = 0.500).
+  external_pool_zero_inflate: true
+  external_pool_scratch_prob: 0.02      # flat, projection-independent late-scratch rate
+  external_pool_mean_calib_batter: 0.88
+  external_pool_mean_calib_pitcher: 1.0
