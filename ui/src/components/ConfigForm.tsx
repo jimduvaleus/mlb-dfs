@@ -233,10 +233,16 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
             )}
             {draft.gpp.external_pool_ev_type === 'p_win' && (
               <>
-                <FieldRow label="P(win) sharpness">
+                <FieldRow label="P(win) sharpness (× entry count)">
                   <input type="number" step={0.05} min={0}
                     value={draft.gpp.external_pool_pwin_sharpness ?? 1.0}
                     onChange={e => setGpp('external_pool_pwin_sharpness', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="P(win) flat exponent ref (0 = per-contest)">
+                  <input type="number" step={1000} min={0}
+                    value={draft.gpp.external_pool_pwin_flat_reference ?? 10000}
+                    onChange={e => setGpp('external_pool_pwin_flat_reference', Number(e.target.value))}
                     disabled={disabled} />
                 </FieldRow>
                 <FieldRow label="P(win) stage-A admit N">

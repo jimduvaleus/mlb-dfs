@@ -96,6 +96,7 @@ export interface GppConfig {
   external_pool_ev_type: ExternalEvType
   external_pool_own_scale: number
   external_pool_pwin_sharpness: number
+  external_pool_pwin_flat_reference: number
   external_pool_pwin_admit_n: number
   external_pool_pwin_admit_multiplier: number
   external_pool_pwin_field_size: number

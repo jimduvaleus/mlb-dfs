@@ -2598,13 +2598,20 @@ class PipelineRunner:
 
                 _field_scores_A = _cs.score_field(_field_A, _sims_A, _col_map)
                 _field_scores_B = _cs.score_field(_field_B, _sims_B, _col_map)
-                _sizes = ep.pwin_implied_entries(groups)
-                _exponents = {cid: max(1.0, _sharpness * sz) for cid, sz in _sizes.items()}
+                # Flat exponent by default (external_pool_pwin_flat_reference):
+                # beat per-contest scaling on 8/8 archived slates, +0.95%,
+                # p=0.0063. See pwin_exponents for the measurement and why the
+                # scaling hurts at both ends of the contest-size range.
+                _flat_ref = float(gpp_cfg.get("external_pool_pwin_flat_reference", 0.0))
+                _exponents = ep.pwin_exponents(groups, _sharpness, _flat_ref)
 
                 self._cb("external_pwin", {
                     "n_sims_per_stage": _n_half, "field_size": _field_n,
                     "n_contests": len(_exponents), "admit_n": _p_win_admit_n,
                     "sharpness": _sharpness,
+                    "flat_reference": _flat_ref,
+                    "exponent": (max(_exponents.values()) if _exponents else 0.0)
+                    if _flat_ref > 0 else None,
                 })
                 _p_win_cull = ep.compute_p_win(
                     _scores_A, _field_scores_A, _exponents,

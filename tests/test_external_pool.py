@@ -32,6 +32,7 @@ from src.api.external_pool import (
     normalize_contest_name,
     parse_lineup_pool,
     parse_player_projections,
+    pwin_exponents,
     pwin_field_size,
     pwin_implied_entries,
     _field_percentiles,
@@ -164,6 +165,56 @@ class TestQuantileGrids:
             assert g.mean() == pytest.approx(base[pid].mean(), rel=1e-6)
         assert changed_bat > 0
         assert changed_pit == 0
+
+
+class TestPwinExponents:
+    @staticmethod
+    def _groups():
+        # a $1 mini-MAX ($20K pool) and a $25 single-entry Skipper ($10K pool):
+        # the two ends of the real per-contest exponent range
+        return [
+            ContestGroup(
+                contest_id="mini", contest_name="mini-MAX", entry_fee_cents=100,
+                prize_pool_cents=20_000 * 100, single_entry_tag=False,
+                roi_key="", entries=[(Path("x"), None)] * 72),
+            ContestGroup(
+                contest_id="skip", contest_name="Skipper", entry_fee_cents=2500,
+                prize_pool_cents=10_000 * 100, single_entry_tag=True,
+                roi_key="", entries=[(Path("x"), None)]),
+        ]
+
+    def test_scaling_is_the_legacy_default(self):
+        e = pwin_exponents(self._groups(), 0.05, flat_reference=0.0)
+        legacy = {cid: max(1.0, 0.05 * sz)
+                  for cid, sz in pwin_implied_entries(self._groups()).items()}
+        assert e == legacy
+
+    def test_scaling_spreads_exponents_by_contest_size(self):
+        e = pwin_exponents(self._groups(), 0.05, flat_reference=0.0)
+        # mini-MAX implies ~23.8k entries, Skipper ~476 — a ~50x spread
+        assert e["mini"] > 20 * e["skip"]
+
+    def test_flat_reference_gives_every_contest_the_same_exponent(self):
+        e = pwin_exponents(self._groups(), 0.05, flat_reference=10_000.0)
+        assert set(e) == {"mini", "skip"}
+        assert len(set(e.values())) == 1
+        assert e["mini"] == pytest.approx(500.0)
+
+    def test_sharpness_still_scales_the_flat_exponent(self):
+        a = pwin_exponents(self._groups(), 0.05, flat_reference=10_000.0)["mini"]
+        b = pwin_exponents(self._groups(), 0.10, flat_reference=10_000.0)["mini"]
+        assert b == pytest.approx(2 * a)
+
+    def test_exponent_floored_at_one(self):
+        e = pwin_exponents(self._groups(), 1e-9, flat_reference=10_000.0)
+        assert all(v >= 1.0 for v in e.values())
+
+    def test_flat_needs_no_prize_pool(self):
+        g = [ContestGroup(
+            contest_id="c", contest_name="c", entry_fee_cents=400,
+            prize_pool_cents=None, single_entry_tag=False,
+            roi_key="", entries=[(Path("x"), None)] * 5)]
+        assert pwin_exponents(g, 0.05, flat_reference=10_000.0)["c"] == pytest.approx(500.0)
 
 
 class TestBatterBlankProbability:

@@ -448,9 +448,11 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     df = pd.read_csv(path)
     mean_col = "fd_points" if platform == "fanduel" else "dk_points"
     std_col = "fd_std" if platform == "fanduel" else "dk_std"
-    # SaberSim's Pos column uses "SP"/"RP", never bare "P" (unlike the DK
-    # slate's ingested `position`, which DraftKingsSlateIngestor maps to "P").
-    is_pitcher = df["Pos"].astype(str).isin(["SP", "RP"])
+    # SaberSim's Pos column is inconsistent across export files -- some days
+    # it uses "SP"/"RP", others plain "P" (unlike the DK slate's ingested
+    # `position`, which DraftKingsSlateIngestor always normalizes to "P" --
+    # see twitter_lineups._PITCHER_POSITIONS for the same {SP, RP, P} set).
+    is_pitcher = df["Pos"].astype(str).isin(["P", "SP", "RP"])
     confirmed = df["Status"].astype(str) == "Confirmed"
     order = pd.to_numeric(df.get("Order"), errors="coerce")
     mean_raw = pd.to_numeric(df[mean_col], errors="coerce")
@@ -1292,6 +1294,48 @@ def pwin_implied_entries(groups: list[ContestGroup]) -> dict[str, float]:
     for g in groups:
         sizes.setdefault(g.contest_id, default)
     return sizes
+
+
+def pwin_exponents(
+    groups: list[ContestGroup], sharpness: float, flat_reference: float = 0.0,
+) -> dict[str, float]:
+    """`{contest_id: exponent}` for compute_p_win.
+
+    `flat_reference > 0` substitutes that fixed entry count for every contest's
+    own implied entries, i.e. every contest gets the SAME exponent
+    (`sharpness * flat_reference`) instead of one scaled to its size.
+
+    Why the flat form is the better default (measured 2026-07-30, 8 archived
+    slates with recoverable prize pools, calibrated sims, disjoint evaluation
+    slice, graded on expected gross dollars per entry against the real
+    standings field): a flat exponent of 500 beat production's per-contest
+    scaling on **8 of 8 slates**, +0.95% (t-test p=0.0063), with a worst case of
+    +0.07% and no slate negative. It was also better on both `$top10` and
+    `win_rate`, unusually — nearly every other change in this pipeline trades
+    breadth against depth.
+
+    The scaling hurts because it pushes both ends into bad territory. Across the
+    archive the real per-contest exponents span 18 (a $25 single-entry Skipper)
+    to 2,381 (a $200K Knuckleball). Below ~100, `q**n` degenerates toward "beat
+    the median" and p_win stops being a ceiling statistic at all; above ~1,500 a
+    sharpness sweep measured a 1.5-5.4% EV cost. A flat 500 sits in the healthy
+    band for every contest. Capping the scaled exponent instead was tested and
+    is inert (+0.01%, better on 1/8 slates).
+
+    Note `sharpness` keeps its documented meaning — the exponent is still
+    `sharpness * an entry count`, just a fixed reference one rather than each
+    contest's own — so 1.0 remains "literal P(win) in a contest of
+    `flat_reference` entries" and lower values slide toward P(top X%).
+
+    `flat_reference = 0` restores the original per-contest scaling.
+    """
+    if flat_reference > 0:
+        exp = max(1.0, sharpness * float(flat_reference))
+        return {g.contest_id: exp for g in groups}
+    return {
+        cid: max(1.0, sharpness * sz)
+        for cid, sz in pwin_implied_entries(groups).items()
+    }
 
 
 def pwin_field_size(groups: list[ContestGroup], floor: int = 5_000,
