@@ -90,6 +90,7 @@ CONTEST_STRUCTURES = {
     "knuckleball": ["dk_knuckleball"],
     "pickoff": ["dk_pickoff"],
     "chin music": ["dk_chin_music"],
+    "relay throw": ["dk_relay_throw"],
 }
 
 
