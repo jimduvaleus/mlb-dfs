@@ -408,6 +408,7 @@ class TestRealPayoutStructures:
 
     @pytest.mark.parametrize("contest,n,fee,first_share", [
         ("Skipper", 352, 25.0, 0.200),
+        ("Pickoff", 594, 3.0, 0.100),
         ("Base Hit", 490, 12.0, 0.100),
         ("Hot Corner", 792, 3.0, 0.100),
         ("Four-Seamer", 4458, 4.0, 0.100),

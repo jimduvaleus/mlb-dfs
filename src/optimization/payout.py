@@ -88,6 +88,7 @@ CONTEST_STRUCTURES = {
     "bat flip": ["dk_bat_flip"],
     "mini-max": ["dk_mini_max"],
     "knuckleball": ["dk_knuckleball"],
+    "pickoff": ["dk_pickoff"],
 }
 
 
