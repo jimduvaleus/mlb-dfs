@@ -80,7 +80,7 @@ def scaled_payout_curve(structure: dict, n_field: int) -> tuple[np.ndarray, floa
 CONTEST_STRUCTURES = {
     "skipper": ["dk_skipper", "dk_skipper_470"],
     "base hit": ["dk_base_hit", "dk_base_hit_392", "dk_base_hit_588", "dk_base_hit_980"],
-    "hot corner": ["dk_hot_corner", "dk_hot_corner_1189"],
+    "hot corner": ["dk_hot_corner", "dk_hot_corner_1189", "dk_hot_corner_1585"],
     "four-seamer": ["dk_four_seamer", "dk_four_seamer_5945"],
     "rally cap": ["dk_rally_cap", "dk_rally_cap_8823", "dk_rally_cap_11764"],
     "solo shot": ["dk_solo_shot", "dk_solo_shot_7134"],
