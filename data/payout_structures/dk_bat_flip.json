@@ -1,0 +1,74 @@
+{
+  "name": "DraftKings $18 Bat Flip [$50K to 1st]",
+  "entry_fee": 18.0,
+  "total_entries": 9803,
+  "total_payout_positions": 1963,
+  "source": "real DK contest payout table, captured 2026-07-30",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 50000.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 15000.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 5000.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 2000.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 1000.0
+    },
+    {
+      "start": 6,
+      "end": 7,
+      "amount": 500.0
+    },
+    {
+      "start": 8,
+      "end": 11,
+      "amount": 300.0
+    },
+    {
+      "start": 12,
+      "end": 19,
+      "amount": 200.0
+    },
+    {
+      "start": 20,
+      "end": 39,
+      "amount": 150.0
+    },
+    {
+      "start": 40,
+      "end": 89,
+      "amount": 100.0
+    },
+    {
+      "start": 90,
+      "end": 288,
+      "amount": 50.0
+    },
+    {
+      "start": 289,
+      "end": 788,
+      "amount": 40.0
+    },
+    {
+      "start": 789,
+      "end": 1963,
+      "amount": 30.0
+    }
+  ]
+}

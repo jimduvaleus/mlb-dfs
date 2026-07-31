@@ -400,3 +400,50 @@ def test_scorer_different_seeds_vary(sim_results, players_df, candidates, owners
     _, r2 = scorer2.score_candidates(candidates[:10])
     # Should not be identical (different fields → different percentiles)
     assert not np.allclose(r1, r2)
+
+
+class TestRealPayoutStructures:
+    """The five real DK tables captured 2026-07-30, and the guard rails around
+    the size-scaled curve that necessitated them."""
+
+    @pytest.mark.parametrize("contest,n,fee,first_share", [
+        ("Skipper", 352, 25.0, 0.200),
+        ("Base Hit", 490, 12.0, 0.100),
+        ("Four-Seamer", 4458, 4.0, 0.100),
+        ("Bat Flip", 9803, 18.0, 0.333),
+        ("mini-MAX", 17835, 1.0, 0.100),
+    ])
+    def test_real_tables_match_captured_values(self, contest, n, fee, first_share):
+        from src.optimization.payout import structure_for_contest, payout_table_to_array
+        s = structure_for_contest(contest)
+        assert s is not None and s["total_entries"] == n and s["entry_fee"] == fee
+        a = payout_table_to_array(s)
+        assert a[0] / a.sum() == pytest.approx(first_share, abs=0.005)
+        # DK keeps ~15% rake; pool must be a plausible share of collected fees
+        assert 0.80 < a.sum() / (n * fee) < 0.90
+
+    def test_unknown_contest_returns_none(self):
+        from src.optimization.payout import structure_for_contest
+        assert structure_for_contest("Knuckleball") is None
+        assert structure_for_contest("") is None
+
+    def test_first_place_share_is_not_a_function_of_size(self):
+        """The finding that invalidated size-scaled curves: two contests of
+        near-identical size differ 2x, and a 20x larger one is the most
+        top-heavy. Guards against anyone reintroducing a curve(n) model."""
+        from src.optimization.payout import structure_for_contest, payout_table_to_array
+        share = {}
+        for c in ("Skipper", "Base Hit", "Bat Flip"):
+            a = payout_table_to_array(structure_for_contest(c))
+            share[c] = a[0] / a.sum()
+        assert share["Skipper"] > 1.8 * share["Base Hit"]      # 352 vs 490 entries
+        assert share["Bat Flip"] > 3.0 * share["Base Hit"]     # 9,803 vs 490
+
+    def test_scaled_curve_is_unusable_at_small_n(self):
+        """Documents why structure_for_contest exists: the size-scaled curve
+        pays ~85% of the pool to first at n~400 (real: 20%)."""
+        from src.optimization.payout import load_payout_structure, scaled_payout_curve
+        cv, _ = scaled_payout_curve(load_payout_structure("dk_classic_gpp"), 416)
+        assert cv[0] / cv.sum() > 0.80
+        near, _ = scaled_payout_curve(load_payout_structure("dk_classic_gpp"), 14863)
+        assert near[0] / near.sum() == pytest.approx(0.10, abs=0.01)
