@@ -84,6 +84,7 @@ CONTEST_STRUCTURES = {
     "bat flip": "dk_bat_flip",
     "solo shot": "dk_solo_shot",
     "rally cap": "dk_rally_cap",
+    "hot corner": "dk_hot_corner",
     "mini-max": "dk_mini_max",
 }
 
