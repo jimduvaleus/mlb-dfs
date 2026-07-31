@@ -1,0 +1,84 @@
+{
+  "name": "DraftKings $3 Hot Corner (1.2k)",
+  "entry_fee": 3.0,
+  "total_entries": 1189,
+  "total_payout_positions": 305,
+  "source": "real DK contest payout table, captured 2026-07-31 (07/28 slate size)",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 300.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 200.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 100.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 80.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 65.0
+    },
+    {
+      "start": 6,
+      "end": 6,
+      "amount": 50.0
+    },
+    {
+      "start": 7,
+      "end": 8,
+      "amount": 40.0
+    },
+    {
+      "start": 9,
+      "end": 10,
+      "amount": 30.0
+    },
+    {
+      "start": 11,
+      "end": 15,
+      "amount": 25.0
+    },
+    {
+      "start": 16,
+      "end": 20,
+      "amount": 20.0
+    },
+    {
+      "start": 21,
+      "end": 30,
+      "amount": 15.0
+    },
+    {
+      "start": 31,
+      "end": 50,
+      "amount": 10.0
+    },
+    {
+      "start": 51,
+      "end": 95,
+      "amount": 8.0
+    },
+    {
+      "start": 96,
+      "end": 175,
+      "amount": 6.0
+    },
+    {
+      "start": 176,
+      "end": 305,
+      "amount": 5.0
+    }
+  ]
+}
