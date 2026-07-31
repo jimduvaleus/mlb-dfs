@@ -83,6 +83,7 @@ CONTEST_STRUCTURES = {
     "four-seamer": "dk_four_seamer",
     "bat flip": "dk_bat_flip",
     "solo shot": "dk_solo_shot",
+    "rally cap": "dk_rally_cap",
     "mini-max": "dk_mini_max",
 }
 
