@@ -19,6 +19,7 @@ data/raw/MLB_*.csv
 data/processed/projections.csv
 outputs/
 archive/
+tests/backtest_output/
 config.yaml
 .claude/settings.json
 
