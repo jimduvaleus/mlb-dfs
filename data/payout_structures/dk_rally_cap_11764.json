@@ -1,0 +1,104 @@
+{
+  "name": "DraftKings $8 Rally Cap ($80K)",
+  "entry_fee": 8.0,
+  "total_entries": 11764,
+  "total_payout_positions": 2612,
+  "source": "real DK contest payout table, captured 2026-07-31 (07/28 slate size)",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 20000.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 7500.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 3000.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 2000.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 1000.0
+    },
+    {
+      "start": 6,
+      "end": 6,
+      "amount": 700.0
+    },
+    {
+      "start": 7,
+      "end": 7,
+      "amount": 500.0
+    },
+    {
+      "start": 8,
+      "end": 9,
+      "amount": 300.0
+    },
+    {
+      "start": 10,
+      "end": 12,
+      "amount": 200.0
+    },
+    {
+      "start": 13,
+      "end": 17,
+      "amount": 150.0
+    },
+    {
+      "start": 18,
+      "end": 27,
+      "amount": 100.0
+    },
+    {
+      "start": 28,
+      "end": 47,
+      "amount": 70.0
+    },
+    {
+      "start": 48,
+      "end": 77,
+      "amount": 50.0
+    },
+    {
+      "start": 78,
+      "end": 127,
+      "amount": 40.0
+    },
+    {
+      "start": 128,
+      "end": 202,
+      "amount": 30.0
+    },
+    {
+      "start": 203,
+      "end": 327,
+      "amount": 25.0
+    },
+    {
+      "start": 328,
+      "end": 667,
+      "amount": 20.0
+    },
+    {
+      "start": 668,
+      "end": 1312,
+      "amount": 15.0
+    },
+    {
+      "start": 1313,
+      "end": 2612,
+      "amount": 12.0
+    }
+  ]
+}
