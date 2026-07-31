@@ -91,6 +91,7 @@ CONTEST_STRUCTURES = {
     "pickoff": ["dk_pickoff"],
     "chin music": ["dk_chin_music"],
     "relay throw": ["dk_relay_throw"],
+    "five-tool player": ["dk_five_tool"],
 }
 
 
