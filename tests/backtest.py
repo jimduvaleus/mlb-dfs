@@ -137,14 +137,16 @@ _PWIN_FIELD_CAP = 25_000
 # EVw=None means "ignore p_win ranking entirely, draw uniformly" -- the cull
 # (admit_floor/admit_mult) still applies unless it's also zero.
 ARMS: dict[str, tuple] = {
-    "old":      (False, 250, 12.0, 0.25),   # pre-2026-07-30: uncalibrated grids, wide admit window
-    "new":      (True,  100, 1.5,  0.25),   # current production: calibrated, tight admit window
-    "cull_lo":  (True,  100, 1.5,  0.10),   # cull as production, lean hard on diversity (EVw 0.10)
-    "cull_d0":  (True,  100, 1.5,  0.00),   # cull as production, pure diversity (no EV term)
-    "cull_rnd": (True,  100, 1.5,  None),   # cull as production, then draw uniformly from survivors
-    "wide":     (True,    0, 0.0,  0.25),   # no cull at all, production EVw -- isolates the cull's effect
-    "wide_lo":  (True,    0, 0.0,  0.10),   # no cull, heavy diversity
-    "random":   (True,    0, 0.0,  None),   # no cull, no ranking signal -- the baseline that matters most
+    "old":         (False, 250,  12.0, 0.25),  # 2026-07-28 to 07-30 era: uncalibrated grids, 250-floor/12x window
+    "flat2000_uc": (False, 2000, 0.0,  0.25),  # 2026-07-27 17:16 to 07-28 11:22 era: uncalibrated grids, LITERAL flat-2000 window (no multiplier existed yet) -- the config actually being asked about here
+    "flat2000_c":  (True,  2000, 0.0,  0.25),  # same flat-2000 window, but on TODAY's calibrated sims -- isolates "was it the window" from "was it that era's uncalibrated grids"
+    "new":         (True,  100,  1.5,  0.25),  # current production: calibrated, tight admit window
+    "cull_lo":     (True,  100,  1.5,  0.10),  # cull as production, lean hard on diversity (EVw 0.10)
+    "cull_d0":     (True,  100,  1.5,  0.00),  # cull as production, pure diversity (no EV term)
+    "cull_rnd":    (True,  100,  1.5,  None),  # cull as production, then draw uniformly from survivors
+    "wide":        (True,    0,  0.0,  0.25),  # no cull at all, production EVw -- isolates the cull's effect
+    "wide_lo":     (True,    0,  0.0,  0.10),  # no cull, heavy diversity
+    "random":      (True,    0,  0.0,  None),  # no cull, no ranking signal -- the baseline that matters most
 }
 
 # standings zip stem (lowercased, no extension) -> display key matching
@@ -160,6 +162,9 @@ ZIP_TO_CONTEST = {
     "relay-throw": "Relay Throw", "skipper": "Skipper",
     "solo-shot": "Solo Shot", "moonshot": "Moonshot",
     "knuckleball": "Knuckleball",
+    # 07/25 archive: misnamed file, 2,972 entries matches four-seamer-payout.txt
+    # exactly and no four-seamer.zip exists otherwise -- see git log f20550a.
+    "sour-seamer": "Four-Seamer",
 }
 
 
@@ -195,13 +200,29 @@ def load_real_contests(d: Path) -> list[dict]:
         body = rows[1:]
         scores = sorted(float(r[4]) for r in body if r and r[0].strip().isdigit())
         n_field = len(scores)
-        fee_guess = None  # resolved against the payout table below
         struct = structure_for_contest(contest, n_entries=n_field)
-        if struct is None or struct["total_entries"] != n_field:
+        table_n = struct["total_entries"] if struct is not None else None
+        # DK's payout tiers are fixed to the contest's DESIGNED/advertised
+        # size at creation, not to how many people actually showed up that
+        # day -- a guaranteed contest that under-fills still pays from the
+        # full-size table (confirmed 2026-07-31: two 07/22 captures had the
+        # table's OWN stated header size, not that day's real fill, and were
+        # byte-identical to already-registered tables at the larger size).
+        # So table_n >= n_field is expected and fine; only a real MISMATCH
+        # (table smaller than the real field, or a big relative gap --
+        # meaning nearest-match grabbed the wrong contest's table) is an error.
+        gap = None if table_n is None else table_n - n_field
+        if struct is None or gap < 0 or gap > max(50, round(0.05 * table_n)):
             raise SystemExit(
-                f"no exact payout table for {contest!r} at n={n_field:,} "
-                f"(zip {z.name} in {d.name}) -- capture and register it first."
+                f"no matching payout table for {contest!r} at real fill n={n_field:,} "
+                f"(zip {z.name} in {d.name}, nearest table n={table_n}) -- "
+                "capture and register the right one."
             )
+        if gap > 0:
+            print(f"    note: {contest} real fill {n_field:,} < designed table size "
+                  f"{table_n:,} (gap {gap}, {100*gap/table_n:.1f}%) -- using the full-size "
+                  "table, DK's payout tiers don't shrink for an under-filled guarantee",
+                  flush=True)
         out.append({
             "contest": contest,
             "contest_id": f"{d.name}:{stem}",
@@ -478,10 +499,57 @@ def grade_pick(actual_score: float, sorted_real: np.ndarray, payout_arr: np.ndar
     return (float(band.mean()) if len(band) else 0.0), rank
 
 
+def _append_and_reload(new_rows: list[dict]) -> pd.DataFrame:
+    """Append this slate's rows to the results CSV immediately and return
+    the full accumulated table read back from disk -- so a crash, kill, or
+    just impatience mid-run still leaves every completed slate's results on
+    disk and gradeable, instead of everything living only in this
+    process's memory until the very last slate finishes."""
+    df = pd.DataFrame(new_rows)
+    if not df.empty:
+        df["slate"] = df["slate"].astype(str)
+    RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
+    if RESULTS_CSV.exists():
+        # dtype pin is load-bearing: every slate name is all-digit
+        # (07262026), so an untyped read_csv infers int64 and silently
+        # drops the leading zero -- breaking every later string comparison
+        # against SLATES/argv.
+        old = pd.read_csv(RESULTS_CSV, dtype={"slate": str})
+        df = pd.concat([old, df], ignore_index=True)
+    df.to_csv(RESULTS_CSV, index=False)
+    return df
+
+
+def print_summary(df: pd.DataFrame, label: str) -> None:
+    if df.empty:
+        print(f"\n[{label}] no results")
+        return
+    df = df.copy()
+    df["fees"] = df["n"] * df["fee"]
+    present_arms = [a for a in ARMS if a in df["arm"].unique()]
+    print(f"\n===== {label} =====\n")
+    p = df.groupby(["slate", "arm"], as_index=False)[["fees", "won"]].sum()
+    p["net"] = p["won"] - p["fees"]
+    piv = p.pivot_table(index="slate", columns="arm", values="net")[present_arms]
+    print("  net by slate:")
+    print(piv.round(2).to_string())
+
+    c = df.groupby("arm").agg(entries=("n", "sum"), fees=("fees", "sum"), won=("won", "sum"))
+    c["net"] = c["won"] - c["fees"]
+    c["ROI"] = 100 * c["net"] / c["fees"]
+    print("\n" + c.loc[present_arms].round(2).to_string())
+
+    r = df.groupby("arm").agg(top1=("top1", "sum"), top01=("top01", "sum"),
+                              best_rank=("best_rank", "min"))
+    print("\n" + r.loc[present_arms].to_string())
+
+
 def main() -> None:
-    rows = []
-    fill_events = []
+    all_fill_events = []
+    full_df = pd.DataFrame()
     for slate in SLATES:
+        rows = []
+        fill_events = []
         d = PROJECT_ROOT / "archive" / slate
         real = load_real_contests(d)
         # DKSalaries.csv's raw Name/ID columns -- verify_slate needs the
@@ -534,43 +602,27 @@ def main() -> None:
                             "unfilled": n_ambiguous,
                         })
 
-    print("\n===== FILL CHECK =====")
-    if fill_events:
-        fe = pd.DataFrame(fill_events)
-        print("  UNFILLED ENTRIES FOUND -- per-entry $ metrics for the affected "
-              "(slate, seed, arm) below are on a SMALLER denominator than intended. "
-              "An arm that silently drops hard-to-fill entries must not read as "
-              "'better' per-entry just because it graded fewer of them.")
-        print(fe.groupby(["arm"])["unfilled"].agg(["sum", "count"]).to_string())
-    else:
-        print("  clean -- every arm filled every contest at its intended size.")
+        print(f"\n===== FILL CHECK [{slate}] =====")
+        if fill_events:
+            fe = pd.DataFrame(fill_events)
+            print("  UNFILLED ENTRIES FOUND -- per-entry $ metrics for the affected "
+                  "(seed, arm) below are on a SMALLER denominator than intended. An "
+                  "arm that silently drops hard-to-fill entries must not read as "
+                  "'better' per-entry just because it graded fewer of them.")
+            print(fe.groupby(["arm"])["unfilled"].agg(["sum", "count"]).to_string())
+        else:
+            print("  clean -- every arm filled every contest at its intended size.")
+        all_fill_events.extend(fill_events)
 
-    df = pd.DataFrame(rows)
-    if df.empty:
-        print("no results")
-        return
-    RESULTS_CSV.parent.mkdir(parents=True, exist_ok=True)
-    if RESULTS_CSV.exists():
-        df = pd.concat([pd.read_csv(RESULTS_CSV), df], ignore_index=True)
-    df.to_csv(RESULTS_CSV, index=False)
-    print(f"\nresults -> {RESULTS_CSV}")
+        # Flushed to disk (and printed) as soon as THIS slate finishes --
+        # a crash, kill, or a check-in partway through a multi-hour run
+        # still has every completed slate's results available, instead of
+        # everything living only in memory until the very last slate.
+        full_df = _append_and_reload(rows)
+        print(f"results -> {RESULTS_CSV}  ({len(full_df)} rows total)")
+        print_summary(full_df[full_df["slate"].astype(str) == slate], f"THIS SLATE ({slate})")
 
-    df["fees"] = df["n"] * df["fee"]
-    print("\n===== REAL-MONEY BACKTEST =====\n")
-    p = df.groupby(["slate", "arm"], as_index=False)[["fees", "won"]].sum()
-    p["net"] = p["won"] - p["fees"]
-    piv = p.pivot_table(index="slate", columns="arm", values="net")[list(ARMS)]
-    print("  net by slate:")
-    print(piv.round(2).to_string())
-
-    c = df.groupby("arm").agg(entries=("n", "sum"), fees=("fees", "sum"), won=("won", "sum"))
-    c["net"] = c["won"] - c["fees"]
-    c["ROI"] = 100 * c["net"] / c["fees"]
-    print("\n" + c.loc[list(ARMS)].round(2).to_string())
-
-    r = df.groupby("arm").agg(top1=("top1", "sum"), top01=("top01", "sum"),
-                              best_rank=("best_rank", "min"))
-    print("\n" + r.loc[list(ARMS)].to_string())
+    print_summary(full_df, f"POOLED ACROSS {full_df['slate'].nunique()} SLATE(S)")
 
 
 if __name__ == "__main__":
