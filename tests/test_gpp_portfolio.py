@@ -427,6 +427,16 @@ class TestRealPayoutStructures:
         # DK keeps ~15% rake; pool must be a plausible share of collected fees
         assert 0.80 < a.sum() / (n * fee) < 0.90
 
+    def test_size_variants_pick_the_nearest_field(self):
+        """DK runs several sizes of the same contest; Four-Seamer exists as a
+        $15K/4,458 and a $20K/5,945 version."""
+        from src.optimization.payout import structure_for_contest
+        assert structure_for_contest("Four-Seamer", 4458)["total_entries"] == 4458
+        assert structure_for_contest("Four-Seamer", 5945)["total_entries"] == 5945
+        # single-variant contests ignore the hint; no hint falls back to the first
+        assert structure_for_contest("mini-MAX", 99)["total_entries"] == 17835
+        assert structure_for_contest("Four-Seamer") is not None
+
     def test_unknown_contest_returns_none(self):
         from src.optimization.payout import structure_for_contest
         assert structure_for_contest("Chin Music") is None   # no table captured yet

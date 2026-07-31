@@ -78,27 +78,39 @@ def scaled_payout_curve(structure: dict, n_field: int) -> tuple[np.ndarray, floa
 # Keyed by the short contest name as it appears in DK entry files and in
 # portfolio_sweep_draftkings.json's `contest_name`.
 CONTEST_STRUCTURES = {
-    "skipper": "dk_skipper",
-    "base hit": "dk_base_hit",
-    "four-seamer": "dk_four_seamer",
-    "bat flip": "dk_bat_flip",
-    "solo shot": "dk_solo_shot",
-    "rally cap": "dk_rally_cap",
-    "hot corner": "dk_hot_corner",
-    "moonshot": "dk_moonshot",
-    "knuckleball": "dk_knuckleball",
-    "mini-max": "dk_mini_max",
+    "skipper": ["dk_skipper"],
+    "base hit": ["dk_base_hit"],
+    "hot corner": ["dk_hot_corner"],
+    "four-seamer": ["dk_four_seamer", "dk_four_seamer_5945"],
+    "rally cap": ["dk_rally_cap"],
+    "solo shot": ["dk_solo_shot"],
+    "moonshot": ["dk_moonshot"],
+    "bat flip": ["dk_bat_flip"],
+    "mini-max": ["dk_mini_max"],
+    "knuckleball": ["dk_knuckleball"],
 }
 
 
-def structure_for_contest(contest_name: str) -> Optional[dict]:
+def structure_for_contest(
+    contest_name: str, n_entries: Optional[int] = None,
+) -> Optional[dict]:
     """The real payout structure for `contest_name`, or None when we have no
     table for it.
 
+    DK runs several size variants of the same contest (Four-Seamer appears as
+    both a $15K/4,458 and a $20K/5,945 version), so pass `n_entries` — the
+    contest's actual field that day, e.g. from its standings zip — to pick the
+    closest captured variant. Without it the first registered variant is used.
+
     Prefer this over scaling a reference curve by field size: payout shape
     tracks contest design, not size (see scaled_payout_curve's warning). A
-    caller with no table should either skip the contest or be explicit that
-    it is extrapolating.
+    caller with no table should skip the contest or be explicit that it is
+    extrapolating.
     """
-    key = CONTEST_STRUCTURES.get(str(contest_name).strip().lower())
-    return load_payout_structure(key) if key else None
+    keys = CONTEST_STRUCTURES.get(str(contest_name).strip().lower())
+    if not keys:
+        return None
+    if len(keys) == 1 or n_entries is None:
+        return load_payout_structure(keys[0])
+    cands = [load_payout_structure(k) for k in keys]
+    return min(cands, key=lambda s: abs(int(s["total_entries"]) - int(n_entries)))
