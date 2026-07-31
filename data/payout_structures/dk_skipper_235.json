@@ -1,0 +1,59 @@
+{
+  "name": "DraftKings $25 Skipper (235)",
+  "entry_fee": 25.0,
+  "total_entries": 235,
+  "total_payout_positions": 47,
+  "source": "real DK contest payout table, captured 2026-07-31 (07/25 slate size)",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 1000.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 500.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 350.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 250.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 200.0
+    },
+    {
+      "start": 6,
+      "end": 7,
+      "amount": 150.0
+    },
+    {
+      "start": 8,
+      "end": 10,
+      "amount": 100.0
+    },
+    {
+      "start": 11,
+      "end": 15,
+      "amount": 80.0
+    },
+    {
+      "start": 16,
+      "end": 25,
+      "amount": 60.0
+    },
+    {
+      "start": 26,
+      "end": 47,
+      "amount": 50.0
+    }
+  ]
+}

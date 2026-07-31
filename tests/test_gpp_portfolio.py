@@ -437,8 +437,8 @@ class TestRealPayoutStructures:
         from src.optimization.payout import structure_for_contest
         assert structure_for_contest("Four-Seamer", 4458)["total_entries"] == 4458
         assert structure_for_contest("Four-Seamer", 5945)["total_entries"] == 5945
-        # single-variant contests ignore the hint; no hint falls back to the first
-        assert structure_for_contest("mini-MAX", 99)["total_entries"] == 17835
+        # nearest-match by hint (mini-MAX has 14,268 / 17,835 / 23,781 variants)
+        assert structure_for_contest("mini-MAX", 99)["total_entries"] == 14268
         assert structure_for_contest("Four-Seamer") is not None
 
     def test_unknown_contest_returns_none(self):
