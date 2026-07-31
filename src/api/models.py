@@ -187,10 +187,25 @@ class GppConfig(BaseModel):
     # to rank it (mirrors the internal pipeline's fresh-rescore pattern).
     # <= 0 disables the cull (rank the whole pool on the second draw alone).
     #
-    # RECALIBRATED 2026-07-30: flat 250 (multiplier 0.0). Beat every
-    # alternative on 8/8 slates -- +2.66% $/entry vs the previous 250x12 rule
-    # (paired p=0.0006), +7.5% vs 1000x12, +16.5% vs no cull at all. The
-    # response is monotone in window size: tighter is better on every slate.
+    # RECALIBRATED 2026-07-30 to max(100, 1.5 * entries). Two sweeps, real
+    # payout tables, per-contest grading, 8 slates x risks 1/3/5:
+    #   round 1  flat250 beat 250x12 / 1000x12 / 2000x12 / flat1000 / no-cull
+    #            on 8/8 slates (+2.66% vs the old rule, paired p=0.0006)
+    #   round 2  flat100 5.8498 > flat150 5.6973 > flat200 5.5632 >
+    #            flat250 5.4661 > flat300 5.4129 > flat400 5.2828
+    #            (+7.02% vs flat250, 8/8 slates, sign test p=0.0078)
+    # The response is monotone in window size on every individual slate --
+    # tighter is better, without exception, and the trend NEVER REVERSED. It
+    # stopped only at the fill constraint: mini-MAX takes up to 95 of our
+    # entries, so ~95 is the narrowest window that can still fill it.
+    #
+    # Hence the small multiplier rather than a bare flat 100. mini-MAX permits
+    # 150 entries; a fixed 100 would silently leave 50 UNSUBMITTED if volume
+    # ever rises -- the same partial-fill trap that made an experimental
+    # flat-50 arm post the highest score in round 2a (it kept only its best 50
+    # lineups and the per-entry metric divided by entries FILLED, not
+    # intended). max(100, 1.5*k) yields 100-143 across this sample, entirely
+    # inside the tested-best band, and 225 at a 150-entry contest.
     #
     # This supersedes the 2026-07-28 calibration (sweep_admit_n_scaling.py),
     # which chose floor=250/multiplier=12 and whose result does not survive.
@@ -202,7 +217,7 @@ class GppConfig(BaseModel):
     #     (bc4b59c).
     # The 07/30 rerun fixes both and adds REAL DK payout tables per contest
     # (data/payout_structures/, structure_for_contest).
-    external_pool_pwin_admit_n: int = 250
+    external_pool_pwin_admit_n: int = 100
     # Scales the p_win cull by each contest's OWN entry count:
     # effective_admit_n = max(admit_n, round(multiplier * n_entries)).
     # 0.0 disables scaling (flat admit_n) and is the CALIBRATED DEFAULT.
