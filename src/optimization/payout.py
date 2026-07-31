@@ -82,6 +82,7 @@ CONTEST_STRUCTURES = {
     "base hit": "dk_base_hit",
     "four-seamer": "dk_four_seamer",
     "bat flip": "dk_bat_flip",
+    "solo shot": "dk_solo_shot",
     "mini-max": "dk_mini_max",
 }
 
