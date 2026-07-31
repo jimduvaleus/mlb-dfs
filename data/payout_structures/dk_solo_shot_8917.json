@@ -1,0 +1,119 @@
+{
+  "name": "DraftKings $1 Solo Shot (8.9k)",
+  "entry_fee": 1.0,
+  "total_entries": 8917,
+  "total_payout_positions": 2305,
+  "source": "real DK contest payout table, captured 2026-07-31 (07/24 slate size)",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 750.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 300.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 200.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 150.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 125.0
+    },
+    {
+      "start": 6,
+      "end": 7,
+      "amount": 100.0
+    },
+    {
+      "start": 8,
+      "end": 10,
+      "amount": 75.0
+    },
+    {
+      "start": 11,
+      "end": 13,
+      "amount": 60.0
+    },
+    {
+      "start": 14,
+      "end": 16,
+      "amount": 50.0
+    },
+    {
+      "start": 17,
+      "end": 19,
+      "amount": 40.0
+    },
+    {
+      "start": 20,
+      "end": 22,
+      "amount": 30.0
+    },
+    {
+      "start": 23,
+      "end": 25,
+      "amount": 25.0
+    },
+    {
+      "start": 26,
+      "end": 29,
+      "amount": 20.0
+    },
+    {
+      "start": 30,
+      "end": 35,
+      "amount": 15.0
+    },
+    {
+      "start": 36,
+      "end": 45,
+      "amount": 10.0
+    },
+    {
+      "start": 46,
+      "end": 55,
+      "amount": 8.0
+    },
+    {
+      "start": 56,
+      "end": 80,
+      "amount": 6.0
+    },
+    {
+      "start": 81,
+      "end": 130,
+      "amount": 5.0
+    },
+    {
+      "start": 131,
+      "end": 240,
+      "amount": 4.0
+    },
+    {
+      "start": 241,
+      "end": 485,
+      "amount": 3.0
+    },
+    {
+      "start": 486,
+      "end": 1045,
+      "amount": 2.0
+    },
+    {
+      "start": 1046,
+      "end": 2305,
+      "amount": 1.5
+    }
+  ]
+}
