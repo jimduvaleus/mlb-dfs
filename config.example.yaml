@@ -95,8 +95,8 @@ gpp:
   external_pool_ev_type: roi        # roi | prj_own | p_win
   external_pool_own_scale: 30000.0  # prj_own: field size where 1 ownership pt == 1 proj pt
   external_pool_pwin_sharpness: 0.05 # p_win: exponent multiplier on an entry count (1.0 = literal P(win); calibrated lower, see models.py). With flat_reference below, the count is that fixed reference rather than each contest's implied entries
-  external_pool_pwin_admit_n: 1000  # p_win: stage-A cull floor per contest (0 disables the two-stage guard)
-  external_pool_pwin_admit_multiplier: 12.0  # p_win: scales the cull by our own entry count per contest (0 = flat admit_n)
+  external_pool_pwin_admit_n: 250  # p_win: stage-A cull window per contest. FLAT 250 beat every alternative on 8/8 slates under real payout tables (+2.66% vs the old 250x12 rule, +7.5% vs 1000x12)
+  external_pool_pwin_admit_multiplier: 0.0  # 0 = flat admit_n. Scaling by entry count was measured HARMFUL: it widens mini-MAX's reservoir, the one contest where tight is best (-9.0% ROI there)
   external_pool_pwin_field_size: 0  # p_win: simulated opponent field size (0 = auto via pwin_field_size)
   external_pool_pwin_flat_reference: 0.0  # p_win: >0 gives every contest one flat exponent (sharpness x this). 0 = per-contest scaling, the VALIDATED setting (flat costs ~1.75% $/entry and wrecks the chalk-to-small-fields gradient)
   external_pool_roi_floor_pct: 40.0

@@ -186,43 +186,38 @@ class GppConfig(BaseModel):
     # only looks good on the draw used to pick it can't reach the draw used
     # to rank it (mirrors the internal pipeline's fresh-rescore pattern).
     # <= 0 disables the cull (rank the whole pool on the second draw alone).
-    # With external_pool_pwin_admit_multiplier below, this value is a FLOOR,
-    # not the literal cull size -- see that field for the full calibration
-    # history, including a correction: an earlier flat-admit_n sweep (run
-    # with scripts/sim_evaluate_portfolios.py --build, a single synthetic
-    # 150-entry contest group) found flat 250 beating 1000/2000. That result
-    # didn't survive a more faithful test (scripts/sweep_admit_n_scaling.py,
-    # each slate's REAL multi-contest entry-count breakdown, 7 settled
-    # slates, 07/27 excluded for an unrelated postponement confound): under
-    # real conditions flat 250 was the WORST option tested, not the best --
-    # every alternative (no cull, flat 500-5000, the scaled formula) beat it,
-    # most with real significance. The single-contest test couldn't see this
-    # because it has no cross-contest shared-pool depletion to get wrong.
-    external_pool_pwin_admit_n: int = 250
-    # Scales the p_win cull by each contest's OWN entry count -- the number
-    # of OUR entries actually uploaded to that contest (ContestGroup.entries,
-    # from the parsed DK Entries CSV), not the contest's field size or any
-    # entry-max cap -- instead of applying one flat number everywhere:
-    # effective_admit_n = max(external_pool_pwin_admit_n, round(multiplier *
-    # n_entries)). Motivated by production data: a flat admit_n gives a
-    # large-fill contest (e.g. 72 entries) a much tighter *relative*
-    # reservoir than a small one (e.g. 14), and on two live slates the
-    # single biggest-entry contest landed hit99=0 both times while every
-    # smaller contest on the same slate caught at least one -- despite
-    # having the most entries (most chances) of any of them.
     #
-    # Calibrated 2026-07-28 (sweep_admit_n_scaling.py, 7 settled slates,
-    # real per-contest entry counts, 07/27 excluded): floor=250/multiplier=12
-    # was the only rule to beat the flat-250 baseline on every single slate
-    # (7/7, t=+3.50 on mean real-field percentile) -- several flat values
-    # (1500, 2000, 5000) scored a higher raw mean on this sample, but each
-    # lost on 1-2 individual slates, and none was distinguishable from "no
-    # cull at all" with any confidence (|t|<1.6 in every case). The scaled
-    # rule was preferred over a bigger flat number specifically for that
-    # consistency -- a flat number tuned to one sample's contest-size mix is
-    # a bet that the mix doesn't shift; the scaled rule adapts by
-    # construction. 0.0 disables scaling (flat admit_n).
-    external_pool_pwin_admit_multiplier: float = 12.0
+    # RECALIBRATED 2026-07-30: flat 250 (multiplier 0.0). Beat every
+    # alternative on 8/8 slates -- +2.66% $/entry vs the previous 250x12 rule
+    # (paired p=0.0006), +7.5% vs 1000x12, +16.5% vs no cull at all. The
+    # response is monotone in window size: tighter is better on every slate.
+    #
+    # This supersedes the 2026-07-28 calibration (sweep_admit_n_scaling.py),
+    # which chose floor=250/multiplier=12 and whose result does not survive.
+    # That run had BOTH of the evaluation flaws found on 07/30:
+    #   * it graded every entry against ONE borrowed contest field
+    #     (load_real_field_points) rather than its own contest;
+    #   * it used `_FLAT_IMPLIED_ENTRIES = 10_000`, i.e. a FLAT p_win exponent
+    #     -- since measured worse than per-contest scaling and reverted
+    #     (bc4b59c).
+    # The 07/30 rerun fixes both and adds REAL DK payout tables per contest
+    # (data/payout_structures/, structure_for_contest).
+    external_pool_pwin_admit_n: int = 250
+    # Scales the p_win cull by each contest's OWN entry count:
+    # effective_admit_n = max(admit_n, round(multiplier * n_entries)).
+    # 0.0 disables scaling (flat admit_n) and is the CALIBRATED DEFAULT.
+    #
+    # The multiplier was introduced 2026-07-28 to give large-fill contests a
+    # wider relative reservoir, after the biggest-entry contest landed
+    # hit99=0 on two live slates. Under correct evaluation it does the
+    # opposite of what was intended: it widens the window exactly where a
+    # tight one is best. Per-contest ROI, flat 250 vs 250x12 --
+    #     mini-MAX (57-95 of our entries):  2.2260 vs 2.0422   +9.0%
+    #     Four-Seamer / Bat Flip:           unchanged to +0.1%
+    #     Skipper / Base Hit (1-3 entries): identical -- a 250 reservoir is
+    #                                       never exhausted by 3 picks
+    # So the contest the multiplier was built for is the one it damages, and
+    # every contest small enough to be unaffected is unaffected either way.
     # p_win simulated opponent field size. 0 = auto (ep.pwin_field_size:
     # grows gpp.n_field_lineups to the largest contest's implied entry
     # count, capped for memory).
