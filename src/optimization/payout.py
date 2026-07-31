@@ -86,6 +86,7 @@ CONTEST_STRUCTURES = {
     "rally cap": "dk_rally_cap",
     "hot corner": "dk_hot_corner",
     "moonshot": "dk_moonshot",
+    "knuckleball": "dk_knuckleball",
     "mini-max": "dk_mini_max",
 }
 

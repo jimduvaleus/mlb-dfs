@@ -1,0 +1,94 @@
+{
+  "name": "DraftKings $5 Knuckleball [$50K to 1st]",
+  "entry_fee": 5.0,
+  "total_entries": 47562,
+  "total_payout_positions": 9525,
+  "source": "real DK contest payout table, captured 2026-07-31",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 50000.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 20000.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 10000.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 5000.0
+    },
+    {
+      "start": 5,
+      "end": 6,
+      "amount": 2000.0
+    },
+    {
+      "start": 7,
+      "end": 10,
+      "amount": 1000.0
+    },
+    {
+      "start": 11,
+      "end": 15,
+      "amount": 500.0
+    },
+    {
+      "start": 16,
+      "end": 25,
+      "amount": 250.0
+    },
+    {
+      "start": 26,
+      "end": 40,
+      "amount": 150.0
+    },
+    {
+      "start": 41,
+      "end": 60,
+      "amount": 100.0
+    },
+    {
+      "start": 61,
+      "end": 90,
+      "amount": 75.0
+    },
+    {
+      "start": 91,
+      "end": 150,
+      "amount": 50.0
+    },
+    {
+      "start": 151,
+      "end": 250,
+      "amount": 30.0
+    },
+    {
+      "start": 251,
+      "end": 550,
+      "amount": 20.0
+    },
+    {
+      "start": 551,
+      "end": 1500,
+      "amount": 15.0
+    },
+    {
+      "start": 1501,
+      "end": 4025,
+      "amount": 10.0
+    },
+    {
+      "start": 4026,
+      "end": 9525,
+      "amount": 8.0
+    }
+  ]
+}
