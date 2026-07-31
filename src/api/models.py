@@ -233,6 +233,7 @@ class GppConfig(BaseModel):
     #                                       never exhausted by 3 picks
     # So the contest the multiplier was built for is the one it damages, and
     # every contest small enough to be unaffected is unaffected either way.
+    external_pool_pwin_admit_multiplier: float = 0.0
     # p_win simulated opponent field size. 0 = auto (ep.pwin_field_size:
     # grows gpp.n_field_lineups to the largest contest's implied entry
     # count, capped for memory).
