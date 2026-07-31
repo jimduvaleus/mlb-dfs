@@ -1,0 +1,109 @@
+{
+  "name": "DraftKings $3 Moonshot",
+  "entry_fee": 3.0,
+  "total_entries": 5945,
+  "total_payout_positions": 1523,
+  "source": "real DK contest payout table, captured 2026-07-31",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 1500.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 750.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 500.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 300.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 250.0
+    },
+    {
+      "start": 6,
+      "end": 7,
+      "amount": 200.0
+    },
+    {
+      "start": 8,
+      "end": 10,
+      "amount": 150.0
+    },
+    {
+      "start": 11,
+      "end": 13,
+      "amount": 100.0
+    },
+    {
+      "start": 14,
+      "end": 16,
+      "amount": 75.0
+    },
+    {
+      "start": 17,
+      "end": 20,
+      "amount": 60.0
+    },
+    {
+      "start": 21,
+      "end": 25,
+      "amount": 50.0
+    },
+    {
+      "start": 26,
+      "end": 35,
+      "amount": 40.0
+    },
+    {
+      "start": 36,
+      "end": 45,
+      "amount": 30.0
+    },
+    {
+      "start": 46,
+      "end": 55,
+      "amount": 25.0
+    },
+    {
+      "start": 56,
+      "end": 65,
+      "amount": 20.0
+    },
+    {
+      "start": 66,
+      "end": 95,
+      "amount": 15.0
+    },
+    {
+      "start": 96,
+      "end": 170,
+      "amount": 10.0
+    },
+    {
+      "start": 171,
+      "end": 310,
+      "amount": 8.0
+    },
+    {
+      "start": 311,
+      "end": 610,
+      "amount": 6.0
+    },
+    {
+      "start": 611,
+      "end": 1523,
+      "amount": 5.0
+    }
+  ]
+}

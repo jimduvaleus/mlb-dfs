@@ -412,6 +412,7 @@ class TestRealPayoutStructures:
         ("Hot Corner", 792, 3.0, 0.100),
         ("Four-Seamer", 4458, 4.0, 0.100),
         ("Solo Shot", 5945, 1.0, 0.200),
+        ("Moonshot", 5945, 3.0, 0.100),
         ("Rally Cap", 5882, 8.0, 0.250),
         ("Bat Flip", 9803, 18.0, 0.333),
         ("mini-MAX", 17835, 1.0, 0.100),
