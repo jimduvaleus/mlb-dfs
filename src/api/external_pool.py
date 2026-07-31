@@ -1303,31 +1303,43 @@ def pwin_exponents(
 
     `flat_reference > 0` substitutes that fixed entry count for every contest's
     own implied entries, i.e. every contest gets the SAME exponent
-    (`sharpness * flat_reference`) instead of one scaled to its size.
+    (`sharpness * flat_reference`). **Default 0.0 -- per-contest scaling -- is
+    the validated setting. Do not enable the flat form without re-reading the
+    history below.**
 
-    Why the flat form is the better default (measured 2026-07-30, 8 archived
-    slates with recoverable prize pools, calibrated sims, disjoint evaluation
-    slice, graded on expected gross dollars per entry against the real
-    standings field): a flat exponent of 500 beat production's per-contest
-    scaling on **8 of 8 slates**, +0.95% (t-test p=0.0063), with a worst case of
-    +0.07% and no slate negative. It was also better on both `$top10` and
-    `win_rate`, unusually — nearly every other change in this pipeline trades
-    breadth against depth.
+    A flat exponent was briefly shipped (2026-07-30) on evidence that has since
+    been RETRACTED. That evidence graded every entry in the portfolio against a
+    single archived contest's field and payout curve, so a 352-entry $25 Skipper
+    lineup was scored against ~11k-47k opponents and paid from their curve.
+    Re-graded per contest against REAL DK payout tables (Skipper 352, Base Hit
+    490, Four-Seamer 4,458, Bat Flip 9,803, mini-MAX 17,835 -- 61% of entry
+    slots), per-contest scaling WINS:
 
-    The scaling hurts because it pushes both ends into bad territory. Across the
-    archive the real per-contest exponents span 18 (a $25 single-entry Skipper)
-    to 2,381 (a $200K Knuckleball). Below ~100, `q**n` degenerates toward "beat
-    the median" and p_win stops being a ceiling statistic at all; above ~1,500 a
-    sharpness sweep measured a 1.5-5.4% EV cost. A flat 500 sits in the healthy
-    band for every contest. Capping the scaled exponent instead was tested and
-    is inert (+0.01%, better on 1/8 slates).
+        flat vs scaled   $/entry -1.75%, better on 1/8 slates, p=0.0042
+        floor vs scaled  $/entry -1.64%, better on 1/8 slates, p=0.0153
 
-    Note `sharpness` keeps its documented meaning — the exponent is still
-    `sharpness * an entry count`, just a fixed reference one rather than each
-    contest's own — so 1.0 remains "literal P(win) in a contest of
-    `flat_reference` entries" and lower values slide toward P(top X%).
+    Note both flat and floor RAISE P(win) (+2.8%/+3.2%, 7/8 slates) while
+    LOSING money -- they chase outright wins in contests whose payout curves do
+    not reward winning enough to cover the consistency given up.
 
-    `flat_reference = 0` restores the original per-contest scaling.
+    WHY scaling is right, confirmed payout-free: mean ownership of the lineups
+    each rule sends to each field size gives a small-minus-large gradient of
+    **+23.2** under scaling vs **+6.8** flat. Scaling routes chalk/high-projection
+    lineups to small fields and leverage to large ones -- standard DFS strategy
+    that the flat form destroys. Small contests get low exponents (a 352-entry
+    Skipper gets ~18) and `q**18` rewards consistency; large ones get ~900-2,400
+    and reward extreme ceiling. That is the feature, not a bug.
+
+    Also note the payout-modelling trap that produced the retracted result:
+    DK payout SHAPE is a property of contest design, not field size. Real
+    first-place shares are 20.0% at n=352, 10.0% at n=490, 10.0% at n=4,458,
+    33.3% at n=9,803 (a tagged "[$50K to 1st]" format) and 10.0% at n=17,835.
+    `scaled_payout_curve` -- which derives a curve from size alone -- cannot
+    represent this and pays 84.5% to first at n=416. Never evaluate contest-size
+    -dependent behaviour with it.
+
+    `sharpness` keeps its meaning either way: the exponent is
+    `sharpness * an entry count`.
     """
     if flat_reference > 0:
         exp = max(1.0, sharpness * float(flat_reference))

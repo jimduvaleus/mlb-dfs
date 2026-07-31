@@ -98,7 +98,7 @@ gpp:
   external_pool_pwin_admit_n: 1000  # p_win: stage-A cull floor per contest (0 disables the two-stage guard)
   external_pool_pwin_admit_multiplier: 12.0  # p_win: scales the cull by our own entry count per contest (0 = flat admit_n)
   external_pool_pwin_field_size: 0  # p_win: simulated opponent field size (0 = auto via pwin_field_size)
-  external_pool_pwin_flat_reference: 10000.0  # p_win: one exponent for every contest (sharpness x this) instead of scaling by each contest's implied entries; beat scaling 8/8 slates +0.95% (p=.006). 0 = per-contest scaling
+  external_pool_pwin_flat_reference: 0.0  # p_win: >0 gives every contest one flat exponent (sharpness x this). 0 = per-contest scaling, the VALIDATED setting (flat costs ~1.75% $/entry and wrecks the chalk-to-small-fields gradient)
   external_pool_roi_floor_pct: 40.0
   external_pool_proj_score_pct: 0.0
   external_pool_ceiling_weight: 0.25

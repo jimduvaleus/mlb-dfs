@@ -260,16 +260,15 @@ class GppConfig(BaseModel):
     # external_pool.py. scratch_prob is the flat, projection-INDEPENDENT
     # component (late scratch after lineup confirmation); it is kept separate
     # because it takes out studs at the same rate as punts.
-    # p_win exponent: use ONE exponent for every contest (sharpness *
-    # flat_reference) instead of scaling each contest by its own implied entry
-    # count. Measured 2026-07-30 over 8 archived slates with recoverable prize
-    # pools: a flat 500 beat per-contest scaling on 8/8 slates, +0.95%
-    # (p=0.0063), worst case +0.07%, and was better on $top10 and win_rate too.
-    # The scaling pushes both ends into bad territory — real exponents span 18
-    # to 2,381, and p_win degenerates toward "beat the median" below ~100 while
-    # costing 1.5-5.4% EV above ~1,500. `sharpness` stays operational and keeps
-    # its meaning (exponent = sharpness * an entry count, now a fixed reference
-    # one). 0.0 restores per-contest scaling. See pwin_exponents.
+    # p_win exponent: >0 uses ONE exponent for every contest
+    # (sharpness * flat_reference) instead of scaling each contest by its own
+    # implied entry count. DEFAULT 0.0 (per-contest scaling) IS THE VALIDATED
+    # SETTING. A flat exponent was briefly shipped 2026-07-30 and reverted: the
+    # supporting evidence graded every entry against one archived contest's
+    # field and payout curve. Re-graded per contest on REAL DK payout tables,
+    # scaling wins -- flat costs 1.75% of $/entry (better on 1/8 slates,
+    # p=0.0042) and cuts the chalk-to-small-fields ownership gradient from
+    # +23.2 to +6.8. See pwin_exponents in external_pool.py.
     external_pool_pwin_flat_reference: float = 0.0
 
     external_pool_zero_inflate: bool = False
