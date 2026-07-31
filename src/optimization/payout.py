@@ -89,6 +89,7 @@ CONTEST_STRUCTURES = {
     "mini-max": ["dk_mini_max"],
     "knuckleball": ["dk_knuckleball"],
     "pickoff": ["dk_pickoff"],
+    "chin music": ["dk_chin_music"],
 }
 
 

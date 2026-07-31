@@ -1,0 +1,94 @@
+{
+  "name": "DraftKings $5 Chin Music",
+  "entry_fee": 5.0,
+  "total_entries": 1426,
+  "total_payout_positions": 300,
+  "source": "real DK contest payout table, captured 2026-07-31",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 600.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 300.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 200.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 150.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 100.0
+    },
+    {
+      "start": 6,
+      "end": 7,
+      "amount": 75.0
+    },
+    {
+      "start": 8,
+      "end": 10,
+      "amount": 60.0
+    },
+    {
+      "start": 11,
+      "end": 13,
+      "amount": 55.0
+    },
+    {
+      "start": 14,
+      "end": 16,
+      "amount": 50.0
+    },
+    {
+      "start": 17,
+      "end": 19,
+      "amount": 45.0
+    },
+    {
+      "start": 20,
+      "end": 25,
+      "amount": 40.0
+    },
+    {
+      "start": 26,
+      "end": 30,
+      "amount": 35.0
+    },
+    {
+      "start": 31,
+      "end": 35,
+      "amount": 30.0
+    },
+    {
+      "start": 36,
+      "end": 45,
+      "amount": 25.0
+    },
+    {
+      "start": 46,
+      "end": 70,
+      "amount": 20.0
+    },
+    {
+      "start": 71,
+      "end": 121,
+      "amount": 15.0
+    },
+    {
+      "start": 122,
+      "end": 300,
+      "amount": 10.0
+    }
+  ]
+}

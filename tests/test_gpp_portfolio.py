@@ -411,6 +411,7 @@ class TestRealPayoutStructures:
         ("Pickoff", 594, 3.0, 0.100),
         ("Base Hit", 490, 12.0, 0.100),
         ("Hot Corner", 792, 3.0, 0.100),
+        ("Chin Music", 1426, 5.0, 0.100),
         ("Four-Seamer", 4458, 4.0, 0.100),
         ("Solo Shot", 5945, 1.0, 0.200),
         ("Moonshot", 5945, 3.0, 0.100),
@@ -440,7 +441,7 @@ class TestRealPayoutStructures:
 
     def test_unknown_contest_returns_none(self):
         from src.optimization.payout import structure_for_contest
-        assert structure_for_contest("Chin Music") is None   # no table captured yet
+        assert structure_for_contest("Relay Throw") is None   # no table captured yet
         assert structure_for_contest("Nonexistent Contest") is None
         assert structure_for_contest("") is None
 
