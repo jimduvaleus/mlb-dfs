@@ -1,0 +1,94 @@
+{
+  "name": "DraftKings $12 Base Hit ($10K)",
+  "entry_fee": 12.0,
+  "total_entries": 980,
+  "total_payout_positions": 180,
+  "source": "real DK contest payout table, captured 2026-07-31",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 1000.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 675.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 450.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 300.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 225.0
+    },
+    {
+      "start": 6,
+      "end": 6,
+      "amount": 175.0
+    },
+    {
+      "start": 7,
+      "end": 8,
+      "amount": 150.0
+    },
+    {
+      "start": 9,
+      "end": 10,
+      "amount": 125.0
+    },
+    {
+      "start": 11,
+      "end": 15,
+      "amount": 110.0
+    },
+    {
+      "start": 16,
+      "end": 20,
+      "amount": 90.0
+    },
+    {
+      "start": 21,
+      "end": 30,
+      "amount": 70.0
+    },
+    {
+      "start": 31,
+      "end": 40,
+      "amount": 55.0
+    },
+    {
+      "start": 41,
+      "end": 50,
+      "amount": 45.0
+    },
+    {
+      "start": 51,
+      "end": 65,
+      "amount": 40.0
+    },
+    {
+      "start": 66,
+      "end": 90,
+      "amount": 35.0
+    },
+    {
+      "start": 91,
+      "end": 130,
+      "amount": 30.0
+    },
+    {
+      "start": 131,
+      "end": 180,
+      "amount": 25.0
+    }
+  ]
+}

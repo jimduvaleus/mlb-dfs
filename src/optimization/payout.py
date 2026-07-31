@@ -78,8 +78,8 @@ def scaled_payout_curve(structure: dict, n_field: int) -> tuple[np.ndarray, floa
 # Keyed by the short contest name as it appears in DK entry files and in
 # portfolio_sweep_draftkings.json's `contest_name`.
 CONTEST_STRUCTURES = {
-    "skipper": ["dk_skipper"],
-    "base hit": ["dk_base_hit"],
+    "skipper": ["dk_skipper", "dk_skipper_470"],
+    "base hit": ["dk_base_hit", "dk_base_hit_392", "dk_base_hit_980"],
     "hot corner": ["dk_hot_corner", "dk_hot_corner_1189"],
     "four-seamer": ["dk_four_seamer", "dk_four_seamer_5945"],
     "rally cap": ["dk_rally_cap", "dk_rally_cap_11764"],
