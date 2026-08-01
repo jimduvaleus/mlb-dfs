@@ -171,29 +171,33 @@ def load_external_lineups(lineups_paths: list[Path]) -> tuple[pd.DataFrame, dict
     independent) are dropped across the combined set, keeping the first
     occurrence.
 
+    Contest ROI blocks are optional — an export sourced for the "prj_own"/
+    "p_win" EV currency (see src.api.external_pool.parse_lineup_pool's
+    require_roi_blocks) carries none. When absent, contest_blocks is {} and
+    no roi__*/win_rate__*/cash_rate__* columns exist at all; callers treat
+    a None contest_norm (see resolve_contest) as "no contest tier
+    available" rather than erroring.
+
     would_dedupe_9of10 flags lineups that the live pipeline's
     src.api.external_pool.parse_lineup_pool would *additionally* remove as
     near-duplicates (10-player set overlapping a higher-ROI surviving
     lineup's in exactly 9 players — a single swapped player), using the
     exact same tie-break logic (_pick_primary_contest_index /
     _find_near_duplicate_removals: ROI in the largest contest by parsed
-    prize pool). This script does NOT drop those rows — it's an offline
-    analysis tool and dropping them would silently hide what real-money
-    lineups a stricter dedup would have discarded — so the flag is purely
-    informational, letting --top / the eval CSV show whether a given
-    lineup's real result would even have been reachable in production.
+    prize pool, or — when there are no ROI blocks at all — each lineup's
+    own "Proj Score" column, mirroring parse_lineup_pool's
+    require_roi_blocks=False fallback). This script does NOT drop those
+    rows — it's an offline analysis tool and dropping them would silently
+    hide what real-money lineups a stricter dedup would have discarded —
+    so the flag is purely informational, letting --top / the eval CSV show
+    whether a given lineup's real result would even have been reachable in
+    production.
     """
     df = load_combined_lineups_csv(lineups_paths)
     id_cols = list(df.columns[:_N_SLOT_COLS])
     player_ids = df[id_cols].astype("int64").values.tolist()
 
     contest_blocks = discover_contest_blocks(df.columns)
-    if not contest_blocks:
-        names = ", ".join(p.name for p in lineups_paths)
-        raise ValueError(
-            f"{names}: no contest ROI blocks found (no '<name> ROI' column "
-            "with a matching '<name> Sim Dupes' sibling)"
-        )
 
     out = pd.DataFrame({
         "lineup_index": np.arange(len(df)),
@@ -215,19 +219,24 @@ def load_external_lineups(lineups_paths: list[Path]) -> tuple[pd.DataFrame, dict
     out = out.loc[~key.duplicated()].reset_index(drop=True)
     n_dup = n_before - len(out)
 
-    # contest_meta shape expected by _pick_primary_contest_index: norm ->
-    # (raw_name, prize_pool_cents, single_entry) -- single_entry is unused
-    # by that function, so it's not worth deriving here.
-    contest_order = list(contest_blocks.keys())
-    contest_meta = {
-        norm: (block["raw_name"], _parse_prize_pool_cents(block["raw_name"]), False)
-        for norm, block in contest_blocks.items()
-    }
-    primary_norm = contest_order[_pick_primary_contest_index(contest_order, contest_meta)]
-    # roi__<norm> is already x100 percentage points (see above) rather than
-    # parse_lineup_pool's raw fraction, but the near-dup pass only compares
-    # relative order, which a uniform positive scaling never changes.
-    primary_roi = out[f"roi__{primary_norm}"].to_numpy()
+    if contest_blocks:
+        # contest_meta shape expected by _pick_primary_contest_index: norm ->
+        # (raw_name, prize_pool_cents, single_entry) -- single_entry is unused
+        # by that function, so it's not worth deriving here.
+        contest_order = list(contest_blocks.keys())
+        contest_meta = {
+            norm: (block["raw_name"], _parse_prize_pool_cents(block["raw_name"]), False)
+            for norm, block in contest_blocks.items()
+        }
+        primary_norm = contest_order[_pick_primary_contest_index(contest_order, contest_meta)]
+        # roi__<norm> is already x100 percentage points (see above) rather than
+        # parse_lineup_pool's raw fraction, but the near-dup pass only compares
+        # relative order, which a uniform positive scaling never changes.
+        primary_roi = out[f"roi__{primary_norm}"].to_numpy()
+    else:
+        # No ROI blocks at all -- fall back to "Proj Score", same as
+        # src.api.external_pool.parse_lineup_pool's require_roi_blocks=False.
+        primary_roi = out["proj_score"].to_numpy()
     removed = _find_near_duplicate_removals(out["player_ids"].tolist(), primary_roi) if len(out) > 1 else set()
     would_dedupe = np.zeros(len(out), dtype=bool)
     if removed:
@@ -254,10 +263,19 @@ def add_actual_score(lineup_df: pd.DataFrame, fpts_map: dict) -> pd.DataFrame:
     return df
 
 
-def resolve_contest(contest_blocks: dict, query: str | None) -> str:
+def resolve_contest(contest_blocks: dict, query: str | None) -> str | None:
     """Return the norm_name of the contest tier matching --contest (substring,
     case-insensitive). Defaults to the first tier in file column order when
-    --contest is omitted."""
+    --contest is omitted.
+
+    Returns None when the export has no contest ROI blocks at all (a
+    "prj_own"/"p_win"-sourced export — see load_external_lineups); callers
+    then skip ROI/win_rate/cash_rate-dependent output. A --contest query
+    that fails to match against blocks that DO exist is still a real error
+    and still raises — only the "no blocks whatsoever" case degrades
+    gracefully."""
+    if not contest_blocks:
+        return None
     if query is None:
         return next(iter(contest_blocks))
     q = query.casefold()
@@ -272,6 +290,9 @@ def resolve_contest(contest_blocks: dict, query: str | None) -> str:
 
 
 def print_contest_list(contest_blocks: dict, lineup_df: pd.DataFrame) -> None:
+    if not contest_blocks:
+        print("No contest ROI blocks found in this export (a prj_own/p_win-sourced pool).")
+        return
     print(f"{len(contest_blocks)} contest tiers found:")
     for norm, block in contest_blocks.items():
         roi = lineup_df[f"roi__{norm}"]
@@ -281,18 +302,22 @@ def print_contest_list(contest_blocks: dict, lineup_df: pd.DataFrame) -> None:
         )
 
 
-def top_candidates_table(lineup_df: pd.DataFrame, contest_norm: str, top_n: int) -> pd.DataFrame:
+def top_candidates_table(lineup_df: pd.DataFrame, contest_norm: str | None, top_n: int) -> pd.DataFrame:
     """Top `top_n` lineups by actual_score, descending. Lineups with
     incomplete actual-score coverage (a player missing from the resolved
-    contest fpts map) are excluded — their actual_score is NaN, not low."""
-    roi_col, win_col, cash_col = f"roi__{contest_norm}", f"win_rate__{contest_norm}", f"cash_rate__{contest_norm}"
+    contest fpts map) are excluded — their actual_score is NaN, not low.
+
+    contest_norm=None (no ROI blocks in the export) drops the roi/win_rate/
+    cash_rate columns from the table entirely rather than erroring."""
     df = lineup_df.dropna(subset=["actual_score"]).sort_values("actual_score", ascending=False).head(top_n)
-    return df[[
-        "lineup_index", "actual_score", "salary", "proj_score", "ownership", roi_col, win_col, cash_col,
-        "would_dedupe_9of10",
-    ]].rename(columns={
-        "proj_score": "mean", roi_col: "roi", win_col: "win_rate", cash_col: "cash_rate",
-    }).reset_index(drop=True)
+    cols = ["lineup_index", "actual_score", "salary", "proj_score", "ownership"]
+    rename = {"proj_score": "mean"}
+    if contest_norm is not None:
+        roi_col, win_col, cash_col = f"roi__{contest_norm}", f"win_rate__{contest_norm}", f"cash_rate__{contest_norm}"
+        cols += [roi_col, win_col, cash_col]
+        rename.update({roi_col: "roi", win_col: "win_rate", cash_col: "cash_rate"})
+    cols.append("would_dedupe_9of10")
+    return df[cols].rename(columns=rename).reset_index(drop=True)
 
 
 def run_top_candidates(archive_dirs: list[Path], top_n: int, contest_query: str | None) -> None:
@@ -312,6 +337,8 @@ def run_top_candidates(archive_dirs: list[Path], top_n: int, contest_query: str 
         except ValueError as exc:
             print(f"{d.name}: {exc}")
             continue
+        if contest_norm is None and contest_query is not None:
+            print(f"{d.name}: no contest ROI blocks in this export — ignoring --contest {contest_query!r}.")
 
         lineup_df = add_actual_score(lineup_df, fpts_map)
         table = top_candidates_table(lineup_df, contest_norm, top_n)
@@ -321,15 +348,18 @@ def run_top_candidates(archive_dirs: list[Path], top_n: int, contest_query: str 
             f"  ({n_near_dup} near-duplicates [9/10 overlap] flagged via would_dedupe_9of10, not dropped)"
             if n_near_dup else ""
         )
+        contest_label = contest_blocks[contest_norm]["raw_name"] if contest_norm is not None else "none (no ROI blocks)"
         print(
             f"\n=== {d.name} === top {len(table)} lineups by actual_score "
-            f"[contest={contest_blocks[contest_norm]['raw_name']!r}]{dup_note}{near_dup_note}"
+            f"[contest={contest_label!r}]{dup_note}{near_dup_note}"
         )
         # roi is already in percentage points (see load_external_lineups) — format
         # it as "+71.5%" for the printed table, matching the portfolio-panel UI's
-        # display convention; the CSV keeps the plain numeric percentage.
+        # display convention; the CSV keeps the plain numeric percentage. Absent
+        # entirely (not just blank) when the export has no ROI blocks at all.
         display = table.copy()
-        display["roi"] = display["roi"].map(lambda x: f"{x:+.1f}%")
+        if "roi" in display.columns:
+            display["roi"] = display["roi"].map(lambda x: f"{x:+.1f}%")
         print(display.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
 
         out_path = d / "external_top_candidates.csv"
@@ -357,6 +387,9 @@ def run_roi_sweep(
             contest_norm = resolve_contest(contest_blocks, contest_query)
         except ValueError as exc:
             print(f"{d.name}: {exc}")
+            continue
+        if contest_norm is None:
+            print(f"{d.name}: no contest ROI blocks in this export — --sweep needs an ROI column, skipping.")
             continue
         roi_col = f"roi__{contest_norm}"
 
@@ -462,8 +495,11 @@ def run_own_scale_sweep(
         rows = [
             _selection_metrics("pool (all)", pool),
             _selection_metrics("proj only", pool.nlargest(n, "proj_score")),
-            _selection_metrics("saber ROI", pool.nlargest(n, f"roi__{contest_norm}")),
         ]
+        if contest_norm is not None:
+            rows.append(_selection_metrics("saber ROI", pool.nlargest(n, f"roi__{contest_norm}")))
+        else:
+            print(f"{d.name}: no contest ROI blocks in this export — skipping the 'saber ROI' reference row.")
         for own_scale in grid:
             k = n_field / own_scale
             ev = pool["proj_score"] - k * pool["ownership"]
@@ -473,10 +509,11 @@ def run_own_scale_sweep(
             rows.append(row)
 
         table = pd.DataFrame(rows)
+        contest_label = contest_blocks[contest_norm]["raw_name"] if contest_norm is not None else "none (no ROI blocks)"
         print(
             f"\n=== {d.name} ===  n_field={n_field:,}  pool={len(pool):,} of {len(lineup_df):,} "
             f"(proj cull {proj_score_pct:.0f}% -> {cutoff:.1f} pts)  top-N={n}  "
-            f"contest={contest_blocks[contest_norm]['raw_name']!r}"
+            f"contest={contest_label!r}"
         )
         print(table.to_string(index=False, float_format=lambda x: f"{x:.3f}"))
         for r in rows:
@@ -499,8 +536,10 @@ def run_own_scale_sweep(
     print(f"\nSweep written -> {out}")
 
 
-def compute_slate_metrics(lineup_df: pd.DataFrame, contest_norm: str) -> dict:
-    roi_col = f"roi__{contest_norm}"
+def compute_slate_metrics(lineup_df: pd.DataFrame, contest_norm: str | None) -> dict:
+    """contest_norm=None (no ROI blocks in the export) leaves
+    spearman_roi_actual at NaN rather than erroring — proj/ownership
+    correlations don't depend on ROI and are always computed."""
     complete = lineup_df.dropna(subset=["actual_score"])
     n_total = len(lineup_df)
     n_complete = len(complete)
@@ -513,7 +552,9 @@ def compute_slate_metrics(lineup_df: pd.DataFrame, contest_norm: str) -> dict:
         "spearman_ownership_actual": float("nan"),
     }
     if n_complete >= 10:
-        metrics["spearman_roi_actual"] = spearmanr(complete[roi_col], complete["actual_score"]).correlation
+        if contest_norm is not None:
+            roi_col = f"roi__{contest_norm}"
+            metrics["spearman_roi_actual"] = spearmanr(complete[roi_col], complete["actual_score"]).correlation
         metrics["spearman_proj_actual"] = spearmanr(complete["proj_score"], complete["actual_score"]).correlation
         metrics["spearman_ownership_actual"] = spearmanr(complete["ownership"], complete["actual_score"]).correlation
     return metrics
@@ -548,8 +589,8 @@ def evaluate_archive_dirs(
         except ValueError as exc:
             print(f"{d.name}: {exc}")
             continue
-        roi_col = f"roi__{contest_norm}"
-        contest_raw = contest_blocks[contest_norm]["raw_name"]
+        roi_col = f"roi__{contest_norm}" if contest_norm is not None else None
+        contest_raw = contest_blocks[contest_norm]["raw_name"] if contest_norm is not None else None
 
         lineup_df = add_actual_score(lineup_df, fpts_map)
         metrics = compute_slate_metrics(lineup_df, contest_norm)
@@ -557,8 +598,10 @@ def evaluate_archive_dirs(
         try:
             field_points = load_real_field_points(d)
             lineup_df = add_real_percentile(lineup_df, field_points, cash_threshold, top_percentile)
-            swept = lineup_df.rename(columns={roi_col: "projected_ev"})
-            metrics.update(compute_floor_metrics(swept, roi_floor, len(field_points)))
+            metrics["n_field"] = len(field_points)
+            if roi_col is not None:
+                swept = lineup_df.rename(columns={roi_col: "projected_ev"})
+                metrics.update(compute_floor_metrics(swept, roi_floor, len(field_points)))
             metrics["cash_threshold"] = cash_threshold
             metrics["top_percentile"] = top_percentile
             complete = lineup_df.dropna(subset=["would_top_pct"])
@@ -566,19 +609,26 @@ def evaluate_archive_dirs(
             metrics["n_top_pct"] = int(complete["would_top_pct"].sum())
 
             if len(archive_dirs) == 1:
-                print(f"\n=== {d.name} === [contest={contest_raw!r}]")
+                contest_label = contest_raw if contest_raw is not None else "none (no ROI blocks)"
+                print(f"\n=== {d.name} === [contest={contest_label!r}]")
                 print(
                     f"Lineups: {metrics['n_lineups']}  (complete actual-score coverage: "
                     f"{metrics['n_complete']} = {metrics['coverage'] * 100:.1f}%)"
                 )
-                print(f"Spearman(roi,        actual_score) = {metrics['spearman_roi_actual']:+.3f}")
+                if roi_col is not None:
+                    print(f"Spearman(roi,        actual_score) = {metrics['spearman_roi_actual']:+.3f}")
+                else:
+                    print("Spearman(roi,        actual_score) = n/a (no ROI blocks in this export)")
                 print(f"Spearman(proj_score, actual_score) = {metrics['spearman_proj_actual']:+.3f}")
                 print(f"Spearman(ownership,  actual_score) = {metrics['spearman_ownership_actual']:+.3f}")
 
-                print("\nROI deciles (1 = lowest ROI .. 10 = highest ROI):")
-                roi_dec = _decile_table(lineup_df.rename(columns={roi_col: "roi"}), "roi")
-                print(roi_dec.to_string(index=False, float_format=lambda x: f"{x:.3f}") if not roi_dec.empty
-                      else "  (not enough complete-coverage lineups for deciles)")
+                if roi_col is not None:
+                    print("\nROI deciles (1 = lowest ROI .. 10 = highest ROI):")
+                    roi_dec = _decile_table(lineup_df.rename(columns={roi_col: "roi"}), "roi")
+                    print(roi_dec.to_string(index=False, float_format=lambda x: f"{x:.3f}") if not roi_dec.empty
+                          else "  (not enough complete-coverage lineups for deciles)")
+                else:
+                    print("\nROI deciles: n/a (no ROI blocks in this export)")
 
                 print("\nOwnership deciles (1 = lowest owned .. 10 = highest owned):")
                 own_dec = _decile_table(lineup_df, "ownership")
@@ -590,23 +640,26 @@ def evaluate_archive_dirs(
                     f"\nTop {pct_label:.1f}th percentile (real field): "
                     f"{metrics['top_pct_rate'] * 100:.1f}% of lineups ({metrics['n_top_pct']} / {metrics['n_complete']})"
                 )
-                print(
-                    f"\nROI-floor calibration vs. real field (n_field={metrics['n_field']:.0f}, "
-                    f"roi_floor={roi_floor:+.1f}%, cash_threshold={cash_threshold:.2f}, "
-                    f"top_percentile={top_percentile:.2f}):"
-                )
-                print(
-                    f"  below floor      (n={metrics['n_below_floor']:>6.0f}):  "
-                    f"mean real_percentile={metrics['real_percentile_below_floor']:.3f}   "
-                    f"cash_rate={metrics['cash_rate_below_floor']:.3f}   "
-                    f"top{pct_label:.0f}_rate={metrics['top_pct_rate_below_floor']:.3f}"
-                )
-                print(
-                    f"  at/above floor   (n={metrics['n_at_or_above_floor']:>6.0f}):  "
-                    f"mean real_percentile={metrics['real_percentile_at_or_above_floor']:.3f}   "
-                    f"cash_rate={metrics['cash_rate_at_or_above_floor']:.3f}   "
-                    f"top{pct_label:.0f}_rate={metrics['top_pct_rate_at_or_above_floor']:.3f}"
-                )
+                if roi_col is not None:
+                    print(
+                        f"\nROI-floor calibration vs. real field (n_field={metrics['n_field']:.0f}, "
+                        f"roi_floor={roi_floor:+.1f}%, cash_threshold={cash_threshold:.2f}, "
+                        f"top_percentile={top_percentile:.2f}):"
+                    )
+                    print(
+                        f"  below floor      (n={metrics['n_below_floor']:>6.0f}):  "
+                        f"mean real_percentile={metrics['real_percentile_below_floor']:.3f}   "
+                        f"cash_rate={metrics['cash_rate_below_floor']:.3f}   "
+                        f"top{pct_label:.0f}_rate={metrics['top_pct_rate_below_floor']:.3f}"
+                    )
+                    print(
+                        f"  at/above floor   (n={metrics['n_at_or_above_floor']:>6.0f}):  "
+                        f"mean real_percentile={metrics['real_percentile_at_or_above_floor']:.3f}   "
+                        f"cash_rate={metrics['cash_rate_at_or_above_floor']:.3f}   "
+                        f"top{pct_label:.0f}_rate={metrics['top_pct_rate_at_or_above_floor']:.3f}"
+                    )
+                else:
+                    print("\nROI-floor calibration: n/a (no ROI blocks in this export)")
             else:
                 print_condensed_line(d.name, metrics)
         except (FileNotFoundError, ValueError) as exc:
