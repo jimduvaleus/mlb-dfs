@@ -679,12 +679,12 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                     the selector's choices can be read directly. */}
                 {lineup.lineup_mean != null && (
                   <span className="lineup-card-ev" title="Sum of projected scores">
-                    {`MEAN ${lineup.lineup_mean.toFixed(1)}`}
+                    {`PRJ ${Math.round(lineup.lineup_mean)}`}
                   </span>
                 )}
                 {lineup.lineup_ownership != null && (
                   <span className="lineup-card-ev" title="Sum of projected ownership (percentage points)">
-                    {`OWN ${lineup.lineup_ownership.toFixed(1)}`}
+                    {`OWN ${Math.round(lineup.lineup_ownership)}`}
                   </span>
                 )}
                 {optIdx != null && (
