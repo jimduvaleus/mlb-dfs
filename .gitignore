@@ -20,7 +20,7 @@ data/processed/projections.csv
 outputs/
 archive/
 tests/backtest_output/
-tests/backtest_output_log.txt
+tests/backtest_output_log*.txt
 config.yaml
 .claude/settings.json
 
