@@ -711,9 +711,18 @@ def main() -> None:
                             out_arm = arm
                             if floor_pct is not None:
                                 out_arm += f"@floor{floor_pct:g}"
-                            if pw != 1.0:
+                            # Suffix whenever a sweep was actually REQUESTED
+                            # (env var set), not just when the value differs
+                            # from the no-op default -- an explicit sweep that
+                            # happens to include the default value (e.g.
+                            # BT_PITCHER_WEIGHTS=1.0,1.5,...) must not collide
+                            # with pre-existing unsuffixed baseline rows from
+                            # an earlier, unrelated run. (Found the hard way:
+                            # a pw sweep silently duplicated/corrupted
+                            # "random"/"flat2000_uc"'s bare-label rows.)
+                            if _pw_sweep is not None:
                                 out_arm += f"@pw{pw:g}"
-                            if corr_variant != "full":
+                            if _corr_sweep is not None:
                                 out_arm += f"@corr{corr_variant}"
                             picks, unfilled = run_arm(ctx, arm, seed, floor_pct=floor_pct,
                                                        pitcher_weight=pw, corr_variant=corr_variant)
