@@ -174,6 +174,15 @@ if _arm_subset:
 _floor_sweep = os.environ.get("BT_FLOOR_PCTS")
 FLOOR_SWEEP: list = [float(x) for x in _floor_sweep.split(",")] if _floor_sweep else [None]
 
+# BT_PITCHER_WEIGHTS=1.0,1.5,2.0,2.5,3.0 sweeps the pitcher weight in the
+# proj-score-floor basis (see weighted_proj_scores) -- same "cheap, no new
+# sims" property as FLOOR_SWEEP. Output arm names get a "@pwN" suffix.
+# Motivated by pitcher proj correlating with real FPTS 2.5x as strongly as
+# hitter proj (0.415 vs 0.167, all 8 archived slates) -- the floor currently
+# trusts both equally.
+_pw_sweep = os.environ.get("BT_PITCHER_WEIGHTS")
+PW_SWEEP: list = [float(x) for x in _pw_sweep.split(",")] if _pw_sweep else [1.0]
+
 # standings zip stem (lowercased, no extension) -> display key matching
 # portfolio_sweep_draftkings.json's contest_name AND the payout registry's
 # lowercased contest key (structure_for_contest lowercases internally).
@@ -415,7 +424,7 @@ def build_slate_context(d: Path, seed: int, calibrated: bool, real: list[dict]):
     p_win_select = ep.compute_p_win(scores_B, field_scores_B, exponents)
 
     return dict(
-        pool=pool, corr=corr, proj_scores=proj_scores,
+        pool=pool, corr=corr, proj_scores=proj_scores, players_df=players_df,
         contests=contests, p_win_cull=p_win_cull, p_win_select=p_win_select,
     )
 
@@ -440,14 +449,35 @@ class _FakeGroup:
         self.entries = [(contest_id, j) for j in range(k)]
 
 
+def weighted_proj_scores(ctx: dict, pitcher_weight: float) -> np.ndarray:
+    """Pool proj-score sum with each pitcher's projected mean multiplied by
+    `pitcher_weight` before summing (hitters unweighted) -- pitcher_weight=1.0
+    reproduces ctx["proj_scores"] exactly. Motivated by a direct measurement
+    against real outcomes across all 8 archived slates: pitcher projected
+    mean correlates with real FPTS more than 2x as strongly as hitter
+    projected mean does (r=0.415 vs 0.167; see memory
+    project-cull-calibration-followup). The floor currently sums both
+    equally, trusting a noisy hitter signal exactly as much as a much more
+    reliable pitcher one -- this tests whether weighting the sum toward the
+    more trustworthy half changes what the floor admits/culls."""
+    if pitcher_weight == 1.0:
+        return ctx["proj_scores"]
+    players_df = ctx["players_df"]
+    w = np.where(players_df["position"].to_numpy() == "P", pitcher_weight, 1.0)
+    weighted_means = players_df["mean"].to_numpy(dtype=np.float64) * w
+    tmp = players_df.copy()
+    tmp["mean"] = weighted_means
+    return ep.compute_pool_proj_scores(ctx["pool"].lineups, tmp)
+
+
 def _random_pick(ctx: dict, admit_floor: int, admit_mult: float, rng: np.random.Generator,
-                  floor_pct: float = None):
+                  floor_pct: float = None, pitcher_weight: float = 1.0):
     """cull_rnd / random arms: not expressible through allocate_contests
     (it always ranks by an EV vector). Reuses allocate_contests's exact
     proj-floor + p_win cull logic (see the docstring on allocate_contests
     in src/api/external_pool.py for the formula this mirrors), then draws
     uniformly from the survivors instead of ranking them."""
-    proj_scores = ctx["proj_scores"]
+    proj_scores = weighted_proj_scores(ctx, pitcher_weight)
     floor = ep.compute_proj_score_floor(proj_scores, FLOOR_PCT if floor_pct is None else floor_pct)
     mask = np.isfinite(proj_scores)
     if floor is not None:
@@ -472,6 +502,7 @@ def _random_pick(ctx: dict, admit_floor: int, admit_mult: float, rng: np.random.
 
 
 def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
+            pitcher_weight: float = 1.0,
             ) -> tuple[dict[str, list[int]], dict[str, int]]:
     """Returns (picks, unfilled_by_contest) -- callers must check the
     second dict before trusting per-entry $ metrics (see _FakeGroup).
@@ -479,7 +510,9 @@ def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
     single call -- used by the proj-score-floor calibration sweep, which
     needs the SAME arm run at several floor percentiles within one context
     build (floor is a pure selection-time parameter, so this needs no new
-    sims/corr/p_win -- see build_slate_context)."""
+    sims/corr/p_win -- see build_slate_context). pitcher_weight similarly
+    overrides the basis the floor is computed from -- see
+    weighted_proj_scores; 1.0 is the unweighted baseline."""
     _, admit_floor, admit_mult, evw = ARMS[arm]
     eff_floor_pct = FLOOR_PCT if floor_pct is None else floor_pct
     if evw is None:
@@ -487,7 +520,8 @@ def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
         # randomized per process by default, which would make "random"/
         # "cull_rnd" non-reproducible across runs of the same seed)
         rng = np.random.default_rng(seed * 1000 + list(ARMS).index(arm))
-        picks = _random_pick(ctx, admit_floor, admit_mult, rng, floor_pct=eff_floor_pct)
+        picks = _random_pick(ctx, admit_floor, admit_mult, rng, floor_pct=eff_floor_pct,
+                              pitcher_weight=pitcher_weight)
         unfilled = {c["contest_id"]: c["k"] - len(picks.get(c["contest_id"], []))
                     for c in ctx["contests"]}
         return picks, unfilled
@@ -496,7 +530,7 @@ def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
     alloc = ep.allocate_contests(
         ctx["pool"], ctx["corr"], groups, risk=3.0,
         evw_base=evw, evw_max=evw,
-        proj_scores=ctx["proj_scores"], proj_score_floor_percentile=eff_floor_pct,
+        proj_scores=weighted_proj_scores(ctx, pitcher_weight), proj_score_floor_percentile=eff_floor_pct,
         ev_type="p_win", p_win_cull=ctx["p_win_cull"], p_win_select=ctx["p_win_select"],
         p_win_admit_n=admit_floor, p_win_admit_multiplier=admit_mult,
     )
@@ -609,38 +643,43 @@ def main() -> None:
                 calib_flag = ARMS[arm][0]
                 ctx = ctxs[calib_flag]
                 for floor_pct in FLOOR_SWEEP:
-                    out_arm = arm if floor_pct is None else f"{arm}@floor{floor_pct:g}"
-                    picks, unfilled = run_arm(ctx, arm, seed, floor_pct=floor_pct)
-                    for cid, n_unfilled in unfilled.items():
-                        if n_unfilled > 0:
-                            fill_events.append({
-                                "slate": slate, "seed": seed, "arm": out_arm,
-                                "contest_id": cid, "unfilled": n_unfilled,
-                            })
-                    actual = {i: sum(fpts.get(int(p), float("nan")) for p in lu.player_ids)
-                              for i, lu in enumerate(ctx["pool"].lineups)}
-                    for c in ctx["contests"]:
-                        idxs = picks.get(c["contest_id"], [])
-                        n_ambiguous = 0
-                        for i in idxs:
-                            a = actual[i]
-                            if not np.isfinite(a):
-                                n_ambiguous += 1  # rostered an ambiguous-name player -- see verify_slate
-                                continue
-                            gross, rank = grade_pick(a, c["sorted_scores"], c["payout_arr"])
-                            rows.append({
-                                "slate": slate, "seed": seed, "arm": out_arm,
-                                "contest": c["contest"], "n": 1, "fee": c["fee"],
-                                "won": gross, "best_rank": rank, "n_field": c["n_field"],
-                                "top1": int(rank <= max(1, c["n_field"] // 100)),
-                                "top01": int(rank <= max(1, c["n_field"] // 1000)),
-                            })
-                        if n_ambiguous:
-                            fill_events.append({
-                                "slate": slate, "seed": seed, "arm": out_arm,
-                                "contest_id": c["contest_id"] + " [ambiguous-name drop]",
-                                "unfilled": n_ambiguous,
-                            })
+                    for pw in PW_SWEEP:
+                        out_arm = arm
+                        if floor_pct is not None:
+                            out_arm += f"@floor{floor_pct:g}"
+                        if pw != 1.0:
+                            out_arm += f"@pw{pw:g}"
+                        picks, unfilled = run_arm(ctx, arm, seed, floor_pct=floor_pct, pitcher_weight=pw)
+                        for cid, n_unfilled in unfilled.items():
+                            if n_unfilled > 0:
+                                fill_events.append({
+                                    "slate": slate, "seed": seed, "arm": out_arm,
+                                    "contest_id": cid, "unfilled": n_unfilled,
+                                })
+                        actual = {i: sum(fpts.get(int(p), float("nan")) for p in lu.player_ids)
+                                  for i, lu in enumerate(ctx["pool"].lineups)}
+                        for c in ctx["contests"]:
+                            idxs = picks.get(c["contest_id"], [])
+                            n_ambiguous = 0
+                            for i in idxs:
+                                a = actual[i]
+                                if not np.isfinite(a):
+                                    n_ambiguous += 1  # rostered an ambiguous-name player -- see verify_slate
+                                    continue
+                                gross, rank = grade_pick(a, c["sorted_scores"], c["payout_arr"])
+                                rows.append({
+                                    "slate": slate, "seed": seed, "arm": out_arm,
+                                    "contest": c["contest"], "n": 1, "fee": c["fee"],
+                                    "won": gross, "best_rank": rank, "n_field": c["n_field"],
+                                    "top1": int(rank <= max(1, c["n_field"] // 100)),
+                                    "top01": int(rank <= max(1, c["n_field"] // 1000)),
+                                })
+                            if n_ambiguous:
+                                fill_events.append({
+                                    "slate": slate, "seed": seed, "arm": out_arm,
+                                    "contest_id": c["contest_id"] + " [ambiguous-name drop]",
+                                    "unfilled": n_ambiguous,
+                                })
 
         print(f"\n===== FILL CHECK [{slate}] =====")
         if fill_events:
