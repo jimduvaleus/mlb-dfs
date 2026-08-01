@@ -143,11 +143,36 @@ ARMS: dict[str, tuple] = {
     "new":         (True,  100,  1.5,  0.25),  # current production: calibrated, tight admit window
     "cull_lo":     (True,  100,  1.5,  0.10),  # cull as production, lean hard on diversity (EVw 0.10)
     "cull_d0":     (True,  100,  1.5,  0.00),  # cull as production, pure diversity (no EV term)
-    "cull_rnd":    (True,  100,  1.5,  None),  # cull as production, then draw uniformly from survivors
+    "cull_rnd":    (True,  100,  1.5,  None),  # cull as production (NARROW window), then draw uniformly from survivors
+    "flat2000_rnd":(False, 2000, 0.0,  None),  # cull as flat2000_uc (WIDE window, uncalibrated), then draw uniformly --
+                                                # isolates "does the wide cull's floor help random coverage" from cull_rnd's
+                                                # narrow-window version, which was the single worst arm in the 8-slate run
     "wide":        (True,    0,  0.0,  0.25),  # no cull at all, production EVw -- isolates the cull's effect
     "wide_lo":     (True,    0,  0.0,  0.10),  # no cull, heavy diversity
     "random":      (True,    0,  0.0,  None),  # no cull, no ranking signal -- the baseline that matters most
 }
+
+# BT_ARMS=name1,name2 restricts a run to a subset of ARMS (e.g. testing one
+# new arm against the existing 8-slate archive without re-running, and
+# duplicating, every other arm's already-collected rows in results.csv).
+_arm_subset = os.environ.get("BT_ARMS")
+if _arm_subset:
+    _wanted = [a.strip() for a in _arm_subset.split(",")]
+    _missing = [a for a in _wanted if a not in ARMS]
+    if _missing:
+        raise SystemExit(f"BT_ARMS names not in ARMS: {_missing}")
+    ARMS = {a: ARMS[a] for a in _wanted}
+
+# BT_FLOOR_PCTS=0,10,20,30,40,50 sweeps the proj-score-floor percentile for
+# every active arm, at each (slate, seed) context -- cheap to add since the
+# floor is a pure selection-time parameter (see run_arm's floor_pct):
+# no new sims/corr/p_win needed, just extra allocate_contests/_random_pick
+# calls against contexts already being built. Output arm names become
+# "<arm>@floor<pct>" so results.csv can distinguish sweep points from the
+# single-floor (module FLOOR_PCT) runs. A single value (or unset) leaves
+# arm names unchanged, matching every prior run's schema.
+_floor_sweep = os.environ.get("BT_FLOOR_PCTS")
+FLOOR_SWEEP: list = [float(x) for x in _floor_sweep.split(",")] if _floor_sweep else [None]
 
 # standings zip stem (lowercased, no extension) -> display key matching
 # portfolio_sweep_draftkings.json's contest_name AND the payout registry's
@@ -415,14 +440,15 @@ class _FakeGroup:
         self.entries = [(contest_id, j) for j in range(k)]
 
 
-def _random_pick(ctx: dict, admit_floor: int, admit_mult: float, rng: np.random.Generator):
+def _random_pick(ctx: dict, admit_floor: int, admit_mult: float, rng: np.random.Generator,
+                  floor_pct: float = None):
     """cull_rnd / random arms: not expressible through allocate_contests
     (it always ranks by an EV vector). Reuses allocate_contests's exact
     proj-floor + p_win cull logic (see the docstring on allocate_contests
     in src/api/external_pool.py for the formula this mirrors), then draws
     uniformly from the survivors instead of ranking them."""
     proj_scores = ctx["proj_scores"]
-    floor = ep.compute_proj_score_floor(proj_scores, FLOOR_PCT)
+    floor = ep.compute_proj_score_floor(proj_scores, FLOOR_PCT if floor_pct is None else floor_pct)
     mask = np.isfinite(proj_scores)
     if floor is not None:
         mask &= proj_scores >= floor[0]
@@ -445,16 +471,23 @@ def _random_pick(ctx: dict, admit_floor: int, admit_mult: float, rng: np.random.
     return picks
 
 
-def run_arm(ctx: dict, arm: str, seed: int) -> tuple[dict[str, list[int]], dict[str, int]]:
+def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
+            ) -> tuple[dict[str, list[int]], dict[str, int]]:
     """Returns (picks, unfilled_by_contest) -- callers must check the
-    second dict before trusting per-entry $ metrics (see _FakeGroup)."""
+    second dict before trusting per-entry $ metrics (see _FakeGroup).
+    floor_pct overrides the module-level FLOOR_PCT (config default) for a
+    single call -- used by the proj-score-floor calibration sweep, which
+    needs the SAME arm run at several floor percentiles within one context
+    build (floor is a pure selection-time parameter, so this needs no new
+    sims/corr/p_win -- see build_slate_context)."""
     _, admit_floor, admit_mult, evw = ARMS[arm]
+    eff_floor_pct = FLOOR_PCT if floor_pct is None else floor_pct
     if evw is None:
         # offset by the arm's position (not hash(arm) -- string hashing is
         # randomized per process by default, which would make "random"/
         # "cull_rnd" non-reproducible across runs of the same seed)
         rng = np.random.default_rng(seed * 1000 + list(ARMS).index(arm))
-        picks = _random_pick(ctx, admit_floor, admit_mult, rng)
+        picks = _random_pick(ctx, admit_floor, admit_mult, rng, floor_pct=eff_floor_pct)
         unfilled = {c["contest_id"]: c["k"] - len(picks.get(c["contest_id"], []))
                     for c in ctx["contests"]}
         return picks, unfilled
@@ -463,7 +496,7 @@ def run_arm(ctx: dict, arm: str, seed: int) -> tuple[dict[str, list[int]], dict[
     alloc = ep.allocate_contests(
         ctx["pool"], ctx["corr"], groups, risk=3.0,
         evw_base=evw, evw_max=evw,
-        proj_scores=ctx["proj_scores"], proj_score_floor_percentile=FLOOR_PCT,
+        proj_scores=ctx["proj_scores"], proj_score_floor_percentile=eff_floor_pct,
         ev_type="p_win", p_win_cull=ctx["p_win_cull"], p_win_select=ctx["p_win_select"],
         p_win_admit_n=admit_floor, p_win_admit_multiplier=admit_mult,
     )
@@ -526,7 +559,12 @@ def print_summary(df: pd.DataFrame, label: str) -> None:
         return
     df = df.copy()
     df["fees"] = df["n"] * df["fee"]
-    present_arms = [a for a in ARMS if a in df["arm"].unique()]
+    seen = set(df["arm"].unique())
+    # floor-sweep output arms are "<arm>@floor<pct>", not literal ARMS keys --
+    # order them after their base arm's ARMS position, sorted by floor value.
+    present_arms = [a for a in ARMS if a in seen]
+    extra = sorted(a for a in seen if a not in ARMS)
+    present_arms += extra
     print(f"\n===== {label} =====\n")
     p = df.groupby(["slate", "arm"], as_index=False)[["fees", "won"]].sum()
     p["net"] = p["won"] - p["fees"]
@@ -570,37 +608,39 @@ def main() -> None:
             for arm in ARMS:
                 calib_flag = ARMS[arm][0]
                 ctx = ctxs[calib_flag]
-                picks, unfilled = run_arm(ctx, arm, seed)
-                for cid, n_unfilled in unfilled.items():
-                    if n_unfilled > 0:
-                        fill_events.append({
-                            "slate": slate, "seed": seed, "arm": arm,
-                            "contest_id": cid, "unfilled": n_unfilled,
-                        })
-                actual = {i: sum(fpts.get(int(p), float("nan")) for p in lu.player_ids)
-                          for i, lu in enumerate(ctx["pool"].lineups)}
-                for c in ctx["contests"]:
-                    idxs = picks.get(c["contest_id"], [])
-                    n_ambiguous = 0
-                    for i in idxs:
-                        a = actual[i]
-                        if not np.isfinite(a):
-                            n_ambiguous += 1  # rostered an ambiguous-name player -- see verify_slate
-                            continue
-                        gross, rank = grade_pick(a, c["sorted_scores"], c["payout_arr"])
-                        rows.append({
-                            "slate": slate, "seed": seed, "arm": arm,
-                            "contest": c["contest"], "n": 1, "fee": c["fee"],
-                            "won": gross, "best_rank": rank, "n_field": c["n_field"],
-                            "top1": int(rank <= max(1, c["n_field"] // 100)),
-                            "top01": int(rank <= max(1, c["n_field"] // 1000)),
-                        })
-                    if n_ambiguous:
-                        fill_events.append({
-                            "slate": slate, "seed": seed, "arm": arm,
-                            "contest_id": c["contest_id"] + " [ambiguous-name drop]",
-                            "unfilled": n_ambiguous,
-                        })
+                for floor_pct in FLOOR_SWEEP:
+                    out_arm = arm if floor_pct is None else f"{arm}@floor{floor_pct:g}"
+                    picks, unfilled = run_arm(ctx, arm, seed, floor_pct=floor_pct)
+                    for cid, n_unfilled in unfilled.items():
+                        if n_unfilled > 0:
+                            fill_events.append({
+                                "slate": slate, "seed": seed, "arm": out_arm,
+                                "contest_id": cid, "unfilled": n_unfilled,
+                            })
+                    actual = {i: sum(fpts.get(int(p), float("nan")) for p in lu.player_ids)
+                              for i, lu in enumerate(ctx["pool"].lineups)}
+                    for c in ctx["contests"]:
+                        idxs = picks.get(c["contest_id"], [])
+                        n_ambiguous = 0
+                        for i in idxs:
+                            a = actual[i]
+                            if not np.isfinite(a):
+                                n_ambiguous += 1  # rostered an ambiguous-name player -- see verify_slate
+                                continue
+                            gross, rank = grade_pick(a, c["sorted_scores"], c["payout_arr"])
+                            rows.append({
+                                "slate": slate, "seed": seed, "arm": out_arm,
+                                "contest": c["contest"], "n": 1, "fee": c["fee"],
+                                "won": gross, "best_rank": rank, "n_field": c["n_field"],
+                                "top1": int(rank <= max(1, c["n_field"] // 100)),
+                                "top01": int(rank <= max(1, c["n_field"] // 1000)),
+                            })
+                        if n_ambiguous:
+                            fill_events.append({
+                                "slate": slate, "seed": seed, "arm": out_arm,
+                                "contest_id": c["contest_id"] + " [ambiguous-name drop]",
+                                "unfilled": n_ambiguous,
+                            })
 
         print(f"\n===== FILL CHECK [{slate}] =====")
         if fill_events:
