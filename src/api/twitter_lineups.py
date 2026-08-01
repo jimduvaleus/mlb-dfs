@@ -162,11 +162,20 @@ def _strip_accents(s: str) -> str:
     return unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode("ascii")
 
 
-def match_player_name(abbreviated: str, candidates: list[dict]) -> list[dict]:
+def match_player_name(
+    abbreviated: str, candidates: list[dict], position: Optional[str] = None
+) -> list[dict]:
     """Match an abbreviated player name like 'F. Freeman' or bare 'Freeman' against a candidate pool.
 
     Each candidate dict must have at least: player_id, name, team, position, salary.
     Returns a list of matching candidates (with match_confidence added), ordered best-first.
+
+    `position` is the position the notification itself reported for this slot (e.g. "3B"
+    from an "W. Wilson 3B" line). It's used only as a tiebreaker: when the name alone
+    resolves to 2+ exact candidates, matches whose `eligible_positions` don't include it
+    are dropped, but only if that narrows the field to exactly one — a same-name tie where
+    both candidates share the reported position (e.g. two players both DK-eligible at 3B)
+    is still genuinely ambiguous and is returned unnarrowed.
     """
     abbreviated = abbreviated.strip()
     m = re.match(r"^([A-Z])\.\s+(.+)$", abbreviated)
@@ -202,7 +211,12 @@ def match_player_name(abbreviated: str, candidates: list[dict]) -> list[dict]:
     if results:
         # If any exact-initial match exists, drop the cross-initial fuzzy fallbacks.
         exact_only = [r for r in results if r["match_confidence"] == "exact"]
-        return exact_only if exact_only else results
+        final = exact_only if exact_only else results
+        if position and len(final) > 1:
+            narrowed = [r for r in final if position in (r.get("eligible_positions") or [r.get("position")])]
+            if len(narrowed) == 1:
+                return narrowed
+        return final
 
     # Second pass: difflib fuzzy on last name only.
     # When an initial is known, enforce it — eliminates cross-initial false positives.

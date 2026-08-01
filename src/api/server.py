@@ -31,6 +31,7 @@ from .config_io import read_config, write_config
 from .models import AppConfig, DoubleheaderStatusResponse, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
 from .mlb_schedule import get_doubleheader_teams_cached
 from .twitter_lineups import (
+    _PITCHER_POSITIONS,
     delete_twitter_lineup,
     get_confirmed_team_lineups,
     get_twitter_overrides,
@@ -531,6 +532,7 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
                 "name": str(r["name"]),
                 "team": str(r["team"]),
                 "position": str(r["position"]),
+                "eligible_positions": list(r["eligible_positions"]) if "eligible_positions" in r and isinstance(r["eligible_positions"], list) else [str(r["position"])],
                 "salary": int(r["salary"]),
             }
             for _, r in rows.iterrows()
@@ -542,7 +544,11 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
 
     parsed_slots: list[ParsedSlot] = []
     for raw in raw_slots:
-        candidate_dicts = match_player_name(raw["name"], team_players)
+        # DK lists every pitcher as eligible position "P" regardless of SP/RP —
+        # normalize the notification's SP/RP label so the eligible_positions
+        # tiebreaker in match_player_name can actually match.
+        match_position = "P" if raw["position"] in _PITCHER_POSITIONS else raw["position"]
+        candidate_dicts = match_player_name(raw["name"], team_players, position=match_position)
         matches = [
             PlayerMatch(
                 player_id=c["player_id"],
@@ -560,6 +566,9 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
             position=raw["position"],
             matches=matches,
         ))
+
+    if team_in_slate:
+        _maybe_emit_partial_lineup_diff(team, req.notification_id, parsed_slots)
 
     return TwitterLineupParseResponse(
         team=team,
@@ -611,9 +620,6 @@ def _emit_lineup_diff_notification(
     pitcher_added = new_pitcher_ids - old_pitcher_ids if pitcher_diff_applicable else set()
     pitcher_removed = old_pitcher_ids - new_pitcher_ids if pitcher_diff_applicable else set()
 
-    if not (batter_added or batter_removed or pitcher_added or pitcher_removed):
-        return
-
     added_ids = batter_added | pitcher_added
     removed_ids = batter_removed | pitcher_removed
 
@@ -632,9 +638,27 @@ def _emit_lineup_diff_notification(
         if pid is not None and pid not in name_map:
             name_map[pid] = s.get("name", str(pid))
 
-    # Slot 10 is the pitcher (see parse_notification_body/_best_guess_lineup_slots) —
-    # call it out on its own line rather than burying it in the batter In/Out list,
-    # since a pitcher swap is usually the most fantasy-relevant part of the diff.
+    _post_lineup_diff_notification(summary, batter_added, batter_removed, pitcher_added, pitcher_removed, name_map)
+
+
+def _post_lineup_diff_notification(
+    summary: str,
+    batter_added: set[int],
+    batter_removed: set[int],
+    pitcher_added: set[int],
+    pitcher_removed: set[int],
+    name_map: dict[int, str],
+    extra_note: str | None = None,
+) -> None:
+    """Format and post an In/Out (+ optional note) notification/email for an already-computed diff.
+
+    Slot 10 is the pitcher (see parse_notification_body/_best_guess_lineup_slots) —
+    call it out on its own line rather than burying it in the batter In/Out list,
+    since a pitcher swap is usually the most fantasy-relevant part of the diff.
+    """
+    if not (batter_added or batter_removed or pitcher_added or pitcher_removed):
+        return
+
     parts: list[str] = []
     if pitcher_added or pitcher_removed:
         pitcher_bits: list[str] = []
@@ -647,6 +671,8 @@ def _emit_lineup_diff_notification(
         parts.append("In: " + ", ".join(name_map.get(p, str(p)) for p in sorted(batter_added)))
     if batter_removed:
         parts.append("Out: " + ", ".join(name_map.get(p, str(p)) for p in sorted(batter_removed)))
+    if extra_note:
+        parts.append(extra_note)
 
     diff_notif = {
         "id": str(uuid.uuid4()),
@@ -663,6 +689,86 @@ def _emit_lineup_diff_notification(
     threading.Thread(
         target=send_notification_email, args=(summary, diff_notif["body"]), daemon=True
     ).start()
+
+
+def _maybe_emit_partial_lineup_diff(team: str, notification_id: str, parsed_slots: list[ParsedSlot]) -> None:
+    """When a parsed Underdog/Twitter lineup can't be silently auto-confirmed because one or
+    more slots are ambiguous (2+ name matches, e.g. two same-initial Wilsons), still surface
+    whatever part of the diff against the SaberSim-confirmed baseline IS unambiguous — e.g.
+    "Emerson out, Crawford in" — instead of staying silent until a human resolves the
+    ambiguous slot(s) by hand. An old confirmed player who happens to be a candidate for an
+    ambiguous slot is never reported "Out": he may simply be the (not yet disambiguated)
+    answer to that slot.
+
+    Runs at most once per notification — this is called on every /twitter-lineups/parse
+    request, including repeated manual opens of the resolution dialog for the same
+    notification, tracked via a flag on the notification's own persisted record.
+    """
+    if not _is_sabersim_source():
+        return
+    if all(len(s.matches) <= 1 for s in parsed_slots):
+        return  # fully resolvable — the normal auto-confirm/save path already handles it
+
+    with _notifications_lock:
+        notif = next((n for n in _notifications if n.get("id") == notification_id), None)
+        if notif is None or notif.get("partial_diff_sent"):
+            return
+        notif["partial_diff_sent"] = True
+        _save_notifications()
+
+    old_slots = _best_guess_lineup_slots(team)
+    if old_slots is None:
+        return
+    old_batter_ids = {s["player_id"] for s in old_slots if s.get("player_id") is not None and s.get("slot") != 10}
+    old_pitcher_ids = {s["player_id"] for s in old_slots if s.get("player_id") is not None and s.get("slot") == 10}
+
+    resolved_batter_ids: set[int] = set()
+    resolved_pitcher_ids: set[int] = set()
+    ambiguous_batter_candidates: set[int] = set()
+    ambiguous_pitcher_candidates: set[int] = set()
+    ambiguous_desc: list[str] = []
+    name_map: dict[int, str] = {}
+    for s in parsed_slots:
+        is_pitcher_slot = s.slot == 10
+        for m in s.matches:
+            name_map[m.player_id] = m.name
+        if len(s.matches) == 1:
+            (resolved_pitcher_ids if is_pitcher_slot else resolved_batter_ids).add(s.matches[0].player_id)
+        elif len(s.matches) > 1:
+            ids = {m.player_id for m in s.matches}
+            (ambiguous_pitcher_candidates if is_pitcher_slot else ambiguous_batter_candidates).update(ids)
+            ambiguous_desc.append(s.raw_name + " (" + " or ".join(m.name for m in s.matches) + "?)")
+        # 0-match (unmatched) slots contribute nothing — conservatively ignored.
+
+    batter_added = resolved_batter_ids - old_batter_ids
+    batter_removed = old_batter_ids - resolved_batter_ids - ambiguous_batter_candidates
+    pitcher_diff_applicable = bool(old_pitcher_ids) and bool(resolved_pitcher_ids)
+    pitcher_added = (resolved_pitcher_ids - old_pitcher_ids) if pitcher_diff_applicable else set()
+    pitcher_removed = (
+        old_pitcher_ids - resolved_pitcher_ids - ambiguous_pitcher_candidates
+    ) if pitcher_diff_applicable else set()
+
+    if not (batter_added or batter_removed or pitcher_added or pitcher_removed):
+        return
+
+    slate_df = _load_slate_df()
+    needed_ids = (batter_added | batter_removed | pitcher_added | pitcher_removed) - name_map.keys()
+    if slate_df is not None:
+        for pid in needed_ids:
+            row = slate_df[slate_df["player_id"] == pid]
+            if not row.empty:
+                name_map[pid] = str(row.iloc[0]["name"])
+    for s in old_slots:
+        pid = s.get("player_id")
+        if pid is not None and pid not in name_map:
+            name_map[pid] = s.get("name", str(pid))
+
+    extra_note = ("Still ambiguous: " + "; ".join(ambiguous_desc)) if ambiguous_desc else None
+    _post_lineup_diff_notification(
+        f"{team} lineup update (partial)",
+        batter_added, batter_removed, pitcher_added, pitcher_removed,
+        name_map, extra_note=extra_note,
+    )
 
 
 _LINEUP_DIFF_WINDOW = timedelta(minutes=10)
