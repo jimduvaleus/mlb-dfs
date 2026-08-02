@@ -89,31 +89,22 @@ infrastructure worth keeping. It is NOT picked up by `pytest tests/`
 (doesn't match the test_*.py discovery pattern) and is not part of the
 `python -m pytest tests/` suite CLAUDE.md documents; run it directly.
 """
-import csv as csv_mod
 import os
 import sys
 import time
-import zipfile
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.api import external_pool as ep  # noqa: E402
-from src.api.pipeline import PipelineRunner  # noqa: E402
-from src.ingestion.dk_slate import DraftKingsSlateIngestor  # noqa: E402
-from src.models.copula import EmpiricalCopula  # noqa: E402
-from src.optimization.contest import ContestSimulator  # noqa: E402
-from src.optimization.gpp_portfolio import (  # noqa: E402
-    DeterminantPortfolioSelector, _HEDGE_WEIGHT_FRACTION,
+from tests.bt_core import (  # noqa: E402
+    LIVE_CFG, build_slate_context, grade_pick,
+    load_real_contests, verify_slate, weighted_proj_scores, _FakeGroup,
 )
-from src.optimization.payout import payout_table_to_array, structure_for_contest  # noqa: E402
-from src.simulation.engine import SimulationEngine  # noqa: E402
-from src.simulation.results import SimulationResults  # noqa: E402
 
 SLATES = [s for s in sys.argv[1:] if s.isdigit()]
 if not SLATES:
@@ -126,12 +117,9 @@ RESULTS_CSV = OUT_DIR / "results.csv"
 SIM_CACHE_DIR = OUT_DIR / "sim_cache"
 SIM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-with open(PROJECT_ROOT / "config.yaml") as f:
-    LIVE_CFG = yaml.safe_load(f)
 N_SIMS = int(os.environ.get("BT_NSIMS", LIVE_CFG["simulation"]["n_sims"]))
 SHARPNESS = float(LIVE_CFG["gpp"].get("external_pool_pwin_sharpness", 0.05))
 FLOOR_PCT = float(LIVE_CFG["gpp"].get("external_pool_proj_score_pct", 30.0))
-_PWIN_FIELD_CAP = 25_000
 
 # (uses_calibration, admit_floor, admit_mult, EVw)
 # EVw=None means "ignore p_win ranking entirely, draw uniformly" -- the cull
@@ -140,7 +128,9 @@ ARMS: dict[str, tuple] = {
     "old":         (False, 250,  12.0, 0.25),  # 2026-07-28 to 07-30 era: uncalibrated grids, 250-floor/12x window
     "flat2000_uc": (False, 2000, 0.0,  0.25),  # 2026-07-27 17:16 to 07-28 11:22 era: uncalibrated grids, LITERAL flat-2000 window (no multiplier existed yet) -- the config actually being asked about here
     "flat2000_c":  (True,  2000, 0.0,  0.25),  # same flat-2000 window, but on TODAY's calibrated sims -- isolates "was it the window" from "was it that era's uncalibrated grids"
-    "new":         (True,  100,  1.5,  0.25),  # current production: calibrated, tight admit window
+    "new":         (True,  100,  1.5,  0.25),  # 2026-07-30 to 07-31 era: calibrated, tight max(100, 1.5x) admit window.
+                                                # NOT current production -- flat2000_uc was promoted to the permanent
+                                                # default on 2026-07-31 (commit 81db769), so THAT arm is the live config.
     "cull_lo":     (True,  100,  1.5,  0.10),  # cull as production, lean hard on diversity (EVw 0.10)
     "cull_d0":     (True,  100,  1.5,  0.00),  # cull as production, pure diversity (no EV term)
     "cull_rnd":    (True,  100,  1.5,  None),  # cull as production (NARROW window), then draw uniformly from survivors
@@ -151,6 +141,13 @@ ARMS: dict[str, tuple] = {
     "wide_lo":     (True,    0,  0.0,  0.10),  # no cull, heavy diversity
     "random":      (True,    0,  0.0,  None),  # no cull, no ranking signal -- the baseline that matters most
 }
+
+# Frozen BEFORE any BT_ARMS filtering, because the random arms seed their RNG
+# off an arm's position in this list (see run_arm). Taking the position from
+# the filtered dict instead would give "random" a different draw depending on
+# what else was requested that run -- while still writing it under the same
+# label, silently pooling two different draws in results.csv.
+_ARMS_RNG_ORDER = list(ARMS)
 
 # BT_ARMS=name1,name2 restricts a run to a subset of ARMS (e.g. testing one
 # new arm against the existing 8-slate archive without re-running, and
@@ -197,327 +194,9 @@ _bad_corr = [c for c in DIVERSITY_CORR_SWEEP if c not in _VALID_CORR_VARIANTS]
 if _bad_corr:
     raise SystemExit(f"BT_DIVERSITY_CORR values not in {_VALID_CORR_VARIANTS}: {_bad_corr}")
 
-# standings zip stem (lowercased, no extension) -> display key matching
-# portfolio_sweep_draftkings.json's contest_name AND the payout registry's
-# lowercased contest key (structure_for_contest lowercases internally).
-ZIP_TO_CONTEST = {
-    "4k-base-hit": "Base Hit", "6k-base-hit": "Base Hit",
-    "10k-base-hit": "Base Hit", "base-hit": "Base Hit",
-    "bat-flip": "Bat Flip", "chin-music": "Chin Music",
-    "five-tool-player": "Five-Tool Player", "four-seamer": "Four-Seamer",
-    "hot-corner": "Hot Corner", "mini-max": "mini-MAX",
-    "pickoff": "Pickoff", "rally-cap": "Rally Cap",
-    "relay-throw": "Relay Throw", "skipper": "Skipper",
-    "solo-shot": "Solo Shot", "moonshot": "Moonshot",
-    "knuckleball": "Knuckleball",
-    # 07/25 archive: misnamed file, 2,972 entries matches four-seamer-payout.txt
-    # exactly and no four-seamer.zip exists otherwise -- see git log f20550a.
-    "sour-seamer": "Four-Seamer",
-}
-
-
-# ---------------------------------------------------------------------------
-# Real-field / real-money grading
-# ---------------------------------------------------------------------------
-
-def load_real_contests(d: Path) -> list[dict]:
-    """[{contest, contest_id, n_field, fee, sorted_scores, payout_arr}] --
-    one entry per real standings zip in this slate's archive dir.
-
-    `contest-standings-*.zip` is always excluded: on every slate checked
-    it's a byte-identical (or, once, a stale same-night pre-stat-correction)
-    duplicate of one of the named zips, kept around only because the
-    Analyze Contest UI feature expects a file with that name to exist.
-    """
-    out = []
-    for z in sorted(d.glob("*.zip")):
-        if z.name.startswith("contest-standings"):
-            continue
-        stem = z.stem.lower()
-        contest = ZIP_TO_CONTEST.get(stem)
-        if contest is None:
-            raise SystemExit(
-                f"unmapped zip {z.name} in {d.name} -- add it to ZIP_TO_CONTEST. "
-                "Silently skipping a contest would drop real entries from the backtest."
-            )
-        with zipfile.ZipFile(z) as zf:
-            name = next(n for n in zf.namelist() if n.endswith(".csv"))
-            rows = list(csv_mod.reader(
-                zf.read(name).decode("utf-8-sig", errors="replace").splitlines()
-            ))
-        body = rows[1:]
-        scores = sorted(float(r[4]) for r in body if r and r[0].strip().isdigit())
-        n_field = len(scores)
-        struct = structure_for_contest(contest, n_entries=n_field)
-        table_n = struct["total_entries"] if struct is not None else None
-        # DK's payout tiers are fixed to the contest's DESIGNED/advertised
-        # size at creation, not to how many people actually showed up that
-        # day -- a guaranteed contest that under-fills still pays from the
-        # full-size table (confirmed 2026-07-31: two 07/22 captures had the
-        # table's OWN stated header size, not that day's real fill, and were
-        # byte-identical to already-registered tables at the larger size).
-        # So table_n >= n_field is expected and fine; only a real MISMATCH
-        # (table smaller than the real field, or a big relative gap --
-        # meaning nearest-match grabbed the wrong contest's table) is an error.
-        gap = None if table_n is None else table_n - n_field
-        if struct is None or gap < 0 or gap > max(50, round(0.05 * table_n)):
-            raise SystemExit(
-                f"no matching payout table for {contest!r} at real fill n={n_field:,} "
-                f"(zip {z.name} in {d.name}, nearest table n={table_n}) -- "
-                "capture and register the right one."
-            )
-        if gap > 0:
-            print(f"    note: {contest} real fill {n_field:,} < designed table size "
-                  f"{table_n:,} (gap {gap}, {100*gap/table_n:.1f}%) -- using the full-size "
-                  "table, DK's payout tiers don't shrink for an under-filled guarantee",
-                  flush=True)
-        out.append({
-            "contest": contest,
-            "contest_id": f"{d.name}:{stem}",
-            "n_field": n_field,
-            "fee": struct["entry_fee"],
-            "sorted_scores": np.array(scores, dtype=np.float64),
-            "payout_arr": payout_table_to_array(struct),
-        })
-    return out
-
-
-def verify_slate(d: Path, real: list[dict], nm: dict) -> dict:
-    """{player_id: actual_fpts} rebuilt fresh from every real zip's embedded
-    per-player FPTS side table (never trusts a separately-archived
-    contest_player_fpts.json -- that file was found stale once already,
-    see git log). Every zip must agree with every other on every
-    unambiguous player or this raises: a mismatch across INDEPENDENTLY
-    downloaded real files means one of them is wrong (a DK retroactive
-    stat correction between download times, most often) and grading
-    against it would silently score real money wrong.
-
-    DKSalaries names that map to more than one player_id that slate (two
-    real MLB players who happen to share a name) can't be resolved from
-    the zip's Player/FPTS side table alone (no ID column) -- both ids are
-    left out of the returned map, and any of our lineups rostering either
-    one drops out of grading (NaN actual_score) rather than risk crediting
-    the wrong player's score.
-    """
-    dup_names = set(nm["Name"][nm["Name"].duplicated(keep=False)])
-    id_by_name = {r.Name: str(r.ID) for r in nm.itertuples() if r.Name not in dup_names}
-    merged: dict[str, float] = {}
-    for c in real:
-        z = d / f"{c['contest_id'].split(':', 1)[1]}.zip"
-        with zipfile.ZipFile(z) as zf:
-            name = next(n for n in zf.namelist() if n.endswith(".csv"))
-            rows = list(csv_mod.reader(
-                zf.read(name).decode("utf-8-sig", errors="replace").splitlines()
-            ))
-        body = rows[1:]
-        emb = {
-            r[7].strip(): float(r[10]) for r in body
-            if len(r) > 10 and r[7].strip() and r[10] not in ("", "FPTS")
-        }
-        for pname, fp in emb.items():
-            pid = id_by_name.get(pname)
-            if pid is None:
-                continue
-            if pid in merged and abs(merged[pid] - fp) >= 0.011:
-                raise SystemExit(
-                    f"{d.name}: real zips disagree on {pname} ({pid}) -- "
-                    f"{merged[pid]} vs {fp} from {c['contest_id']}. "
-                    "Independently downloaded real files should never differ; "
-                    "investigate before trusting this slate."
-                )
-            merged[pid] = fp
-    return {int(k): v for k, v in merged.items()}
-
-
 # ---------------------------------------------------------------------------
 # Pipeline replication (real production functions only)
 # ---------------------------------------------------------------------------
-
-def build_slate_context(d: Path, seed: int, calibrated: bool, real: list[dict]):
-    """Everything needed to run every arm for one (slate, seed, calibration)
-    combination: pool, players_df, sim_results, corr, proj_scores, p_win
-    cull/select dicts (two-stage), and the per-contest real allocation
-    (sizes/fees keyed to `real`, splitting a display name shared by more
-    than one real contest that slate -- e.g. "Base Hit" covering both a
-    $4K and $10K variant -- proportionally by real field size)."""
-    raw_dir = str(d)
-    found = ep.discover_external_files(raw_dir)
-    if not found["lineups_paths"] or not found["projections_path"]:
-        raise SystemExit(f"{d.name}: no lineups_*.csv / projections CSV pair found.")
-
-    slate_df = DraftKingsSlateIngestor(str(d / "DKSalaries.csv")).get_slate_dataframe()
-    valid_ids = {int(p) for p in slate_df["player_id"]}
-    pool = ep.parse_lineup_pool(found["lineups_paths"], valid_ids, require_roi_blocks=False)
-    if not pool.lineups:
-        raise SystemExit(f"{d.name}: every lineup dropped (unknown player ids).")
-    proj_ext = ep.parse_player_projections(found["projections_path"])
-    pool_pids = {int(p) for lu in pool.lineups for p in lu.player_ids}
-    players_df = ep.build_external_players_df(
-        slate_df, proj_ext, pool_pids, PipelineRunner._derive_opponent,
-    )
-
-    copula = EmpiricalCopula(str(PROJECT_ROOT / LIVE_CFG["paths"]["copula"]))
-    if calibrated:
-        grids = ep.build_quantile_grids(
-            proj_ext, zero_inflate=True, scratch_prob=0.02,
-            mean_calib_batter=0.88, mean_calib_pitcher=1.0,
-        )
-    else:
-        grids = ep.build_quantile_grids(
-            proj_ext, zero_inflate=False, scratch_prob=0.0,
-            mean_calib_batter=1.0, mean_calib_pitcher=1.0,
-        )
-    engine = SimulationEngine(copula, players_df, batter_pca_model=None,
-                              score_grid=None, quantile_grids=grids)
-
-    cache_path = SIM_CACHE_DIR / f"{d.name}_{N_SIMS}_{seed}_calib{calibrated}.npz"
-    if cache_path.exists():
-        with np.load(cache_path) as z:
-            sim_results = SimulationResults(
-                [int(p) for p in z["player_ids"]], z["results_matrix"].astype(np.float64),
-            )
-    else:
-        rng_state = np.random.get_state()
-        np.random.seed(seed)
-        sim_results = engine.simulate(N_SIMS)
-        np.random.set_state(rng_state)
-        np.savez_compressed(
-            cache_path,
-            player_ids=np.asarray(sim_results.player_ids, dtype=np.int64),
-            results_matrix=sim_results.results_matrix.astype(np.float32),
-        )
-
-    lineup_scores = ep.compute_lineup_scores(pool.lineups, sim_results)
-    corr = ep.compute_pool_corr(pool.lineups, sim_results, scores=lineup_scores)
-    proj_scores = ep.compute_pool_proj_scores(pool.lineups, players_df)
-
-    hitter_corr = None
-    if "hitter_only" in DIVERSITY_CORR_SWEEP:
-        hitter_corr = hitter_only_corr(pool, sim_results, players_df)
-
-    # --- real per-contest sizes: split a shared display name proportionally
-    # by real field size (e.g. "Base Hit" covering both a $4K and $10K
-    # contest the same slate) ---
-    sw = __import__("json").loads((d / "portfolio_sweep_draftkings.json").read_text())
-    r1 = next(x for x in sw["sweep"] if x["risk"] == 1.0)
-    display_sizes: dict[str, int] = {}
-    for lu in r1["lineups"]:
-        display_sizes[lu["contest_name"]] = display_sizes.get(lu["contest_name"], 0) + 1
-    by_display: dict[str, list[dict]] = {}
-    for c in real:
-        by_display.setdefault(c["contest"], []).append(c)
-    contests: list[dict] = []
-    for display, n_total in display_sizes.items():
-        variants = by_display.get(display)
-        if not variants:
-            continue  # no real zip for this display name -- can't grade it
-        if len(variants) == 1:
-            contests.append({**variants[0], "k": n_total})
-            continue
-        total_field = sum(v["n_field"] for v in variants)
-        alloc = [int(round(n_total * v["n_field"] / total_field)) for v in variants]
-        alloc[-1] += n_total - sum(alloc)  # fix rounding drift on the last one
-        for v, k in zip(variants, alloc):
-            if k > 0:
-                contests.append({**v, "k": k})
-
-    # --- p_win: two-stage winner's-curse guard, mirrors pipeline.py exactly ---
-    own_vec = players_df["ownership"].astype(float).to_numpy()
-    col_map = {int(p): i for i, p in enumerate(sim_results.player_ids)}
-    n_half = N_SIMS // 2
-    sims_A, sims_B = sim_results.results_matrix[:n_half], sim_results.results_matrix[n_half:2 * n_half]
-    scores_A, scores_B = lineup_scores[:, :n_half], lineup_scores[:, n_half:2 * n_half]
-
-    field_n = int(min(max(5_000, max(c["n_field"] for c in contests)), _PWIN_FIELD_CAP))
-    cs = ContestSimulator()
-    field_A = cs.generate_field(players_df, own_vec, n_lineups=field_n, rng_seed=seed)
-    field_B = cs.generate_field(players_df, own_vec, n_lineups=field_n, rng_seed=seed + 1)
-    field_scores_A = cs.score_field(field_A, sims_A, col_map)
-    field_scores_B = cs.score_field(field_B, sims_B, col_map)
-
-    # Ground-truth field size (from the real zip), not an implied estimate --
-    # strictly better information than production has at run time.
-    exponents = {c["contest_id"]: max(1.0, SHARPNESS * c["n_field"]) for c in contests}
-    p_win_cull = ep.compute_p_win(scores_A, field_scores_A, exponents)
-    p_win_select = ep.compute_p_win(scores_B, field_scores_B, exponents)
-
-    return dict(
-        pool=pool, corr=corr, hitter_corr=hitter_corr, proj_scores=proj_scores,
-        players_df=players_df, contests=contests,
-        p_win_cull=p_win_cull, p_win_select=p_win_select,
-    )
-
-
-class _FakeGroup:
-    """Minimal stand-in for ep.ContestGroup: allocate_contests's p_win
-    branch only reads .contest_id and len(.entries). We know real per-
-    contest entry counts from portfolio_sweep_draftkings.json directly
-    (the pipeline's actual submitted counts -- overflow entries some days
-    come from a second account and shouldn't be replicated here), so a
-    dummy .entries list of the right length is sufficient and exact.
-
-    Entries are tagged (contest_id, j) rather than bare ints: when a
-    contest's pool is exhausted before it fills, allocate_contests reports
-    the shortfall via a flat `unfilled` list with no group boundary
-    markers -- globally-unique entries let run_arm trace an unfilled
-    placeholder back to the contest it belongs to (see the partial-fill
-    trap this guards against: an arm that silently drops entries must not
-    look "better" per-entry just because it graded fewer of them)."""
-    def __init__(self, contest_id: str, k: int):
-        self.contest_id = contest_id
-        self.entries = [(contest_id, j) for j in range(k)]
-
-
-def weighted_proj_scores(ctx: dict, pitcher_weight: float) -> np.ndarray:
-    """Pool proj-score sum with each pitcher's projected mean multiplied by
-    `pitcher_weight` before summing (hitters unweighted) -- pitcher_weight=1.0
-    reproduces ctx["proj_scores"] exactly. Motivated by a direct measurement
-    against real outcomes across all 8 archived slates: pitcher projected
-    mean correlates with real FPTS more than 2x as strongly as hitter
-    projected mean does (r=0.415 vs 0.167; see memory
-    project-cull-calibration-followup). The floor currently sums both
-    equally, trusting a noisy hitter signal exactly as much as a much more
-    reliable pitcher one -- this tests whether weighting the sum toward the
-    more trustworthy half changes what the floor admits/culls."""
-    if pitcher_weight == 1.0:
-        return ctx["proj_scores"]
-    players_df = ctx["players_df"]
-    w = np.where(players_df["position"].to_numpy() == "P", pitcher_weight, 1.0)
-    weighted_means = players_df["mean"].to_numpy(dtype=np.float64) * w
-    tmp = players_df.copy()
-    tmp["mean"] = weighted_means
-    return ep.compute_pool_proj_scores(ctx["pool"].lineups, tmp)
-
-
-def hitter_only_lineup_scores(pool, sim_results, players_df) -> np.ndarray:
-    """(M, n_sims) lineup scores identical to ep.compute_lineup_scores, but
-    with every pitcher's simulated points zeroed first -- pitcher marker is
-    players_df["position"] == "P" (build_external_players_df), the same
-    convention src/simulation/engine.py and ContestSimulator's
-    _build_pos_pools use everywhere else. Zeroes sim columns and reuses the
-    public compute_lineup_scores matmul unchanged (mirrors compute_pool_corr's
-    own approach) rather than reimplementing the indicator matmul."""
-    pitcher_ids = set(int(p) for p in
-                       players_df.loc[players_df["position"] == "P", "player_id"])
-    hitter_matrix = sim_results.results_matrix.copy()
-    pitcher_cols = [i for i, pid in enumerate(sim_results.player_ids)
-                     if int(pid) in pitcher_ids]
-    hitter_matrix[:, pitcher_cols] = 0.0
-    hitter_sim = SimulationResults(sim_results.player_ids, hitter_matrix)
-    return ep.compute_lineup_scores(pool.lineups, hitter_sim)
-
-
-def hitter_only_corr(pool, sim_results, players_df) -> np.ndarray:
-    """(M, M) correlation of hitter-only simulated lineup scores -- same
-    shape/semantics as ep.compute_pool_corr's full-lineup matrix, restricted
-    to the 9 hitter slots. Motivated by pitcher proj correlating with real
-    FPTS 2.5x as strongly as hitter proj (r=0.415 vs 0.167, all 8 archived
-    slates) -- if pitchers are the reliably-forecastable half, diversity
-    effort should concentrate on the unpredictable hitter half instead of
-    diversifying against the pitcher slot's contribution to the full sum."""
-    scores = hitter_only_lineup_scores(pool, sim_results, players_df)
-    return ep.compute_pool_corr(pool.lineups, sim_results, scores=scores)
-
 
 def _random_pick(ctx: dict, admit_floor: int, admit_mult: float, rng: np.random.Generator,
                   floor_pct: float = None, pitcher_weight: float = 1.0):
@@ -571,8 +250,10 @@ def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
     if evw is None:
         # offset by the arm's position (not hash(arm) -- string hashing is
         # randomized per process by default, which would make "random"/
-        # "cull_rnd" non-reproducible across runs of the same seed)
-        rng = np.random.default_rng(seed * 1000 + list(ARMS).index(arm))
+        # "cull_rnd" non-reproducible across runs of the same seed).
+        # Position comes from the UNFILTERED order so BT_ARMS can't change
+        # the draw behind a label that stays the same.
+        rng = np.random.default_rng(seed * 1000 + _ARMS_RNG_ORDER.index(arm))
         picks = _random_pick(ctx, admit_floor, admit_mult, rng, floor_pct=eff_floor_pct,
                               pitcher_weight=pitcher_weight)
         unfilled = {c["contest_id"]: c["k"] - len(picks.get(c["contest_id"], []))
@@ -606,23 +287,6 @@ def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
     unfilled = {c["contest_id"]: unfilled_by_contest.get(c["contest_id"], 0)
                 for c in ctx["contests"]}
     return picks, unfilled
-
-
-# ---------------------------------------------------------------------------
-# Grading
-# ---------------------------------------------------------------------------
-
-def grade_pick(actual_score: float, sorted_real: np.ndarray, payout_arr: np.ndarray):
-    """(gross_$, rank) inserting our lineup as one more competitor in the
-    real field, ties split evenly across the tie band (including us)."""
-    n_field = len(sorted_real)
-    right = int(np.searchsorted(sorted_real, actual_score, side="right"))
-    left = int(np.searchsorted(sorted_real, actual_score, side="left"))
-    n_above, n_tied = n_field - right, right - left
-    rank = n_above + 1
-    lo, hi = n_above, min(n_above + n_tied + 1, len(payout_arr))
-    band = payout_arr[lo:hi] if lo < len(payout_arr) else np.array([])
-    return (float(band.mean()) if len(band) else 0.0), rank
 
 
 def _append_and_reload(new_rows: list[dict]) -> pd.DataFrame:
@@ -695,7 +359,11 @@ def main() -> None:
             ctxs = {}
             for calib in (False, True):
                 t0 = time.time()
-                ctxs[calib] = build_slate_context(d, seed, calib, real)
+                ctxs[calib] = build_slate_context(
+                    d, seed, calib, real,
+                    n_sims=N_SIMS, sharpness=SHARPNESS, sim_cache_dir=SIM_CACHE_DIR,
+                    want_hitter_corr="hitter_only" in DIVERSITY_CORR_SWEEP,
+                )
                 print(f"    seed {seed} calib={calib} context built in {time.time() - t0:.0f}s", flush=True)
 
             for arm in ARMS:
