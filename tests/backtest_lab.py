@@ -33,6 +33,7 @@ spread.
     python tests/backtest_lab.py verify      # substrate equivalence checks
     python tests/backtest_lab.py currencies  # Phase B: whole-pool decile lift
     python tests/backtest_lab.py arms        # portfolio arms + report
+    python tests/backtest_lab.py adjudicate  # Amendment A1: model-light adjudication
 """
 import functools
 import sys
@@ -137,7 +138,7 @@ def proj_floor_mask(sd: SlateData, floor_pct: float) -> np.ndarray:
 def select_greedy(sd: SlateData, sel: np.ndarray, cull: np.ndarray, *,
                   floor_pct: float = 30.0, admit_n: int = 2000,
                   admit_mult: float = 0.0, evw: float = 1.0,
-                  corr: np.ndarray = None, order: list = None,
+                  corr: np.ndarray = None, corr_fn=None, order: list = None,
                   rng: np.random.Generator = None) -> dict:
     """Production's shape: per contest, cull to a window on the independent
     `cull` draw, then rank survivors on `sel`, removing picks from a shared
@@ -147,6 +148,12 @@ def select_greedy(sd: SlateData, sel: np.ndarray, cull: np.ndarray, *,
     arms here); evw<1.0 delegates to the real DeterminantPortfolioSelector so
     the diversity/hedge terms are production's, not a reimplementation.
     rng set (with evw=None) draws uniformly from the survivors instead.
+
+    `corr_fn`, if given, is a callable `rem -> (len(rem), len(rem))` matrix
+    computed lazily for just that contest's admit window, for correlation
+    sources too large to hold densely at (M, M) (e.g. composition overlap --
+    see `_composition_overlap_fn`). Takes precedence over `corr` when both
+    are supplied; existing callers pass only `corr` and are unaffected.
     """
     mask = proj_floor_mask(sd, floor_pct)
     picks: dict = {}
@@ -167,11 +174,13 @@ def select_greedy(sd: SlateData, sel: np.ndarray, cull: np.ndarray, *,
             chosen = rem[np.argsort(-sel[ci][rem])[:k]]
         else:
             from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
+            sub_corr = (corr_fn(rem) if corr_fn is not None
+                       else corr[np.ix_(rem, rem)])
             s = DeterminantPortfolioSelector(
                 robust_payout=None, candidates=list(range(sd.M)), portfolio_size=k,
                 risk=3.0, evw_base=evw, evw_max=evw, ev_floor=float("-inf"),
                 precomputed=(rem, sel[ci][rem].astype(np.float64),
-                             np.ascontiguousarray(corr[np.ix_(rem, rem)])),
+                             np.ascontiguousarray(sub_corr)),
             )
             chosen = np.array([i for i, _ in s.select()], dtype=np.int64)
         picks[sd.cids[ci]] = list(map(int, chosen))
@@ -1791,6 +1800,379 @@ def cmd_jointcheck(seeds=(42, 137, 4242)) -> None:
     print(f"\nappended {len(tidy)} rows -> {out_path}")
 
 
+# ---------------------------------------------------------------------------
+# Amendment A1 (EVIDENCE_LOG.md, 2026-08-02): Phase 4' model-light adjudication
+# ---------------------------------------------------------------------------
+
+A1_BASELINE = "prod_faithful"
+A1_NULL = "random@floor30"
+A1_CHALLENGERS = ["proj_score", "p_cash", "p_cash@assign", "coverage_light"]
+A1_ARMS = [A1_BASELINE, A1_NULL] + A1_CHALLENGERS
+A1_SEEDS = (42, 137, 4242)
+
+_CORR_CACHE_DIR = ORACLE_DIR.parent / "audit"
+_CORR_MEM_CACHE: dict = {}
+
+
+def _prod_corr(slate: str, seed: int) -> np.ndarray:
+    """(M, M) float32 simulated-lineup-score correlation matrix -- exactly
+    what production's DeterminantPortfolioSelector runs on, and what
+    cmd_verify's check 2 builds via build_slate_context(want_corr=True). Not
+    stored in the existing oracle/audit npz sidecars (checked: the
+    {slate}_workunit_s{seed}_c{calib}.npz files hold PIT/crowding scalars,
+    not a corr matrix), so this is its own cache -- a module-level dict for
+    reuse within one process, and an on-disk copy under
+    tests/backtest_output/audit/ so a rerun of cmd_adjudicate (or the
+    prod_faithful self-check alone) doesn't pay the ~100s/slate context-build
+    cost again. want_pwin=False: the oracle table's own p_win currency
+    (already proven bit-identical to ep.compute_p_win by backtest_oracle.py)
+    covers the EV side, so only the corr matrix needs to come from a fresh
+    context build.
+    """
+    key = (slate, seed)
+    if key in _CORR_MEM_CACHE:
+        return _CORR_MEM_CACHE[key]
+    path = _CORR_CACHE_DIR / f"{slate}_corr_s{seed}.npz"
+    if path.exists():
+        with np.load(path, allow_pickle=False) as z:
+            corr = z["corr"]
+    else:
+        from tests.bt_core import build_slate_context, load_real_contests
+
+        d = PROJECT_ROOT / "archive" / slate
+        real = load_real_contests(d)
+        ctx = build_slate_context(
+            d, seed, False, real, n_sims=25000, sharpness=0.05,
+            sim_cache_dir=PROJECT_ROOT / "tests/backtest_output/sim_cache",
+            want_corr=True, want_pwin=False,
+        )
+        corr = ctx["corr"]
+        _CORR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        np.savez(path, corr=corr)
+    _CORR_MEM_CACHE[key] = corr
+    return corr
+
+
+def _composition_overlap_fn(slate: str):
+    """Lazy per-contest composition-overlap "correlation" for coverage_light:
+    overlap(i, j) = |shared player_ids| / roster_size, built purely from
+    {slate}_real.npz's player_ids -- no sim inputs anywhere in this arm.
+
+    A dense (M, M) overlap matrix is 100M floats at M~10k (800MB) -- too big
+    to hold per slate, and unnecessary: select_greedy's evw<1.0 path only
+    ever needs the submatrix for one contest's admit window (`rem`, capped
+    at admit_n=2000 rows). So a one-hot lineup x player incidence matrix is
+    built once per slate (independent of seed -- composition doesn't change
+    across seeds) and this returns a closure computing
+    (H[rem] @ H[rem].T) / roster_size on demand: sparse x sparse, a few
+    hundredths of a second even at admit_n=2000 (measured).
+    """
+    import scipy.sparse as sp
+
+    with np.load(ORACLE_DIR / f"{slate}_real.npz", allow_pickle=False) as z:
+        pids = z["player_ids"]                       # (M, roster_size)
+    roster_size = pids.shape[1]
+    uniq, inv = np.unique(pids, return_inverse=True)
+    inv = np.asarray(inv).reshape(pids.shape)
+    rows = np.repeat(np.arange(pids.shape[0]), roster_size)
+    H = sp.csr_matrix(
+        (np.ones(rows.size, dtype=np.float32), (rows, inv.ravel())),
+        shape=(pids.shape[0], len(uniq)),
+    )
+
+    def overlap(rem: np.ndarray) -> np.ndarray:
+        hs = H[rem]
+        return np.asarray((hs @ hs.T).toarray(), dtype=np.float64) / roster_size
+
+    return overlap
+
+
+def _a1_pick(sd: SlateData, arm: str, corr: np.ndarray, comp_fn) -> dict:
+    """One arm's picks for the pre-registered A1 arm set (EVIDENCE_LOG.md,
+    Amendment A1). Built directly here rather than through build_arms() so
+    the pre-registered configuration is visible in one place and adding it
+    can't perturb any existing command's arm registry.
+    """
+    curs = _candidate_currencies(sd)
+    if arm == A1_BASELINE:
+        # The faithful production baseline: p_win currency (B-half select,
+        # A-half cull, floor 30, admit 2000) through evw=0.25 + the real
+        # DeterminantPortfolioSelector + the sim corr matrix -- exactly the
+        # configuration cmd_verify's check 2 validates against production's
+        # own ep.allocate_contests, NOT the arm registry's evw=1.0
+        # "prod_p_win" approximation.
+        return select_greedy(
+            sd, curs["p_win"], sd.currency("p_win", "A"),
+            floor_pct=30.0, admit_n=2000, evw=0.25, corr=corr,
+        )
+    if arm == A1_NULL:
+        import zlib
+        rng = np.random.default_rng(
+            zlib.crc32(f"{sd.slate}|{sd.seed}|{arm}".encode()) & 0xFFFFFFFF)
+        return select_greedy(
+            sd, curs["p_win"], sd.currency("p_win", "A"),
+            floor_pct=30.0, admit_n=0, rng=rng,
+        )
+    if arm == "proj_score":
+        sel = curs["proj_score"]
+        return select_greedy(sd, sel, sel, floor_pct=30.0, admit_n=2000)
+    if arm == "p_cash":
+        return select_greedy(
+            sd, curs["p_cash"], sd.currency("p_cash", "A"),
+            floor_pct=30.0, admit_n=2000,
+        )
+    if arm == "p_cash@assign":
+        return select_assign(
+            sd, curs["p_cash"], sd.currency("p_cash", "A"),
+            floor_pct=30.0, admit_n=2000,
+        )
+    if arm == "coverage_light":
+        # proj_score as the EV term (a global currency, broadcast to every
+        # contest) ranked through the real Det selector with COMPOSITION
+        # correlation instead of a sim corr matrix -- no sim inputs in
+        # either term.
+        sel = curs["proj_score"]
+        return select_greedy(
+            sd, sel, sel, floor_pct=30.0, admit_n=2000, evw=0.25, corr_fn=comp_fn,
+        )
+    raise ValueError(f"unknown A1 arm {arm!r}")
+
+
+def _selfcheck_prod_faithful(slate: str = "07222026", seed: int = 42) -> None:
+    """Cheap startup self-check for cmd_adjudicate: prod_faithful's
+    select_greedy(evw=0.25, corr=sim corr) must reproduce production's own
+    ep.allocate_contests picks exactly (152/152 on 07222026 s42, the same
+    number cmd_verify's check 2 prints) -- the identical equivalence, run
+    standalone so a corr-cache bug or an accidental drift in prod_faithful's
+    configuration can't silently invalidate everything cmd_adjudicate reports.
+    Also seeds _CORR_MEM_CACHE / the on-disk corr cache for (slate, seed) so
+    the main loop doesn't rebuild the same context a second time.
+    """
+    from src.api import external_pool as ep
+    from tests.bt_core import build_slate_context, load_real_contests, _FakeGroup
+
+    d = PROJECT_ROOT / "archive" / slate
+    real = load_real_contests(d)
+    ctx = build_slate_context(
+        d, seed, False, real, n_sims=25000, sharpness=0.05,
+        sim_cache_dir=PROJECT_ROOT / "tests/backtest_output/sim_cache",
+    )
+    groups = [_FakeGroup(c["contest_id"], c["k"]) for c in ctx["contests"] if c["k"] > 0]
+    alloc = ep.allocate_contests(
+        ctx["pool"], ctx["corr"], groups, risk=3.0, evw_base=0.25, evw_max=0.25,
+        proj_scores=ctx["proj_scores"], proj_score_floor_percentile=30.0,
+        ev_type="p_win", p_win_cull=ctx["p_win_cull"], p_win_select=ctx["p_win_select"],
+        p_win_admit_n=2000, p_win_admit_multiplier=0.0,
+    )
+    idx_of = {id(lu): i for i, lu in enumerate(ctx["pool"].lineups)}
+    prod_picks: dict = {}
+    i = 0
+    for g in groups:
+        prod_picks[g.contest_id] = [idx_of[id(lu)] for lu, _ in alloc.portfolio[i:i + len(g.entries)]]
+        i += len(g.entries)
+
+    # Seed the corr cache with what we just built, before the main loop asks
+    # _prod_corr for the same (slate, seed) again.
+    _CORR_MEM_CACHE[(slate, seed)] = ctx["corr"]
+    cache_path = _CORR_CACHE_DIR / f"{slate}_corr_s{seed}.npz"
+    if not cache_path.exists():
+        _CORR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        np.savez(cache_path, corr=ctx["corr"])
+
+    sd = load_slate(slate, seed, False)
+    lab_picks = select_greedy(
+        sd, sd.currency("p_win", "B"), sd.currency("p_win", "A"),
+        floor_pct=30.0, admit_n=2000, evw=0.25, corr=ctx["corr"],
+    )
+    same = sum(len(set(lab_picks.get(c, [])) & set(prod_picks.get(c, [])))
+              for c in sd.cids)
+    tot = sum(len(v) for v in prod_picks.values())
+    print(f"  prod_faithful vs production allocate_contests ({slate} s{seed}): "
+          f"{same}/{tot} identical picks")
+    assert tot > 0 and same == tot, (
+        f"prod_faithful self-check FAILED: {same}/{tot} identical picks "
+        f"(expected {tot}/{tot}) -- prod_faithful no longer reproduces "
+        "production's own allocate_contests; stop, nothing below this is "
+        "trustworthy."
+    )
+
+
+def _a1_pooled(df: pd.DataFrame, arm: str, seed: int = None) -> dict:
+    """Pooled (over slates, and over seeds unless `seed` narrows it) $/entry,
+    cash% and top1% for one arm from a (slate, seed, arm)-tidy grade
+    dataframe (grade()/grade_joint() output, possibly multi-seed)."""
+    g = df[df.arm == arm]
+    if seed is not None:
+        g = g[g.seed == seed]
+    if g.empty:
+        return {"$/entry": np.nan, "cash%": np.nan, "top1%": np.nan}
+    fees, won = g.fee.sum(), g.won.sum()
+    return {
+        "$/entry": (won - fees) / len(g),
+        "cash%": 100 * g.cash.mean(),
+        "top1%": 100 * g.top1.mean(),
+    }
+
+
+def cmd_adjudicate(calib: bool = False) -> None:
+    """Amendment A1 (EVIDENCE_LOG.md, 2026-08-02): Phase 4' model-light
+    adjudication, run against the FAITHFUL production baseline (evw=0.25 +
+    DeterminantPortfolioSelector + sim corr -- see prod_faithful in
+    _a1_pick), not the arm registry's evw=1.0 approximation. 9 slates x
+    seeds 42/137/4242, calib=False. Every arm is graded BOTH single-insertion
+    (grade, for comparability with the rest of this file) and jointly
+    (grade_joint, the headline number here). Reports:
+
+      * report() vs prod_faithful, single-insertion AND joint (two blocks).
+      * realized per-slate log-growth Sum_s log(1 + net_s/(50*fees_s)) from
+        JOINT grading, per (arm, seed), and how many seeds each challenger
+        beats the baseline on (gate G5).
+      * the mechanical G1-G5 gate table per challenger vs prod_faithful
+        (joint grading) and the pre-registered verdict line.
+
+    Tidy per-(slate, seed, arm) rows -> tests/backtest_output/lab_adjudicate.csv;
+    the gate table -> tests/backtest_output/lab_adjudicate_gates.csv.
+    """
+    print("== self-check: prod_faithful reproduces production's allocate_contests ==")
+    _selfcheck_prod_faithful()
+
+    slates = [s for s in BACKTEST_SLATES if (ORACLE_DIR / f"{s}_real.npz").exists()]
+    single_frames, joint_frames, tidy_rows = [], [], []
+    for s in slates:
+        comp_fn = _composition_overlap_fn(s)
+        for seed in A1_SEEDS:
+            sd = load_slate(s, seed, calib)
+            corr = _prod_corr(s, seed)
+            for arm in A1_ARMS:
+                picks = _a1_pick(sd, arm, corr, comp_fn)
+                g_single = grade(sd, picks, arm)
+                g_joint = grade_joint(sd, picks, arm)
+                if not g_single.empty:
+                    single_frames.append(g_single)
+                if not g_joint.empty:
+                    joint_frames.append(g_joint)
+
+                s_fees = float(g_single.fee.sum()) if not g_single.empty else 0.0
+                s_won = float(g_single.won.sum()) if not g_single.empty else 0.0
+                j_fees = float(g_joint.fee.sum()) if not g_joint.empty else 0.0
+                j_won = float(g_joint.won.sum()) if not g_joint.empty else 0.0
+                j_net = j_won - j_fees
+                G_s = float(np.log(1.0 + j_net / (50.0 * j_fees))) if j_fees > 0 else np.nan
+                tidy_rows.append({
+                    "slate": s, "seed": seed, "calib": calib, "arm": arm,
+                    "entries_single": len(g_single), "entries_joint": len(g_joint),
+                    "single_fees": s_fees, "single_won": s_won,
+                    "single_net": s_won - s_fees,
+                    "single_dollar_per_entry": (s_won - s_fees) / len(g_single)
+                                              if len(g_single) else np.nan,
+                    "joint_fees": j_fees, "joint_won": j_won, "joint_net": j_net,
+                    "joint_dollar_per_entry": j_net / len(g_joint) if len(g_joint) else np.nan,
+                    "joint_cash_rate": 100 * g_joint.cash.mean() if not g_joint.empty else np.nan,
+                    "joint_top1_rate": 100 * g_joint.top1.mean() if not g_joint.empty else np.nan,
+                    "joint_top01_rate": 100 * g_joint.top01.mean() if not g_joint.empty else np.nan,
+                    "G_s": G_s,
+                })
+            print(f"  {s} s{seed}: {len(A1_ARMS)} arms graded both ways", flush=True)
+
+    single_df = pd.concat(single_frames, ignore_index=True)
+    joint_df = pd.concat(joint_frames, ignore_index=True)
+    tidy_df = pd.DataFrame(tidy_rows)
+
+    out_tidy = ORACLE_DIR.parent / "lab_adjudicate.csv"
+    header = not out_tidy.exists()
+    tidy_df.to_csv(out_tidy, mode="a", header=header, index=False)
+
+    res_single = report(single_df, baseline=A1_BASELINE)
+    res_joint = report(joint_df, baseline=A1_BASELINE)
+    print_report(res_single, "A1 ADJUDICATION -- SINGLE-INSERTION (comparability only)")
+    print_report(res_joint, "A1 ADJUDICATION -- JOINT GRADING (headline)")
+
+    # -- realized per-slate log-growth, from JOINT grading --------------
+    sumG = tidy_df.groupby(["seed", "arm"])["G_s"].sum().unstack("arm")
+    sumG = sumG[[a for a in A1_ARMS if a in sumG.columns]]
+    print("\n===== REALIZED LOG-GROWTH  Sum_s log(1 + net_s/(50*fees_s))  "
+          "(joint grading) =====")
+    print(sumG.round(4).to_string())
+    g5_beats = {
+        arm: int(sum(sumG.loc[seed, arm] > sumG.loc[seed, A1_BASELINE]
+                    for seed in A1_SEEDS))
+        for arm in A1_CHALLENGERS
+    }
+    print("\nseeds where challenger's SumG beats prod_faithful's (gate G5, need >=2/3):")
+    for arm in A1_CHALLENGERS:
+        print(f"  {arm:16s} {g5_beats[arm]}/3")
+
+    # -- mechanical G1-G5 gates, joint grading, vs prod_faithful ----------
+    per_slate_seed = joint_df.groupby(["slate", "seed", "arm"]).apply(
+        lambda g: (g.won.sum() - g.fee.sum()) / len(g), include_groups=False)
+
+    base_by_seed = {seed: _a1_pooled(joint_df, A1_BASELINE, seed) for seed in A1_SEEDS}
+    base_cash_range = (max(v["cash%"] for v in base_by_seed.values())
+                       - min(v["cash%"] for v in base_by_seed.values()))
+    base_top1_range = (max(v["top1%"] for v in base_by_seed.values())
+                       - min(v["top1%"] for v in base_by_seed.values()))
+    base_pooled = _a1_pooled(joint_df, A1_BASELINE)
+
+    gate_rows = []
+    for arm in A1_CHALLENGERS:
+        # G1: pooled d$/entry > 0 on EVERY seed.
+        g1_deltas = [_a1_pooled(joint_df, arm, seed)["$/entry"]
+                    - base_by_seed[seed]["$/entry"] for seed in A1_SEEDS]
+        g1 = all(d > 0 for d in g1_deltas)
+
+        # G2: seed-averaged per-slate d$/entry, win_slates >= 6/9.
+        slate_deltas = []
+        for slate_ in slates:
+            seed_deltas = []
+            for seed in A1_SEEDS:
+                key_c, key_b = (slate_, seed, arm), (slate_, seed, A1_BASELINE)
+                if key_c in per_slate_seed.index and key_b in per_slate_seed.index:
+                    seed_deltas.append(per_slate_seed[key_c] - per_slate_seed[key_b])
+            if seed_deltas:
+                slate_deltas.append(float(np.mean(seed_deltas)))
+        g2_win = sum(d > 0 for d in slate_deltas)
+        g2 = g2_win >= 6
+
+        # G3: drop_max and LOSO_min (pooled joint report, all seeds) >= baseline's.
+        base_row = res_joint.loc[res_joint.arm == A1_BASELINE].iloc[0]
+        chall_row = res_joint.loc[res_joint.arm == arm].iloc[0]
+        g3 = (chall_row["drop_max"] >= base_row["drop_max"]
+             and chall_row["LOSO_min"] >= base_row["LOSO_min"])
+
+        # G4: pooled top1%/cash% >= baseline's pooled rate minus baseline's
+        # OWN 3-seed range (the seed noise floor).
+        chall_pooled = _a1_pooled(joint_df, arm)
+        g4 = (chall_pooled["top1%"] >= base_pooled["top1%"] - base_top1_range
+             and chall_pooled["cash%"] >= base_pooled["cash%"] - base_cash_range)
+
+        # G5: ΣG beats baseline's on >= 2/3 seeds.
+        g5 = g5_beats[arm] >= 2
+
+        if g1 and g2 and g3 and g4 and g5:
+            verdict = "recommend prospective A/B"
+        elif g1 and g3:
+            verdict = "promising, extend prospectively"
+        else:
+            verdict = "no evidence -- production stands"
+
+        gate_rows.append({
+            "arm": arm, "G1_dpe_pos_all_seeds": g1, "G2_win_slates_ge6": g2,
+            "G2_win_slates": f"{g2_win}/{len(slate_deltas)}", "G3_drop_loso_ge_base": g3,
+            "G4_rate_ge_base_minus_range": g4, "G5_sumG_beats_ge2of3": g5,
+            "G5_seeds": f"{g5_beats[arm]}/3", "verdict": verdict,
+        })
+
+    gate_df = pd.DataFrame(gate_rows)
+    print("\n===== G1-G5 GATE TABLE vs prod_faithful (joint grading) =====")
+    print(gate_df.to_string(index=False))
+
+    out_gates = ORACLE_DIR.parent / "lab_adjudicate_gates.csv"
+    header = not out_gates.exists()
+    gate_df.to_csv(out_gates, mode="a", header=header, index=False)
+    print(f"\nappended {len(tidy_df)} rows -> {out_tidy}")
+    print(f"appended {len(gate_df)} rows -> {out_gates}")
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "verify"
     if cmd == "verify":
@@ -1815,11 +2197,13 @@ def main() -> None:
         cmd_own()
     elif cmd == "jointcheck":
         cmd_jointcheck()
+    elif cmd == "adjudicate":
+        cmd_adjudicate()
     else:
         raise SystemExit(
             f"unknown command {cmd!r} "
             "(verify|currencies|stages|arms|model|selector|null|slices|"
-            "seedcheck|own|jointcheck)")
+            "seedcheck|own|jointcheck|adjudicate)")
 
 
 if __name__ == "__main__":
