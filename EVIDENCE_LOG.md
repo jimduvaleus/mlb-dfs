@@ -35,4 +35,40 @@ Arms registered for Phase 4: `prod_p_win`, `worldEV_topk`, `kelly_B50`,
 plus the existing contrarian registry (`neg_own`, `prj_own`,
 `p_win_no_top10`, `ceiling_contrarian`) as references.
 
+Results (2026-08-02, full memo in `docs/audit_2026-08-02_model_error.md`):
+
+- **H1 FAILED**: p_win/ev_dollars/ev_tail lose to proj_score 7/9 slates at
+  all 3 seeds (n_pos 2/9, well under the ≤5/9 failure line). p_cash ties
+  proj_score (4–5/9). → **Pivot rule invoked**: model-light selection;
+  robust-worlds/Kelly build descoped; H2 mooted.
+- **H3(a)** directionally supported, unproven (Spearman −0.50, p=0.17, n=9).
+- **H3(b) INVERTED**: the real top band is LESS crowded than the simulated
+  field on 6/9 slates — the field model over-concentrates; the crowding
+  payout correction is dropped (premise reversed); `kelly_crowd_robust`
+  not built.
+- Calibration: mean PIT < 0.5 on 8/9 slates; sim field p99 exceeds max
+  realized by 47–90 FPTS every slate; σ_team(batter) 0.49z > σ_pitcher
+  0.35z > σ_slate 0.27z.
+
+## 2026-08-02 — Amendment A1: Phase 4′ model-light adjudication (post-pivot)
+
+Pre-registered BEFORE running. Baseline: faithful production
+(`prod_p_win` with evw=0.25 + DeterminantPortfolioSelector + sim corr, the
+cmd_verify-validated configuration — NOT the arm registry's evw=1.0
+approximation). Null: `random@floor30`. Challengers:
+
+- `proj_score` (greedy, floor 30, admit 2000) — the model-free control as
+  an arm.
+- `p_cash` (same shape) — the one sim currency that matched projections.
+- `p_cash@assign` — global assignment routing on p_cash.
+- `coverage_light` — proj_score ranked through the real Det selector
+  (evw 0.25) with **composition** correlation (shared-player overlap),
+  no sim inputs in either term.
+
+9 slates × seeds 42/137/4242, calib=False, entry-weighted, gates G1–G5 vs
+the faithful baseline, **joint grading for headline numbers**, single-
+insertion reported for comparability. Verdict vocabulary as above.
+Failure looks like: no challenger passes G1+G3 → "no evidence — production
+stands" is the recorded outcome.
+
 Results: (pending)
