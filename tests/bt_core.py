@@ -29,6 +29,7 @@ late); it is unrecoverable, not merely unmapped. Eight slates is the ceiling
 today.
 """
 import csv as csv_mod
+import os
 import zipfile
 from pathlib import Path
 
@@ -41,12 +42,18 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 with open(PROJECT_ROOT / "config.yaml") as _f:
     LIVE_CFG = yaml.safe_load(_f)
 
-# Slates with intact (non-empty) standings zips.
-BACKTEST_SLATES = [
-    "07222026", "07242026", "07252026", "07262026",
-    "07282026", "07292026", "07302026", "07312026",
-    "08012026",
-]
+# Slates with intact (non-empty) standings zips. BT_SLATES (comma-separated
+# MMDDYYYY) overrides for walk-forward appends without editing source; the
+# committed constant is updated only at milestones (see PROSPECTIVE_PROTOCOL.md).
+BACKTEST_SLATES = (
+    [s for s in os.environ["BT_SLATES"].split(",") if s]
+    if os.environ.get("BT_SLATES")
+    else [
+        "07222026", "07242026", "07252026", "07262026",
+        "07282026", "07292026", "07302026", "07312026",
+        "08012026",
+    ]
+)
 
 # standings zip stem (lowercased, no extension) -> display key matching
 # portfolio_sweep_draftkings.json's contest_name AND the payout registry's

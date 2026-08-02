@@ -71,4 +71,27 @@ insertion reported for comparability. Verdict vocabulary as above.
 Failure looks like: no challenger passes G1+G3 → "no evidence — production
 stands" is the recorded outcome.
 
-Results: (pending)
+Results (2026-08-02, joint grading, 9 slates × 3 seeds, baseline
+`prod_faithful` self-checked 152/152 vs live allocate_contests):
+
+| arm | $/entry | cash% | top1% | G1 | G2 | G3 | G4 | G5 | verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| prod_faithful | +3.48 | 17.4 | 1.02 | — | — | — | — | — | baseline |
+| p_cash | +4.81 | 31.9 | 1.46 | ✗ | ✗ 4/9 | ✓ | ✓ | ✓ 3/3 | **no evidence — production stands** |
+| p_cash@assign | +1.02 | 32.0 | 1.51 | ✗ | ✗ 4/9 | ✓ | ✓ | ✓ 2/3 | no evidence — production stands |
+| proj_score | +0.66 | 31.7 | 1.74 | ✗ | ✗ 4/9 | ✓ | ✓ | ✓ 2/3 | no evidence — production stands |
+| coverage_light | −1.22 | 26.8 | 0.91 | ✗ | ✗ 5/9 | ✗ | ✓ | ✗ | no evidence — production stands |
+| random@floor30 | −0.41 | 21.4 | 0.95 | (null) | | | | | |
+
+- G1 fails for every challenger: each has ≥1 seed with negative pooled
+  d$/entry vs baseline — no seed-robust dollar edge exists in this sample.
+- p_cash is the strongest challenger (G3+G4+G5, 3/3 seeds on log-growth,
+  drop_max +2.49 vs baseline −1.17 — its edge survives removing its own
+  largest payout) but wins only 4/9 slates. Logged as the one arm to track
+  prospectively as new slates accrue; NOT promoted.
+- coverage_light (composition-only diversity) underperforms the random
+  null on $/entry and the whole rate ladder — composition overlap through
+  the Det selector is anti-signal as implemented, a genuine negative result.
+- Dollar/ROI columns remain outlier-dominated at n=9 (baseline +99% ROI
+  rests on outright contest wins); the gates, not the ROI column, are the
+  decision instrument.
