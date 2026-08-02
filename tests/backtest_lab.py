@@ -34,6 +34,7 @@ spread.
     python tests/backtest_lab.py currencies  # Phase B: whole-pool decile lift
     python tests/backtest_lab.py arms        # portfolio arms + report
 """
+import functools
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,6 +106,18 @@ def load_slate(slate: str, seed: int = 42, calib: bool = False) -> SlateData:
 
 def load_all(seed: int = 42, calib: bool = False, slates=None) -> list:
     return [load_slate(s, seed, calib) for s in (slates or BACKTEST_SLATES)]
+
+
+@functools.lru_cache(maxsize=None)
+def load_field(slate: str) -> dict:
+    """{contest_id: (sorted_scores, payout_arr)} from
+    tests/backtest_oracle.py's {slate}_field.npz sidecar -- the whole real
+    ladder per contest, needed by grade_joint/bt_core.grade_portfolio (unlike
+    {slate}_real.npz, which only carries the realized payout for pool
+    lineups, not the field itself)."""
+    z = np.load(ORACLE_DIR / f"{slate}_field.npz", allow_pickle=False)
+    cids = [str(x) for x in z["contest_id"]]
+    return {cid: (z[f"scores_{j}"], z[f"payout_{j}"]) for j, cid in enumerate(cids)}
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +264,44 @@ def grade(sd: SlateData, picks: dict, arm: str) -> pd.DataFrame:
     return df
 
 
+def grade_joint(sd: SlateData, picks: dict, arm: str) -> pd.DataFrame:
+    """Same output schema as `grade` (same columns, same handling of
+    contests we placed nothing in / an all-empty picks dict), but per-contest
+    gross/rank come from bt_core.grade_portfolio -- ALL of that contest's
+    picked entries inserted into the real field JOINTLY -- instead of
+    `grade`'s per-lineup lookup into {slate}_real.npz's single-insertion
+    table. Needs the {slate}_field.npz sidecar (load_field) for the whole
+    real ladder per contest, not just our lineups' realized payouts."""
+    from tests.bt_core import grade_portfolio
+
+    field = load_field(sd.slate)
+    rows = []
+    for ci, cid in enumerate(sd.cids):
+        idx = picks.get(cid, [])
+        if not idx:
+            continue
+        idx = np.asarray(idx, dtype=np.int64)
+        sorted_scores, payout_arr = field[cid]
+        g, r = grade_portfolio(sd.actual[idx], sorted_scores, payout_arr)
+        nf = int(sd.n_field[ci])
+        rows.append(pd.DataFrame({
+            "slate": sd.slate, "seed": sd.seed, "calib": sd.calib, "arm": arm,
+            "contest": str(sd.contest[ci]), "cid": cid, "fee": float(sd.fee[ci]),
+            "won": g, "rank": r, "n_field": nf,
+            "cash": (g > 0).astype(int),
+            "top1": (r <= max(1, nf // 100)).astype(int),
+            "top01": (r <= max(1, nf // 1000)).astype(int),
+        }))
+    if not rows:
+        return pd.DataFrame()
+    df = pd.concat(rows, ignore_index=True)
+    unfilled = int(sd.k.sum()) - len(df)
+    if unfilled:
+        print(f"    WARNING {arm} {sd.slate}: {unfilled} entries unfilled "
+              "-- per-entry figures are on a smaller denominator")
+    return df
+
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -332,6 +383,55 @@ def print_report(res: pd.DataFrame, title: str) -> None:
 # Substrate verification
 # ---------------------------------------------------------------------------
 
+def _brute_grade_portfolio(actual_scores: np.ndarray, sorted_real: np.ndarray,
+                           payout_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Independent O((n+k) log(n+k)) reference for bt_core.grade_portfolio,
+    used only by cmd_verify's check 4.
+
+    Deliberately NOT the searchsorted/prefix-sum algebra grade_portfolio
+    itself uses: this literally merges our k scores into the field's score
+    list (tagging which entries are ours), sorts the merged list descending,
+    walks it top-down assigning 1-indexed ranks, groups consecutive equal-
+    score entries into one tie band, and averages the clipped payout window
+    over that band -- same clipped-width convention as grade_pool /
+    grade_portfolio (band = payout_arr[lo:hi] clipped to the table length,
+    mean over the CLIPPED width). A genuinely different code path from the
+    vectorized implementation, so it can catch a bug in that implementation's
+    own logic rather than merely re-deriving the same formula.
+
+    NaN entries are excluded from the merge (they don't displace/tie with
+    anyone) and come back as gross=NaN, rank=-1, matching grade_portfolio.
+    """
+    k = len(actual_scores)
+    L = len(payout_arr)
+    cum = np.concatenate(([0.0], np.cumsum(payout_arr, dtype=np.float64)))
+    gross = np.full(k, np.nan)
+    rank = np.full(k, -1, dtype=np.int64)
+
+    tagged = [(float(v), i) for i, v in enumerate(actual_scores) if np.isfinite(v)]
+    field = [(float(v), -1) for v in sorted_real]
+    merged = sorted(tagged + field, key=lambda t: -t[0])  # descending by score
+    n = len(merged)
+    idx = 0
+    while idx < n:
+        v = merged[idx][0]
+        j = idx
+        while j < n and merged[j][0] == v:
+            j += 1
+        # 0-indexed positions [idx, j) tie at this score -> 1-indexed ranks
+        # idx+1 .. j. lo/hi mirror grade_pool's clipped-width band exactly.
+        lo, hi = min(idx, L), min(j, L)
+        width = hi - lo
+        band_mean = (cum[hi] - cum[lo]) / width if width > 0 else 0.0
+        for p in range(idx, j):
+            _, tag = merged[p]
+            if tag >= 0:
+                gross[tag] = band_mean
+                rank[tag] = idx + 1
+        idx = j
+    return gross, rank
+
+
 def cmd_verify(slate: str = "07222026", seed: int = 42) -> None:
     """Two independent checks that the fast substrate is the real thing.
 
@@ -343,7 +443,7 @@ def cmd_verify(slate: str = "07222026", seed: int = 42) -> None:
     """
     from src.api import external_pool as ep
     from tests.bt_core import (build_slate_context, grade_pick, grade_pool,
-                               load_real_contests, _FakeGroup)
+                               grade_portfolio, load_real_contests, _FakeGroup)
 
     print("== check 1: grade_pool == grade_pick, exhaustively ==")
     worst = 0.0
@@ -416,6 +516,79 @@ def cmd_verify(slate: str = "07222026", seed: int = 42) -> None:
     print(f"\n  lab select_greedy(evw=0.25) vs production: {same}/{tot} identical picks")
     print("  (the lab drops ambiguous-name lineups up front, so a small gap here "
           "is expected on slates that have them)")
+
+    print("\n== check 3: grade_portfolio([v]) == grade_pick(v), k=1 reduction, "
+          "2000-lineup sample per slate ==")
+    rng3 = np.random.default_rng(20260802)
+    n_checked3 = mismatches3 = 0
+    for s in BACKTEST_SLATES:
+        if not (ORACLE_DIR / f"{s}_real.npz").exists():
+            print(f"  {s}: no oracle table yet, skipped")
+            continue
+        sd3 = load_slate(s, seed, False)
+        real3 = load_real_contests(PROJECT_ROOT / "archive" / s)
+        by_id3 = {c["contest_id"]: c for c in real3}
+        gradeable3 = np.where(sd3.ok)[0]
+        n_sample = min(2000, len(gradeable3))
+        sample = rng3.choice(gradeable3, size=n_sample, replace=False)
+        sample_scores = sd3.actual[sample]
+        slate_mismatch = 0
+        for cid in sd3.cids:
+            c = by_id3[cid]
+            # grade_pool (already proven == grade_pick in check 1) as the bulk
+            # reference, so the loop only pays for grade_portfolio's own call.
+            ref_g, ref_r = grade_pool(sample_scores, c["sorted_scores"], c["payout_arr"])
+            for j, v in enumerate(sample_scores):
+                g, r = grade_portfolio(np.array([v]), c["sorted_scores"], c["payout_arr"])
+                n_checked3 += 1
+                if g[0] != ref_g[j] or r[0] != ref_r[j]:
+                    mismatches3 += 1
+                    slate_mismatch += 1
+        print(f"  {s}: {n_sample} lineups x {len(sd3.cids)} contests, "
+              f"{slate_mismatch} mismatches")
+    print(f"  => {n_checked3:,} k=1 checks, {mismatches3} mismatches "
+          f"{'PASS' if mismatches3 == 0 else 'FAIL'}")
+
+    print("\n== check 4: brute-force cross-check, 50 random portfolios/slate "
+          "(k in [2,300], dupes injected) ==")
+    rng4 = np.random.default_rng(9182736)
+    n_portfolios4 = n_cells4 = mismatches4 = property_violations4 = 0
+    worst4 = 0.0
+    for s in BACKTEST_SLATES:
+        if not (ORACLE_DIR / f"{s}_real.npz").exists():
+            print(f"  {s}: no oracle table yet, skipped")
+            continue
+        sd4 = load_slate(s, seed, False)
+        real4 = load_real_contests(PROJECT_ROOT / "archive" / s)
+        gradeable4 = np.where(sd4.ok)[0]
+        for _trial in range(50):
+            k = int(rng4.integers(2, 301))
+            idx = rng4.choice(gradeable4, size=k, replace=True)  # replace=True injects dupes
+            scores = sd4.actual[idx]
+            n_portfolios4 += 1
+            for c in real4:
+                joint_g, joint_r = grade_portfolio(scores, c["sorted_scores"], c["payout_arr"])
+                brute_g, brute_r = _brute_grade_portfolio(scores, c["sorted_scores"], c["payout_arr"])
+                d = np.max(np.abs(joint_g - brute_g))
+                worst4 = max(worst4, float(d))
+                n_cells4 += k
+                if not (np.array_equal(joint_r, brute_r) and
+                        np.allclose(joint_g, brute_g, atol=1e-9)):
+                    mismatches4 += 1
+                # property: joint total gross <= sum of single-insertion grosses.
+                single_total = sum(
+                    grade_pick(v, c["sorted_scores"], c["payout_arr"])[0] for v in scores
+                )
+                joint_total = float(joint_g.sum())
+                if joint_total > single_total + 1e-6:
+                    property_violations4 += 1
+        print(f"  {s}: 50 portfolios x {len(real4)} contests checked", flush=True)
+    print(f"  => {n_portfolios4} portfolios x contests, {n_cells4:,} entry-cells, "
+          f"max |diff| {worst4:.3g}, {mismatches4} mismatches "
+          f"{'PASS' if mismatches4 == 0 else 'FAIL'}")
+    print(f"  => joint-total <= sum-of-single-insertions property: "
+          f"{property_violations4} violations "
+          f"{'PASS' if property_violations4 == 0 else 'FAIL'}")
 
 
 # ---------------------------------------------------------------------------
@@ -1504,6 +1677,120 @@ def _slice_draw(sd: SlateData, q: float, rng, *, floor_pct: float = 0.0,
     return picks
 
 
+# ---------------------------------------------------------------------------
+# Joint (whole-portfolio) vs single-insertion grading
+# ---------------------------------------------------------------------------
+
+def cmd_jointcheck(seeds=(42, 137, 4242)) -> None:
+    """How much does joint insertion (grade_joint / bt_core.grade_portfolio)
+    actually change realized $ versus the existing single-insertion grading
+    (grade / grade_pick), on the arms this harness already uses elsewhere?
+
+    Single insertion grades each of our entries as if it were the ONLY thing
+    we added to the real field, so when we hold more than one entry in the
+    same contest it can (a) let a worse entry of ours claim a rank a better
+    entry of ours actually occupies (self-displacement), (b) let two of our
+    own tied entries each claim the full tie-band prize instead of splitting
+    it (self-tie-splitting), and (c) let literal duplicate lineups each
+    collect a full prize (a special case of (b)). grade_joint fixes all
+    three by inserting a contest's whole set of our picks at once. This
+    quantifies the gap on real arms/slates/seeds rather than only on the
+    synthetic property checks in cmd_verify.
+    """
+    arm_names = ["prod_p_win", "ev_dollars", "random"]
+    arms = build_arms()
+    have_real = [s for s in BACKTEST_SLATES if (ORACLE_DIR / f"{s}_real.npz").exists()]
+    slates = [s for s in have_real if (ORACLE_DIR / f"{s}_field.npz").exists()]
+    missing_field = [s for s in have_real if s not in slates]
+    if missing_field:
+        print(f"  note: {missing_field} have no {{slate}}_field.npz sidecar yet "
+              "-- run `python tests/backtest_oracle.py field` first; skipping them")
+
+    tidy_rows = []
+    contest_deltas = []  # (|delta|, delta, slate, seed, arm, contest, cid, k)
+    for s in slates:
+        for seed in seeds:
+            sd = load_slate(s, seed, False)
+            curs = _candidate_currencies(sd)
+            curs_A = {"p_win": sd.currency("p_win", "A"),
+                      "ev_dollars": sd.currency("ev_dollars", "A"),
+                      "ev_tail": sd.currency("ev_tail", "A"),
+                      "p_cash": sd.currency("p_cash", "A")}
+            for name in arm_names:
+                cur, mode, kw = arms[name]
+                if cur is None:
+                    import zlib
+                    rng = np.random.default_rng(
+                        zlib.crc32(f"{s}|{seed}|{name}".encode()) & 0xFFFFFFFF)
+                    picks = select_greedy(sd, curs["p_win"], curs_A["p_win"], rng=rng, **kw)
+                else:
+                    sel = curs[cur]
+                    cull = curs_A.get(cur, sel)
+                    fn = select_assign if mode == "assign" else select_greedy
+                    picks = fn(sd, sel, cull, **kw)
+
+                g_single = grade(sd, picks, name)
+                g_joint = grade_joint(sd, picks, name)
+                if g_single.empty and g_joint.empty:
+                    continue
+
+                n_single, n_joint = len(g_single), len(g_joint)
+                s_won, j_won = float(g_single.won.sum()), float(g_joint.won.sum())
+                s_fee, j_fee = float(g_single.fee.sum()), float(g_joint.fee.sum())
+                s_dpe = (s_won - s_fee) / max(n_single, 1)
+                j_dpe = (j_won - j_fee) / max(n_joint, 1)
+                tidy_rows.append({
+                    "slate": s, "seed": seed, "arm": name, "entries": n_single,
+                    "single_won": s_won, "joint_won": j_won,
+                    "d_total_gross": j_won - s_won,
+                    "single_dollar_per_entry": s_dpe, "joint_dollar_per_entry": j_dpe,
+                    "d_dollar_per_entry": j_dpe - s_dpe,
+                })
+
+                for ci, cid in enumerate(sd.cids):
+                    s_g = g_single.loc[g_single.cid == cid, "won"] if not g_single.empty else pd.Series(dtype=float)
+                    j_g = g_joint.loc[g_joint.cid == cid, "won"] if not g_joint.empty else pd.Series(dtype=float)
+                    if s_g.empty and j_g.empty:
+                        continue
+                    d = float(j_g.sum() - s_g.sum())
+                    k_here = max(len(s_g), len(j_g))
+                    contest_deltas.append((abs(d), d, s, seed, name, str(sd.contest[ci]), cid, k_here))
+        print(f"  {s}: {len(seeds)} seeds x {len(arm_names)} arms graded both ways", flush=True)
+
+    tidy = pd.DataFrame(tidy_rows)
+    out_path = ORACLE_DIR.parent / "lab_jointcheck.csv"
+    header = not out_path.exists()
+    tidy.to_csv(out_path, mode="a", header=header, index=False)
+
+    print(f"\n===== JOINT vs SINGLE INSERTION ({len(slates)} slates x {len(seeds)} "
+          f"seeds x {len(arm_names)} arms) =====")
+    print("delta = joint (grade_joint) minus single (grade), same picks either way.\n")
+
+    print("-- per (slate, arm), pooled over seeds --")
+    per_slate = tidy.groupby(["slate", "arm"]).apply(lambda g: pd.Series({
+        "entries": g.entries.sum(),
+        "d$/entry": g.d_dollar_per_entry.mean(),
+        "d_total_gross": g.d_total_gross.sum(),
+    }), include_groups=False)
+    print(per_slate.round(4).to_string())
+
+    print("\n-- pooled over everything, per arm --")
+    pooled = tidy.groupby("arm").apply(lambda g: pd.Series({
+        "entries": g.entries.sum(),
+        "d$/entry": g.d_dollar_per_entry.mean(),
+        "d_total_gross": g.d_total_gross.sum(),
+    }), include_groups=False)
+    print(pooled.round(4).to_string())
+
+    print("\n-- 5 largest per-contest |delta| across everything --")
+    top5 = sorted(contest_deltas, key=lambda t: -t[0])[:5]
+    for absd, d, s, seed, name, contest, cid, k in top5:
+        print(f"  delta ${d:+.2f}  {s} s{seed} arm={name} contest={contest!r} "
+              f"(cid={cid}) k={k}")
+
+    print(f"\nappended {len(tidy)} rows -> {out_path}")
+
+
 def main() -> None:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "verify"
     if cmd == "verify":
@@ -1526,11 +1813,13 @@ def main() -> None:
         cmd_seedcheck()
     elif cmd == "own":
         cmd_own()
+    elif cmd == "jointcheck":
+        cmd_jointcheck()
     else:
         raise SystemExit(
             f"unknown command {cmd!r} "
             "(verify|currencies|stages|arms|model|selector|null|slices|"
-            "seedcheck|own)")
+            "seedcheck|own|jointcheck)")
 
 
 if __name__ == "__main__":

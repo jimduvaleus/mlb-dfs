@@ -324,6 +324,78 @@ def grade_pool(actual_scores: np.ndarray, sorted_real: np.ndarray,
     return gross, rank.astype(np.int64)
 
 
+def grade_portfolio(actual_scores: np.ndarray, sorted_real: np.ndarray,
+                    payout_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Joint insertion of ALL k of our entries into one real contest at once,
+    fixing three things single-entry insertion (grade_pick/grade_pool) gets
+    wrong whenever we hold more than one entry in the same contest:
+
+      * SELF-DISPLACEMENT -- grade_pick/grade_pool rank each of our entries
+        against the real field alone, so a better entry of OURS sitting above
+        a worse one is invisible; both get graded as if they were the field's
+        (n_above + 1)'th-best entry. Here `n_above` for each of our finite
+        entries counts real-field entries strictly above it PLUS our own
+        finite entries strictly above it.
+      * SELF-TIE-SPLITTING -- two of our entries landing on the same score
+        would each independently claim the FULL tie-band mean, rather than
+        splitting it three (or more) ways with each other and the field.
+      * OUR-DUPE PRIZE SPLITTING -- literal duplicate lineups (same score) in
+        the same contest are a special case of the above: each was being
+        graded as if it alone occupied the tie band, double- (or n-)
+        counting a single real prize.
+
+    Semantics, matching grade_pool's clipped-width convention exactly (so
+    k=1 reduces bit-for-bit to grade_pick/grade_pool, including the
+    band-straddles-the-paying-table edge case): for each of our finite
+    entries with score v, let f = # field entries == v and g = # of our
+    finite entries == v (including itself). n_above = (field entries > v)
+    + (our finite entries > v); rank = n_above + 1. The tie band is
+    [n_above, n_above + f + g), clipped to [0, len(payout_arr)]; each of our
+    g tied entries gets (cum[hi] - cum[lo]) / max(hi - lo, 1) of that band,
+    the same prefix-sum-over-clipped-width mean grade_pool uses.
+
+    NaN entries (ambiguous-name drops, see verify_slate) get gross=NaN,
+    rank=-1, and -- critically -- are excluded from every OTHER entry's
+    n_above/tie-band computation, i.e. they do not displace anyone.
+
+    Vectorized via np.unique-style sorting/searchsorted over our own k
+    scores (not a Python loop over entries): O(k log k + k log n_field).
+    """
+    a = np.asarray(actual_scores, dtype=np.float64)
+    finite = np.isfinite(a)
+    safe = np.where(finite, a, 0.0)
+
+    n_field = len(sorted_real)
+    L = len(payout_arr)
+
+    right_field = np.searchsorted(sorted_real, safe, side="right")
+    left_field = np.searchsorted(sorted_real, safe, side="left")
+    n_above_field = n_field - right_field
+    f_ties = right_field - left_field
+
+    # Our own side: only finite entries can displace/tie with each other.
+    own_vals = safe[finite]
+    own_sorted = np.sort(own_vals)
+    k_finite = len(own_vals)
+    own_right = np.searchsorted(own_sorted, safe, side="right")
+    own_left = np.searchsorted(own_sorted, safe, side="left")
+    own_above = k_finite - own_right
+    g_ties = own_right - own_left  # includes self
+
+    n_above = n_above_field + own_above
+    rank = n_above + 1
+
+    cum = np.concatenate(([0.0], np.cumsum(payout_arr, dtype=np.float64)))
+    lo = np.clip(n_above, 0, L)
+    hi = np.clip(n_above + f_ties + g_ties, 0, L)
+    width = hi - lo
+    gross = np.where(width > 0, (cum[hi] - cum[lo]) / np.maximum(width, 1), 0.0)
+
+    gross = np.where(finite, gross, np.nan)
+    rank = np.where(finite, rank, -1)
+    return gross, rank.astype(np.int64)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline replication (real production functions only)
 # ---------------------------------------------------------------------------

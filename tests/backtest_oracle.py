@@ -232,12 +232,62 @@ def repair_real(slate: str) -> bool:
     return True
 
 
+def build_field(slate: str) -> Path:
+    """{slate}_field.npz -- every real contest's own full sorted-score ladder
+    and payout table, sidecar to {slate}_real.npz.
+
+    grade_pool/grade_portfolio need the WHOLE (sorted_scores, payout_arr) per
+    contest, not just the realized payout for our lineups -- grade_portfolio
+    in particular has to re-derive rank/gross for an arbitrary set of our own
+    entries against the real ladder, which {slate}_real.npz alone (already
+    reduced to our-lineup outcomes) can't supply. Aligned to the SAME
+    contest_id order as {slate}_real.npz so callers can zip the two by index
+    without a second lookup; drift between the two is a hard failure, not a
+    warning, since a silent misalignment would grade lineups against the
+    wrong contest's payout table.
+    """
+    path = ORACLE_DIR / f"{slate}_field.npz"
+    if path.exists():
+        return path
+    real_path = ORACLE_DIR / f"{slate}_real.npz"
+    if not real_path.exists():
+        build_real(slate)
+    with np.load(real_path, allow_pickle=False) as z:
+        real_cids = [str(x) for x in z["contest_id"]]
+
+    d = PROJECT_ROOT / "archive" / slate
+    real = load_real_contests(d)
+    by_id = {c["contest_id"]: c for c in real}
+    missing = [cid for cid in real_cids if cid not in by_id]
+    if missing:
+        raise SystemExit(
+            f"{slate}: {real_path.name} references contest_id(s) {missing} not "
+            f"found in {d}'s standings zips -- archive drift, investigate before "
+            "building the field sidecar."
+        )
+
+    out: dict = {"contest_id": np.array(real_cids)}
+    for j, cid in enumerate(real_cids):
+        c = by_id[cid]
+        out[f"scores_{j}"] = c["sorted_scores"].astype(np.float64)
+        out[f"payout_{j}"] = c["payout_arr"].astype(np.float64)
+
+    ORACLE_DIR.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(path, **out)
+    return path
+
+
 def main() -> None:
     if sys.argv[1:2] == ["repair"]:
         for slate in ([s for s in sys.argv[2:] if s.isdigit()] or BACKTEST_SLATES):
             if (ORACLE_DIR / f"{slate}_real.npz").exists():
                 if not repair_real(slate):
                     print(f"  {slate}: unchanged")
+        return
+    if sys.argv[1:2] == ["field"]:
+        for slate in ([s for s in sys.argv[2:] if s.isdigit()] or BACKTEST_SLATES):
+            build_field(slate)
+            print(f"  {slate}: field sidecar ready")
         return
     slates = [s for s in sys.argv[1:] if s.isdigit()] or BACKTEST_SLATES
     ORACLE_DIR.mkdir(parents=True, exist_ok=True)
@@ -247,6 +297,7 @@ def main() -> None:
         for seed in SEEDS:
             for calib in (False, True):
                 build_currencies(slate, seed, calib)
+        build_field(slate)
         print(f"  {slate}: currencies for {len(SEEDS)} seed(s) x2 calib "
               f"in {time.time() - t0:.0f}s", flush=True)
     print(f"\noracle -> {ORACLE_DIR}")
