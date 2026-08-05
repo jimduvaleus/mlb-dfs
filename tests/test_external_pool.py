@@ -871,6 +871,360 @@ class TestAllocation:
         assert picks1 != picks5  # different EV/diversity blends pick differently
 
 
+class TestProjTopOwnershipCap:
+    """ev_type='proj_top' with own_cap_start_pct/own_cap_end_pct: an
+    optional large-field (implied_field_size >= 5,000) ownership cap, off
+    by default (100/100)."""
+
+    def _pool(self, M=60, seed=0):
+        rng = np.random.default_rng(seed)
+        lineups = [Lineup(player_ids=list(range(10 * i, 10 * i + 10))) for i in range(M)]
+        name = "MLB $5K Test"
+        contests = {normalize_contest_name(name): ExternalContest(
+            raw_name=name, norm_name=normalize_contest_name(name),
+            roi=rng.normal(0, 0.3, M), prize_pool_cents=500_000, single_entry=False,
+        )}
+        return ExternalPool(lineups=lineups, contests=contests,
+                            n_dropped_unknown_players=0, n_dropped_duplicates=0,
+                            n_dropped_near_duplicates=0,
+                            source_paths=[Path("synthetic.csv")])
+
+    def _group(self, pool, size, *, prize_pool_cents, entry_fee_cents, cid="c0"):
+        key = next(iter(pool.contests))
+        return ContestGroup(
+            contest_id=cid, contest_name=pool.contests[key].raw_name,
+            entry_fee_cents=entry_fee_cents, prize_pool_cents=prize_pool_cents,
+            single_entry_tag=size == 1,
+            entries=[(Path("x/Entries.csv"), _rec(cid, "n", entry_fee_cents, f"{cid}-{i}"))
+                     for i in range(size)],
+            roi_key=key,
+        )
+
+    # $100,000 / $20 * 0.84 ~= 5,952 implied entries -- comfortably >= 5,000.
+    _LARGE = dict(prize_pool_cents=100_000_00, entry_fee_cents=2000)
+    # $1,000 / $10 * 0.84 ~= 119 implied entries -- comfortably < 5,000.
+    _SMALL = dict(prize_pool_cents=100_000, entry_fee_cents=1000)
+
+    def test_default_is_byte_identical_to_uncapped(self):
+        pool = self._pool(M=20)
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 10, **self._LARGE)
+        proj_scores = np.arange(20, dtype=np.float64)
+        own_scores = np.arange(20, dtype=np.float64)[::-1].astype(np.float64)
+        baseline = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores,
+        )
+        with_own = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+        )
+        ids_base = [id(lu) for lu, _ in baseline.portfolio]
+        ids_own = [id(lu) for lu, _ in with_own.portfolio]
+        assert ids_base == ids_own == [id(pool.lineups[i]) for i in range(19, 9, -1)]
+
+    def test_small_field_unaffected_by_tight_cap(self):
+        """A contest below the 5,000-entry threshold ignores the cap
+        entirely, however tight."""
+        pool = self._pool(M=20)
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 10, **self._SMALL)
+        proj_scores = np.arange(20, dtype=np.float64)
+        own_scores = np.arange(20, dtype=np.float64)  # highest-proj is also highest-owned
+        uncapped = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+        )
+        capped = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+            own_cap_start_pct=10.0, own_cap_end_pct=10.0,
+        )
+        assert ([id(lu) for lu, _ in uncapped.portfolio]
+                == [id(lu) for lu, _ in capped.portfolio])
+
+    def test_tight_cap_excludes_high_ownership_top_pick(self):
+        """The single highest-proj_score lineup is also the highest-owned;
+        a tight cap on a large-field contest must exclude it, so a
+        lower-projection/lower-ownership lineup wins the slot instead."""
+        pool = self._pool(M=20)
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 1, **self._LARGE)
+        proj_scores = np.arange(20, dtype=np.float64)  # index 19 best
+        own_scores = np.arange(20, dtype=np.float64)   # index 19 also most-owned
+        uncapped = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+        )
+        assert id(uncapped.portfolio[0][0]) == id(pool.lineups[19])
+
+        capped = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+            own_cap_start_pct=50.0, own_cap_end_pct=50.0,
+        )
+        assert id(capped.portfolio[0][0]) != id(pool.lineups[19])
+
+    def test_phase_in_tightens_with_field_size(self):
+        """Two large contests, same start/end percentages: the one with the
+        bigger implied field size gets a strictly tighter effective cutoff
+        (fewer eligible candidates), never a looser one."""
+        pool = self._pool(M=40)
+        corr = np.eye(40, dtype=np.float32)
+        proj_scores = np.arange(40, dtype=np.float64)
+        own_scores = np.arange(40, dtype=np.float64)  # monotone with proj_score
+        medium = self._group(pool, 1, prize_pool_cents=100_000_00, entry_fee_cents=2000, cid="c0")
+        huge = self._group(pool, 1, prize_pool_cents=100_000_00_00, entry_fee_cents=2000, cid="c1")
+        assert implied_field_size(medium) < implied_field_size(huge)
+
+        alloc = allocate_contests(
+            pool, corr, [medium, huge], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+            own_cap_start_pct=90.0, own_cap_end_pct=50.0,
+            own_cap_max_field_size=implied_field_size(huge),
+        )
+        # Both contests take the single best surviving lineup by proj_score;
+        # the medium (looser cap) contest is filled first (larger prize
+        # pool sorts first under no explicit fill order here since both
+        # share entry_fee/size -- assert via the two winners' own_scores
+        # instead of fill order).
+        picked = {g.contest_id: lu for (lu, _), g in zip(alloc.portfolio, [medium, huge])}
+        assert own_scores[[i for i, lu in enumerate(pool.lineups)
+                           if id(lu) == id(picked["c0"])][0]] >= \
+               own_scores[[i for i, lu in enumerate(pool.lineups)
+                           if id(lu) == id(picked["c1"])][0]]
+
+    def test_degenerate_max_equals_threshold(self):
+        """implied field size exactly at the 5,000 threshold: no
+        divide-by-zero, resolves to the loose (start) end."""
+        pool = self._pool(M=10)
+        corr = np.eye(10, dtype=np.float32)
+        group = self._group(pool, 1, **self._LARGE)
+        proj_scores = np.arange(10, dtype=np.float64)
+        own_scores = np.arange(10, dtype=np.float64)
+        alloc = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+            own_cap_start_pct=90.0, own_cap_end_pct=10.0,
+            own_cap_max_field_size=implied_field_size(group),  # == this contest's own size
+        )
+        assert len(alloc.portfolio) == 1  # no crash/NaN cutoff
+
+    def test_requires_own_scores_when_cap_active(self):
+        pool = self._pool(M=10)
+        corr = np.eye(10, dtype=np.float32)
+        group = self._group(pool, 1, **self._LARGE)
+        with pytest.raises(ValueError, match="own_scores"):
+            allocate_contests(
+                pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+                ev_type="proj_top", proj_scores=np.arange(10, dtype=np.float64),
+                own_cap_start_pct=50.0,
+            )
+
+    def test_other_ev_types_unaffected_by_cap_kwargs(self):
+        """roi/prj_own/p_win must be byte-identical whether or not the new
+        cap kwargs are passed -- the gating on ev_type=='proj_top' must be
+        airtight."""
+        pool = self._pool(M=20)
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 10, **self._LARGE)
+        baseline = allocate_contests(pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4)
+        with_cap_kwargs = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            own_cap_start_pct=10.0, own_cap_end_pct=5.0,
+            own_scores=np.arange(20, dtype=np.float64),
+        )
+        assert ([id(lu) for lu, _ in baseline.portfolio]
+                == [id(lu) for lu, _ in with_cap_kwargs.portfolio])
+
+    def test_max_field_size_none_self_computes_from_groups(self):
+        pool = self._pool(M=20)
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 1, **self._LARGE)
+        proj_scores = np.arange(20, dtype=np.float64)
+        own_scores = np.arange(20, dtype=np.float64)
+        explicit = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+            own_cap_start_pct=90.0, own_cap_end_pct=50.0,
+            own_cap_max_field_size=implied_field_size(group),
+        )
+        auto = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+            own_cap_start_pct=90.0, own_cap_end_pct=50.0,
+        )
+        assert ([id(lu) for lu, _ in explicit.portfolio]
+                == [id(lu) for lu, _ in auto.portfolio])
+
+
+class TestProjTopCeilingTiers:
+    """ev_type='proj_top' with ceiling_tier_boundary: an optional
+    field-size-tiered ranking-signal swap (mean below 5,000, sim p95
+    from 5,000 to the boundary, sim p99 at/above the boundary), off by
+    default (ceiling_tier_boundary=None)."""
+
+    def _pool(self, M=20, seed=0):
+        rng = np.random.default_rng(seed)
+        lineups = [Lineup(player_ids=list(range(10 * i, 10 * i + 10))) for i in range(M)]
+        name = "MLB $5K Test"
+        contests = {normalize_contest_name(name): ExternalContest(
+            raw_name=name, norm_name=normalize_contest_name(name),
+            roi=rng.normal(0, 0.3, M), prize_pool_cents=500_000, single_entry=False,
+        )}
+        return ExternalPool(lineups=lineups, contests=contests,
+                            n_dropped_unknown_players=0, n_dropped_duplicates=0,
+                            n_dropped_near_duplicates=0,
+                            source_paths=[Path("synthetic.csv")])
+
+    def _group(self, pool, size, *, prize_pool_cents, entry_fee_cents, cid="c0"):
+        key = next(iter(pool.contests))
+        return ContestGroup(
+            contest_id=cid, contest_name=pool.contests[key].raw_name,
+            entry_fee_cents=entry_fee_cents, prize_pool_cents=prize_pool_cents,
+            single_entry_tag=size == 1,
+            entries=[(Path("x/Entries.csv"), _rec(cid, "n", entry_fee_cents, f"{cid}-{i}"))
+                     for i in range(size)],
+            roi_key=key,
+        )
+
+    # < 5,000 implied entries (small tier -- always mean, regardless of
+    # ceiling_tier_boundary).
+    _SMALL = dict(prize_pool_cents=100_000, entry_fee_cents=1000)
+    # ~5,952 implied entries -- medium tier under the default 15,000 boundary.
+    _MEDIUM = dict(prize_pool_cents=100_000_00, entry_fee_cents=2000)
+    # ~17,857 implied entries -- large tier under the default 15,000 boundary.
+    _LARGE = dict(prize_pool_cents=300_000_00, entry_fee_cents=2000)
+
+    def _signals(self, M=20):
+        # Three signals disagree on the winner so the active one is
+        # identifiable from the single pick: proj_scores peaks at the last
+        # index, sim_p95_scores at the first, sim_p99_scores in the middle.
+        proj_scores = np.arange(M, dtype=np.float64)
+        sim_p95_scores = np.arange(M, dtype=np.float64)[::-1].astype(np.float64)
+        mid = M // 2
+        sim_p99_scores = -np.square(np.arange(M) - mid).astype(np.float64)
+        return proj_scores, sim_p95_scores, sim_p99_scores
+
+    def test_default_off_byte_identical_even_with_percentiles_passed(self):
+        pool = self._pool()
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 10, **self._LARGE)
+        proj_scores, sim_p95_scores, sim_p99_scores = self._signals()
+        baseline = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores,
+        )
+        with_percentiles = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores,
+            sim_p95_scores=sim_p95_scores, sim_p99_scores=sim_p99_scores,
+        )
+        assert ([id(lu) for lu, _ in baseline.portfolio]
+                == [id(lu) for lu, _ in with_percentiles.portfolio])
+
+    def test_small_field_always_uses_mean(self):
+        pool = self._pool()
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 1, **self._SMALL)
+        proj_scores, sim_p95_scores, sim_p99_scores = self._signals()
+        alloc = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores,
+            sim_p95_scores=sim_p95_scores, sim_p99_scores=sim_p99_scores,
+            ceiling_tier_boundary=15000.0,
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[19])
+
+    def test_medium_field_uses_p95(self):
+        pool = self._pool()
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 1, **self._MEDIUM)
+        proj_scores, sim_p95_scores, sim_p99_scores = self._signals()
+        alloc = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores,
+            sim_p95_scores=sim_p95_scores, sim_p99_scores=sim_p99_scores,
+            ceiling_tier_boundary=15000.0,
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[0])
+
+    def test_large_field_uses_p99(self):
+        pool = self._pool()
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 1, **self._LARGE)
+        proj_scores, sim_p95_scores, sim_p99_scores = self._signals()
+        alloc = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores,
+            sim_p95_scores=sim_p95_scores, sim_p99_scores=sim_p99_scores,
+            ceiling_tier_boundary=15000.0,
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[10])
+
+    def test_field_exactly_at_boundary_uses_p99(self):
+        """implied_field_size(group) == ceiling_tier_boundary resolves to
+        the large-tier (p99) treatment, not medium."""
+        pool = self._pool()
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 1, **self._MEDIUM)
+        boundary = implied_field_size(group)
+        proj_scores, sim_p95_scores, sim_p99_scores = self._signals()
+        alloc = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores,
+            sim_p95_scores=sim_p95_scores, sim_p99_scores=sim_p99_scores,
+            ceiling_tier_boundary=boundary,
+        )
+        assert id(alloc.portfolio[0][0]) == id(pool.lineups[10])
+
+    def test_requires_both_percentile_arrays(self):
+        pool = self._pool()
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 1, **self._LARGE)
+        proj_scores, sim_p95_scores, _ = self._signals()
+        with pytest.raises(ValueError, match="sim_p95_scores"):
+            allocate_contests(
+                pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+                ev_type="proj_top", proj_scores=proj_scores,
+                sim_p95_scores=sim_p95_scores, ceiling_tier_boundary=15000.0,
+            )
+
+    def test_other_ev_types_unaffected_by_ceiling_kwargs(self):
+        """roi/prj_own/p_win must be byte-identical whether or not the new
+        ceiling-tier kwargs are passed -- the ev_type=='proj_top' gate
+        must be airtight."""
+        pool = self._pool()
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 10, **self._LARGE)
+        _, sim_p95_scores, sim_p99_scores = self._signals()
+        baseline = allocate_contests(pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4)
+        with_kwargs = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            sim_p95_scores=sim_p95_scores, sim_p99_scores=sim_p99_scores,
+            ceiling_tier_boundary=15000.0,
+        )
+        assert ([id(lu) for lu, _ in baseline.portfolio]
+                == [id(lu) for lu, _ in with_kwargs.portfolio])
+
+    def test_combines_without_crashing_with_ownership_cap(self):
+        """Discouraged in docs (tested to hurt), but not blocked: both
+        features can be enabled together without error."""
+        pool = self._pool()
+        corr = np.eye(20, dtype=np.float32)
+        group = self._group(pool, 5, **self._LARGE)
+        proj_scores, sim_p95_scores, sim_p99_scores = self._signals()
+        own_scores = np.arange(20, dtype=np.float64)
+        alloc = allocate_contests(
+            pool, corr, [group], risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="proj_top", proj_scores=proj_scores, own_scores=own_scores,
+            sim_p95_scores=sim_p95_scores, sim_p99_scores=sim_p99_scores,
+            ceiling_tier_boundary=15000.0,
+            own_cap_start_pct=90.0, own_cap_end_pct=50.0,
+        )
+        assert len(alloc.portfolio) == 5
+
+
 class TestComputeCeilingEv:
     def test_returns_none_without_stddev(self):
         roi = np.linspace(-0.2, 0.5, 50)

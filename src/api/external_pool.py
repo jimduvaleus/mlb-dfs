@@ -1210,6 +1210,14 @@ def implied_field_size(group: "ContestGroup") -> float:
 
 _DEFAULT_OWN_SCALE = 30_000.0
 
+_SMALL_FIELD_THRESHOLD = 5000.0
+"""Shared "small field" boundary for proj_top's two field-size-aware
+sub-features: the ownership cap (own_cap_start_pct/own_cap_end_pct) and the
+ceiling-tier ranking signal (ceiling_tier_boundary) in allocate_contests.
+Below this, both are inert -- proj_top is plain mean-proj_score ranking.
+Fixed, NOT user-configurable -- only each feature's own dial(s) are exposed
+via GppConfig/the UI."""
+
 
 def compute_prj_own_ev(
     proj_scores: np.ndarray, own_scores: np.ndarray, field_size: float,
@@ -1453,6 +1461,13 @@ def allocate_contests(
     ev_type: str = "roi",
     own_scores: Optional[np.ndarray] = None,
     own_scale: float = _DEFAULT_OWN_SCALE,
+    own_cap_start_pct: float = 100.0,
+    own_cap_end_pct: float = 100.0,
+    own_cap_field_size_threshold: float = _SMALL_FIELD_THRESHOLD,
+    own_cap_max_field_size: Optional[float] = None,
+    sim_p95_scores: Optional[np.ndarray] = None,
+    sim_p99_scores: Optional[np.ndarray] = None,
+    ceiling_tier_boundary: Optional[float] = None,
     p_win_cull: Optional[dict[str, np.ndarray]] = None,
     p_win_select: Optional[dict[str, np.ndarray]] = None,
     p_win_admit_n: int = 0,
@@ -1497,6 +1512,94 @@ def allocate_contests(
       post-floor pool on p_win_select alone). Requires both `p_win_cull` and
       `p_win_select`, each `{contest_id: (M,) array}`, built from the same
       underlying sims via two calls to compute_p_win.
+    * `"proj_top"` — rank directly on `proj_scores` (plain projected mean,
+      the same array the pool-wide floor already culls on), no ROI/ownership
+      currency at all. Like `prj_own`/`p_win`, Saber's ROI plays no part, so
+      `roi_floor_percentile` and the ceiling lean are inert; the pool-wide
+      `proj_score_floor_percentile` cull is the only cull. Requires
+      `proj_scores`.
+
+      Backtested (tests/backtest_needle.py, 14 archived slates 07/19-08/02):
+      the single best-performing currency found for recovering a slate's own
+      top-10-real-score lineups from its candidate pool (50% of slates hit
+      vs. 14% for a uniform-random pick at the same budget/floor) — every
+      diversity-blending or team/overlap-constrained variant tried came back
+      at or below this plain ranking. But the portfolios it produces are
+      correspondingly concentrated, not diversified: ~34% of a slate's teams
+      represented (vs. ~90% for a team-diversity-constrained selection) and
+      the single most-rostered player appears in ~76% of the portfolio on
+      average — a real correlated-bust risk the needle-hit metric doesn't
+      price in. The backtested/validated result is specifically the pure
+      ranking (`evw=1.0`, no diversity term at all); the risk sweep's usual
+      `evw_base`/`evw_max` (e.g. the shipped 0.10/0.40) means even risk=5
+      only *approaches* that, never reproduces it exactly, blending in the
+      same correlation diversity term as every other ev_type at every risk
+      level — unvalidated for this objective, but a sane default hedge
+      against the concentration. Pass `evw_base=evw_max=1.0` to reproduce
+      the exact backtested setting.
+
+      `own_cap_start_pct`/`own_cap_end_pct` (both default 100.0, i.e. off)
+      add an optional large-field ownership cap on top of the ranking
+      above: for any contest with `implied_field_size(g) >=
+      own_cap_field_size_threshold` (fixed at 5,000, not user-configurable),
+      candidates are further restricted to lineups whose `own_scores` falls
+      at or below a percentile of that contest's own ownership distribution
+      (the pool-wide-floor survivors). The percentile phases in linearly
+      with the contest's own implied field size, from `own_cap_start_pct`
+      at the threshold to `own_cap_end_pct` at the largest implied field
+      size among that day's own `groups` (self-calibrating anchor, no
+      hardcoded number — pass `own_cap_max_field_size` explicitly to reuse
+      a precomputed, risk-invariant value across a risk sweep instead of
+      recomputing it from `groups` on every call). 100.0 at either end is a
+      literal no-op (`np.percentile(dist, 100)` is the distribution max,
+      which nothing exceeds), so the default reproduces today's exact
+      proj_top behavior byte-for-byte.
+
+      UNVALIDATED: derived from a small-sample (10 archived slates, real
+      payout tables) follow-up backtest, not yet promoted to an
+      EVIDENCE_LOG.md entry. A FLAT percentile cap at any single value
+      (50-95) consistently hurt cash%/top1% vs. uncapped proj_top, worse the
+      tighter the cap, whether tested at a 6,000+ or a 5,000+ field-size
+      threshold. This GRADUAL phase-in shape traded some of that cash-rate
+      consistency (uncapped proj_top still won cash%/top1% in every tested
+      variant) for more "big" finishes (payout >= 10x entry — the `ev_tail`
+      convention in `tests/bt_core.py`'s `accumulate_currencies`) instead of
+      occasional lucky ones — but a nearby start value (85) performed
+      erratically worse than its neighbors, a sign the specific percentile
+      values aren't yet distinguishable from noise at n=10. It's the
+      *shape* (loose start, gentle tightening, large fields only) worth
+      shipping as a dialable control, not these particular numbers — hence
+      OFF by default.
+
+      `ceiling_tier_boundary` (default `None`, i.e. off) swaps the *ranking
+      signal itself* by field size instead of restricting eligibility:
+      below `_SMALL_FIELD_THRESHOLD` (5,000, fixed), proj_top stays plain
+      mean-`proj_scores` ranking; from there up to `ceiling_tier_boundary`,
+      it ranks on `sim_p95_scores` (the 95th percentile of each lineup's
+      simulated score distribution); above `ceiling_tier_boundary`, on
+      `sim_p99_scores`. Requires both `sim_p95_scores` and `sim_p99_scores`
+      (e.g. `np.percentile(lineup_scores, 95/99, axis=1)` over the same
+      matrix `compute_lineup_scores` produces).
+
+      VALIDATED more strongly than the ownership cap above (same 10-slate
+      real-payout-table backtest, but the pattern held cleanly rather than
+      being a single-slate artifact): p95 beat mean, and p99 beat both p95
+      and mean, each on its own field-size population, with `drop_max`
+      (this contest's largest single payout removed) staying positive for
+      every uncapped tier — the signal survives the same robustness check
+      that discarded most other findings in this line of testing. The
+      medium/large boundary is a real cliff, not a gradual knob: every
+      tested value from 10,000 up performed almost identically (differences
+      within noise), while 9,000 and below dropped sharply and `drop_max`
+      turned negative — driven by a specific recurring contest
+      (`Bat Flip`, consistently ~9,900 implied entries) that p99 handles
+      poorly and p95 handles well. 15,000 is the shipped default as a
+      defensible round number inside the flat, well-supported region — not
+      because it beats 10,000-14,000, which it doesn't distinguishably.
+      Combining this with the ownership cap above was tested and found to
+      hurt (cash%/top1% dropped for every signal it was layered onto,
+      including p95/p99) — the two features are independent dials, but
+      using both together is not recommended based on what's been tested.
 
       `p_win_admit_multiplier > 0` scales the cull by each contest's own
       entry count instead of using one flat number across every contest:
@@ -1553,8 +1656,10 @@ def allocate_contests(
     though the percentile alone would have let it through."""
     from src.optimization.gpp_portfolio import DeterminantPortfolioSelector
 
-    if ev_type not in ("roi", "prj_own", "p_win"):
-        raise ValueError(f"Unknown ev_type {ev_type!r} (expected 'roi', 'prj_own', or 'p_win')")
+    if ev_type not in ("roi", "prj_own", "p_win", "proj_top"):
+        raise ValueError(
+            f"Unknown ev_type {ev_type!r} (expected 'roi', 'prj_own', 'p_win', or 'proj_top')"
+        )
     if ev_type == "prj_own" and (proj_scores is None or own_scores is None):
         raise ValueError(
             "ev_type='prj_own' requires both proj_scores and own_scores "
@@ -1565,6 +1670,28 @@ def allocate_contests(
             "ev_type='p_win' requires both p_win_cull and p_win_select "
             "(see compute_p_win)"
         )
+    if ev_type == "proj_top" and proj_scores is None:
+        raise ValueError(
+            "ev_type='proj_top' requires proj_scores (see compute_pool_proj_scores)"
+        )
+    if (
+        ev_type == "proj_top"
+        and (own_cap_start_pct < 100.0 or own_cap_end_pct < 100.0)
+        and own_scores is None
+    ):
+        raise ValueError(
+            "ev_type='proj_top' with own_cap_start_pct/own_cap_end_pct < 100 "
+            "requires own_scores (see compute_pool_ownership)"
+        )
+    if (
+        ev_type == "proj_top" and ceiling_tier_boundary is not None
+        and (sim_p95_scores is None or sim_p99_scores is None)
+    ):
+        raise ValueError(
+            "ev_type='proj_top' with ceiling_tier_boundary set requires both "
+            "sim_p95_scores and sim_p99_scores (percentiles of the simulated "
+            "lineup score matrix, see compute_lineup_scores)"
+        )
 
     M = len(pool.lineups)
     mask = np.ones(M, dtype=bool)
@@ -1573,6 +1700,36 @@ def allocate_contests(
         if floor is not None:
             proj_floor, _ = floor
             mask &= np.isfinite(proj_scores) & (proj_scores >= proj_floor)
+
+    # Ownership cap (proj_top, large fields only) -- percentile basis and the
+    # "largest field seen today" anchor, both computed ONCE here (not per
+    # contest; not per risk tier when the caller precomputes and passes
+    # own_cap_max_field_size explicitly). own_cap_start_pct == own_cap_end_pct
+    # == 100.0 (the default) is a guaranteed no-op: np.percentile(dist, 100)
+    # is the distribution max, which every finite own_scores value is <= by
+    # construction -- so today's proj_top behavior is unchanged with no
+    # special-case "disabled" flag needed.
+    _owncap_on = (
+        ev_type == "proj_top" and own_scores is not None
+        and (own_cap_start_pct < 100.0 or own_cap_end_pct < 100.0)
+    )
+    _owncap_basis = own_scores[mask & np.isfinite(own_scores)] if _owncap_on else None
+    if _owncap_on and (_owncap_basis is None or _owncap_basis.size == 0):
+        _owncap_on = False
+    _owncap_max_field = own_cap_max_field_size
+    if _owncap_on and _owncap_max_field is None:
+        _owncap_max_field = max((implied_field_size(g) for g in groups), default=0.0)
+
+    # Ceiling-tier ranking signal (proj_top, off by default): below
+    # _SMALL_FIELD_THRESHOLD, proj_top stays plain mean-proj_score ranking;
+    # from there up to ceiling_tier_boundary, rank on sim_p95_scores;
+    # above ceiling_tier_boundary, sim_p99_scores. ceiling_tier_boundary is
+    # None (disabled) by default, reproducing today's proj_top exactly.
+    _ceiling_tier_on = (
+        ev_type == "proj_top" and ceiling_tier_boundary is not None
+        and sim_p95_scores is not None and sim_p99_scores is not None
+    )
+
     idx_of = {id(lu): i for i, lu in enumerate(pool.lineups)}
     portfolio: list = []
     entry_plan: list = []
@@ -1610,6 +1767,33 @@ def allocate_contests(
                 # cannot also be the reason it survives this cull.
                 keep = rem[np.argsort(-cull_for_contest[rem])[:effective_admit_n]]
                 rem = np.sort(keep)
+        elif ev_type == "proj_top":
+            # No ROI/ownership currency at all: rank on proj_scores by
+            # default, or (optional, off by default) a field-size-tiered
+            # ceiling signal instead -- see ceiling_tier_boundary. The
+            # pool-wide floor already seeded `mask`, so no further per-
+            # contest cull applies here except the two optional large-field
+            # features below (ceiling tiering, ownership cap).
+            _field_size = (
+                implied_field_size(g) if (_ceiling_tier_on or _owncap_on) else None
+            )
+            ev_vals = proj_scores
+            if _ceiling_tier_on and _field_size >= _SMALL_FIELD_THRESHOLD:
+                ev_vals = (
+                    sim_p99_scores if _field_size >= ceiling_tier_boundary
+                    else sim_p95_scores
+                )
+            rem = rem_all[np.isfinite(ev_vals[rem_all])]
+            if _owncap_on and _field_size >= own_cap_field_size_threshold:
+                span = _owncap_max_field - own_cap_field_size_threshold
+                frac = (
+                    (_field_size - own_cap_field_size_threshold) / span
+                    if span > 0 else 0.0
+                )
+                frac = min(max(frac, 0.0), 1.0)
+                pct = own_cap_start_pct + frac * (own_cap_end_pct - own_cap_start_pct)
+                cutoff = np.percentile(_owncap_basis, pct)
+                rem = rem[np.isfinite(own_scores[rem]) & (own_scores[rem] <= cutoff)]
         else:
             contest = pool.contests.get(g.roi_key)
             if contest is None:

@@ -153,8 +153,18 @@ class GppConfig(BaseModel):
     #               * implied field size. See compute_p_win in
     #               src/api/external_pool.py. Falls back to "prj_own" at
     #               runtime if field/sim generation fails.
-    # Under "prj_own"/"p_win" Saber's ROI is not consulted at all, so
-    # external_pool_roi_floor_pct, external_pool_ceiling_weight and
+    #   "proj_top" — rank directly on projected mean, no ROI/ownership
+    #               currency at all. Backtested as the best currency found
+    #               for recovering a slate's own top-10-real-score lineups
+    #               from its pool (needle-in-haystack framing, 50% of 14
+    #               archived slates vs. 14% for random at the same budget) —
+    #               see the ev_type docstring in allocate_contests for the
+    #               full comparison. Trades this for a materially
+    #               concentrated portfolio (far fewer distinct teams, high
+    #               single-player exposure) that the needle metric doesn't
+    #               price as a cost; use `risk` to dial diversity back in.
+    # Under "prj_own"/"p_win"/"proj_top" Saber's ROI is not consulted at all,
+    # so external_pool_roi_floor_pct, external_pool_ceiling_weight and
     # external_pool_cash_anchor_fraction are all inert; the pool-wide
     # external_pool_proj_score_pct cull still applies.
     external_pool_ev_type: str = "roi"
@@ -238,6 +248,64 @@ class GppConfig(BaseModel):
     # grows gpp.n_field_lineups to the largest contest's implied entry
     # count, capped for memory).
     external_pool_pwin_field_size: int = 0
+    # Large-field ownership cap for "proj_top" (phase-in, off by default).
+    # Restricts proj_top's per-contest candidate pool, for contests with
+    # implied_field_size >= 5,000 only, to lineups whose summed ownership
+    # (own_scores) falls at or below a percentile of that contest's own
+    # ownership distribution (the pool-wide floor's survivors). The
+    # percentile itself phases in linearly by contest size, from
+    # own_cap_start_pct at the 5,000-entry threshold to own_cap_end_pct at
+    # the largest implied field size among that day's own contests (a
+    # self-calibrating anchor, not a hardcoded number -- mirrors the
+    # backtest's own methodology). 100/100 (the default) is a no-op:
+    # percentile(dist, 100) == dist.max(), which nothing exceeds, so every
+    # proj_top run is byte-identical to today's until one of these is dialed
+    # below 100. See the ev_type docstring in allocate_contests.
+    #
+    # UNVALIDATED, shape-only finding, not a specific calibrated pair (10
+    # archived slates, real payout tables, not yet an EVIDENCE_LOG.md
+    # entry): a FLAT percentile cap at any single value (50-95) consistently
+    # hurt cash%/top1% vs. uncapped proj_top, monotonically worse as the cap
+    # tightened, at both a 6,000+ and a 5,000+ field-size threshold. A
+    # GRADUAL phase-in -- loose (near 90-100) right at the threshold,
+    # tightening only for the largest fields seen that day -- traded some of
+    # that cash-rate consistency (uncapped proj_top still wins cash%/top1%
+    # in every tested variant) for more "big" finishes (payout >= 10x entry,
+    # the ev_tail convention in tests/bt_core.py's accumulate_currencies)
+    # instead of occasional lucky ones. Small sample: a nearby start value
+    # (85) performed erratically worse than its neighbors, a sign the exact
+    # percentile values aren't yet distinguishable from noise at n=10 -- it's
+    # the SHAPE (loose start, gentle tightening, large fields only) that's
+    # considered worth shipping as a user-dialable control, not these
+    # specific numbers. Leave at 100/100 unless deliberately exploring this.
+    external_pool_proj_top_own_cap_start_pct: float = 100.0
+    external_pool_proj_top_own_cap_end_pct: float = 100.0
+    # External pool mode, proj_top only, off by default: swaps the *ranking
+    # signal* itself by field size instead of touching eligibility. Below
+    # 5,000 implied entries, proj_top always ranks on plain mean projected
+    # score (proj_scores), unaffected by this flag. From 5,000 up to
+    # external_pool_proj_top_medium_large_boundary, ranks on each lineup's
+    # simulated 95th-percentile score; at/above the boundary, on the 99th
+    # percentile. Both percentiles are computed once per run from the
+    # already-simulated lineup score matrix (see sim_p95_scores/sim_p99_scores
+    # in pipeline.py) — no extra simulation cost.
+    #
+    # Backtested across 10 archived slates, real payout tables, graded
+    # against real contest fields: unlike the ownership cap above, this
+    # passed the drop_max robustness check (leave-the-largest-payout-out) —
+    # p95 and p99 both beat plain mean ranking with a positive drop_max,
+    # not just a lucky top-line ROI number. The medium/large boundary showed
+    # a genuine cliff at 10,000 implied entries, not a smooth optimum,
+    # traced to a single recurring contest (Bat Flip, ~9,900 implied
+    # entries) crossing from p95 to p99 treatment; 15,000 was chosen as a
+    # defensible round number inside the flat, well-supported region above
+    # that cliff — it does not distinguishably beat 10,000-14,000, it's just
+    # not sensitive to the exact recurring-contest-size coincidence that
+    # produced the cliff. Combining this with the ownership cap above was
+    # also tested and found to hurt regardless of which ranking signal is
+    # underneath — leave the cap at 100/100 (off) when using this.
+    external_pool_proj_top_ceiling_tiers: bool = False
+    external_pool_proj_top_medium_large_boundary: float = 15000.0
     # External pool mode: per-contest ROI percentile floor for the pre-Det
     # cull (see allocate_contests in src/api/external_pool.py). A raw ROI
     # cutoff doesn't generalize across contests of different sizes/payout

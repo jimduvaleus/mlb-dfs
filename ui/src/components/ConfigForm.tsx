@@ -221,8 +221,39 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <option value="roi">ROI</option>
                 <option value="prj_own">PRJ/OWN</option>
                 <option value="p_win">P(WIN)</option>
+                <option value="proj_top">PROJ TOP</option>
               </select>
             </FieldRow>
+            {draft.gpp.external_pool_ev_type === 'proj_top' && (
+              <>
+                <p className="field-hint">
+                  Ranks purely on projected mean — best backtested currency for catching a
+                  slate's own top-10-real-score lineups, but produces a concentrated portfolio
+                  (few distinct teams, high single-player exposure). Use risk 1-5 to blend
+                  diversity back in.
+                </p>
+                <FieldRow label="Ceiling tiers (rank medium/large fields on sim p95/p99)">
+                  <input type="checkbox"
+                    checked={draft.gpp.external_pool_proj_top_ceiling_tiers ?? false}
+                    onChange={e => setGpp('external_pool_proj_top_ceiling_tiers', e.target.checked)}
+                    disabled={disabled} />
+                </FieldRow>
+                {draft.gpp.external_pool_proj_top_ceiling_tiers && (
+                  <FieldRow label="Medium/large field boundary (implied entries)">
+                    <input type="number" step={1000} min={5000}
+                      value={draft.gpp.external_pool_proj_top_medium_large_boundary ?? 15000}
+                      onChange={e => setGpp('external_pool_proj_top_medium_large_boundary', Number(e.target.value))}
+                      disabled={disabled} />
+                  </FieldRow>
+                )}
+                <p className="field-hint">
+                  Below 5,000 implied entries, proj_top always ranks on mean projected score.
+                  With ceiling tiers on, fields from 5,000 up to the boundary rank on each
+                  lineup's simulated 95th-percentile score, and fields at/above the boundary on
+                  the 99th percentile — validated on 10 archived slates (positive drop_max).
+                </p>
+              </>
+            )}
             {draft.gpp.external_pool_ev_type === 'prj_own' && (
               <FieldRow label="Ownership scale (entries)">
                 <input type="number" step={1000} min={1000}

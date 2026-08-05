@@ -40,7 +40,7 @@ export interface PortfolioConfig {
 
 // External-pool EV currency: Saber's per-contest ROI, our own projected
 // score minus ownership scaled by implied field size, or simulated P(win).
-export type ExternalEvType = 'roi' | 'prj_own' | 'p_win'
+export type ExternalEvType = 'roi' | 'prj_own' | 'p_win' | 'proj_top'
 
 export interface GppConfig {
   n_candidates: number
@@ -100,6 +100,10 @@ export interface GppConfig {
   external_pool_pwin_admit_n: number
   external_pool_pwin_admit_multiplier: number
   external_pool_pwin_field_size: number
+  external_pool_proj_top_own_cap_start_pct: number
+  external_pool_proj_top_own_cap_end_pct: number
+  external_pool_proj_top_ceiling_tiers: boolean
+  external_pool_proj_top_medium_large_boundary: number
   external_pool_roi_floor_pct: number
   external_pool_proj_score_pct: number
   external_pool_ceiling_weight: number
@@ -185,6 +189,7 @@ export type SSEStage =
   | 'ppd_applied'
   | 'external_ppd_applied'
   | 'external_proj_score_floor'
+  | 'external_owncap_cull'
   | 'external_load'
   | 'external_pool'
   | 'external_pwin'

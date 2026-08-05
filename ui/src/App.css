@@ -412,6 +412,13 @@ button { cursor: pointer; }
   opacity: 0.5;
 }
 
+.field-hint {
+  color: #a0aec0;
+  font-size: 12px;
+  margin: -2px 0 6px;
+  text-align: right;
+}
+
 .config-form-footer {
   display: flex;
   align-items: center;

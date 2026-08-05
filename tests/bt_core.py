@@ -79,6 +79,29 @@ ZIP_TO_CONTEST = {
 # Real-field / real-money grading
 # ---------------------------------------------------------------------------
 
+def prod_order(cids: list, fee, prize_pool: dict) -> list:
+    """Production's real per-contest fill order: entry fee desc, prize pool
+    asc, contest_id -- see src/api/external_pool.py::group_and_match_contests.
+    Matters because every per-contest greedy fill in this file's family
+    shares one candidate-removal mask across contests, so which contest
+    claims the pool first can change who gets what; the default (whatever
+    order an oracle's contest_id array happens to store) does not reproduce
+    this and should not be assumed to.
+
+    Returns a list of indices into `cids`/`fee` in fill order -- pass
+    directly as `order=` to backtest_lab.select_greedy or any per-contest
+    greedy fill using the same shape.
+
+    `prize_pool` should map contest_id -> the real payout table's own total
+    (e.g. `{cid: float(field[cid][1].sum()) for cid in sd.cids}` from
+    backtest_lab.load_field) -- exact, not approximated via field size.
+    Unmapped contest ids sort as if prize_pool were 0 (first among ties).
+    """
+    idx = list(range(len(cids)))
+    idx.sort(key=lambda i: (-fee[i], prize_pool.get(cids[i], 0.0), cids[i]))
+    return idx
+
+
 def load_real_contests(d: Path) -> list[dict]:
     """[{contest, contest_id, n_field, fee, sorted_scores, payout_arr}] --
     one entry per real standings zip in this slate's archive dir.
@@ -147,6 +170,35 @@ def load_real_contests(d: Path) -> list[dict]:
             "payout_arr": payout_table_to_array(struct),
         })
     return out
+
+
+def discover_fpts_zips(d: Path) -> list[dict]:
+    """[{contest_id}] for recovering real per-player FPTS -- unlike
+    load_real_contests, does not require ZIP_TO_CONTEST membership or a
+    matching payout table. verify_slate/resolve_duplicate_names only ever
+    read `contest_id` off these dicts (to locate the zip and read its
+    Player/FPTS side table), so this is enough to recover real per-player
+    FPTS on slates that have only a generic contest-standings-*.zip and no
+    named per-contest zips -- fine for a pool-internal metric that never
+    touches a payout table, even though those slates stay out of the
+    $-denominated backtest in tests/backtest.py.
+
+    Prefers named (non-generic) zips exactly like load_real_contests, and
+    only falls back to contest-standings-*.zip when no named zip exists:
+    load_real_contests' own docstring documents that the generic zip is
+    sometimes a stale, pre-stat-correction duplicate of a named zip, and
+    verify_slate hard-fails on any two zips disagreeing on a player's FPTS --
+    so including both on a slate that already has named zips would trip that
+    guard on stale data rather than genuinely conflicting sources.
+    """
+    named, generic = [], []
+    for z in sorted(d.glob("*.zip")):
+        with zipfile.ZipFile(z) as zf:
+            if not any(n.endswith(".csv") for n in zf.namelist()):
+                continue
+        entry = {"contest_id": f"{d.name}:{z.stem.lower()}"}
+        (generic if z.name.startswith("contest-standings") else named).append(entry)
+    return named or generic
 
 
 def resolve_duplicate_names(d: Path, real: list[dict], nm: pd.DataFrame) -> dict:

@@ -27,6 +27,7 @@ const STAGE_LABELS: Record<string, string> = {
   ppd_applied: 'PPD applied',
   external_ppd_applied: 'PPD applied',
   external_proj_score_floor: 'Proj-score floor',
+  external_owncap_cull: 'Ownership cap',
   external_load: 'External pool files',
   external_pool: 'External pool',
   external_pwin: 'P(win) scoring',
@@ -736,6 +737,16 @@ function renderDetail(e: SSEEvent): string {
     case 'external_proj_score_floor': {
       const ev = e as unknown as { cutoff: number; n_culled: number; percentile: number; pool_size: number }
       return `Bottom ${ev.percentile}% culled — ${ev.n_culled.toLocaleString()} of ${ev.pool_size.toLocaleString()} lineups below ${ev.cutoff.toFixed(1)} projected points`
+    }
+    case 'external_owncap_cull': {
+      const ev = e as unknown as {
+        contest: string; field_size: number; cap_pct: number; cap_cutoff: number;
+        n_before: number; n_after: number; n_culled: number;
+      }
+      return `${ev.contest} (${Math.round(ev.field_size).toLocaleString()} field): ` +
+        `${ev.n_culled.toLocaleString()} of ${ev.n_before.toLocaleString()} lineups above the ` +
+        `${ev.cap_pct.toFixed(0)}th ownership percentile (${ev.cap_cutoff.toFixed(1)} total own pts) ` +
+        `culled — ${ev.n_after.toLocaleString()} remain`
     }
     case 'external_pwin': {
       const ev = e as unknown as {

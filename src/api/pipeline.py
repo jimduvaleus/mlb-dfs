@@ -2363,7 +2363,7 @@ class PipelineRunner:
 
         gpp_cfg = cfg.get("gpp", {})
         _ev_type = str(gpp_cfg.get("external_pool_ev_type", "roi")).strip().lower()
-        if _ev_type not in ("roi", "prj_own", "p_win"):
+        if _ev_type not in ("roi", "prj_own", "p_win", "proj_top"):
             logger.warning(
                 "External pool: unknown external_pool_ev_type %r — falling back to 'roi'.",
                 _ev_type,
@@ -2454,6 +2454,14 @@ class PipelineRunner:
         corr = ep.compute_pool_corr(pool.lineups, sim_results, scores=lineup_scores)
         proj_scores = ep.compute_pool_proj_scores(pool.lineups, players_df)
         own_scores = ep.compute_pool_ownership(pool.lineups, players_df)
+        # Field-blind percentiles of the already-computed simulated score
+        # matrix -- cheap (no new simulation), only consulted when proj_top's
+        # ceiling-tier ranking signal is enabled (see external_pool_proj_top_
+        # ceiling_tiers below), but computed unconditionally here alongside
+        # proj_scores/own_scores to match their risk-invariant precompute
+        # pattern.
+        sim_p95_scores = np.percentile(lineup_scores, 95, axis=1)
+        sim_p99_scores = np.percentile(lineup_scores, 99, axis=1)
         # Already percentage points here ("My Own" is not divided by 100 in
         # parse_player_projections), unlike the internal pipeline's fractions.
         self._ownership_pct = {
@@ -2537,6 +2545,69 @@ class PipelineRunner:
                 "External pool: %d entries but only %d lineups — later "
                 "contests will be left unfilled.", total_entries, len(pool.lineups),
             )
+
+        # --- proj_top ownership cap (large fields only, off by default) ----
+        # Risk-invariant (like corr/proj_floor/own_scores), so computed once
+        # and handed to every allocate_contests call in the sweep below.
+        _owncap_start_pct = float(gpp_cfg.get("external_pool_proj_top_own_cap_start_pct", 100.0))
+        _owncap_end_pct = float(gpp_cfg.get("external_pool_proj_top_own_cap_end_pct", 100.0))
+        if _owncap_start_pct < _owncap_end_pct:
+            logger.warning(
+                "External pool: proj_top ownership cap start_pct (%s) < end_pct "
+                "(%s) — swapping so the phase-in stays loose-then-tight.",
+                _owncap_start_pct, _owncap_end_pct,
+            )
+            _owncap_start_pct, _owncap_end_pct = _owncap_end_pct, _owncap_start_pct
+        _owncap_max_field_size = max((ep.implied_field_size(g) for g in groups), default=0.0)
+        if _ev_type == "proj_top" and (_owncap_start_pct < 100.0 or _owncap_end_pct < 100.0):
+            # Diagnostic-only preview, one line per large-field contest, using
+            # the INITIAL pool-wide floor mask (before any contest has
+            # claimed anything) — the same mask allocate_contests seeds
+            # internally, reconstructed here purely for reporting. This is
+            # deliberately NOT read from inside the risk sweep: the actual
+            # per-risk-tier cull count can drift slightly contest-to-contest
+            # (the shared removal mask evolves differently per risk, since
+            # each risk tier picks different specific lineups upstream), so
+            # a live-per-risk number would be noisy without being more
+            # accurate — the pre-allocation preview is the risk-invariant,
+            # honest answer to "how many lineups does this cap remove".
+            _owncap_pool_mask = np.isfinite(proj_scores)
+            if _proj_floor is not None:
+                _owncap_pool_mask &= proj_scores >= _proj_cutoff
+            _owncap_basis = own_scores[_owncap_pool_mask & np.isfinite(own_scores)]
+            if _owncap_basis.size > 0:
+                _owncap_threshold = ep._SMALL_FIELD_THRESHOLD
+                _owncap_span = _owncap_max_field_size - _owncap_threshold
+                for g in groups:
+                    _field_size = ep.implied_field_size(g)
+                    if _field_size < _owncap_threshold:
+                        continue
+                    _frac = (_field_size - _owncap_threshold) / _owncap_span if _owncap_span > 0 else 0.0
+                    _frac = min(max(_frac, 0.0), 1.0)
+                    _pct = _owncap_start_pct + _frac * (_owncap_end_pct - _owncap_start_pct)
+                    _cutoff = float(np.percentile(_owncap_basis, _pct))
+                    _n_before = int(_owncap_pool_mask.sum())
+                    _n_after = int((_owncap_pool_mask & np.isfinite(own_scores)
+                                   & (own_scores <= _cutoff)).sum())
+                    self._cb("external_owncap_cull", {
+                        "contest": g.contest_name,
+                        "field_size": _field_size,
+                        "cap_pct": _pct,
+                        "cap_cutoff": _cutoff,
+                        "n_before": _n_before,
+                        "n_after": _n_after,
+                        "n_culled": _n_before - _n_after,
+                    })
+
+        # --- proj_top ceiling-tier ranking signal (off by default) ---------
+        # Risk-invariant, computed once alongside the ownership cap above.
+        # sim_p95_scores/sim_p99_scores were already precomputed from the
+        # simulated score matrix regardless of this flag (see above).
+        _ceiling_tiers_on = bool(gpp_cfg.get("external_pool_proj_top_ceiling_tiers", False))
+        _ceiling_tier_boundary = (
+            float(gpp_cfg.get("external_pool_proj_top_medium_large_boundary", 15000.0))
+            if _ceiling_tiers_on else None
+        )
 
         # --- p_win EV currency: simulated P(win) against an ownership-
         # sampled opponent field, two-stage to guard the winner's curse ----
@@ -2661,6 +2732,12 @@ class PipelineRunner:
                 ev_type=_ev_type,
                 own_scores=own_scores,
                 own_scale=_own_scale,
+                own_cap_start_pct=_owncap_start_pct,
+                own_cap_end_pct=_owncap_end_pct,
+                own_cap_max_field_size=_owncap_max_field_size,
+                sim_p95_scores=sim_p95_scores,
+                sim_p99_scores=sim_p99_scores,
+                ceiling_tier_boundary=_ceiling_tier_boundary,
                 p_win_cull=_p_win_cull,
                 p_win_select=_p_win_select,
                 p_win_admit_n=_p_win_admit_n,

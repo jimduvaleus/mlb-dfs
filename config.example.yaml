@@ -92,13 +92,17 @@ gpp:
   dupe_salary_coef: 0.095
   dupe_stack_coef: -0.102
   dupe_min_gross_payout: 15.0
-  external_pool_ev_type: roi        # roi | prj_own | p_win
+  external_pool_ev_type: roi        # roi | prj_own | p_win | proj_top
   external_pool_own_scale: 30000.0  # prj_own: field size where 1 ownership pt == 1 proj pt
   external_pool_pwin_sharpness: 0.05 # p_win: exponent multiplier on an entry count (1.0 = literal P(win); calibrated lower, see models.py). With flat_reference below, the count is that fixed reference rather than each contest's implied entries
   external_pool_pwin_admit_n: 2000  # p_win stage-A cull window (flat -- see multiplier below). 100 (max(100,1.5x) scaled) was the prior default, validated on an 8-slate replay-harness sweep; SUPERSEDED 2026-07-31: a real-money 7-slate/21-draw backtest (tests/backtest.py) with exact payout tables + real fields found this wider flat-2000 window beats it at p=0.007-0.03 on 5/6 alternate arms -- do not revert without new empirical evidence (see memory project-flat2000-live-override-20260731)
   external_pool_pwin_admit_multiplier: 0.0  # 0 = flat admit_n (matches the 2026-07-27/07-28 era, before this field existed). 1.5 (max(floor,1.5x), guaranteeing the largest contest fills) was the prior default; superseded alongside admit_n above
   external_pool_pwin_field_size: 0  # p_win: simulated opponent field size (0 = auto via pwin_field_size)
   external_pool_pwin_flat_reference: 0.0  # p_win: >0 gives every contest one flat exponent (sharpness x this). 0 = per-contest scaling, the VALIDATED setting (flat costs ~1.75% $/entry and wrecks the chalk-to-small-fields gradient)
+  external_pool_proj_top_own_cap_start_pct: 100.0  # proj_top only, field size >= 5,000: ownership-percentile cap, loose (threshold) end. 100 = off (default; unvalidated, see models.py)
+  external_pool_proj_top_own_cap_end_pct: 100.0    # proj_top only: cap percentile, tight end (today's largest implied field size). 100 = off
+  external_pool_proj_top_ceiling_tiers: false       # proj_top only: rank medium/large fields on sim p95/p99 instead of mean proj_score. VALIDATED (drop_max-positive), off by default -- do not combine with the ownership cap above (tested, hurts). See models.py
+  external_pool_proj_top_medium_large_boundary: 15000.0  # proj_top ceiling tiers only: implied-field-size boundary between p95 (medium) and p99 (large) treatment
   external_pool_roi_floor_pct: 40.0
   external_pool_proj_score_pct: 0.0
   external_pool_ceiling_weight: 0.25
