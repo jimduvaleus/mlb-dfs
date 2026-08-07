@@ -1,0 +1,31 @@
+{
+  "name": "DraftKings $8 Rally Cap ($200K)",
+  "entry_fee": 8.0,
+  "total_entries": 29411,
+  "total_payout_positions": 6445,
+  "source": "real DK contest payout table, captured 2026-08-04 (08/03 slate size). Entry fee not directly stated in the captured table (no Entries.csv this slate) -- inferred from the tiers summing to an exact $200,000 (clean GTD figure) and every prior captured Rally Cap size being $8: 200000 / 29411 / 0.84 (rake) = $8.10, matching within rake-model rounding.",
+  "payouts": [
+    { "start": 1, "end": 1, "amount": 50000.0 },
+    { "start": 2, "end": 2, "amount": 20000.0 },
+    { "start": 3, "end": 3, "amount": 10000.0 },
+    { "start": 4, "end": 4, "amount": 5000.0 },
+    { "start": 5, "end": 5, "amount": 4000.0 },
+    { "start": 6, "end": 6, "amount": 3000.0 },
+    { "start": 7, "end": 7, "amount": 2000.0 },
+    { "start": 8, "end": 8, "amount": 1500.0 },
+    { "start": 9, "end": 10, "amount": 1000.0 },
+    { "start": 11, "end": 12, "amount": 700.0 },
+    { "start": 13, "end": 15, "amount": 500.0 },
+    { "start": 16, "end": 20, "amount": 300.0 },
+    { "start": 21, "end": 25, "amount": 200.0 },
+    { "start": 26, "end": 35, "amount": 150.0 },
+    { "start": 36, "end": 55, "amount": 100.0 },
+    { "start": 56, "end": 90, "amount": 75.0 },
+    { "start": 91, "end": 160, "amount": 50.0 },
+    { "start": 161, "end": 300, "amount": 30.0 },
+    { "start": 301, "end": 500, "amount": 25.0 },
+    { "start": 501, "end": 900, "amount": 20.0 },
+    { "start": 901, "end": 2145, "amount": 15.0 },
+    { "start": 2146, "end": 6445, "amount": 12.0 }
+  ]
+}

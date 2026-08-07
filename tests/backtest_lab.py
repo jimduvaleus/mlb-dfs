@@ -121,6 +121,26 @@ def load_field(slate: str) -> dict:
     return {cid: (z[f"scores_{j}"], z[f"payout_{j}"]) for j, cid in enumerate(cids)}
 
 
+@functools.lru_cache(maxsize=None)
+def load_leverage(slate: str) -> dict:
+    """Optimal-ownership/leverage sidecar from
+    tests/backtest_oracle.py::build_leverage (src/optimization/leverage.py,
+    plan doc need-a-plan-to-squishy-sutherland.md): contest_id-aligned (C, M)
+    p_opt/leverage_ratio_mean and (C, P) player-level optimal_ownership/
+    leverage_diff/leverage_ratio, plus the player_id row order the (C, P)
+    arrays use."""
+    z = np.load(ORACLE_DIR / f"{slate}_leverage.npz", allow_pickle=False)
+    return {
+        "contest_id": [str(x) for x in z["contest_id"]],
+        "player_id": z["player_id"],
+        "p_opt": z["p_opt"],
+        "leverage_ratio_mean": z["leverage_ratio_mean"],
+        "optimal_ownership": z["optimal_ownership"],
+        "leverage_diff": z["leverage_diff"],
+        "leverage_ratio": z["leverage_ratio"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Selection
 # ---------------------------------------------------------------------------
@@ -238,6 +258,66 @@ def select_assign(sd: SlateData, sel: np.ndarray, cull: np.ndarray, *,
         if cost[r, c] >= 1e17:
             continue
         picks[sd.cids[col_ci[c]]].append(int(rows[r]))
+    return picks
+
+
+def select_leverage(sd: SlateData, *, floor_pct: float = 30.0,
+                    target_anchor_c: float = 1.0,
+                    band_widen_steps: tuple = (1.0, 0.5, 0.25, 0.1, 0.01),
+                    min_candidates: int = None, coverage_weight: float = 0.5,
+                    prefer_leverage_over_sizing: bool = True,
+                    order: list = None) -> dict:
+    """Per-contest LeveragePortfolioSelector picks (src/optimization/
+    gpp_portfolio.py, plan doc need-a-plan-to-squishy-sutherland.md),
+    sharing one removal mask across contests exactly like select_greedy (a
+    lineup used in one contest is unavailable to the rest of the slate).
+
+    Doesn't fit select_greedy's generic argsort-or-DeterminantSelector shape
+    (it needs LeveragePortfolioSelector's own band-widening + regret-
+    minimization loop per contest), so this is its own small multi-contest
+    driver -- the same role _a1_pick's per-arm dispatch plays for arms that
+    don't fit build_arms()'s (currency, mode, kwargs) tuple shape, just
+    factored out as a reusable function since (unlike A1's one-off arms)
+    this is meant to be swept over parameters (target_anchor_c etc).
+    """
+    from src.optimization.gpp_portfolio import LeveragePortfolioSelector
+
+    lev = load_leverage(sd.slate)
+    assert lev["contest_id"] == sd.cids, f"{sd.slate}: leverage/real contest_id drift"
+    with np.load(ORACLE_DIR / f"{sd.slate}_real.npz", allow_pickle=False) as z:
+        pids_arr = z["player_ids"]                      # (M, roster_size)
+    id_to_row = {int(pid): i for i, pid in enumerate(lev["player_id"])}
+    P, M, roster_size = len(lev["player_id"]), pids_arr.shape[0], pids_arr.shape[1]
+    I = np.zeros((P, M), dtype=np.float64)
+    rows = np.repeat(np.arange(M), roster_size)
+    cols = np.array([id_to_row[int(p)] for p in pids_arr.reshape(-1)])
+    I[cols, rows] = 1.0
+
+    mask = proj_floor_mask(sd, floor_pct)
+    picks: dict = {}
+    for ci in (order if order is not None else range(len(sd.cids))):
+        k = int(sd.k[ci])
+        if k <= 0:
+            continue
+        rem = np.where(mask & np.isfinite(lev["p_opt"][ci]))[0]
+        if len(rem) == 0:
+            continue
+        sel = LeveragePortfolioSelector(
+            candidates=list(rem), portfolio_size=k,
+            p_opt=lev["p_opt"][ci][rem],
+            optimal_ownership=lev["optimal_ownership"][ci],
+            leverage_diff=lev["leverage_diff"][ci],
+            leverage_ratio=lev["leverage_ratio"][ci],
+            player_indicator=I[:, rem], field_size=float(sd.n_field[ci]),
+            target_anchor_c=target_anchor_c, band_widen_steps=band_widen_steps,
+            min_candidates=min_candidates, coverage_weight=coverage_weight,
+            prefer_leverage_over_sizing=prefer_leverage_over_sizing,
+        )
+        chosen = [int(c) for c, _ in sel.select()]
+        if not chosen:
+            continue
+        picks[sd.cids[ci]] = chosen
+        mask[chosen] = False
     return picks
 
 
@@ -703,6 +783,13 @@ def _candidate_currencies(sd: SlateData) -> dict:
     # projected score minus an ownership penalty scaled by field size.
     proj, own = sd.feats["proj_score"], sd.feats["own_sum"]
     out["prj_own"] = np.stack([proj - own * (nf / 30_000.0) for nf in sd.n_field])
+    # Leverage currency (plan doc need-a-plan-to-squishy-sutherland.md):
+    # per-candidate mean leverage_ratio across its rostered players, at
+    # THIS contest's field-size bucket -- field-size-dependent like
+    # prj_own above, not a global currency sd.currency() would broadcast.
+    lev = load_leverage(sd.slate)
+    assert lev["contest_id"] == sd.cids, f"{sd.slate}: leverage/real contest_id drift"
+    out["leverage"] = lev["leverage_ratio_mean"]
     # Rank-space contrarian blends: equal-weighted so neither term's scale
     # decides the ranking, which the raw prj_own subtraction lets it do.
     rp, ro = _rank_norm(proj), _rank_norm(own)
@@ -964,6 +1051,54 @@ def cmd_arms(seed: int = 42, calib: bool = False) -> None:
     df.to_csv(out, index=False)
     res = report(df, baseline="prod_p_win")
     print_report(res, f"PORTFOLIO ARMS (seed {seed}, calib={calib}, "
+                      f"{df.slate.nunique()} slates)")
+    print(f"\nwrote {out}")
+
+
+def run_leverage_arms(seed: int = 42, calib: bool = False, slates=None) -> pd.DataFrame:
+    """leverage (full LeveragePortfolioSelector) vs leverage_rank_only (the
+    same currency, plain top-K rank via select_greedy -- isolates whether
+    the band-widening/regret-minimization machinery adds anything over just
+    ranking on leverage) vs prod_p_win/random reference points. Graded via
+    grade_joint (not grade) throughout: the leverage arm places multiple of
+    our own entries into the same contest, so self-displacement/self-tie-
+    splitting/self-dupe-prize-splitting matter -- see bt_core.grade_portfolio.
+    """
+    slates = [s for s in (slates or BACKTEST_SLATES)
+              if (ORACLE_DIR / f"{s}_real.npz").exists()
+              and (ORACLE_DIR / f"{s}_leverage.npz").exists()]
+    frames = []
+    for s in slates:
+        sd = load_slate(s, seed, calib)
+        curs = _candidate_currencies(sd)
+        curs_A = {"p_win": sd.currency("p_win", "A")}
+
+        picks = select_leverage(sd)
+        frames.append(grade_joint(sd, picks, "leverage"))
+
+        picks = select_greedy(sd, curs["leverage"], curs["leverage"],
+                              floor_pct=30.0, admit_n=2000)
+        frames.append(grade_joint(sd, picks, "leverage_rank_only"))
+
+        picks = select_greedy(sd, curs["p_win"], curs_A["p_win"],
+                              floor_pct=30.0, admit_n=2000)
+        frames.append(grade_joint(sd, picks, "prod_p_win"))
+
+        import zlib
+        rng = np.random.default_rng(
+            zlib.crc32(f"{s}|{seed}|random".encode()) & 0xFFFFFFFF)
+        picks = select_greedy(sd, curs["p_win"], curs_A["p_win"],
+                              floor_pct=30.0, admit_n=0, rng=rng)
+        frames.append(grade_joint(sd, picks, "random"))
+    return pd.concat([f for f in frames if not f.empty], ignore_index=True)
+
+
+def cmd_leverage_arms(seed: int = 42, calib: bool = False, slates=None) -> None:
+    df = run_leverage_arms(seed, calib, slates)
+    out = ORACLE_DIR.parent / f"lab_leverage_arms_s{seed}_c{int(calib)}.csv"
+    df.to_csv(out, index=False)
+    res = report(df, baseline="prod_p_win")
+    print_report(res, f"LEVERAGE SELECTOR ARMS (seed {seed}, calib={calib}, "
                       f"{df.slate.nunique()} slates)")
     print(f"\nwrote {out}")
 
@@ -2181,6 +2316,8 @@ def main() -> None:
         cmd_currencies()
     elif cmd == "arms":
         cmd_arms()
+    elif cmd == "leverage_arms":
+        cmd_leverage_arms()
     elif cmd == "model":
         cmd_model()
     elif cmd == "stages":
@@ -2202,8 +2339,8 @@ def main() -> None:
     else:
         raise SystemExit(
             f"unknown command {cmd!r} "
-            "(verify|currencies|stages|arms|model|selector|null|slices|"
-            "seedcheck|own|jointcheck|adjudicate)")
+            "(verify|currencies|stages|arms|leverage_arms|model|selector|null|"
+            "slices|seedcheck|own|jointcheck|adjudicate)")
 
 
 if __name__ == "__main__":

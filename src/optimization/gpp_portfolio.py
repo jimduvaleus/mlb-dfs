@@ -1441,3 +1441,152 @@ class CoveragePortfolioSelector:
             len(result), min(n_anchor, size), bits.shape[1], time.perf_counter() - t0,
         )
         return result
+
+
+class LeveragePortfolioSelector:
+    """Field-size-anchored candidate subsetting plus a regret-minimization
+    greedy loop, built on the leverage/optimal-ownership currency in
+    src/optimization/leverage.py (see plan doc
+    need-a-plan-to-squishy-sutherland.md for the full design).
+
+    Step 1 (subsetting, _admissible_subset): admit candidates whose
+    per-candidate p_opt clears a threshold anchored at target_anchor_c /
+    field_size -- the same "how big a longshot is justified by this field
+    size" reasoning p_win's exponent already encodes, applied here to gate
+    which candidates are even eligible rather than to rank them. Only a
+    LOWER bound: a candidate more likely to be optimal than the anchor is
+    never excluded for being "too safe" -- an overly-chalky candidate will
+    already show low or negative leverage and lose in step 2, so excluding
+    it here too would be redundant gatekeeping on the same signal twice.
+    When fewer than min_candidates clear the threshold, the threshold is
+    repeatedly LOWERED (band_widen_steps, multiples of the anchor) rather
+    than raised: p_opt mass concentrates at the low end of a large pool, so
+    admitting more candidates means accepting smaller p_opt, not chasing an
+    even rarer one. If even the most permissive step still falls short,
+    prefer_leverage_over_sizing (default True, matching the user's stated
+    preference) drops the size-fit gate entirely for that contest rather
+    than shorting the portfolio.
+
+    Step 2 (select, greedy): each pick is scored by a weighted blend of
+    (a) the candidate's own mean leverage_ratio across its rostered
+    players -- the ratio form, not the raw percentage-point diff, so a
+    30%-vs-27%-projected player and a 6%-vs-3%-projected player (same 3pt
+    diff, very different relative mispricing) aren't scored the same -- and
+    (b) how much picking it would close the gap between a running
+    per-player usage count and target_count[p] = portfolio_size *
+    optimal_ownership[p]/100, computed only for POSITIVE-leverage players
+    (no reason to chase coverage of a player already thought to be
+    over-owned). This is the "regret minimization" / player-coverage idea:
+    the same target-count/residual-gap pattern
+    scripts/select_needlunchmoney_pool.py's select_portfolio already uses
+    for a single scalar (pitcher_target_count), generalized to the whole
+    positive-leverage player set via one indicator matmul per step (the
+    continuous analogue of CoveragePortfolioSelector's popcount-gain loop).
+    """
+
+    def __init__(
+        self,
+        candidates: list,
+        portfolio_size: int,
+        p_opt: np.ndarray,               # (M,) this contest's field-size bucket
+        optimal_ownership: np.ndarray,   # (P,) percentage points, aligned to player_indicator rows
+        leverage_diff: np.ndarray,       # (P,) percentage points, same row order
+        leverage_ratio: np.ndarray,      # (P,) same row order
+        player_indicator: np.ndarray,    # (P, M) 0/1, from compute_lineup_scores's indicator matrix
+        field_size: float,
+        target_anchor_c: float = 1.0,
+        band_widen_steps: tuple = (1.0, 0.5, 0.25, 0.1, 0.01),
+        min_candidates: Optional[int] = None,
+        coverage_weight: float = 0.5,
+        prefer_leverage_over_sizing: bool = True,
+    ) -> None:
+        self._candidates = candidates
+        self._portfolio_size = portfolio_size
+        self._p_opt = np.asarray(p_opt, dtype=np.float64)
+        self._optimal_ownership = np.asarray(optimal_ownership, dtype=np.float64)
+        self._leverage_diff = np.asarray(leverage_diff, dtype=np.float64)
+        self._leverage_ratio = np.asarray(leverage_ratio, dtype=np.float64)
+        self._I = np.asarray(player_indicator)
+        self._field_size = float(field_size)
+        self._target_anchor_c = float(target_anchor_c)
+        self._band_widen_steps = tuple(band_widen_steps)
+        # Matches the p_win admit_n convention elsewhere in this codebase
+        # (memory: admit_n recalibration, max(100, 1.5x entries)) rather
+        # than inventing a new multiplier.
+        self._min_candidates = (
+            min_candidates if min_candidates is not None
+            else max(100, int(round(1.5 * portfolio_size)))
+        )
+        self._coverage_weight = float(coverage_weight)
+        self._prefer_leverage_over_sizing = bool(prefer_leverage_over_sizing)
+
+    def _admissible_subset(self) -> np.ndarray:
+        """Indices into candidates/p_opt/player_indicator columns admitted
+        by the band-widening p_opt >= threshold gate."""
+        M = len(self._candidates)
+        target_n = min(self._min_candidates, M)
+        anchor = self._target_anchor_c / max(self._field_size, 1.0)
+        widest = np.array([], dtype=np.int64)
+        for mult in self._band_widen_steps:
+            idx = np.where(self._p_opt >= anchor * mult)[0]
+            widest = idx
+            if len(idx) >= target_n:
+                return idx
+        if self._prefer_leverage_over_sizing:
+            return np.where(np.isfinite(self._p_opt))[0]
+        return widest
+
+    def select(
+        self,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> list[tuple[Lineup, float]]:
+        t0 = time.perf_counter()
+        idx = self._admissible_subset()
+        if len(idx) == 0:
+            logger.warning("LeverageSelector: no candidates cleared the p_opt gate.")
+            return []
+        I = self._I[:, idx].astype(np.float64)          # (P, M_sub)
+        roster_size = np.maximum(I.sum(axis=0), 1.0)     # (M_sub,), defensively floored
+        candidate_leverage = (I.T @ self._leverage_ratio) / roster_size  # (M_sub,)
+
+        positive = self._leverage_diff > 0.0
+        target_count = np.where(positive, self._optimal_ownership / 100.0 * self._portfolio_size, 0.0)
+        usage = np.zeros(self._I.shape[0], dtype=np.float64)
+
+        size = min(self._portfolio_size, len(idx))
+        selected: list[int] = []
+        remaining = np.ones(len(idx), dtype=bool)
+
+        lev_lo, lev_hi = float(candidate_leverage.min()), float(candidate_leverage.max())
+        lev_span = max(lev_hi - lev_lo, 1e-9)
+        lev_norm = (candidate_leverage - lev_lo) / lev_span
+
+        for k in range(size):
+            if stop_check is not None and stop_check():
+                logger.info("LeverageSelector: stop requested at step %d.", k + 1)
+                break
+            gap = np.maximum(target_count - usage, 0.0)
+            gain = I.T @ np.minimum(gap, 1.0)             # (M_sub,)
+            gain_norm = gain / max(float(gain.max()), 1e-9)
+            score = (1.0 - self._coverage_weight) * lev_norm + self._coverage_weight * gain_norm
+            score = np.where(remaining, score, -np.inf)
+            best = int(np.argmax(score))
+            selected.append(best)
+            remaining[best] = False
+            usage += I[:, best]
+            if progress_cb is not None:
+                progress_cb({
+                    "step": k + 1, "portfolio_size": size,
+                    "lineup_leverage": float(candidate_leverage[best]),
+                    "coverage_gap_remaining": float(gap.sum()),
+                    "n_remaining": int(remaining.sum()),
+                })
+
+        result = [(self._candidates[idx[i]], float(candidate_leverage[i])) for i in selected]
+        logger.info(
+            "LeverageSelector done: %d lineups (subset=%d/%d, field_size=%.0f) in %.1fs",
+            len(result), len(idx), len(self._candidates), self._field_size,
+            time.perf_counter() - t0,
+        )
+        return result

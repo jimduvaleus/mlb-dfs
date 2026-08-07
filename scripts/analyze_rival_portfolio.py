@@ -55,16 +55,12 @@ _SPLIT = re.compile(r"\s*\b(" + "|".join(_POS) + r")\b\s+")
 _ENTRY_SUFFIX = re.compile(r"\s*\(\d+/\d+\)\s*$")
 
 
-def parse_standings(archive_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """(entries, field_players). The standings CSV holds two tables side by
-    side separated by an empty column: per-entry results on the left, the
-    player %Drafted/FPTS sidebar on the right."""
-    zips = sorted(archive_dir.glob("contest-standings-*.zip"))
-    if not zips:
-        raise FileNotFoundError(f"no contest-standings zip in {archive_dir}")
-    with zipfile.ZipFile(zips[0]) as zf:
-        name = next(n for n in zf.namelist() if n.endswith(".csv"))
-        rows = list(csv.reader(io.StringIO(zf.read(name).decode("utf-8-sig"))))
+def parse_standings_rows(rows: list[list[str]]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(entries, field_players) from an already-decoded standings CSV's rows.
+    The standings CSV holds two tables side by side separated by an empty
+    column: per-entry results on the left, the player %Drafted/FPTS sidebar
+    on the right. Shared by parse_standings (the UI-dupe zip, one contest)
+    and any caller that loops the named per-contest zips instead."""
     hdr = rows[0]
     ci = {c: i for i, c in enumerate(hdr) if c}
     entries, players = [], []
@@ -88,6 +84,18 @@ def parse_standings(archive_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     e["names"] = e["lineup_raw"].map(lambda s: tuple(sorted(x for x in _SPLIT.split(s)[1:][1::2])))
     e["handle"] = e["entry_name"].map(lambda s: _ENTRY_SUFFIX.sub("", s))
     return e, pd.DataFrame(players)
+
+
+def parse_standings(archive_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(entries, field_players) for the UI-dupe contest-standings zip (one
+    contest per slate -- whichever the operator last exported from DK)."""
+    zips = sorted(archive_dir.glob("contest-standings-*.zip"))
+    if not zips:
+        raise FileNotFoundError(f"no contest-standings zip in {archive_dir}")
+    with zipfile.ZipFile(zips[0]) as zf:
+        name = next(n for n in zf.namelist() if n.endswith(".csv"))
+        rows = list(csv.reader(io.StringIO(zf.read(name).decode("utf-8-sig"))))
+    return parse_standings_rows(rows)
 
 
 def team_map(archive_dir: Path) -> dict:

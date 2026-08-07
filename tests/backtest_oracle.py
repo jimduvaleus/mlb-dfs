@@ -52,6 +52,10 @@ from tests.bt_core import (  # noqa: E402
     BACKTEST_SLATES, LIVE_CFG, accumulate_currencies, build_slate_context,
     grade_pool, load_real_contests, verify_slate,
 )
+from src.api.external_pool import _lineup_indicator_matrix  # noqa: E402
+from src.optimization.leverage import (  # noqa: E402
+    compute_candidate_p_opt, compute_leverage, compute_optimal_ownership,
+)
 
 OUT_DIR = PROJECT_ROOT / "tests" / "backtest_output"
 ORACLE_DIR = OUT_DIR / "oracle"
@@ -277,6 +281,84 @@ def build_field(slate: str) -> Path:
     return path
 
 
+def build_leverage(slate: str, seed: int = None) -> Path:
+    """{slate}_leverage.npz -- optimal-ownership/leverage per real contest's
+    field-size bucket (src/optimization/leverage.py, plan doc
+    need-a-plan-to-squishy-sutherland.md), sidecar to {slate}_real.npz.
+
+    Single seed (default SEEDS[0], matching lineup_features' own convention)
+    rather than the two-independent-draw pattern p_win uses: Phase A
+    (scripts/analyze_optimal_ownership.py, 2026-08-07) measured near-perfect
+    (r=1.000) stability of the player-level optimal-ownership aggregate
+    across 3 seeds x 2 independent-draw halves on all 10 archived slates --
+    a single seed here is not a shortcut taken for expedience, it's what
+    that evidence supports. (p_win's own winner's-curse guard exists for a
+    different reason -- per-CANDIDATE p_opt is noisier than its player-level
+    aggregate, see leverage.py's resolution-cap docstring -- so this is not
+    a precedent for dropping p_win's two-draw split.)
+
+    Aligned to the SAME contest_id order as {slate}_real.npz (like
+    {slate}_field.npz) -- drift between the two is a hard failure, not a
+    warning, since a silent misalignment would score a candidate's leverage
+    against the wrong contest's field size.
+    """
+    path = ORACLE_DIR / f"{slate}_leverage.npz"
+    if path.exists():
+        return path
+    seed = SEEDS[0] if seed is None else seed
+    real_path = ORACLE_DIR / f"{slate}_real.npz"
+    if not real_path.exists():
+        build_real(slate)
+    with np.load(real_path, allow_pickle=False) as z:
+        real_cids = [str(x) for x in z["contest_id"]]
+        n_field_by_cid = dict(zip(real_cids, z["n_field"]))
+
+    d = PROJECT_ROOT / "archive" / slate
+    real = load_real_contests(d)
+    ctx = build_slate_context(d, seed, False, real, n_sims=N_SIMS,
+                              sharpness=SHARPNESS, sim_cache_dir=SIM_CACHE_DIR,
+                              want_corr=False, want_pwin=False)
+    pool, players_df, sim_results = ctx["pool"], ctx["players_df"], ctx["sim_results"]
+
+    field_sizes = {cid: float(n_field_by_cid[cid]) for cid in real_cids}
+    p_opt = compute_candidate_p_opt(pool.lineups, sim_results, field_sizes, sharpness=SHARPNESS)
+    optimal_own = compute_optimal_ownership(
+        pool.lineups, sim_results, players_df, field_sizes, sharpness=SHARPNESS,
+    )
+
+    player_id = players_df["player_id"].to_numpy()
+    I = _lineup_indicator_matrix(pool.lineups, player_id.tolist())  # (P, M)
+    roster_size = np.maximum(I.sum(axis=0), 1.0)                    # (M,)
+
+    C, M, P = len(real_cids), len(pool.lineups), len(player_id)
+    p_opt_mat = np.zeros((C, M), dtype=np.float64)
+    lev_ratio_mean = np.zeros((C, M), dtype=np.float64)   # per-candidate, feeds backtest_lab's "leverage" currency
+    optimal_own_mat = np.zeros((C, P), dtype=np.float64)
+    lev_diff_mat = np.zeros((C, P), dtype=np.float64)
+    lev_ratio_mat = np.zeros((C, P), dtype=np.float64)
+    for j, cid in enumerate(real_cids):
+        p_opt_mat[j] = p_opt[cid]
+        O_c = optimal_own[cid]
+        diff, ratio = compute_leverage(O_c, players_df)
+        optimal_own_mat[j] = O_c
+        lev_diff_mat[j] = diff
+        lev_ratio_mat[j] = ratio
+        lev_ratio_mean[j] = (I.T @ ratio) / roster_size
+
+    ORACLE_DIR.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        path,
+        contest_id=np.array(real_cids),
+        player_id=player_id,
+        p_opt=p_opt_mat,
+        leverage_ratio_mean=lev_ratio_mean,
+        optimal_ownership=optimal_own_mat,
+        leverage_diff=lev_diff_mat,
+        leverage_ratio=lev_ratio_mat,
+    )
+    return path
+
+
 def main() -> None:
     if sys.argv[1:2] == ["repair"]:
         for slate in ([s for s in sys.argv[2:] if s.isdigit()] or BACKTEST_SLATES):
@@ -289,6 +371,12 @@ def main() -> None:
             build_field(slate)
             print(f"  {slate}: field sidecar ready")
         return
+    if sys.argv[1:2] == ["leverage"]:
+        for slate in ([s for s in sys.argv[2:] if s.isdigit()] or BACKTEST_SLATES):
+            t0 = time.time()
+            build_leverage(slate)
+            print(f"  {slate}: leverage sidecar ready in {time.time() - t0:.0f}s", flush=True)
+        return
     slates = [s for s in sys.argv[1:] if s.isdigit()] or BACKTEST_SLATES
     ORACLE_DIR.mkdir(parents=True, exist_ok=True)
     for slate in slates:
@@ -298,6 +386,7 @@ def main() -> None:
             for calib in (False, True):
                 build_currencies(slate, seed, calib)
         build_field(slate)
+        build_leverage(slate)
         print(f"  {slate}: currencies for {len(SEEDS)} seed(s) x2 calib "
               f"in {time.time() - t0:.0f}s", flush=True)
     print(f"\noracle -> {ORACLE_DIR}")
