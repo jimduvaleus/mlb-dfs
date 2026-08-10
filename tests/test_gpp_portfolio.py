@@ -8,7 +8,10 @@ from src.optimization.gpp_portfolio import (
     _build_dilutable_lookup,
     _build_payout_lookup,
     _compute_payout_from_sorted_field,
+    _compute_payout_tiered,
     _payout_cumsum,
+    _tier_boundaries,
+    _tier_partition,
 )
 from src.optimization.lineup import Lineup
 from src.optimization.ownership import compute_heuristic_ownership
@@ -231,6 +234,150 @@ def test_payout_kernel_output_shape():
     result = _kernel(cand, field, lookup)
     assert result.shape == (BATCH, n_sims)
     assert result.dtype == np.float32
+
+
+# ------------------------------------------------------------------ #
+#  Tiered payout kernel (_compute_payout_tiered) -- must match          #
+#  _compute_payout_from_sorted_field EXACTLY; ground truth is the       #
+#  existing (already-trusted) full-sort kernel, not hand derivation.    #
+# ------------------------------------------------------------------ #
+
+def _tiered_kernel(cand, field_raw, gross_arr, N, entry_fee=0.0, dilute_min_gross=None, dupe_scale=None):
+    """Mirrors _kernel's helper shape, but for the tiered path -- takes the
+    real gross payout array (not a prebuilt lookup) since _tier_boundaries
+    needs the lookup built at the SAME N as the field being partitioned."""
+    lookup = _build_payout_lookup(gross_arr, N=N, entry_fee=entry_fee)
+    cs = _payout_cumsum(lookup)
+    if dilute_min_gross is not None:
+        dilute_lookup = _build_dilutable_lookup(gross_arr, N=N, min_gross_payout=dilute_min_gross)
+        dil = _payout_cumsum(dilute_lookup)
+    else:
+        dil = np.zeros_like(cs)
+    scale = (
+        dupe_scale.astype(np.float32) if dupe_scale is not None
+        else np.ones(cand.shape[0], dtype=np.float32)
+    )
+    boundary_lo = _tier_boundaries(lookup)
+    boundary_scores = _tier_partition(field_raw, boundary_lo)
+    return _compute_payout_tiered(
+        np.ascontiguousarray(cand), np.ascontiguousarray(field_raw),
+        boundary_scores, boundary_lo, cs, dil, scale,
+    )
+
+
+def _reference_kernel(cand, field_raw, gross_arr, N, entry_fee=0.0, dilute_min_gross=None, dupe_scale=None):
+    """Same inputs as _tiered_kernel, run through the existing (trusted)
+    full-sort kernel, for direct side-by-side comparison in one call."""
+    lookup = _build_payout_lookup(gross_arr, N=N, entry_fee=entry_fee)
+    dilute_lookup = (
+        _build_dilutable_lookup(gross_arr, N=N, min_gross_payout=dilute_min_gross)
+        if dilute_min_gross is not None else None
+    )
+    field_sorted = np.ascontiguousarray(np.sort(field_raw, axis=1))
+    return _kernel(cand, field_sorted, lookup, dilute_lookup=dilute_lookup, dupe_scale=dupe_scale)
+
+
+def test_tiered_kernel_matches_reference_continuous():
+    """Real-valued scores -- exact ties are coincidental, not constructed."""
+    rng = np.random.default_rng(10)
+    BATCH, n_sims, N = 40, 60, 2000
+    gross = _make_test_payout_arr(n_entries=500, first_place=5000.0, pay_positions=130, min_cash=6.0)
+    field = rng.uniform(0, 300, (n_sims, N)).astype(np.float32)
+    cand = rng.uniform(0, 300, (BATCH, n_sims)).astype(np.float32)
+    ref = _reference_kernel(cand, field, gross, N)
+    got = _tiered_kernel(cand, field, gross, N)
+    np.testing.assert_allclose(ref, got, atol=1e-4)
+
+
+def test_tiered_kernel_matches_reference_heavy_ties():
+    """Few distinct values -> lots of ties, including at tier boundaries --
+    exercises the exact-tie fallback path, not just the fast path."""
+    rng = np.random.default_rng(11)
+    BATCH, n_sims, N = 40, 30, 500
+    gross = _make_test_payout_arr(n_entries=100, first_place=1000.0, pay_positions=30, min_cash=6.0)
+    field = rng.integers(0, 5, (n_sims, N)).astype(np.float32)
+    cand = rng.integers(0, 5, (BATCH, n_sims)).astype(np.float32)
+    ref = _reference_kernel(cand, field, gross, N)
+    got = _tiered_kernel(cand, field, gross, N)
+    np.testing.assert_allclose(ref, got, atol=1e-4)
+    # sanity: ties actually occurred, otherwise this test doesn't exercise
+    # the fallback it claims to.
+    assert np.any(np.isin(cand[0], field[0]))
+
+
+def test_tiered_kernel_matches_reference_massive_flat_run():
+    """A single value shared by a huge chunk of the field (a real min-cash
+    plateau at scale) -- every candidate at that value ties with hundreds of
+    field members at once."""
+    rng = np.random.default_rng(12)
+    n_sims, N = 25, 1000
+    gross = _make_test_payout_arr(n_entries=1200, first_place=5000.0, pay_positions=300, min_cash=6.0)
+    field = np.concatenate(
+        [np.full((n_sims, 300), 7.0), rng.uniform(0, 20, (n_sims, N - 300))], axis=1
+    ).astype(np.float32)
+    cand = np.full((15, n_sims), 7.0, dtype=np.float32)
+    ref = _reference_kernel(cand, field, gross, N)
+    got = _tiered_kernel(cand, field, gross, N)
+    np.testing.assert_allclose(ref, got, atol=1e-4)
+
+
+def test_tiered_kernel_matches_reference_top_and_bottom_edges():
+    """Candidates that beat literally everyone, and candidates that lose to
+    literally everyone -- the two boundary lo values (0 and N) that need no
+    partitioned value of their own."""
+    rng = np.random.default_rng(13)
+    n_sims, N = 20, 50
+    gross = _make_test_payout_arr(n_entries=60, first_place=1000.0, pay_positions=15, min_cash=6.0)
+    field = rng.uniform(0, 10, (n_sims, N)).astype(np.float32)
+
+    winners = np.tile(field.max(axis=1) + 100.0, (10, 1)).astype(np.float32)
+    ref_w = _reference_kernel(winners, field, gross, N)
+    got_w = _tiered_kernel(winners, field, gross, N)
+    np.testing.assert_allclose(ref_w, got_w, atol=1e-4)
+
+    losers = np.tile(field.min(axis=1) - 100.0, (10, 1)).astype(np.float32)
+    ref_l = _reference_kernel(losers, field, gross, N)
+    got_l = _tiered_kernel(losers, field, gross, N)
+    np.testing.assert_allclose(ref_l, got_l, atol=1e-4)
+
+
+def test_tiered_kernel_matches_reference_with_dupe_dilution():
+    rng = np.random.default_rng(14)
+    BATCH, n_sims, N = 30, 40, 800
+    gross = _make_test_payout_arr(n_entries=200, first_place=2000.0, pay_positions=52, min_cash=6.0)
+    field = rng.uniform(0, 300, (n_sims, N)).astype(np.float32)
+    cand = rng.uniform(0, 300, (BATCH, n_sims)).astype(np.float32)
+    dupe_scale = rng.uniform(0.3, 1.0, BATCH).astype(np.float32)
+    ref = _reference_kernel(cand, field, gross, N, dilute_min_gross=15.0, dupe_scale=dupe_scale)
+    got = _tiered_kernel(cand, field, gross, N, dilute_min_gross=15.0, dupe_scale=dupe_scale)
+    np.testing.assert_allclose(ref, got, atol=1e-4)
+
+
+def test_tiered_kernel_matches_reference_tiny_n():
+    rng = np.random.default_rng(15)
+    for N in (1, 2, 3):
+        n_sims, BATCH = 15, 10
+        gross = _make_test_payout_arr(n_entries=10, first_place=100.0, pay_positions=4, min_cash=6.0)
+        field = rng.uniform(0, 10, (n_sims, N)).astype(np.float32)
+        cand = rng.uniform(0, 10, (BATCH, n_sims)).astype(np.float32)
+        ref = _reference_kernel(cand, field, gross, N)
+        got = _tiered_kernel(cand, field, gross, N)
+        np.testing.assert_allclose(ref, got, atol=1e-4, err_msg=f"mismatch at N={N}")
+
+
+def test_tier_boundaries_and_partition_shapes():
+    N = 100
+    gross = _make_test_payout_arr(n_entries=50, first_place=500.0, pay_positions=15, min_cash=6.0)
+    lookup = _build_payout_lookup(gross, N=N, entry_fee=0.0)
+    boundary_lo = _tier_boundaries(lookup)
+    assert boundary_lo.dtype == np.int64
+    assert np.all(boundary_lo >= 1) and np.all(boundary_lo <= N)
+    assert np.all(np.diff(boundary_lo) > 0)  # strictly ascending
+
+    field = np.random.default_rng(16).uniform(0, 10, (5, N)).astype(np.float32)
+    boundary_scores = _tier_partition(field, boundary_lo)
+    assert boundary_scores.shape == (5, boundary_lo.shape[0])
+    assert np.all(np.diff(boundary_scores, axis=1) >= 0)  # ascending per sim
 
 
 # ------------------------------------------------------------------ #

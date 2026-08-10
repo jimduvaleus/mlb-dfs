@@ -40,7 +40,7 @@ export interface PortfolioConfig {
 
 // External-pool EV currency: Saber's per-contest ROI, our own projected
 // score minus ownership scaled by implied field size, or simulated P(win).
-export type ExternalEvType = 'roi' | 'prj_own' | 'p_win' | 'proj_top'
+export type ExternalEvType = 'roi' | 'prj_own' | 'p_win' | 'proj_top' | 'self_play' | 'topn_coverage'
 
 export interface GppConfig {
   n_candidates: number
@@ -104,6 +104,17 @@ export interface GppConfig {
   external_pool_proj_top_own_cap_end_pct: number
   external_pool_proj_top_ceiling_tiers: boolean
   external_pool_proj_top_medium_large_boundary: number
+  external_pool_self_play_round_n_sims: number
+  external_pool_self_play_precise_n_sims: number
+  external_pool_self_play_shortlist_size: number
+  external_pool_topn_field_pool_size: number
+  external_pool_topn_rank: number
+  external_pool_topn_field_samples: number
+  external_pool_topn_generated_pool_size: number
+  external_pool_topn_sims_per_contest_fraction: number
+  external_pool_topn_sims_min: number
+  external_pool_topn_sims_reference_field_size: number
+  external_pool_topn_sims_power: number
   external_pool_roi_floor_pct: number
   external_pool_proj_score_pct: number
   external_pool_ceiling_weight: number
@@ -228,6 +239,18 @@ export type SSEStage =
   | 'gpp_det_risk_start'
   | 'gpp_det_select_progress'
   | 'gpp_holdout'
+  | 'self_play_pool_start'
+  | 'self_play_pool_done'
+  | 'self_play_contest_progress'
+  | 'self_play_payout_fallback'
+  | 'topn_sims_autosize'
+  | 'topn_pool_start'
+  | 'topn_pool_progress'
+  | 'topn_pool_done'
+  | 'topn_pool_augmented'
+  | 'topn_contest_start'
+  | 'topn_pick_progress'
+  | 'topn_contest_done'
   | 'complete'
   | 'stopped'
   | 'error'
@@ -438,6 +461,112 @@ export interface GppFieldInjectEvent extends SSEEvent {
   stage: 'gpp_field_inject'
   n_field: number
   n_k: number
+}
+
+export interface SelfPlayPoolStartEvent extends SSEEvent {
+  stage: 'self_play_pool_start'
+  n_contests: number
+}
+
+export interface SelfPlayPoolDoneEvent extends SSEEvent {
+  stage: 'self_play_pool_done'
+  pool_size: number
+  precise_n_sims: number | null
+  n_promoted: number
+}
+
+export interface SelfPlayContestProgressEvent extends SSEEvent {
+  stage: 'self_play_contest_progress'
+  contest_id: string
+  k: number
+  n_field: number
+  n_rounds: number
+  elapsed_s: number
+  round_elapsed_s: number
+  refine_elapsed_s: number
+  n_swaps: number
+  contests_done: number
+  contests_total: number
+}
+
+export interface SelfPlayPayoutFallbackEvent extends SSEEvent {
+  stage: 'self_play_payout_fallback'
+  contest_name: string
+  implied_field_size: number
+  matched_total_entries: number
+}
+
+export interface TopnSimsAutosizeEvent extends SSEEvent {
+  stage: 'topn_sims_autosize'
+  configured_n_sims: number
+  total_demand: number
+  effective_n_sims: number
+}
+
+export interface TopnPoolStartEvent extends SSEEvent {
+  stage: 'topn_pool_start'
+  field_pool_size: number
+}
+
+export interface TopnPoolProgressEvent extends SSEEvent {
+  stage: 'topn_pool_progress'
+  n_done: number
+  n_total: number
+}
+
+export interface TopnPoolDoneEvent extends SSEEvent {
+  stage: 'topn_pool_done'
+  field_pool_size: number
+  n_sims: number
+}
+
+export interface TopnPoolAugmentedEvent extends SSEEvent {
+  stage: 'topn_pool_augmented'
+  n_requested: number
+  n_added: number
+  pool_size: number
+}
+
+export interface TopnContestStartEvent extends SSEEvent {
+  stage: 'topn_contest_start'
+  contest_id: string
+  k: number
+  field_size_g: number
+  n_sims_g: number
+  contest_index: number
+  contests_total: number
+  contests_done: number
+}
+
+export interface TopnPickProgressEvent extends SSEEvent {
+  stage: 'topn_pick_progress'
+  contest_id: string
+  pick_num: number
+  k: number
+  uncovered_remaining: number
+  uncovered_total: number
+  relaxations_so_far: number
+  elapsed_s: number
+}
+
+export interface TopnContestDoneEvent extends SSEEvent {
+  stage: 'topn_contest_done'
+  contest_id: string
+  k: number
+  n_filled: number
+  n_relaxations: number
+  elapsed_s: number
+  contests_done: number
+  contests_total: number
+  n_wave_resets: number
+  n_generated_picks: number
+  sim_lap: number
+  sim_lap_used_pct: number
+  sim_total_taken: number
+  n_sims_total: number
+  n_sims_g: number
+  worlds_claimed: number
+  worlds_claimed_pct: number
 }
 
 export interface ExternalPoolStatus {

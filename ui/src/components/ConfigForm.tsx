@@ -222,6 +222,8 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <option value="prj_own">PRJ/OWN</option>
                 <option value="p_win">P(WIN)</option>
                 <option value="proj_top">PROJ TOP</option>
+                <option value="self_play">SELF-PLAY</option>
+                <option value="topn_coverage">TOP-N COVERAGE</option>
               </select>
             </FieldRow>
             {draft.gpp.external_pool_ev_type === 'proj_top' && (
@@ -286,6 +288,112 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                   <input type="number" step={1} min={0}
                     value={draft.gpp.external_pool_pwin_admit_multiplier ?? 12.0}
                     onChange={e => setGpp('external_pool_pwin_admit_multiplier', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+              </>
+            )}
+            {draft.gpp.external_pool_ev_type === 'self_play' && (
+              <>
+                <p className="field-hint">
+                  Fills each contest by iterative best-response against opponents plus its own
+                  prior picks, using the contest's real DK payout table every round — diversity
+                  is a byproduct of the round loop, not a separate mechanism, so this produces a
+                  single portfolio (no risk sweep). Materially slower than the other EV types:
+                  offline timing on archived slates ran ~5-9 minutes per slate, not seconds.
+                  Contests whose name isn't one of DK's ~14 known recurring types use an
+                  approximate closest-size payout table — watch the progress panel for a warning
+                  naming any affected contest.
+                </p>
+                <FieldRow label="Round-loop sims (per pick)">
+                  <input type="number" step={500} min={500}
+                    value={draft.gpp.external_pool_self_play_round_n_sims ?? 2000}
+                    onChange={e => setGpp('external_pool_self_play_round_n_sims', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Precision-refinement sims (0 = disable)">
+                  <input type="number" step={1000} min={0}
+                    value={draft.gpp.external_pool_self_play_precise_n_sims ?? 20000}
+                    onChange={e => setGpp('external_pool_self_play_precise_n_sims', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Shortlist size (candidates re-scored per round)">
+                  <input type="number" step={100} min={100}
+                    value={draft.gpp.external_pool_self_play_shortlist_size ?? 1000}
+                    onChange={e => setGpp('external_pool_self_play_shortlist_size', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+              </>
+            )}
+            {draft.gpp.external_pool_ev_type === 'topn_coverage' && (
+              <>
+                <p className="field-hint">
+                  Fills each contest by greedily picking whichever remaining candidate would have
+                  finished top-N most often against a sub-sampled opponent field, then removes the
+                  simulated worlds a pick "claimed" so later picks have to prove themselves
+                  elsewhere — diversity is a byproduct of the coverage race itself, so this
+                  produces a single portfolio (no risk sweep).
+                </p>
+                <FieldRow label="Top-N rank">
+                  <input type="number" step={1} min={1}
+                    value={draft.gpp.external_pool_topn_rank ?? 10}
+                    onChange={e => setGpp('external_pool_topn_rank', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Field pool size">
+                  <input type="number" step={1000} min={1000}
+                    value={draft.gpp.external_pool_topn_field_pool_size ?? 25000}
+                    onChange={e => setGpp('external_pool_topn_field_pool_size', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Field draws per contest (K)">
+                  <input type="number" step={1} min={1}
+                    value={draft.gpp.external_pool_topn_field_samples ?? 5}
+                    onChange={e => setGpp('external_pool_topn_field_samples', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Generated candidates to add (0 = off)">
+                  <input type="number" step={500} min={0}
+                    value={draft.gpp.external_pool_topn_generated_pool_size ?? 0}
+                    onChange={e => setGpp('external_pool_topn_generated_pool_size', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <p className="field-hint">
+                  Adds this many extra candidates from the same stacked-lineup generator the
+                  opponent field uses, merged into the real external pool after 9/10-overlap dedup
+                  (a real lineup always wins a conflict). Lets the selector pick a high-performing
+                  lineup that's visible in the simulated field but wasn't in the real export.
+                  Unvalidated — off by default.
+                </p>
+                <FieldRow label="Sims-needed floor (at reference field size)">
+                  <input type="number" step={1} min={0}
+                    value={draft.gpp.external_pool_topn_sims_min ?? 4607}
+                    onChange={e => setGpp('external_pool_topn_sims_min', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Reference field size (entries)">
+                  <input type="number" step={1} min={0}
+                    value={draft.gpp.external_pool_topn_sims_reference_field_size ?? 392}
+                    onChange={e => setGpp('external_pool_topn_sims_reference_field_size', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Sims-vs-field-size power">
+                  <input type="number" step="any" min={0}
+                    value={draft.gpp.external_pool_topn_sims_power ?? 0.222}
+                    onChange={e => setGpp('external_pool_topn_sims_power', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <p className="field-hint">
+                  Field-size-aware sim budget per contest: n_sims_g = sims-needed-floor ×
+                  (field_size / reference_field_size) ^ power, clipped to at least the floor.
+                  Calibrated 2026-08-09 against one archived slate — 392-1,189-entry fields needed
+                  ~5,000 sims, 5,945-17,835-entry fields needed ~10,000 (see
+                  scripts/calibrate_topn_sims_per_contest.py). Set any of the three to 0 to fall
+                  back to a flat fraction of total sim worlds instead.
+                </p>
+                <FieldRow label="Fallback: sim-worlds per contest (fraction of n_sims)">
+                  <input type="number" step="any" min={0.01} max={1}
+                    value={draft.gpp.external_pool_topn_sims_per_contest_fraction ?? 0.5}
+                    onChange={e => setGpp('external_pool_topn_sims_per_contest_fraction', Number(e.target.value))}
                     disabled={disabled} />
                 </FieldRow>
               </>

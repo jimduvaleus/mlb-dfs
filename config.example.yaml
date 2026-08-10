@@ -92,7 +92,7 @@ gpp:
   dupe_salary_coef: 0.095
   dupe_stack_coef: -0.102
   dupe_min_gross_payout: 15.0
-  external_pool_ev_type: roi        # roi | prj_own | p_win | proj_top
+  external_pool_ev_type: roi        # roi | prj_own | p_win | proj_top | self_play | topn_coverage
   external_pool_own_scale: 30000.0  # prj_own: field size where 1 ownership pt == 1 proj pt
   external_pool_pwin_sharpness: 0.05 # p_win: exponent multiplier on an entry count (1.0 = literal P(win); calibrated lower, see models.py). With flat_reference below, the count is that fixed reference rather than each contest's implied entries
   external_pool_pwin_admit_n: 2000  # p_win stage-A cull window (flat -- see multiplier below). 100 (max(100,1.5x) scaled) was the prior default, validated on an 8-slate replay-harness sweep; SUPERSEDED 2026-07-31: a real-money 7-slate/21-draw backtest (tests/backtest.py) with exact payout tables + real fields found this wider flat-2000 window beats it at p=0.007-0.03 on 5/6 alternate arms -- do not revert without new empirical evidence (see memory project-flat2000-live-override-20260731)
@@ -107,6 +107,17 @@ gpp:
   external_pool_proj_score_pct: 0.0
   external_pool_ceiling_weight: 0.25
   external_pool_cash_anchor_fraction: 0.25
+  external_pool_self_play_round_n_sims: 2000     # self_play: sims per round-loop pick (see self_play._ROUND_N_SIMS_DEFAULT). Clamped to the actual simulated n_sims if higher
+  external_pool_self_play_precise_n_sims: 20000  # self_play: sims for the post-round-loop precision-refinement pass. 0 disables refinement entirely
+  external_pool_self_play_shortlist_size: 1000   # self_play: candidates re-scored per round after round 0's full pass (see self_play.py's SHORTLIST RESTRICTION note)
+  external_pool_topn_field_pool_size: 25000  # topn_coverage: one-time-per-slate opponent field pool size (ContestSimulator.generate_field)
+  external_pool_topn_rank: 10                # topn_coverage: literal rank a candidate must cross to "cover" a simulated world (top-10)
+  external_pool_topn_field_samples: 5        # topn_coverage: K independent field-pool draws per contest (anti-overfitting to one field snapshot)
+  external_pool_topn_generated_pool_size: 0  # topn_coverage: extra candidates from the same generator the field pool uses, merged in after 9/10-overlap dedup. 0 = off (unvalidated, see models.py)
+  external_pool_topn_sims_min: 4607                     # topn_coverage sim-budget formula (ACTIVE default -- see models.py's calibration note). n_sims_g = clip(round(sims_min*(field_size/reference)^power), sims_min, n_sims)
+  external_pool_topn_sims_reference_field_size: 392     # topn_coverage sim-budget formula reference field size
+  external_pool_topn_sims_power: 0.222                  # topn_coverage sim-budget formula power. CALIBRATED 2026-08-09 against archived slate 07222026 (single slate -- see scripts/calibrate_topn_sims_per_contest.py)
+  external_pool_topn_sims_per_contest_fraction: 0.5  # topn_coverage: fallback flat fraction, used only if any of the three formula knobs above is 0
   # SaberSim grid calibration (see build_quantile_grids in external_pool.py).
   # Two independent corrections, deliberately not merged:
   #   zero_inflate  SHAPE — a DK hitter scores exactly 0 when he never reaches

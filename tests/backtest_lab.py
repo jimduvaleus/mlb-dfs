@@ -321,6 +321,187 @@ def select_leverage(sd: SlateData, *, floor_pct: float = 30.0,
     return picks
 
 
+@functools.lru_cache(maxsize=None)
+def _team_position_maps(slate: str) -> tuple[tuple, tuple]:
+    """({player_id: team}, {player_id: is_pitcher}) from DKSalaries.csv,
+    as sorted tuples of items (hashable, for lru_cache) -- convert back to
+    dict at the call site. GOTCHA (memory project-rival-portfolio-
+    shaidyadvice): DKSalaries Position is SP/RP, never plain "P" -- must
+    substring-match, not equality-match."""
+    sal = pd.read_csv(PROJECT_ROOT / "archive" / slate / "DKSalaries.csv")
+    team_map = dict(zip(sal["ID"].astype(int), sal["TeamAbbrev"].astype(str)))
+    is_pitcher = sal["Position"].astype(str).str.contains("P")
+    pos_map = dict(zip(sal["ID"].astype(int), is_pitcher))
+    return tuple(team_map.items()), tuple(pos_map.items())
+
+
+def _primary_teams(slate: str, pids_arr: np.ndarray) -> np.ndarray:
+    """(M,) str array: each candidate's primary (mode hitter) team -- the
+    same convention scripts/select_needlunchmoney_pool.py/
+    analyze_rival_portfolio.py use to characterize real portfolios."""
+    team_items, pos_items = _team_position_maps(slate)
+    team_map, pos_map = dict(team_items), dict(pos_items)
+    out = np.empty(pids_arr.shape[0], dtype=object)
+    for i, row in enumerate(pids_arr):
+        hitters = [p for p in row if not pos_map.get(int(p), False)]
+        teams = pd.Series([team_map.get(int(p), "?") for p in hitters])
+        out[i] = teams.value_counts().idxmax() if len(teams) else "?"
+    return out
+
+
+@functools.lru_cache(maxsize=None)
+def _pitcher_ss_proj_by_id(slate: str) -> tuple:
+    """{player_id: SS Proj} as a sorted tuple (hashable, for lru_cache) --
+    SaberSim's OWN raw point projection, read directly from the raw
+    export CSV (NOT parse_player_projections' "My Proj"/mean, a distinct
+    column -- see scripts/select_needlunchmoney_pool.py:337,346, the
+    source of the validated pitcher-selection-quality finding, memory
+    project-player-pick-quality: needlunchmoney's real, statistically
+    bulletproof edge, +1.37 FPTS/slot vs projection, p<.0001)."""
+    from src.api.external_pool import discover_external_files
+
+    d = PROJECT_ROOT / "archive" / slate
+    found = discover_external_files(str(d))
+    raw = pd.read_csv(found["projections_path"])
+    ids = pd.to_numeric(raw["DFS ID"], errors="coerce")
+    ss_proj = pd.to_numeric(raw["SS Proj"], errors="coerce")
+    out = {}
+    for pid, q in zip(ids, ss_proj):
+        if pd.notna(pid) and pd.notna(q):
+            out[int(pid)] = float(q)
+    return tuple(out.items())
+
+
+def _pitcher_quality_score(slate: str, pids_arr: np.ndarray, pos_map: dict) -> np.ndarray:
+    """(M,) float array: each candidate's mean SS Proj across its rostered
+    pitcher(s), NaN where neither rostered pitcher has an SS Proj value.
+    Uses the same position lookup as _primary_teams (robust to roster slot
+    order) rather than assuming pitchers sit in fixed columns."""
+    ss_proj = dict(_pitcher_ss_proj_by_id(slate))
+    out = np.full(pids_arr.shape[0], np.nan, dtype=np.float64)
+    for i, row in enumerate(pids_arr):
+        vals = [ss_proj[int(p)] for p in row
+                if pos_map.get(int(p), False) and int(p) in ss_proj]
+        if vals:
+            out[i] = float(np.mean(vals))
+    return out
+
+
+def select_team_diverse_leverage(sd: SlateData, *, floor_pct: float = 30.0,
+                                 target_anchor_c: float = 1.0,
+                                 band_widen_steps: tuple = (1.0, 0.5, 0.25, 0.1, 0.01),
+                                 pitcher_quality_weight: float = 0.0,
+                                 order: list = None) -> dict:
+    """Near-uniform allocation across primary-stack teams (k // n_teams
+    each, remainder to the highest-mean-leverage teams), matching real
+    pros' revealed near-uniform coverage (memory project-rival-portfolio-
+    shaidyadvice: "at ~7 entries per team, min 1, max 15-22... allocation
+    is near-uniform coverage, not a contrarian tilt") -- proj_score/p_cash
+    by contrast pile ~30% of every entry onto ONE team (memory project-
+    leverage-a1-adjudication-result's concentration finding).
+
+    A stronger PROPORTIONAL-to-leverage team allocation was tried and
+    measured WORSE on every metric than this near-uniform-plus-remainder
+    version (same memory) -- consistent with this whole investigation's
+    repeated finding that leverage works best as a light/secondary signal,
+    not a heavily-weighted primary driver. Don't reintroduce a stronger
+    tilt without new evidence.
+
+    Two DIFFERENT currencies for two DIFFERENT decisions, not leverage for
+    both (an earlier version used leverage_ratio for within-bucket ranking
+    too and it also made things worse -- same memory, team_diverse_leverage
+    v1 result):
+
+      * WHICH teams get the remainder-of-k slots, and the field-size-gated
+        p_opt eligibility filter within each team's bucket -- leverage/
+        p_opt. This is "how big a longshot is this team's bet, and is this
+        contest big enough to justify it."
+      * WITHIN a team's bucket, which specific eligible lineup to actually
+        take -- proj_score (raw quality), not leverage_ratio. Re-runs the
+        already-documented bucket experiment from memory project-rival-
+        portfolio-shaidyadvice ("rank within bucket by projection -> best
+        mean_pctl... working hypothesis: fade ownership at the team-
+        allocation level, maximize projection within the team") --
+        leverage decides ELIGIBILITY/riskiness tier, proj_score decides
+        WHICH lineup among the eligible ones is actually good.
+
+    `pitcher_quality_weight > 0` blends needlunchmoney's validated real
+    edge (pitcher-selection quality, +1.37 FPTS/slot vs projection,
+    p<.0001, memory project-player-pick-quality) LIGHTLY into that
+    within-bucket ranking: rank_score = zscore(proj_score) +
+    pitcher_quality_weight * zscore(pitcher SS-Proj). Deliberately a small
+    additive nudge on a z-scored (comparable-magnitude) basis, not a
+    dominant re-ranking term -- an earlier attempt applied this exact
+    signal as a STRONG lever on a non-diverse baseline and it made dollar
+    results worse (project-pitcher-quality-blend); this session separately
+    found leverage-family signals only help applied lightly. weight=0.0
+    (default) reproduces the original proj_score-only ranking exactly,
+    since z-scoring is a monotonic transform of proj_score alone.
+
+    If a team's bucket comes up short even after the widest band step, the
+    shortfall is backfilled from the remaining shared pool by the same
+    rank_score (not left unfilled).
+    """
+    lev = load_leverage(sd.slate)
+    assert lev["contest_id"] == sd.cids, f"{sd.slate}: leverage/real contest_id drift"
+    proj = sd.feats["proj_score"]
+    with np.load(ORACLE_DIR / f"{sd.slate}_real.npz", allow_pickle=False) as z:
+        pids_arr = z["player_ids"]
+    primary = _primary_teams(sd.slate, pids_arr)
+
+    if pitcher_quality_weight != 0.0:
+        _, pos_items = _team_position_maps(sd.slate)
+        pq = _pitcher_quality_score(sd.slate, pids_arr, dict(pos_items))
+        pq_z = np.nan_to_num((pq - np.nanmean(pq)) / (np.nanstd(pq) + 1e-9), nan=0.0)
+        proj_z = (proj - np.nanmean(proj)) / (np.nanstd(proj) + 1e-9)
+        rank_score = proj_z + pitcher_quality_weight * pq_z
+    else:
+        rank_score = proj
+
+    mask = proj_floor_mask(sd, floor_pct)
+    picks: dict = {}
+    for ci in (order if order is not None else range(len(sd.cids))):
+        k = int(sd.k[ci])
+        if k <= 0:
+            continue
+        p_opt = lev["p_opt"][ci]
+        lev_mean = lev["leverage_ratio_mean"][ci]
+        rem = np.where(mask & np.isfinite(p_opt))[0]
+        if len(rem) == 0:
+            continue
+        teams = np.unique(primary[rem])
+        n_teams = len(teams)
+        base_n, remainder = divmod(k, n_teams)
+        team_score = {t: float(lev_mean[rem[primary[rem] == t]].mean()) for t in teams}
+        team_order = sorted(teams, key=lambda t: -team_score[t])
+
+        anchor = target_anchor_c / max(float(sd.n_field[ci]), 1.0)
+        chosen: list[int] = []
+        for ti, t in enumerate(team_order):
+            n_this = base_n + (1 if ti < remainder else 0)
+            if n_this <= 0:
+                continue
+            team_idx = rem[primary[rem] == t]
+            qualifying = team_idx
+            for mult in band_widen_steps:
+                cand = team_idx[p_opt[team_idx] >= anchor * mult]
+                if len(cand) >= n_this:
+                    qualifying = cand
+                    break
+            top = qualifying[np.argsort(-rank_score[qualifying])[:n_this]]
+            chosen.extend(int(i) for i in top)
+
+        if len(chosen) < k:
+            leftover = np.setdiff1d(rem, np.array(chosen, dtype=np.int64))
+            need = k - len(chosen)
+            backfill = leftover[np.argsort(-rank_score[leftover])[:need]]
+            chosen.extend(int(i) for i in backfill)
+
+        picks[sd.cids[ci]] = chosen
+        mask[np.array(chosen, dtype=np.int64)] = False
+    return picks
+
+
 # ---------------------------------------------------------------------------
 # Grading
 # ---------------------------------------------------------------------------
@@ -1941,7 +2122,8 @@ def cmd_jointcheck(seeds=(42, 137, 4242)) -> None:
 
 A1_BASELINE = "prod_faithful"
 A1_NULL = "random@floor30"
-A1_CHALLENGERS = ["proj_score", "p_cash", "p_cash@assign", "coverage_light"]
+A1_CHALLENGERS = ["proj_score", "p_cash", "p_cash@assign", "coverage_light",
+                  "leverage_rank_only", "leverage_selector", "leverage_corr_blend"]
 A1_ARMS = [A1_BASELINE, A1_NULL] + A1_CHALLENGERS
 A1_SEEDS = (42, 137, 4242)
 
@@ -2069,6 +2251,52 @@ def _a1_pick(sd: SlateData, arm: str, corr: np.ndarray, comp_fn) -> dict:
         sel = curs["proj_score"]
         return select_greedy(
             sd, sel, sel, floor_pct=30.0, admit_n=2000, evw=0.25, corr_fn=comp_fn,
+        )
+    if arm == "leverage_rank_only":
+        # Plain top-K rank on the leverage currency (src/optimization/
+        # leverage.py, plan doc need-a-plan-to-squishy-sutherland.md) --
+        # NOT LeveragePortfolioSelector, which two rounds of calibration
+        # sweeps (memory project-leverage-anchor-calibration-todo) failed
+        # to beat plain ranking on. Cull on itself like proj_score: the
+        # leverage currency is single-seed by design (Phase A measured
+        # near-perfect stability across seeds/halves), so it carries no
+        # sim noise of its own to overfit to, and -- unlike every other A1
+        # challenger -- its picks (and therefore its graded results) are
+        # IDENTICAL across A1_SEEDS. That's an expected consequence of the
+        # single-seed cache, not a bug; it means G1/G5's seed-robustness
+        # gates can only read 0/3 or 3/3 for this arm, never a split.
+        sel = curs["leverage"]
+        return select_greedy(sd, sel, sel, floor_pct=30.0, admit_n=2000)
+    if arm == "leverage_selector":
+        # LeveragePortfolioSelector itself (band-widening field-size gate +
+        # regret-minimization coverage of positive-leverage players NOT yet
+        # in the portfolio) -- deliberately NOT prod_faithful/coverage_light's
+        # style of diversity (statistical decorrelation across lineups, via
+        # a sim or composition correlation matrix). The user's own framing:
+        # diversify because specific positive-leverage players are under-
+        # represented so far, not because lineups happen to be correlated.
+        # Default parameters, no tuning cherry-picked from the exploratory
+        # calibration sweeps (project-leverage-anchor-calibration-todo) --
+        # using a post-hoc "best" config here would be exactly the kind of
+        # p-hacking this A1 protocol's pre-registration exists to prevent.
+        return select_leverage(sd)
+    if arm == "leverage_corr_blend":
+        # leverage as the EV term, blended with the REAL simulated-
+        # correlation diversity/hedge mechanism prod_faithful uses
+        # (evw=0.25, same corr matrix as the baseline) instead of either
+        # plain ranking or player-coverage. Three separate tests
+        # (leverage_rank_only, leverage_selector default, LOSO-calibrated)
+        # all showed the same signature -- leverage wins the rate ladder
+        # but loses dollars -- which looks like a missing payout-tail
+        # hedge, not a bad signal; this isolates whether the REAL
+        # correlation-based hedge (as opposed to coverage-of-players,
+        # which already failed three ways) closes that gap. Cull on
+        # itself like proj_score/leverage_rank_only: leverage carries no
+        # sim noise of its own to overfit to (single-seed by design, see
+        # src/optimization/leverage.py).
+        sel = curs["leverage"]
+        return select_greedy(
+            sd, sel, sel, floor_pct=30.0, admit_n=2000, evw=0.25, corr=corr,
         )
     raise ValueError(f"unknown A1 arm {arm!r}")
 

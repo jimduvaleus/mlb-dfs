@@ -19,6 +19,7 @@ import csv
 import logging
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -252,6 +253,47 @@ def _find_near_duplicate_removals(player_ids_list: list, primary_roi: np.ndarray
     return removed
 
 
+def parse_pool_p99(paths, valid_ids: set[int]) -> dict:
+    """{frozenset(player_ids): p99} from the lineup pool file(s)' own "99th"
+    column -- SaberSim's per-lineup 99th-percentile simulated score. Used as
+    a cheap ceiling signal (no simulation of ours required) for promoting
+    external candidates into self-play's precision-refinement pool, see
+    src.optimization.self_play. A separate parse from parse_lineup_pool
+    (re-reads the same file(s)) since ExternalPool/Lineup carry no room for
+    per-lineup metadata beyond ROI -- keyed by player-id set so callers can
+    match it against already-deduped Lineup objects directly. Missing/
+    unparseable cells and files with no "99th" column are silently skipped
+    (this is a promotion signal, not a required field)."""
+    if isinstance(paths, (str, Path)):
+        paths = [Path(paths)]
+    else:
+        paths = [Path(p) for p in paths]
+
+    out: dict = {}
+    for path in paths:
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            rows = list(csv.reader(f))
+        if not rows or "99th" not in rows[0]:
+            continue
+        p99_idx = rows[0].index("99th")
+        for r in rows[1:]:
+            if len(r) < _N_SLOT_COLS:
+                continue
+            try:
+                pids = frozenset(int(r[i]) for i in range(_N_SLOT_COLS))
+            except ValueError:
+                continue
+            if not pids <= valid_ids:
+                continue
+            cell = r[p99_idx] if p99_idx < len(r) else ""
+            try:
+                val = float(cell)
+            except ValueError:
+                continue
+            out.setdefault(pids, val)  # first occurrence wins, matches parse_lineup_pool's dedup
+    return out
+
+
 def parse_lineup_pool(paths, valid_ids: set[int], require_roi_blocks: bool = True) -> ExternalPool:
     """Parse one or more lineup exports for the same slate (see
     discover_external_files) with csv.reader on each raw header (duplicate
@@ -283,7 +325,30 @@ def parse_lineup_pool(paths, valid_ids: set[int], require_roi_blocks: bool = Tru
     file to define a given contest wins its raw name / prize pool / single
     entry metadata). A contest present in one file but not another leaves
     NaN roi (and roi_stddev) for the lineups sourced from file(s) missing
-    that column — no different from any other blank ROI cell."""
+    that column — no different from any other blank ROI cell.
+
+    PRE-LOCK SNAPSHOT LIMITATION (relevant to backtesting, not live use):
+    this file is captured once, at/near the SLATE's first-game lock (its
+    filename embeds that capture time, e.g. `lineups_..._7-22-2026_640pm.csv`
+    for a slate whose first game locked around then) — it can only reflect
+    confirmed-lineup/scratch information known as of that moment. Games
+    later in the same slate lock individually, well after this snapshot, and
+    real DK entrants (including our own accounts) can and do make post-lock
+    swaps as those later games' confirmed lineups/scratches become known —
+    visible directly in the archive as edits to our own real submitted
+    entries after the slate-wide capture time. A backtest that grades THIS
+    frozen pool against the real field is therefore comparing a pre-lock
+    guess to entrants who had strictly more information for the back half
+    of the slate — a real, structural handicap on this pool's apparent
+    performance that has nothing to do with the selection strategy built on
+    top of it. NOT external-specific, despite living in this docstring: a
+    backtest's `generated` candidates are built from the archived projections
+    file, which is captured at essentially this SAME pre-lock moment (verified
+    2026-08-08, 07222026 archive: ~1s apart) -- so a since-scratched player's
+    still-nonzero projection/ownership can seed him into generated lineups
+    too. See src.optimization.self_play's SelfPlaySlateContext for the full
+    note on why external-vs-generated is not the confound to worry about
+    here; both-vs-the-real-field is."""
     if isinstance(paths, (str, Path)):
         paths = [Path(paths)]
     else:
@@ -1176,6 +1241,30 @@ def compute_pool_ownership(lineups: list, players_df: pd.DataFrame) -> np.ndarra
     return (own @ I).astype(np.float64)
 
 
+def compute_pool_ceiling_proxy(lineups: list, players_df: pd.DataFrame, z: float = 2.33) -> np.ndarray:
+    """(M,) float64 `sum(player mean) + z * sqrt(sum(player std_dev^2))` per
+    lineup -- a mean+z*sigma ceiling estimate (z=2.33 ~ the 99th percentile
+    of a standard normal, matching what a lineup-level "99th percentile"
+    column is itself approximating) for lineups that have no such column of
+    their own. Built for self-play's generated candidates (see
+    src.optimization.self_play): they aren't part of a SaberSim export, so
+    they carry no native ceiling signal the way external pool lineups do
+    (parse_pool_p99) -- this is a cheap, independence-assuming stand-in, NOT
+    a substitute for actual simulation. Treating the 10 rostered players'
+    variances as independent is a real simplification (same-team batters
+    correlate) -- defensible only as a promotion SCREEN whose output still
+    gets validated by real per-sim scoring downstream, not as a final
+    ranking signal on its own. `players_df["std_dev"]` is `dk_std` (see
+    parse_player_projections), the same source `players_df["mean"]` (`My
+    Proj`) already comes from."""
+    I = _lineup_indicator_matrix(lineups, players_df["player_id"].tolist())
+    means = players_df["mean"].to_numpy(dtype=np.float64)
+    variances = players_df["std_dev"].to_numpy(dtype=np.float64) ** 2
+    lineup_means = means.astype(np.float32) @ I
+    lineup_var = variances.astype(np.float32) @ I
+    return lineup_means.astype(np.float64) + z * np.sqrt(np.maximum(lineup_var, 0.0))
+
+
 _DK_RAKE = 0.16
 """DK's fixed take across contest sizes: prize_pool = entries * entry_fee *
 (1 - _DK_RAKE), i.e. the prize pool is only ~84% of collected entry fees
@@ -1856,6 +1945,875 @@ def allocate_contests(
 
     if len(portfolio) != len(entry_plan):
         raise RuntimeError("external allocation invariant broken: portfolio/entry_plan length mismatch")
+    return ExternalAllocation(portfolio=portfolio, entry_plan=entry_plan, unfilled=unfilled)
+
+
+# ---------------------------------------------------------------------------
+# Self-play allocation (Phase 1 prototype)
+#
+# See /home/jduvaleus/.claude/plans/reactive-yawning-cookie.md for the full
+# design writeup. Offline/eval use only -- not wired into the live pipeline.
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SelfPlayAllocation:
+    """Same three fields as ExternalAllocation (so anything that already
+    knows how to consume allocate_contests's return type works unchanged),
+    plus the Phase-1 evaluation deliverables this algorithm's design calls
+    for: `source` (parallel to `portfolio` -- "external" or "generated" per
+    pick, for the circularity check), `round_log` (the round-loop
+    operational log, concatenated across every contest), and
+    `refinement_log` (every precision-refinement swap made, concatenated
+    across every qualifying contest -- see
+    src.optimization.self_play.run_contest_precision_refinement)."""
+    portfolio: list               # [(Lineup, roi)] flat, per-contest fill order
+    entry_plan: list              # [(contest_id, j)] parallel to portfolio
+    unfilled: list                # [(contest_id, j)] pool/opponent exhausted
+    source: list                  # str, parallel to portfolio: "external" | "generated"
+    round_log: "pd.DataFrame"
+    refinement_log: "pd.DataFrame"
+
+
+def build_self_play_contests(groups: list["ContestGroup"]) -> tuple[list[dict], list[dict]]:
+    """Adapt the live pipeline's `ContestGroup` list into the
+    `contests: list[dict]` shape `self_play_allocate_contests` expects
+    (`{contest_id, n_field, fee, payout_arr, k}`) -- unlike every other
+    External Pool `ev_type`, self_play's round loop rebuilds a real payout
+    lookup every round and cannot run without one, so every contest here is
+    backed by a real DK payout table via `nearest_payout_structure`
+    (src/optimization/payout.py). Groups with no entries (`k<=0`) are
+    skipped, matching allocate_contests's own convention.
+
+    Returns `(contests, fallback_rows)` -- `fallback_rows` has one dict per
+    contest whose payout table was an approximate closest-size match rather
+    than an exact name match (`{contest_name, implied_field_size,
+    matched_total_entries}`), for the caller to surface as a warning (see
+    pipeline.py's `self_play_payout_fallback` progress event)."""
+    from src.optimization.payout import nearest_payout_structure, payout_table_to_array
+
+    contests: list[dict] = []
+    fallback_rows: list[dict] = []
+    for g in groups:
+        k = len(g.entries)
+        if k <= 0:
+            continue
+        n_field = implied_field_size(g)
+        struct, is_approx = nearest_payout_structure(
+            g.contest_name, n_field if n_field > 0 else None,
+        )
+        if is_approx:
+            fallback_rows.append({
+                "contest_name": g.contest_name,
+                "implied_field_size": n_field,
+                "matched_total_entries": int(struct["total_entries"]),
+            })
+        contests.append({
+            "contest_id": g.contest_id,
+            "n_field": n_field if n_field > 0 else int(struct["total_entries"]),
+            "fee": g.entry_fee_cents / 100.0,
+            "payout_arr": payout_table_to_array(struct),
+            "k": k,
+        })
+    return contests, fallback_rows
+
+
+def remap_self_play_entry_plan(entry_plan: list, groups: list["ContestGroup"]) -> list:
+    """Map a self_play `entry_plan`/`unfilled` list (`[(contest_id, j), ...]`)
+    back to the shape the rest of the live pipeline's entry-writing tail
+    expects (`ExternalAllocation.entry_plan`'s `[(Path, EntryRecord), ...]`),
+    via each `ContestGroup`'s own file-order `entries` list. Valid because
+    `self_play_allocate_contests`'s per-contest local index `j` always runs
+    `0..k-1` where `k == len(g.entries)` (see `build_self_play_contests`,
+    which is what supplied that `k` in the first place)."""
+    groups_by_id = {g.contest_id: g for g in groups}
+    return [groups_by_id[cid].entries[j] for cid, j in entry_plan]
+
+
+def self_play_allocate_contests(
+    contests: list[dict],
+    ctx: "SelfPlaySlateContext",
+    rng_seed: int = 42,
+    shortlist_size: int = 1_000,
+    refresh_every: int = 5,
+    run_refinement: bool = True,
+    refinement_min_field_size: Optional[int] = None,
+    refinement_max_swaps: Optional[int] = None,
+    progress_cb: Optional[Callable[[dict], None]] = None,
+) -> SelfPlayAllocation:
+    """Self-play sibling to allocate_contests: instead of ranking the whole
+    pool once per contest, each contest is filled by iterative best-response
+    -- every remaining candidate's real dollar ROI is scored against
+    `opponents U own_selections_so_far`, one admission per round (see
+    src.optimization.self_play.run_contest_self_play's NO BATCHING note --
+    admitting several per round against one static field snapshot would
+    reintroduce the correlated-cluster problem self-play exists to avoid),
+    refreshing which specific opponent lineups populate the field from
+    `ctx`'s once-per-slate base pool. Diversity is a byproduct of genuinely
+    competing against prior picks rather than a separate correlation term, so
+    unlike allocate_contests this takes no corr_matrix/risk/evw and never
+    touches DeterminantPortfolioSelector.
+
+    `contests` is `[{contest_id, n_field, fee, payout_arr, k}, ...]` -- the
+    exact shape tests/bt_core.py::build_slate_context's `contests` list
+    already produces -- consumed here in CALLER-SUPPLIED order. Pre-sort via
+    `tests.bt_core.prod_order` for the real production fill order (entry fee
+    desc, prize pool asc, contest_id): which contest claims the shared
+    candidate pool first changes who gets what, exactly as it does for
+    allocate_contests's own `mask`.
+
+    `ctx` (src.optimization.self_play.SelfPlaySlateContext) is built once for
+    the whole slate via build_self_play_context, BEFORE calling this
+    function, and is the sole source of the candidate universe: its
+    `lineups` (external pool U generated base-pool lineups, source-tagged)
+    is what's selected from here -- there's no separate `pool` argument,
+    unlike allocate_contests, because ctx already carries everything
+    (a generated lineup can be, and is expected to often be, poached into
+    the portfolio when it out-ROIs every external candidate, since generated
+    lineups vastly outnumber external ones).
+
+    `run_refinement` (default True) runs
+    src.optimization.self_play.run_contest_precision_refinement immediately
+    after each contest's round loop, for contests with
+    `n_field >= refinement_min_field_size` (defaults to that module's
+    _REFINEMENT_MIN_FIELD_SIZE) -- small contests are skipped, see that
+    module's PRECISION REFINEMENT note for why. No-ops automatically (even
+    when True) if `ctx.precise_sim` is None, i.e. `build_self_play_context`
+    was called with `precise_n_sims=None`. `refinement_max_swaps` similarly
+    defaults to that module's _REFINEMENT_MAX_SWAPS.
+
+    `progress_cb`, if given, is called once per contest with a dict
+    `{contest_id, k, n_field, n_rounds, elapsed_s, round_elapsed_s,
+    refine_elapsed_s, n_swaps}` right after that contest fills (`elapsed_s` is
+    the sum of the two `_elapsed_s` splits; `n_swaps` counts only refinement) --
+    the per-contest timing breakdown this function doesn't print on
+    its own (callers running this against a real log, e.g.
+    scripts/eval_self_play_selector.py, want to see which contests are slow,
+    and specifically whether the round loop or the refinement pass is the
+    cost driver, without this library function hardcoding a print statement),
+    mirroring the progress_cb convention already used by
+    ContestScorer.score_candidates and DeterminantPortfolioSelector.select
+    elsewhere in this codebase.
+    """
+    from src.optimization import self_play as sp
+
+    if refinement_min_field_size is None:
+        refinement_min_field_size = sp._REFINEMENT_MIN_FIELD_SIZE
+    if refinement_max_swaps is None:
+        refinement_max_swaps = sp._REFINEMENT_MAX_SWAPS
+
+    candidate_mask = ctx.new_candidate_mask()
+    opponent_mask = ctx.new_opponent_mask()
+    rng = np.random.default_rng(rng_seed)
+
+    portfolio: list = []
+    entry_plan: list = []
+    unfilled: list = []
+    source: list = []
+    round_logs: list = []
+    refinement_logs: list = []
+
+    for c in contests:
+        k = int(c["k"])
+        if k <= 0:
+            continue
+        t0 = time.time()
+        result = sp.run_contest_self_play(
+            ctx, contest_id=c["contest_id"], k=k, field_size=c["n_field"],
+            payout_arr=c["payout_arr"], entry_fee=c["fee"],
+            candidate_mask=candidate_mask, opponent_available_mask=opponent_mask,
+            rng=rng, shortlist_size=shortlist_size, refresh_every=refresh_every,
+        )
+        t_round_done = time.time()
+        own_idx, own_roi = result.own_idx, result.own_roi
+        n_swaps = 0
+        if run_refinement and c["n_field"] >= refinement_min_field_size:
+            own_idx, own_roi, refine_log = sp.run_contest_precision_refinement(
+                ctx, contest_id=c["contest_id"], own_idx=own_idx, own_roi=own_roi,
+                final_shortlist_idx=result.final_shortlist_idx,
+                field_size=c["n_field"], k=k, payout_arr=c["payout_arr"], entry_fee=c["fee"],
+                candidate_mask=candidate_mask, opponent_available_mask=opponent_mask,
+                rng=rng, max_swaps=refinement_max_swaps,
+            )
+            if not refine_log.empty:
+                refinement_logs.append(refine_log)
+                n_swaps = len(refine_log)
+            # Refinement's opponents_scores/pool_scores_precise (see
+            # self_play._MMAP_THRESHOLD_BYTES's comment) can be multiple GB
+            # for a large-field contest -- nudge glibc to actually return
+            # that freed memory to the OS before starting the next contest,
+            # rather than letting it sit in the arena across the whole
+            # per-contest loop.
+            sp._release_free_memory()
+        t_refine_done = time.time()
+        if progress_cb is not None:
+            progress_cb({
+                "contest_id": c["contest_id"], "k": k, "n_field": c["n_field"],
+                "n_rounds": len(result.own_idx), "elapsed_s": t_refine_done - t0,
+                "round_elapsed_s": t_round_done - t0,
+                "refine_elapsed_s": t_refine_done - t_round_done,
+                "n_swaps": n_swaps,
+            })
+        if not result.round_log.empty:
+            round_logs.append(result.round_log)
+        entries = [(c["contest_id"], j) for j in range(k)]
+        for j, (idx, roi) in enumerate(zip(own_idx, own_roi)):
+            portfolio.append((ctx.lineups[idx], roi))
+            source.append(str(ctx.source[idx]))
+            entry_plan.append(entries[j])
+        if len(own_idx) < k:
+            unfilled.extend(entries[len(own_idx):])
+
+    if len(portfolio) != len(entry_plan):
+        raise RuntimeError(
+            "self-play allocation invariant broken: portfolio/entry_plan length mismatch"
+        )
+    round_log = pd.concat(round_logs, ignore_index=True) if round_logs else pd.DataFrame()
+    refinement_log = (
+        pd.concat(refinement_logs, ignore_index=True) if refinement_logs else pd.DataFrame()
+    )
+    return SelfPlayAllocation(
+        portfolio=portfolio, entry_plan=entry_plan, unfilled=unfilled,
+        source=source, round_log=round_log, refinement_log=refinement_log,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Top-N field-coverage allocation
+#
+# Greedily assigns each contest's entries to whichever remaining candidate
+# would have finished top-N most often (a literal rank, not a percentile)
+# against a sub-sampled opponent field, across many simulated worlds -- then
+# removes the worlds a candidate "claimed" so the next pick has to prove
+# itself on worlds nobody has covered yet. Hard-threshold exact set-cover
+# (bit-packed popcount greedy, mirroring CoveragePortfolioSelector), unlike
+# p_win's smooth q**n probability. No risk sweep: a single portfolio, since
+# greedy coverage is diversified by construction. See
+# /home/jduvaleus/.claude/plans/given-external-candidate-lineup-optimized-scone.md
+# for the full design writeup.
+# ---------------------------------------------------------------------------
+
+_TOPN_FIELD_POOL_CAP = 25_000
+
+
+def build_topn_field_pool(
+    players_df: pd.DataFrame,
+    ownership_vec: np.ndarray,
+    field_pool_size: int,
+    rng_seed: int,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+) -> np.ndarray:
+    """(field_pool_size, 10) int64 player-id rows -- one
+    ContestSimulator.generate_field() call. Meant to be built exactly once
+    per slate and reused by every contest's coverage computation (see
+    allocate_contests_topn_coverage) -- generation is the expensive step,
+    the per-contest field subsets are cheap re-slices of this pool's already-
+    simulated scores.
+
+    `stop_check`, if given, is forwarded to generate_field (polled every
+    1,000 attempts) -- this can be the single largest uninterruptible chunk
+    of a topn_coverage run (100+s at production scale) without it, since
+    everything downstream (allocate_contests_topn_coverage's per-pick loop)
+    already checks stop_check but can't do anything about a Stop click that
+    lands during this call."""
+    from src.optimization.contest import ContestSimulator
+
+    return ContestSimulator().generate_field(
+        players_df, ownership_vec, n_lineups=field_pool_size, rng_seed=rng_seed,
+        progress_cb=progress_cb, stop_check=stop_check,
+    )
+
+
+def augment_topn_pool_with_generated(
+    pool: ExternalPool,
+    players_df: pd.DataFrame,
+    ownership_vec: np.ndarray,
+    n_generated: int,
+    rng_seed: int,
+    stop_check: Optional[Callable[[], bool]] = None,
+) -> tuple[ExternalPool, list]:
+    """Adds up to `n_generated` additional candidate lineups to `pool`,
+    drawn from the same ownership-weighted stacked-lineup generator the
+    threshold field pool uses (`build_topn_field_pool` -> ContestSimulator.
+    generate_field), so topn_coverage's greedy selection can pick a
+    high-performing lineup that's visible in the simulated field but wasn't
+    in the real external export -- previously structurally impossible
+    (allocate_contests_topn_coverage only ever picks from `pool.lineups`,
+    which came exclusively from parse_lineup_pool).
+
+    MUST be called with an `rng_seed` independent of whatever seed the
+    threshold field pool (`build_topn_field_pool`) was built with -- the
+    two need to be genuinely separate draws, not just separately named
+    variables, or a generated candidate could be one of the very field
+    lineups a given (draw, world)'s threshold is computed from, comparing
+    it against a bar it partly set itself (see the design discussion this
+    followed: allocate_contests_topn_coverage's field pool and candidate
+    pool were kept as two disjoint arrays from the start specifically to
+    avoid needing a self_play-style "remove from field eligibility once
+    picked" runtime guard -- two independently seeded draws make that
+    guard unnecessary rather than working around not having one).
+
+    Generated lineups are deduplicated against the EXISTING pool using the
+    same 9/10-player-overlap rule `parse_lineup_pool` already applies
+    (`_find_near_duplicate_removals`), with every real external lineup
+    ranked above every generated one so a conflict always keeps the real
+    one -- a generated lineup only ever adds NEW shapes, never displaces or
+    shadows a real SaberSim pick. Generated-vs-generated conflicts (rare at
+    typical pool sizes) break arbitrarily (stable sort order).
+
+    Returns `(augmented_pool, generated_kept)` -- `generated_kept` is the
+    list of generated Lineup objects that actually survived dedup (can be
+    fewer than `n_generated`, both from near-duplicates and from
+    ContestSimulator.generate_field's own rejection sampling not always
+    reaching the requested count). `augmented_pool.lineups` is exactly
+    `pool.lineups + generated_kept`, in that order -- callers that need to
+    tell which of a later allocation's picks were generated-sourced (e.g.
+    for progress reporting) can build a boolean mask directly from
+    `len(pool.lineups)`/`generated_kept` rather than re-deriving it."""
+    if n_generated <= 0:
+        return pool, []
+
+    generated_rows = build_topn_field_pool(
+        players_df, ownership_vec, n_generated, rng_seed, stop_check=stop_check,
+    )
+    generated_lineups = [Lineup(player_ids=[int(p) for p in row]) for row in generated_rows]
+
+    combined_lineups = list(pool.lineups) + generated_lineups
+    combined_ids = [lu.player_ids for lu in combined_lineups]
+    n_external = len(pool.lineups)
+    # Every external lineup outranks every generated one, so any 9/10
+    # conflict always keeps the real one -- generated lineups only ever
+    # fill in NEW shapes.
+    priority = np.concatenate([
+        np.ones(n_external), np.zeros(len(generated_lineups)),
+    ])
+    removed = _find_near_duplicate_removals(combined_ids, priority)
+    # Every external lineup is guaranteed to survive (they're already
+    # mutually deduped from parse_lineup_pool, and outrank every generated
+    # one here), so survivors[:n_external] == pool.lineups exactly and
+    # survivors[n_external:] is exactly the surviving generated lineups, in
+    # their original relative order.
+    survivors = [lu for i, lu in enumerate(combined_lineups) if i not in removed]
+    generated_kept = survivors[n_external:]
+
+    augmented = ExternalPool(
+        lineups=survivors, contests=pool.contests,
+        n_dropped_unknown_players=pool.n_dropped_unknown_players,
+        n_dropped_duplicates=pool.n_dropped_duplicates,
+        n_dropped_near_duplicates=pool.n_dropped_near_duplicates + len(removed),
+        source_paths=pool.source_paths,
+    )
+    return augmented, generated_kept
+
+
+def _topn_sims_for_field_size(
+    field_size_g: float,
+    n_sims: int,
+    sims_per_contest_fraction: float,
+    sims_min: int = 0,
+    sims_reference_field_size: float = 0.0,
+    sims_power: float = 0.0,
+) -> int:
+    """Per-contest sim-world budget n_sims_g.
+
+    Default/active path: the field-size-aware formula
+    `n_sims_g = clip(round(sims_min * (field_size_g /
+    sims_reference_field_size) ** sims_power), sims_min, n_sims)`, used
+    whenever `sims_reference_field_size > 0` and `sims_min > 0` (the shipped
+    `GppConfig` defaults -- see external_pool_topn_sims_min's calibration
+    note in src/api/models.py: 392-1,189-entry fields need ~5,000 sims,
+    5,945-17,835-entry fields need ~10,000, per
+    scripts/calibrate_topn_sims_per_contest.py against a real archived
+    slate). Falls back to a flat fraction of n_sims
+    (`sims_per_contest_fraction`) when either of those two is 0 (e.g. a
+    caller clears one deliberately)."""
+    if sims_reference_field_size > 0 and sims_min > 0:
+        n = sims_min * (max(field_size_g, 1.0) / sims_reference_field_size) ** sims_power
+        return int(np.clip(round(n), sims_min, n_sims))
+    n = int(round(sims_per_contest_fraction * n_sims))
+    return int(np.clip(n, 1, n_sims))
+
+
+class _SimWorldAllocator:
+    """Hands out DISJOINT slices of a shared shuffled permutation of
+    `range(n_sims)` to successive `take()` callers, one per contest.
+
+    An earlier version had each contest draw an INDEPENDENT random
+    subsample of its own `n_sims_g` worlds. That only reduces *expected*
+    overlap between two contests' sim-world sets, it doesn't eliminate it —
+    at production scale `n_sims_g` is often a large fraction of `n_sims`
+    (the calibrated sizing rule needs ~20-40% of a 25,000-sim run per
+    contest), so two independent draws of that size still share a
+    substantial fraction of their worlds by chance, which is exactly the
+    failure mode per-contest subsampling was introduced to avoid (two
+    contests' coverage races converging on the same/near-duplicate
+    best-covering lineup because they're chasing largely the same worlds).
+    Sequentially consuming disjoint slices of one shared permutation
+    guarantees zero overlap between any two contests within a "lap"
+    instead of merely making it less likely.
+
+    When cumulative demand exceeds `n_sims` (a real possibility — e.g. many
+    large-field contests on one slate), `take()` starts a fresh permutation
+    ("lap") rather than raising: mirrors the per-contest greedy loop's own
+    coverage-wave-reset (`allocate_contests_topn_coverage`'s `uncovered`
+    exhaustion handling) — running out of a disjoint resource forces reuse,
+    not failure. Contests within the same lap stay disjoint from each
+    other; a contest in a later lap can share worlds with an earlier-lap
+    contest, same tradeoff as the within-contest wave reset."""
+
+    def __init__(self, n_sims: int, rng_seed: int) -> None:
+        self._n_sims = n_sims
+        self._rng = np.random.default_rng(rng_seed)
+        self._perm = self._rng.permutation(n_sims)
+        self._offset = 0
+        self.lap = 0
+        self.total_taken = 0
+
+    def take(self, n: int) -> np.ndarray:
+        n = min(int(n), self._n_sims)
+        if self._offset + n > self._n_sims:
+            self.lap += 1
+            self._perm = self._rng.permutation(self._n_sims)
+            self._offset = 0
+        idx = np.sort(self._perm[self._offset:self._offset + n])
+        self._offset += n
+        self.total_taken += n
+        return idx
+
+    @property
+    def lap_used_fraction(self) -> float:
+        """Fraction of the CURRENT lap's capacity consumed so far -- the
+        direct answer to "how close is the next contest to forcing a
+        wraparound." 1.0 means the very next `take()` call is guaranteed to
+        start a fresh lap regardless of how small its request is."""
+        return self._offset / self._n_sims if self._n_sims > 0 else 0.0
+
+
+def _topn_field_size_for_group(g: "ContestGroup", field_pool_size: int) -> int:
+    """field_size_g with the nearest-payout-structure fallback for an
+    unparseable prize pool (`implied_field_size` returning 0.0), clipped to
+    the field pool's own size. Shared by `allocate_contests_topn_coverage`'s
+    per-contest loop and `topn_total_sims_needed`'s pre-simulation sim-demand
+    preview (see pipeline.py's topn_coverage auto-sizing step) -- both need
+    the identical field-size-with-fallback logic, computed at two different
+    points in the pipeline (before vs. during allocation)."""
+    from src.optimization.payout import nearest_payout_structure
+
+    implied = implied_field_size(g)
+    if implied > 0:
+        return int(np.clip(implied, 1, field_pool_size))
+    struct, _ = nearest_payout_structure(g.contest_name, None)
+    return int(np.clip(int(struct["total_entries"]), 1, field_pool_size))
+
+
+def topn_total_sims_needed(
+    groups: list["ContestGroup"],
+    field_pool_size: int,
+    sims_per_contest_fraction: float,
+    sims_min: int = 0,
+    sims_reference_field_size: float = 0.0,
+    sims_power: float = 0.0,
+) -> int:
+    """Sum of every contest's `n_sims_g` (see `_topn_sims_for_field_size`) --
+    the total sim-world budget `_SimWorldAllocator` needs to hand out a
+    genuinely disjoint set to every contest with zero wraps. Meant to be
+    called BEFORE the slate's Monte Carlo simulation runs, so its result can
+    become the actual `n_sims` passed to `SimulationEngine.simulate()`
+    (removing the "guess a large-enough n_sims" mental math) -- see
+    pipeline.py's topn_coverage branch.
+
+    Each contest's own clip-upper-bound inside `_topn_sims_for_field_size`
+    is passed as an effectively-unbounded placeholder here (not the final
+    `n_sims`, which is exactly what this function is computing) so no
+    individual contest's natural formula value gets artificially capped
+    before the sum is taken; once the real (now-sized-to-fit) `n_sims` is
+    used for the actual allocation later, it's >= every individual
+    contest's need by construction, so nothing clips there either."""
+    total = 0
+    for g in groups:
+        if len(g.entries) <= 0:
+            continue
+        field_size_g = _topn_field_size_for_group(g, field_pool_size)
+        n = _topn_sims_for_field_size(
+            field_size_g, 2**31 - 1, sims_per_contest_fraction,
+            sims_min, sims_reference_field_size, sims_power,
+        )
+        total += n
+    return total
+
+
+def _score_field_cols_batched(
+    sim_sub_matrix: np.ndarray, cols: np.ndarray, batch_size: int = 500,
+) -> np.ndarray:
+    """`cols`: `(n, 10)` int32 column indices (already resolved from
+    player_ids -- see `allocate_contests_topn_coverage`'s precomputed
+    `field_lineup_cols`, which skips redoing that id->column lookup on
+    every K-draw/contest the way `ContestSimulator.score_field` calling
+    it fresh each time would). Batched over `cols`' first axis, mirroring
+    `score_field`'s own batching -- an unbatched `sim_sub_matrix[:, cols]`
+    materializes a `(n_sims_g, n, 10)` intermediate before the `.sum(axis=2)`
+    reduction, which is exactly the blowup this whole restructuring exists
+    to avoid (a real one at production scale: ~15GB for a single large
+    contest's full field-pool-sized, unbatched score in early testing)."""
+    n = cols.shape[0]
+    n_sims_g = sim_sub_matrix.shape[0]
+    out = np.empty((n_sims_g, n), dtype=np.float32)
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        out[:, start:end] = sim_sub_matrix[:, cols[start:end]].sum(axis=2)
+    return out
+
+
+def allocate_contests_topn_coverage(
+    pool: ExternalPool,
+    sim_results,
+    groups: list[ContestGroup],
+    field_lineups: np.ndarray,
+    proj_scores: Optional[np.ndarray] = None,
+    proj_score_floor_percentile: float = 0.0,
+    topn_rank: int = 10,
+    field_samples: int = 5,
+    sims_per_contest_fraction: float = 0.5,
+    sims_min: int = 0,
+    sims_reference_field_size: float = 0.0,
+    sims_power: float = 0.0,
+    relax_step: float = 1.0,
+    candidate_batch_size: int = 2_000,
+    rng_seed: int = 42,
+    pick_progress_chunk: int = 25,
+    is_generated: Optional[np.ndarray] = None,
+    stop_check: Optional[Callable[[], bool]] = None,
+    progress_cb: Optional[Callable[[dict], None]] = None,
+) -> ExternalAllocation:
+    """Top-N field-coverage allocation: for each contest (iterated in the
+    caller-supplied `groups` order -- entry fee desc, prize pool asc, same
+    convention `allocate_contests`/`self_play_allocate_contests` consume
+    without re-sorting), greedily fill its entries with whichever remaining
+    candidate crosses a per-simulated-world top-`topn_rank` threshold most
+    often among worlds nobody already picked has claimed.
+
+    `sim_results` is a `SimulationResults`-like object (`.results_matrix`
+    `(n_sims, n_players)`, `.player_ids`) and `field_lineups` is the RAW
+    `(field_pool_size, 10)` player-id array from `build_topn_field_pool` --
+    NEITHER is pre-scored against the sim matrix. Both candidate scores and
+    field-pool scores are computed ON DEMAND, per contest, restricted to
+    that contest's own `n_sims_g`-sized disjoint sim-world slice (and, for
+    the field side, only the `field_size_g` lineups actually drawn into a
+    given `field_samples` sample) -- never materializing a full `(n_sims,
+    field_pool_size)` or `(M, n_sims)` matrix. This replaced an earlier
+    version that pre-scored both matrices once up front: harmless at the
+    old flat `n_sims=25,000` default, but with n_sims now auto-sized to a
+    slate's real total sim-world demand (often 2-3x that, see
+    `topn_total_sims_needed`), the pre-scored field matrix alone measured
+    ~6.8GB on a real archived slate (auto-sized to ~68,000 sims) --
+    pushing peak RSS to ~14.6GB, over the 10GB budget. Per-contest,
+    per-K-draw scoring bounds the transient cost by the LARGEST single
+    contest's own `(n_sims_g, field_size_g)` need instead of the whole
+    slate's, freed again once that contest's picks are done.
+
+    `proj_scores`/`proj_score_floor_percentile` mirror `allocate_contests`'s
+    own pool-wide projected-score floor exactly (`compute_proj_score_floor`,
+    seeded into the shared-removal `mask` once, before any contest is
+    processed) -- coverage alone has no notion of "good lineup," only
+    "differentiated lineup," so this keeps the mechanism choosing among
+    already-viable candidates. The pool's existing 9/10-player-overlap
+    near-duplicate cull (`_find_near_duplicate_removals`, applied once in
+    `parse_lineup_pool` before any ev_type branch runs) already covers this
+    pool regardless of ev_type -- no separate handling needed here.
+
+    Per contest:
+
+    1. `field_size_g` = `implied_field_size(g)` clipped to
+       `[1, field_pool_size]` (falls back to the nearest real payout
+       table's `total_entries` when unparseable).
+    2. `n_sims_g` sim-world indices are taken as a DISJOINT slice of a
+       shared shuffled permutation of `range(n_sims)` (`_SimWorldAllocator`
+       -- guarantees zero overlap with every other contest's sim-world set
+       within the same "lap," unlike an independent random draw, which only
+       makes overlap less likely). `sim_results.results_matrix[sim_idx_g]`
+       is sliced down to this subsample FIRST, and every subsequent step --
+       both candidate scoring and field scoring -- only ever touches that
+       small `(n_sims_g, ...)` slice, which is what bounds this contest's
+       cost by its own (possibly much smaller) `n_sims_g` and keeps two
+       different contests from ever racing for the same worlds (which would
+       tend to pick the same lineup's near-neighbors into both).
+    3. `field_samples` (K) independent `field_size_g`-lineup index-subsets
+       are drawn from `field_lineups` (cheap re-slices of the raw lineup
+       array, no new field generation) -- multiple field snapshots per
+       contest instead of one static draw, to avoid overfitting to a single
+       field's idiosyncrasies. Each draw is scored on demand, against only
+       this contest's `n_sims_g` sim-world slice
+       (`_score_field_cols_batched`), then discarded once its threshold row
+       is extracted.
+    4. Per-(field-draw, world) rank-`topn_rank` thresholds are computed via
+       `np.partition` (avoids a full sort).
+    5. Crossing bits (`candidate_score >= threshold`) are computed chunked
+       over candidates and bit-packed, in the same shape
+       `CoveragePortfolioSelector` consumes.
+    6. A greedy hard-coverage loop (popcount, `_POPCOUNT_LUT`) picks one
+       candidate per step -- the one covering the most still-uncovered
+       (draw, world) slots -- then removes those slots from consideration
+       for the rest of this contest. If no remaining candidate covers any
+       uncovered slot, every threshold is deflated (by the minimum amount
+       that lets some candidate cross, equivalent to repeating the literal
+       "deflate by `relax_step`" rule that many times) and crossing bits are
+       recomputed. If every slot is already covered before the contest is
+       full, coverage resets to a fresh "wave" rather than degenerating
+       into unresolvable ties.
+
+    Reported EV per pick is the number of (draw, world) slots that
+    candidate uniquely claimed at pick time (`f`) -- there's no dollar/ROI
+    value native to this currency, but `f` is a meaningful "how much did
+    this pick add" figure for display/logging, paralleling every other
+    ev_type's `(Lineup, ev)` return shape.
+
+    `is_generated`, if given, is a `(M,)` boolean mask aligned with
+    `pool.lineups` (see `augment_topn_pool_with_generated`, which builds
+    `pool.lineups` as `real_lineups + generated_lineups` so `is_generated =
+    [False]*n_real + [True]*n_generated` lines up directly) -- purely for
+    progress reporting (`contest_done`'s `n_generated_picks`), no effect on
+    selection itself; a generated lineup competes on identical footing to a
+    real one once it's in `pool.lineups`."""
+    from src.optimization.gpp_portfolio import _POPCOUNT_LUT
+    from src.optimization import self_play as _sp
+
+    _sp._tune_malloc_for_large_arrays()
+
+    M = len(pool.lineups)
+    n_sims = sim_results.results_matrix.shape[0]
+    K = max(1, int(field_samples))
+
+    # Resolve field_lineups' player_ids to sim-matrix column indices ONCE
+    # (cheap -- doesn't scale with n_sims) rather than re-resolving them on
+    # every K-draw/contest, which is what repeatedly calling
+    # ContestSimulator.score_field would do now that field scoring runs
+    # many times instead of once. Drop any lineup with a player missing
+    # from sim_results (shouldn't happen in practice -- field_lineups and
+    # sim_results are built from the same players_df -- but score_field's
+    # original behavior was to drop rather than crash, so this keeps that).
+    col_map = {int(p): i for i, p in enumerate(sim_results.player_ids)}
+    _field_cols_raw = np.full((field_lineups.shape[0], 10), -1, dtype=np.int32)
+    for _i, _row in enumerate(field_lineups):
+        for _j, _pid in enumerate(_row):
+            _field_cols_raw[_i, _j] = col_map.get(int(_pid), -1)
+    _valid_field = (_field_cols_raw >= 0).all(axis=1)
+    field_lineup_cols = _field_cols_raw[_valid_field]  # (field_pool_size, 10) int32
+    field_pool_size = field_lineup_cols.shape[0]
+    if field_pool_size < field_lineups.shape[0]:
+        logger.warning(
+            "topn_coverage: dropped %d/%d field lineups with a player missing "
+            "from sim_results.", field_lineups.shape[0] - field_pool_size, field_lineups.shape[0],
+        )
+
+    # Candidate-lineup indicator matrix, precomputed once for the whole
+    # pool (P x M, doesn't scale with n_sims) -- sliced per contest to
+    # score only that contest's remaining candidates against only its own
+    # sim-world subsample, instead of a precomputed (M, n_sims) matrix for
+    # the whole pool.
+    I_pool = _lineup_indicator_matrix(pool.lineups, sim_results.player_ids)  # (n_players, M)
+
+    mask = np.ones(M, dtype=bool)
+    if proj_scores is not None:
+        floor = compute_proj_score_floor(proj_scores, proj_score_floor_percentile)
+        if floor is not None:
+            proj_floor, _ = floor
+            mask &= np.isfinite(proj_scores) & (proj_scores >= proj_floor)
+
+    portfolio: list = []
+    entry_plan: list = []
+    unfilled: list = []
+    sim_allocator = _SimWorldAllocator(n_sims, rng_seed)
+
+    for contest_index, g in enumerate(groups):
+        if stop_check is not None and stop_check():
+            break
+        k = len(g.entries)
+        if k <= 0:
+            continue
+        rem_all = np.where(mask)[0]
+        if len(rem_all) == 0:
+            unfilled.extend(g.entries)
+            continue
+
+        field_size_g = _topn_field_size_for_group(g, field_pool_size)
+
+        n_sims_g = _topn_sims_for_field_size(
+            field_size_g, n_sims, sims_per_contest_fraction,
+            sims_min, sims_reference_field_size, sims_power,
+        )
+        rng = np.random.default_rng(rng_seed + contest_index)  # used below for the K field draws
+        sim_idx_g = sim_allocator.take(n_sims_g)
+
+        # Slice down to this contest's sim-world subsample FIRST, then score
+        # ON DEMAND from that small slice -- never touching the full n_sims
+        # axis again for the rest of this contest. Both of these are
+        # transient, freed once this contest's picks are done (see the
+        # explicit `del` at the end of the loop body) -- what bounds peak
+        # memory by the largest single contest's own need instead of the
+        # whole slate's.
+        sim_sub_matrix = sim_results.results_matrix[sim_idx_g].astype(np.float32)  # (n_sims_g, n_players)
+        cand_sub = (sim_sub_matrix @ I_pool[:, rem_all]).T                          # (len(rem_all), n_sims_g)
+
+        N = min(topn_rank, field_size_g)
+        n_slots = K * n_sims_g
+        n_bytes_g = -(-n_slots // 8)
+        pad = n_bytes_g * 8 - n_slots
+
+        def _draw_thresholds() -> np.ndarray:
+            thr = np.empty((K, n_sims_g), dtype=np.float32)
+            for kk in range(K):
+                subset = rng.choice(field_pool_size, size=field_size_g, replace=False)
+                field_batch_scores = _score_field_cols_batched(
+                    sim_sub_matrix, field_lineup_cols[subset],
+                )  # (n_sims_g, field_size_g) -- scored on demand, discarded after this line
+                thr[kk] = np.partition(field_batch_scores, -N, axis=1)[:, -N]
+            return thr
+
+        def _crossing_bits(thr: np.ndarray) -> np.ndarray:
+            """(len(rem_all), n_bytes_g) uint8, chunked over candidates."""
+            n_cand = cand_sub.shape[0]
+            bits = np.zeros((n_cand, n_bytes_g), dtype=np.uint8)
+            for start in range(0, n_cand, candidate_batch_size):
+                end = min(start + candidate_batch_size, n_cand)
+                batch = cand_sub[start:end]                   # (b, n_sims_g)
+                cross = np.empty((end - start, K, n_sims_g), dtype=bool)
+                for kk in range(K):
+                    cross[:, kk, :] = batch >= thr[kk][None, :]
+                bits[start:end] = np.packbits(cross.reshape(end - start, n_slots), axis=1)
+            return bits
+
+        def _fresh_uncovered() -> np.ndarray:
+            u = np.full(n_bytes_g, 0xFF, dtype=np.uint8)
+            if pad:
+                u[-1] = np.uint8((0xFF << pad) & 0xFF)
+            return u
+
+        thresholds = _draw_thresholds()
+        bits = _crossing_bits(thresholds)
+        remaining_local = np.ones(len(rem_all), dtype=bool)
+        uncovered = _fresh_uncovered()
+        # Unlike `uncovered` (reset to all-1s on every coverage wave, so it
+        # only reflects the CURRENT wave), `ever_covered` accumulates via OR
+        # across the whole contest, wave resets included -- the persistent
+        # record of which (draw, world) slots were claimed by ANY pick,
+        # ever, used for the world-level "claimed" summary at contest_done.
+        ever_covered = np.zeros(n_bytes_g, dtype=np.uint8)
+
+        picks_local: list[int] = []
+        picks_ev: list[float] = []
+        n_relaxations = 0
+        n_wave_resets = 0
+        t0 = time.time()
+        target = min(k, len(rem_all))
+        if progress_cb is not None:
+            progress_cb({
+                "event": "contest_start", "contest_id": g.contest_id, "k": k,
+                "field_size_g": field_size_g, "n_sims_g": n_sims_g,
+                "contest_index": contest_index, "contests_total": len(groups),
+                "sim_lap": sim_allocator.lap,
+            })
+        while len(picks_local) < target:
+            if stop_check is not None and stop_check():
+                break
+            new_bits = np.bitwise_and(bits, uncovered[None, :])
+            gains = _POPCOUNT_LUT[new_bits].sum(axis=1).astype(np.int64)
+            gains[~remaining_local] = -1
+            best_local = int(np.argmax(gains))
+            f = int(gains[best_local])
+            if f <= 0:
+                if not uncovered.any():
+                    # Every slot already claimed by earlier picks in this
+                    # contest -- start a fresh coverage wave rather than
+                    # degenerating into unresolvable ties.
+                    uncovered = _fresh_uncovered()
+                    n_wave_resets += 1
+                    continue
+                # Relax: deflate every threshold by the minimum amount that
+                # lets some remaining candidate cross an uncovered slot --
+                # equivalent to (and far cheaper than) repeating the literal
+                # "deflate by relax_step, retry" rule that many times.
+                max_score_per_world = cand_sub[remaining_local].max(axis=0)  # (n_sims_g,)
+                uncovered_mask = np.unpackbits(uncovered)[:n_slots].reshape(K, n_sims_g).astype(bool)
+                gaps = thresholds - max_score_per_world[None, :]
+                gaps = np.where(uncovered_mask, gaps, np.inf)
+                min_gap = float(gaps.min())
+                steps = max(1, int(np.ceil(min_gap / relax_step))) if np.isfinite(min_gap) else 1
+                thresholds -= steps * relax_step
+                bits = _crossing_bits(thresholds)
+                n_relaxations += steps
+                continue
+            picks_local.append(best_local)
+            picks_ev.append(float(f))
+            remaining_local[best_local] = False
+            np.bitwise_and(uncovered, np.bitwise_not(bits[best_local]), out=uncovered)
+            np.bitwise_or(ever_covered, bits[best_local], out=ever_covered)
+            if progress_cb is not None and (
+                len(picks_local) % max(1, pick_progress_chunk) == 0 or len(picks_local) == target
+            ):
+                progress_cb({
+                    "event": "pick", "contest_id": g.contest_id,
+                    "pick_num": len(picks_local), "k": k,
+                    "uncovered_remaining": int(_POPCOUNT_LUT[uncovered].sum()),
+                    "uncovered_total": n_slots, "relaxations_so_far": n_relaxations,
+                    "elapsed_s": time.time() - t0,
+                })
+
+        picks_global = (
+            rem_all[np.array(picks_local, dtype=np.int64)] if picks_local
+            else np.empty(0, dtype=np.int64)
+        )
+        for p, ev in zip(picks_global, picks_ev):
+            mask[int(p)] = False
+            portfolio.append((pool.lineups[int(p)], ev))
+        entry_plan.extend(g.entries[: len(picks_global)])
+        if len(picks_global) < k:
+            unfilled.extend(g.entries[len(picks_global):])
+        if progress_cb is not None:
+            # worlds_claimed: how many of this contest's OWN n_sims_g
+            # sim-worlds were covered by the final portfolio in AT LEAST ONE
+            # of the K field draws (ever_covered, OR-accumulated across any
+            # coverage-wave resets -- not just the current wave's state, and
+            # not double-counted per K draw or per pick). Reported in the
+            # SAME units as n_sims_g/sim_total_taken above (raw sim-world
+            # count, not (draw, world) slots), so summing worlds_claimed's
+            # denominator (n_sims_g) across every contest equals the total
+            # auto-sized n_sims -- and worlds_claimed_pct is always in
+            # [0, 100], with n_wave_resets called out separately instead of
+            # (mis)implied by a >100% figure.
+            ever_covered_mask = np.unpackbits(ever_covered)[:n_slots].reshape(K, n_sims_g).astype(bool)
+            worlds_claimed = int(ever_covered_mask.any(axis=0).sum())
+            n_generated_picks = (
+                int(is_generated[picks_global].sum()) if is_generated is not None and len(picks_global)
+                else 0
+            )
+            progress_cb({
+                "event": "contest_done", "contest_id": g.contest_id, "k": k,
+                "n_filled": len(picks_global), "n_relaxations": n_relaxations,
+                "n_wave_resets": n_wave_resets, "n_generated_picks": n_generated_picks,
+                "elapsed_s": time.time() - t0,
+                "sim_lap": sim_allocator.lap,
+                "sim_lap_used_pct": round(sim_allocator.lap_used_fraction * 100, 1),
+                "sim_total_taken": sim_allocator.total_taken,
+                "n_sims_total": n_sims,
+                "n_sims_g": n_sims_g,
+                "worlds_claimed": worlds_claimed,
+                "worlds_claimed_pct": round(100 * worlds_claimed / n_sims_g, 1) if n_sims_g > 0 else 0.0,
+            })
+        # Explicit del + malloc_trim (see self_play._MMAP_THRESHOLD_BYTES'
+        # comment for the same rationale applied here) rather than relying
+        # on the next loop iteration's reassignment to free these -- both
+        # can be sizable for a large contest, and this is exactly the
+        # alloc/free-many-different-sized-arrays pattern that comment
+        # documents glibc handling poorly without the tuning below.
+        del sim_sub_matrix, cand_sub, bits
+        _sp._release_free_memory()
+        if len(picks_global) < k and stop_check is not None and stop_check():
+            break
+
+    if len(portfolio) != len(entry_plan):
+        raise RuntimeError(
+            "topn_coverage allocation invariant broken: portfolio/entry_plan length mismatch"
+        )
     return ExternalAllocation(portfolio=portfolio, entry_plan=entry_plan, unfilled=unfilled)
 
 

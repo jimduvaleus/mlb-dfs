@@ -95,11 +95,32 @@ CONTEST_STRUCTURES = {
 }
 
 
+def _contest_structure_key(contest_name: str) -> Optional[str]:
+    """Match `contest_name` against CONTEST_STRUCTURES's short keys, either
+    exactly (the offline backtest substrate's convention -- pre-normalized
+    short display names like "Base Hit", see tests/bt_core.py::ZIP_TO_CONTEST)
+    or as a substring (DK's REAL entries-file convention -- full names like
+    "MLB $10K Skipper [Single Entry]". Confirmed via a live smoke test
+    2026-08-08: every one of a real slate's 12 contests only matched this
+    way -- the exact-match path alone never fires against real DK entries
+    files, only against the offline substrate's pre-normalized names).
+
+    Returns None if nothing matches OR if more than one registered key
+    substring-matches (ambiguous) -- callers should treat that the same as
+    "no table" rather than guess wrong."""
+    name = str(contest_name).strip().lower()
+    if name in CONTEST_STRUCTURES:
+        return name
+    hits = [k for k in CONTEST_STRUCTURES if k in name]
+    return hits[0] if len(hits) == 1 else None
+
+
 def structure_for_contest(
     contest_name: str, n_entries: Optional[int] = None,
 ) -> Optional[dict]:
     """The real payout structure for `contest_name`, or None when we have no
-    table for it.
+    table for it. Matches either the offline substrate's exact short names
+    or DK's real full entries-file names (see _contest_structure_key).
 
     DK runs several size variants of the same contest (Four-Seamer appears as
     both a $15K/4,458 and a $20K/5,945 version), so pass `n_entries` — the
@@ -111,10 +132,41 @@ def structure_for_contest(
     caller with no table should skip the contest or be explicit that it is
     extrapolating.
     """
-    keys = CONTEST_STRUCTURES.get(str(contest_name).strip().lower())
-    if not keys:
+    key = _contest_structure_key(contest_name)
+    if key is None:
         return None
+    keys = CONTEST_STRUCTURES[key]
     if len(keys) == 1 or n_entries is None:
         return load_payout_structure(keys[0])
     cands = [load_payout_structure(k) for k in keys]
     return min(cands, key=lambda s: abs(int(s["total_entries"]) - int(n_entries)))
+
+
+def nearest_payout_structure(
+    contest_name: str, n_entries: Optional[float] = None,
+) -> tuple[dict, bool]:
+    """Like `structure_for_contest`, but never returns None: falls back to
+    the closest-*size* table across ALL registered contest types when
+    `contest_name` isn't one of the 14 known DK types (e.g. a live contest
+    name outside the archive this codebase's tables were captured from).
+
+    Returns `(structure, is_approximate)` — `is_approximate` is True
+    whenever the fallback fired (name unmatched, or `n_entries` unusable),
+    so callers that need a REAL payout curve every round (unlike
+    `structure_for_contest`'s callers, which can just skip the contest) can
+    surface a warning rather than silently trusting an approximation.
+
+    `n_entries <= 0` or `None` (e.g. `implied_field_size` returning 0.0 for
+    an unparseable prize pool, external_pool.py) has no size to match
+    against, so it falls back to the smallest registered variant rather
+    than guessing a size.
+    """
+    exact = structure_for_contest(contest_name, int(n_entries) if n_entries else None)
+    if exact is not None:
+        return exact, False
+    all_structs = [
+        load_payout_structure(k) for keys in CONTEST_STRUCTURES.values() for k in keys
+    ]
+    if not n_entries or n_entries <= 0:
+        return min(all_structs, key=lambda s: int(s["total_entries"])), True
+    return min(all_structs, key=lambda s: abs(int(s["total_entries"]) - int(n_entries))), True

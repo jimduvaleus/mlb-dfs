@@ -295,7 +295,11 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
   const fptsOverrides = buildFptsOverrides(contestCollisions, swappedCollisions)
 
   // Derive displayed lineups. viewingRisk=null shows the active portfolio (state.portfolio).
-  const hasSweep = portfolioSweep.length > 0
+  // A single-entry sweep (self_play: no risk/diversity sweep, one portfolio
+  // only — see pipeline.py::_run_external's self_play branch) has nothing
+  // to select between, so the risk-selector strip stays hidden rather than
+  // rendering a pointless one-button row.
+  const hasSweep = portfolioSweep.length > 1
   const displayedRisk = viewingRisk ?? activeRisk
   const sweepEntry = portfolioSweep.find(e => e.risk === displayedRisk)
   const isPrimary = displayedRisk === activeRisk

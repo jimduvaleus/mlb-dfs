@@ -3398,7 +3398,7 @@ def run_cache_status():
     try:
         from .external_pool import discover_external_files
         _ev_type = str(getattr(cfg.gpp, "external_pool_ev_type", "roi") or "roi").strip().lower()
-        _roi_required = _ev_type not in ("prj_own", "p_win", "proj_top")
+        _roi_required = _ev_type not in ("prj_own", "p_win", "proj_top", "self_play", "topn_coverage")
         raw_dir = str((PROJECT_ROOT / slate_path).parent) if slate_path else ""
         found = discover_external_files(raw_dir) if raw_dir else {}
         if found.get("lineups_paths") and found.get("projections_path"):

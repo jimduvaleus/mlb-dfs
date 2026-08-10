@@ -55,6 +55,26 @@ BACKTEST_SLATES = (
     ]
 )
 
+# Our own real DK usernames -- entries submitted under these on the actual
+# slate date are already sitting inside every standings zip we grade against
+# (production draws real submissions from the same external lineup pool this
+# backtest scores candidates from: exact_overlap checked 2026-08-08 at 89-96%
+# across four 07222026 contests, the gap explained by late swaps changing a
+# player or two after the pool snapshot). Left in `sorted_scores` unfiltered,
+# a hypothetical candidate that happens to match one of our real entries gets
+# graded as a "new" competitor tying against a field that already contains
+# it -- splitting the prize with OURSELVES rather than competing against an
+# independent stranger. See load_real_contests.
+OWN_USERNAMES = {"edgelesscart", "eduvaleus"}
+
+
+def _is_own_entry(entry_name: str) -> bool:
+    """DK's EntryName is "username" (single entry) or "username (n/m)"
+    (multi-entry) -- strip the suffix before comparing so a partial/substring
+    match on someone else's real username can't false-positive."""
+    return entry_name.split(" (")[0].strip().lower() in {u.lower() for u in OWN_USERNAMES}
+
+
 # standings zip stem (lowercased, no extension) -> display key matching
 # portfolio_sweep_draftkings.json's contest_name AND the payout registry's
 # lowercased contest key (structure_for_contest lowercases internally).
@@ -103,13 +123,37 @@ def prod_order(cids: list, fee, prize_pool: dict) -> list:
 
 
 def load_real_contests(d: Path) -> list[dict]:
-    """[{contest, contest_id, n_field, fee, sorted_scores, payout_arr}] --
-    one entry per real standings zip in this slate's archive dir.
+    """[{contest, contest_id, n_field, fee, sorted_scores, payout_arr,
+    n_own_excluded}] -- one entry per real standings zip in this slate's
+    archive dir.
 
     `contest-standings-*.zip` is always excluded: on every slate checked
     it's a byte-identical (or, once, a stale same-night pre-stat-correction)
     duplicate of one of the named zips, kept around only because the
     Analyze Contest UI feature expects a file with that name to exist.
+
+    `sorted_scores` excludes real entries matching OWN_USERNAMES (see its
+    docstring) -- grading a hypothetical candidate against a field that
+    still contains our own real submission for that exact lineup would
+    split the prize with ourselves rather than model genuine competition.
+    `n_field`/`payout_arr` are NOT adjusted for this: they're derived from
+    the TRUE full field (ourselves included), because DK's real payout
+    table and the real total entrant count are facts about that day that a
+    "what if I'd entered something else instead" counterfactual doesn't
+    change -- only which specific lineups occupy our own slots does.
+
+    SEPARATE known limitation this function does NOT correct for: ANY
+    candidate built from this slate's archived data -- both the external
+    SaberSim pool (src.api.external_pool.parse_lineup_pool) and anything
+    generated from the archived projections file (players_df) -- is graded
+    here against `sorted_scores`, i.e. real entrants who could and did make
+    post-lock swaps as later games in the slate confirmed, that neither
+    frozen source reflects. That's a real handicap on every candidate's
+    apparent performance here, not a data-quality issue this function can
+    fix, and NOT something that differs between external- and generated-
+    sourced candidates (see parse_lineup_pool's PRE-LOCK SNAPSHOT LIMITATION
+    for the full explanation and evidence -- the two archived files this
+    slate's candidates are built from were captured ~1s apart).
     """
     from src.optimization.payout import payout_table_to_array, structure_for_contest
 
@@ -135,9 +179,8 @@ def load_real_contests(d: Path) -> list[dict]:
             rows = list(csv_mod.reader(
                 zf.read(names[0]).decode("utf-8-sig", errors="replace").splitlines()
             ))
-        body = rows[1:]
-        scores = sorted(float(r[4]) for r in body if r and r[0].strip().isdigit())
-        n_field = len(scores)
+        body = [r for r in rows[1:] if r and r[0].strip().isdigit()]
+        n_field = len(body)  # TRUE field size, including our own real entries
         struct = structure_for_contest(contest, n_entries=n_field)
         table_n = struct["total_entries"] if struct is not None else None
         # DK's payout tiers are fixed to the contest's DESIGNED/advertised
@@ -161,12 +204,14 @@ def load_real_contests(d: Path) -> list[dict]:
                   f"{table_n:,} (gap {gap}, {100*gap/table_n:.1f}%) -- using the full-size "
                   "table, DK's payout tiers don't shrink for an under-filled guarantee",
                   flush=True)
+        others = sorted(float(r[4]) for r in body if not _is_own_entry(r[2]))
         out.append({
             "contest": contest,
             "contest_id": f"{d.name}:{stem}",
             "n_field": n_field,
             "fee": struct["entry_fee"],
-            "sorted_scores": np.array(scores, dtype=np.float64),
+            "sorted_scores": np.array(others, dtype=np.float64),
+            "n_own_excluded": n_field - len(others),
             "payout_arr": payout_table_to_array(struct),
         })
     return out

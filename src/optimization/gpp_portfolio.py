@@ -182,6 +182,123 @@ def _compute_payout_from_sorted_field(
     return out
 
 
+# ------------------------------------------------------------------ #
+#  Tiered payout kernel -- avoids fully sorting the field             #
+# ------------------------------------------------------------------ #
+#
+# _compute_payout_from_sorted_field needs a FULLY sorted field only because
+# its two binary searches assume one. But most of a real DK field never
+# cashes (min-cash plateau, then flat $0 below it) -- exact relative order
+# among ranks that all pay the identical amount is information the payout
+# function never uses. `lookup` (from _build_payout_lookup) already tells us
+# EXACTLY (not by estimating a field-size-independent "~26% cash" rule)
+# which lo-values are tier boundaries, since it's a deterministic function of
+# the real payout_arr. So: partition (not sort) the field around just those
+# boundary positions -- O(N)-ish instead of O(N log N) -- and classify each
+# candidate against the resulting small (T << N) set of boundary SCORES
+# instead of the full N-element sorted field.
+#
+# Correctness: a candidate whose score ties with a field member strictly
+# INSIDE one flat tier needs no special handling -- averaging a constant
+# value over any tie band returns that same constant, so the tier's flat
+# payout is correct whether or not (or how many times) a tie happened inside
+# it. The one case that needs exact resolution is a candidate's score tying
+# with a field member sitting exactly AT a tier boundary, since that tie
+# band can straddle two different payout values -- detected explicitly
+# (bitwise equality against the boundary score) and resolved with an exact
+# O(N) scan of the raw (still-unsorted) field, but only for the specific
+# (candidate, sim) pairs that actually hit it, which real (mostly
+# continuous-valued) FPTS sums should make rare.
+
+def _tier_boundaries(lookup: np.ndarray) -> np.ndarray:
+    """(T,) int64 lo-positions (1..N) where `lookup`'s value changes from the
+    previous lo -- the EXACT tier transitions, read directly off the real
+    payout lookup (no estimation of what fraction of a field cashes)."""
+    return (np.flatnonzero(np.diff(lookup) != 0) + 1).astype(np.int64)
+
+
+def _tier_partition(field_raw: np.ndarray, boundary_lo: np.ndarray) -> np.ndarray:
+    """(n_sims, T) field score value at field-array index (boundary_lo - 1)
+    for each boundary, via one np.partition per sim (multi-kth: numpy
+    partitions around every given position in a single O(N)-ish pass)
+    instead of a full sort.
+
+    The -1 shift is load-bearing, not cosmetic: `boundary_lo[j] = b` means lo
+    first becomes achievable at b for scores ABOVE the b-th smallest field
+    value -- in 0-indexed terms that's `field_sorted[b-1]`, the (b)-th
+    smallest, not `field_sorted[b]`. Getting this off by one silently
+    misclassifies which tier a candidate falls into (caught by
+    tests/test_gpp_portfolio.py's reference comparison against
+    _compute_payout_from_sorted_field, which is exactly why that test exists
+    rather than trusting the derivation by inspection). Every boundary_lo
+    value is in 1..N (see _tier_boundaries), so boundary_lo-1 is always a
+    valid field index (0..N-1) -- no filtering needed, unlike an earlier,
+    buggy version of this function."""
+    field_idx = boundary_lo - 1
+    partitioned = np.partition(field_raw, kth=field_idx, axis=1)
+    return np.ascontiguousarray(partitioned[:, field_idx])
+
+
+@njit(parallel=True, cache=True)
+def _compute_payout_tiered(
+    cand_scores_batch: np.ndarray,  # (BATCH, n_sims) float32, C-contiguous
+    field_raw: np.ndarray,          # (n_sims, N) float32, UNSORTED -- only touched on a boundary-tie
+    boundary_scores: np.ndarray,    # (n_sims, T) float32, ascending -- _tier_partition output
+    boundary_lo: np.ndarray,        # (T,) int64, ascending, in 1..N -- _tier_boundaries output, unfiltered
+    payout_cumsum: np.ndarray,      # (N+2,) float64
+    dilute_cumsum: np.ndarray,      # (N+2,) float64
+    dupe_scale: np.ndarray,         # (BATCH,) float32
+) -> np.ndarray:                    # (BATCH, n_sims) float32
+    """Same exact semantics as _compute_payout_from_sorted_field (see its
+    docstring), computed against tier boundaries instead of the fully sorted
+    field -- see the module comment above this kernel for why that's correct
+    and when the exact-tie fallback triggers."""
+    BATCH = cand_scores_batch.shape[0]
+    n_sims = cand_scores_batch.shape[1]
+    N = field_raw.shape[1]
+    T = boundary_lo.shape[0]
+    out = np.zeros((BATCH, n_sims), dtype=np.float32)
+    for b in prange(BATCH):
+        dilution = 1.0 - np.float64(dupe_scale[b])
+        for s in range(n_sims):
+            score = cand_scores_batch[b, s]
+
+            # searchsorted(boundary_scores[s], score, side="left")
+            lo = 0
+            hi = T
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                if boundary_scores[s, mid] < score:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            bucket = lo
+
+            exact_tie = bucket < T and boundary_scores[s, bucket] == score
+            if not exact_tie:
+                # unambiguous: score falls strictly inside one flat tier --
+                # any lo in that tier's range gives the same payout.
+                lo_idx = boundary_lo[bucket - 1] if bucket > 0 else 0
+                hi_idx = lo_idx
+            else:
+                # rare: score ties a field member exactly at a tier boundary
+                # -- resolve the true tie band exactly, not tier-approximated.
+                cnt_lt = 0
+                cnt_le = 0
+                for i in range(N):
+                    v = field_raw[s, i]
+                    if v < score:
+                        cnt_lt += 1
+                    if v <= score:
+                        cnt_le += 1
+                lo_idx = cnt_lt
+                hi_idx = cnt_le
+
+            total = payout_cumsum[hi_idx + 1] - payout_cumsum[lo_idx]
+            if dilution > 0.0:
+                total -= dilution * (dilute_cumsum[hi_idx + 1] - dilute_cumsum[lo_idx])
+            out[b, s] = total / (hi_idx - lo_idx + 1)
+    return out
 
 
 # ------------------------------------------------------------------ #

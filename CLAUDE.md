@@ -6,6 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 The web UI is **desktop-only**. No consideration needs to be given to mobile or tablet layouts.
 
+## Long-running / multi-slate scripts
+
+Any script that runs for more than a few seconds, or iterates over multiple slates/contests/other large computational blocks, must:
+
+- Force line-buffered stdout (`sys.stdout.reconfigure(line_buffering=True)`) near the top of the script. Python falls back to full block buffering once stdout isn't a TTY, so a script redirected to a log file (the normal way to run anything long) would otherwise show nothing in `tail -f` until the process exits.
+- Checkpoint after each slate/block: append results to a persistent CSV/file immediately and skip already-completed blocks on the next invocation, so an interrupted run (Ctrl-C, kill, crash) can be resumed with the same command line instead of restarting from scratch. See `tests/backtest.py::_append_and_reload` and `scripts/eval_self_play_selector.py::_append_and_reload`/`_done_slates` for the established pattern.
+
+## Memory-conscious matrix operations
+
+At production scale (`n_sims` ~25,000; pools of tens of thousands of lineups), a single `(n_sims × N)` or `(M × n_sims)` float array is already large enough to matter — e.g. a `(n_sims=25,000 × N=29,411)` float32 field-score array is ~2.9GB — and it's easy to build several of these per iteration of a loop without noticing until the process is swapping. Chunk matrix ops over whichever axis is large (candidates/lineups or sim worlds) instead of materializing the whole array at once. Established precedent: `ContestScorer`'s `candidate_batch_size` and `_PWIN_FIELD_CAP` (`src/optimization/gpp_portfolio.py` / `src/api/external_pool.py`), and `accumulate_currencies`'s `chunk` parameter (`tests/bt_core.py`) for the same idea applied to sim-world chunking. A step that rebuilds one of these arrays every round of a repeated loop (not just once) needs this discipline even more, since the cost multiplies by iteration count — this is exactly what caught out the first self-play selector eval run (`src/optimization/self_play.py`'s `_merge_and_sort_field`/`ctx.scores`, diagnosed via `scripts/profile_self_play_round_cost.py` after the run was killed at RSS ~11.5GB with system swap 90% full).
+
 ## Commands
 
 All commands must be run inside the virtualenv:

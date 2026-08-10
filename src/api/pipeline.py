@@ -2363,7 +2363,7 @@ class PipelineRunner:
 
         gpp_cfg = cfg.get("gpp", {})
         _ev_type = str(gpp_cfg.get("external_pool_ev_type", "roi")).strip().lower()
-        if _ev_type not in ("roi", "prj_own", "p_win", "proj_top"):
+        if _ev_type not in ("roi", "prj_own", "p_win", "proj_top", "self_play", "topn_coverage"):
             logger.warning(
                 "External pool: unknown external_pool_ev_type %r — falling back to 'roi'.",
                 _ev_type,
@@ -2420,6 +2420,43 @@ class PipelineRunner:
             mean_calib_pitcher=float(gpp_cfg.get("external_pool_mean_calib_pitcher", 1.0)),
         )
         n_sims = int(sim_cfg.get("n_sims", 10_000))
+        # topn_coverage only: auto-size n_sims to the total sim-world demand
+        # across every real contest being entered, so _SimWorldAllocator can
+        # hand every contest a fully DISJOINT set with zero wraps -- removes
+        # the "guess a large-enough n_sims" mental math the flat configured
+        # value would otherwise require. group_and_match_contests only needs
+        # all_file_entries/pool (both already available), not sim_results,
+        # so this can run before the simulation itself. Computed here
+        # (before simulating) rather than reusing the `groups` built later
+        # at the same call for every ev_type -- reused there via
+        # _topn_groups_preview to avoid computing it twice.
+        _topn_groups_preview = None
+        if _ev_type == "topn_coverage":
+            _topn_groups_preview = ep.group_and_match_contests(all_file_entries, pool)
+            _topn_field_pool_size_preview = int(gpp_cfg.get(
+                "external_pool_topn_field_pool_size", ep._TOPN_FIELD_POOL_CAP,
+            ))
+            _topn_demand = ep.topn_total_sims_needed(
+                _topn_groups_preview, _topn_field_pool_size_preview,
+                sims_per_contest_fraction=float(
+                    gpp_cfg.get("external_pool_topn_sims_per_contest_fraction", 0.5)
+                ),
+                sims_min=int(gpp_cfg.get("external_pool_topn_sims_min", 0)),
+                sims_reference_field_size=float(
+                    gpp_cfg.get("external_pool_topn_sims_reference_field_size", 0.0)
+                ),
+                sims_power=float(gpp_cfg.get("external_pool_topn_sims_power", 0.0)),
+            )
+            if _topn_demand > n_sims:
+                logger.info(
+                    "External pool topn_coverage: auto-sizing n_sims %d -> %d so every "
+                    "contest gets a fully disjoint sim-world set.", n_sims, _topn_demand,
+                )
+                self._cb("topn_sims_autosize", {
+                    "configured_n_sims": n_sims, "total_demand": _topn_demand,
+                    "effective_n_sims": _topn_demand,
+                })
+                n_sims = _topn_demand
         self._cb("simulate", {"n_sims": n_sims})
         engine = SimulationEngine(
             copula, players_df, batter_pca_model=None, score_grid=None,
@@ -2450,18 +2487,31 @@ class PipelineRunner:
                     results_matrix=sim_results.results_matrix.astype(np.float32),
                 )
                 logger.info("External pool: simulation saved to cache %s", self._sim_cache_path)
-        lineup_scores = ep.compute_lineup_scores(pool.lineups, sim_results)
-        corr = ep.compute_pool_corr(pool.lineups, sim_results, scores=lineup_scores)
+        # lineup_scores/corr/sim_p95/sim_p99 are all (M, n_sims)-scaled and
+        # unused by topn_coverage (it scores on demand, per contest, from
+        # sim_results directly -- see allocate_contests_topn_coverage's
+        # docstring) -- skipped there specifically because topn_coverage's
+        # own auto-sizing (topn_total_sims_needed) can inflate n_sims well
+        # past the flat default expressly to serve that ev_type, which would
+        # otherwise inflate this unrelated, unused-by-it computation right
+        # along with it (~2GB+ wasted at a real slate's auto-sized ~68,000
+        # sims with an ~8,000-lineup candidate pool). Every other ev_type
+        # still computes these unconditionally, same as before.
+        if _ev_type == "topn_coverage":
+            lineup_scores = corr = sim_p95_scores = sim_p99_scores = None
+        else:
+            lineup_scores = ep.compute_lineup_scores(pool.lineups, sim_results)
+            corr = ep.compute_pool_corr(pool.lineups, sim_results, scores=lineup_scores)
+            # Field-blind percentiles of the already-computed simulated score
+            # matrix -- cheap (no new simulation), only consulted when proj_top's
+            # ceiling-tier ranking signal is enabled (see external_pool_proj_top_
+            # ceiling_tiers below), but computed unconditionally here alongside
+            # proj_scores/own_scores to match their risk-invariant precompute
+            # pattern.
+            sim_p95_scores = np.percentile(lineup_scores, 95, axis=1)
+            sim_p99_scores = np.percentile(lineup_scores, 99, axis=1)
         proj_scores = ep.compute_pool_proj_scores(pool.lineups, players_df)
         own_scores = ep.compute_pool_ownership(pool.lineups, players_df)
-        # Field-blind percentiles of the already-computed simulated score
-        # matrix -- cheap (no new simulation), only consulted when proj_top's
-        # ceiling-tier ranking signal is enabled (see external_pool_proj_top_
-        # ceiling_tiers below), but computed unconditionally here alongside
-        # proj_scores/own_scores to match their risk-invariant precompute
-        # pattern.
-        sim_p95_scores = np.percentile(lineup_scores, 95, axis=1)
-        sim_p99_scores = np.percentile(lineup_scores, 99, axis=1)
         # Already percentage points here ("My Own" is not divided by 100 in
         # parse_player_projections), unlike the internal pipeline's fractions.
         self._ownership_pct = {
@@ -2520,7 +2570,10 @@ class PipelineRunner:
             })
 
         # --- Contest grouping + ROI matching ------------------------------
-        groups = ep.group_and_match_contests(all_file_entries, pool)
+        groups = (
+            _topn_groups_preview if _topn_groups_preview is not None
+            else ep.group_and_match_contests(all_file_entries, pool)
+        )
         total_entries = sum(len(g.entries) for g in groups)
         self._cb("external_contests", {
             "contests": [
@@ -2709,47 +2762,235 @@ class PipelineRunner:
                 _p_win_cull = None
                 _p_win_select = None
 
-        # --- 5-risk sweep: independent per-contest allocations -------------
-        _evw_base = float(gpp_cfg.get("evw_base", 0.10))
-        _evw_max = float(gpp_cfg.get("evw_max", 0.40))
-        _roi_floor_pct = float(gpp_cfg.get("external_pool_roi_floor_pct", 40.0))
-        _ceiling_weight = float(gpp_cfg.get("external_pool_ceiling_weight", 0.25))
-        _cash_anchor = float(gpp_cfg.get("external_pool_cash_anchor_fraction", 0.25))
-        _risks = [1.0, 2.0, 3.0, 4.0, 5.0]
-        allocations: dict[float, "ep.ExternalAllocation"] = {}
-        for _risk_idx, _risk in enumerate(_risks):
-            if self._stop_check is not None and self._stop_check():
-                break
-            self._cb("gpp_det_risk_start", {
-                "risk": _risk, "risk_index": _risk_idx + 1, "total_risks": len(_risks),
-            })
-            allocations[_risk] = ep.allocate_contests(
-                pool, corr, groups, risk=_risk,
-                evw_base=_evw_base, evw_max=_evw_max,
-                roi_floor_percentile=_roi_floor_pct,
-                proj_scores=proj_scores,
-                proj_score_floor_percentile=_proj_score_floor_pct,
-                ev_type=_ev_type,
-                own_scores=own_scores,
-                own_scale=_own_scale,
-                own_cap_start_pct=_owncap_start_pct,
-                own_cap_end_pct=_owncap_end_pct,
-                own_cap_max_field_size=_owncap_max_field_size,
-                sim_p95_scores=sim_p95_scores,
-                sim_p99_scores=sim_p99_scores,
-                ceiling_tier_boundary=_ceiling_tier_boundary,
-                p_win_cull=_p_win_cull,
-                p_win_select=_p_win_select,
-                p_win_admit_n=_p_win_admit_n,
-                p_win_admit_multiplier=_p_win_admit_multiplier,
-                ceiling_weight=_ceiling_weight,
-                cash_anchor_fraction=_cash_anchor,
-                stop_check=self._stop_check,
-                progress_cb=lambda data, r=_risk, ri=_risk_idx: self._cb(
-                    "gpp_det_select_progress",
-                    {**data, "risk": r, "risk_index": ri + 1, "total_risks": len(_risks)},
-                ),
+        # --- self_play: single sequential best-response allocation, no risk
+        # sweep (diversity is a byproduct of the round loop itself, not a
+        # separate correlation term — see src/optimization/self_play.py) ----
+        if _ev_type == "self_play":
+            from src.optimization import self_play as sp
+
+            self._cb("self_play_pool_start", {"n_contests": len(groups)})
+
+            contests_sp, _fallback_rows = ep.build_self_play_contests(groups)
+            for _row in _fallback_rows:
+                self._cb("self_play_payout_fallback", _row)
+
+            _n_sims_avail = sim_results.results_matrix.shape[0]
+            _round_n_sims = int(gpp_cfg.get(
+                "external_pool_self_play_round_n_sims", sp._ROUND_N_SIMS_DEFAULT,
+            ))
+            if _round_n_sims > _n_sims_avail:
+                logger.warning(
+                    "External pool self_play: round_n_sims %d exceeds simulated "
+                    "%d — clamping.", _round_n_sims, _n_sims_avail,
+                )
+                _round_n_sims = _n_sims_avail
+            _precise_n_sims_cfg = int(gpp_cfg.get(
+                "external_pool_self_play_precise_n_sims", sp._PRECISE_N_SIMS_DEFAULT,
+            ))
+            _precise_n_sims = None
+            if _precise_n_sims_cfg > 0:
+                _precise_n_sims = min(_precise_n_sims_cfg, _n_sims_avail)
+                if _precise_n_sims_cfg > _n_sims_avail:
+                    logger.warning(
+                        "External pool self_play: precise_n_sims %d exceeds "
+                        "simulated %d — clamping.", _precise_n_sims_cfg, _n_sims_avail,
+                    )
+            _shortlist_size = int(gpp_cfg.get(
+                "external_pool_self_play_shortlist_size", 1_000,
+            ))
+
+            _own_vec = players_df["ownership"].astype(float).to_numpy()
+            sp_ctx = sp.build_self_play_context(
+                sim_results, players_df, _own_vec, pool,
+                round_n_sims=_round_n_sims, precise_n_sims=_precise_n_sims,
             )
+            self._cb("self_play_pool_done", {
+                "pool_size": len(sp_ctx.lineups), "precise_n_sims": sp_ctx.precise_n_sims,
+                "n_promoted": len(sp_ctx.promoted_idx),
+            })
+
+            _contests_total = len(contests_sp)
+            _progress_state = {"done": 0}
+
+            def _sp_progress(info: dict) -> None:
+                _progress_state["done"] += 1
+                self._cb("self_play_contest_progress", {
+                    **info, "contests_done": _progress_state["done"],
+                    "contests_total": _contests_total,
+                })
+
+            _sp_result = ep.self_play_allocate_contests(
+                contests_sp, sp_ctx, shortlist_size=_shortlist_size,
+                progress_cb=_sp_progress,
+            )
+
+            allocations: dict[float, "ep.ExternalAllocation"] = {1.0: ep.ExternalAllocation(
+                portfolio=_sp_result.portfolio,
+                entry_plan=ep.remap_self_play_entry_plan(_sp_result.entry_plan, groups),
+                unfilled=ep.remap_self_play_entry_plan(_sp_result.unfilled, groups),
+            )}
+        elif _ev_type == "topn_coverage":
+            # --- topn_coverage: greedy top-N field-coverage allocation, no
+            # risk sweep -- coverage is diversified by construction (see
+            # src/api/external_pool.py::allocate_contests_topn_coverage and
+            # /home/jduvaleus/.claude/plans/
+            # given-external-candidate-lineup-optimized-scone.md) ------------
+            _topn_field_pool_size = int(gpp_cfg.get(
+                "external_pool_topn_field_pool_size", ep._TOPN_FIELD_POOL_CAP,
+            ))
+            _topn_rank = int(gpp_cfg.get("external_pool_topn_rank", 10))
+            _topn_field_samples = int(gpp_cfg.get("external_pool_topn_field_samples", 5))
+            _topn_sims_fraction = float(
+                gpp_cfg.get("external_pool_topn_sims_per_contest_fraction", 0.5)
+            )
+            _topn_sims_min = int(gpp_cfg.get("external_pool_topn_sims_min", 0))
+            _topn_sims_ref = float(
+                gpp_cfg.get("external_pool_topn_sims_reference_field_size", 0.0)
+            )
+            _topn_sims_power = float(gpp_cfg.get("external_pool_topn_sims_power", 0.0))
+            _rng_seed = int(gpp_cfg.get("rng_seed") or 42)
+
+            self._cb("topn_pool_start", {"field_pool_size": _topn_field_pool_size})
+            _own_vec = players_df["ownership"].astype(float).to_numpy()
+            _topn_field_lineups = ep.build_topn_field_pool(
+                players_df, _own_vec, _topn_field_pool_size, _rng_seed,
+                progress_cb=lambda done, total: self._cb(
+                    "topn_pool_progress", {"n_done": done, "n_total": total},
+                ),
+                stop_check=self._stop_check,
+            )
+            # No pre-scoring against the sim matrix here -- allocate_contests_
+            # topn_coverage now scores both the field pool and the candidate
+            # pool ON DEMAND, per contest, restricted to that contest's own
+            # small sim-world/field-size slice (see its docstring). A
+            # pre-scored (n_sims, field_pool_size) matrix was the single
+            # biggest memory cost once n_sims started auto-sizing to a
+            # slate's real total demand (~6.8GB on a real archived slate at
+            # ~68,000 auto-sized sims, pushing peak RSS to ~14.6GB).
+            self._cb("topn_pool_done", {
+                "field_pool_size": _topn_field_lineups.shape[0],
+                # Read the actual sim matrix shape, not the configured n_sims
+                # variable -- identical in the live server (which never sets
+                # sim_cache_path, so sim_results always comes from a fresh
+                # engine.simulate(n_sims) call here) but this stays honest
+                # even if a stale/mismatched sim cache were ever loaded (the
+                # replay-only sim_cache_path hook, see CLAUDE.md's
+                # "Precomputed vs. runtime artifacts" note).
+                "n_sims": sim_results.results_matrix.shape[0],
+            })
+
+            # Optional: augment the real external candidate pool with
+            # additional stacked lineups from the SAME generator the
+            # threshold field pool used, so a high-performing lineup that's
+            # only visible in the simulated field (not the real SaberSim
+            # export) becomes pickable -- see ep.augment_topn_pool_with_
+            # generated's docstring. Off by default (0). Seeded independently
+            # from the threshold field pool (_rng_seed + 1, not _rng_seed) --
+            # reusing the same seed would make this draw start out IDENTICAL
+            # to the field pool, reintroducing the self-comparison bias two
+            # separate pools exist specifically to avoid.
+            _topn_generated_pool_size = int(gpp_cfg.get(
+                "external_pool_topn_generated_pool_size", 0,
+            ))
+            _topn_pool_for_alloc = pool
+            _topn_is_generated = None
+            _topn_proj_scores = proj_scores
+            if _topn_generated_pool_size > 0:
+                _n_real = len(pool.lineups)
+                _topn_pool_for_alloc, _topn_generated_kept = ep.augment_topn_pool_with_generated(
+                    pool, players_df, _own_vec, _topn_generated_pool_size, _rng_seed + 1,
+                    stop_check=self._stop_check,
+                )
+                _topn_is_generated = np.zeros(len(_topn_pool_for_alloc.lineups), dtype=bool)
+                _topn_is_generated[_n_real:] = True
+                # proj_scores was sized for the ORIGINAL (smaller) pool --
+                # must be recomputed over the augmented lineup list before
+                # allocate_contests_topn_coverage's pool-wide floor cull
+                # indexes into it, or a shape mismatch (or worse, silent
+                # misalignment) follows. Generated lineups are built from
+                # this same players_df, so their proj_score is just as real
+                # as an external candidate's.
+                _topn_proj_scores = ep.compute_pool_proj_scores(
+                    _topn_pool_for_alloc.lineups, players_df,
+                )
+                self._cb("topn_pool_augmented", {
+                    "n_requested": _topn_generated_pool_size,
+                    "n_added": len(_topn_generated_kept),
+                    "pool_size": len(_topn_pool_for_alloc.lineups),
+                })
+
+            _contests_total = len(groups)
+            _topn_progress_state = {"contests_done": 0}
+
+            def _topn_progress(info: dict) -> None:
+                _event = info.get("event")
+                if _event == "contest_start":
+                    self._cb("topn_contest_start", {
+                        **info, "contests_done": _topn_progress_state["contests_done"],
+                    })
+                elif _event == "pick":
+                    self._cb("topn_pick_progress", info)
+                elif _event == "contest_done":
+                    _topn_progress_state["contests_done"] += 1
+                    self._cb("topn_contest_done", {
+                        **info, "contests_done": _topn_progress_state["contests_done"],
+                        "contests_total": _contests_total,
+                    })
+
+            _topn_alloc = ep.allocate_contests_topn_coverage(
+                _topn_pool_for_alloc, sim_results, groups, _topn_field_lineups,
+                proj_scores=_topn_proj_scores,
+                proj_score_floor_percentile=_proj_score_floor_pct,
+                topn_rank=_topn_rank, field_samples=_topn_field_samples,
+                sims_per_contest_fraction=_topn_sims_fraction,
+                sims_min=_topn_sims_min, sims_reference_field_size=_topn_sims_ref,
+                sims_power=_topn_sims_power, rng_seed=_rng_seed,
+                is_generated=_topn_is_generated,
+                stop_check=self._stop_check, progress_cb=_topn_progress,
+            )
+            allocations = {1.0: _topn_alloc}
+        else:
+            # --- 5-risk sweep: independent per-contest allocations ---------
+            _evw_base = float(gpp_cfg.get("evw_base", 0.10))
+            _evw_max = float(gpp_cfg.get("evw_max", 0.40))
+            _roi_floor_pct = float(gpp_cfg.get("external_pool_roi_floor_pct", 40.0))
+            _ceiling_weight = float(gpp_cfg.get("external_pool_ceiling_weight", 0.25))
+            _cash_anchor = float(gpp_cfg.get("external_pool_cash_anchor_fraction", 0.25))
+            _risks = [1.0, 2.0, 3.0, 4.0, 5.0]
+            allocations = {}
+            for _risk_idx, _risk in enumerate(_risks):
+                if self._stop_check is not None and self._stop_check():
+                    break
+                self._cb("gpp_det_risk_start", {
+                    "risk": _risk, "risk_index": _risk_idx + 1, "total_risks": len(_risks),
+                })
+                allocations[_risk] = ep.allocate_contests(
+                    pool, corr, groups, risk=_risk,
+                    evw_base=_evw_base, evw_max=_evw_max,
+                    roi_floor_percentile=_roi_floor_pct,
+                    proj_scores=proj_scores,
+                    proj_score_floor_percentile=_proj_score_floor_pct,
+                    ev_type=_ev_type,
+                    own_scores=own_scores,
+                    own_scale=_own_scale,
+                    own_cap_start_pct=_owncap_start_pct,
+                    own_cap_end_pct=_owncap_end_pct,
+                    own_cap_max_field_size=_owncap_max_field_size,
+                    sim_p95_scores=sim_p95_scores,
+                    sim_p99_scores=sim_p99_scores,
+                    ceiling_tier_boundary=_ceiling_tier_boundary,
+                    p_win_cull=_p_win_cull,
+                    p_win_select=_p_win_select,
+                    p_win_admit_n=_p_win_admit_n,
+                    p_win_admit_multiplier=_p_win_admit_multiplier,
+                    ceiling_weight=_ceiling_weight,
+                    cash_anchor_fraction=_cash_anchor,
+                    stop_check=self._stop_check,
+                    progress_cb=lambda data, r=_risk, ri=_risk_idx: self._cb(
+                        "gpp_det_select_progress",
+                        {**data, "risk": r, "risk_index": ri + 1, "total_risks": len(_risks)},
+                    ),
+                )
         if not allocations:
             self._cb("stopped", {"portfolio": [], "n_lineups": 0,
                                  "optimal_lineups": [], "portfolio_sweep": []})

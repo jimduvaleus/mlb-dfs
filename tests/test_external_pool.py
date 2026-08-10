@@ -7,15 +7,20 @@ import pandas as pd
 import pytest
 from pathlib import Path
 
+import src.api.external_pool as ep
 from src.api.dk_entries import EntryRecord
 from src.api.external_pool import (
     ContestGroup,
     ExternalContest,
     ExternalPool,
     allocate_contests,
+    allocate_contests_topn_coverage,
     archive_external_inputs,
+    augment_topn_pool_with_generated,
     build_external_players_df,
     build_quantile_grids,
+    build_self_play_contests,
+    build_topn_field_pool,
     batter_blank_probability,
     _zero_inflate_grid,
     compute_ceiling_ev,
@@ -26,6 +31,7 @@ from src.api.external_pool import (
     compute_pool_proj_scores,
     compute_ppd_roi_adjustment,
     compute_prj_own_ev,
+    compute_proj_score_floor,
     discover_external_files,
     implied_field_size,
     group_and_match_contests,
@@ -35,10 +41,18 @@ from src.api.external_pool import (
     pwin_exponents,
     pwin_field_size,
     pwin_implied_entries,
+    remap_self_play_entry_plan,
+    self_play_allocate_contests,
     _field_percentiles,
+    _find_near_duplicate_removals,
     _pava,
+    _SimWorldAllocator,
+    _topn_sims_for_field_size,
+    topn_total_sims_needed,
 )
 from src.optimization.lineup import Lineup
+from src.optimization.payout import payout_table_to_array
+from src.optimization.self_play import SelfPlaySlateContext
 from src.simulation.results import SimulationResults
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -1639,6 +1653,89 @@ class TestImpliedFieldSize:
         assert implied_field_size(self._group(100_000_00, 0)) == 0.0
 
 
+class TestSelfPlayAllocation:
+    """Synthetic context: exercises the orchestration layer (cross-contest
+    removal, source tagging, round-log aggregation, unfilled reporting)
+    without needing real sims -- the round-loop math itself is covered by
+    tests/test_self_play.py. Scores are constant across sims and strictly
+    distinct across all 8 lineups, so (as established in test_self_play.py)
+    relative ROI ranking each round is field-composition-independent: the
+    highest-scoring remaining candidate always wins, making pick order
+    deterministic regardless of which specific opponents get subsampled."""
+
+    def _ctx(self, n_sims=4):
+        # idx 0-3: external candidates (scores 40, 30, 20, 10)
+        # idx 4-7: generated candidates, ALSO opponent-eligible (35, 25, 15, 5)
+        const = [40.0, 30.0, 20.0, 10.0, 35.0, 25.0, 15.0, 5.0]
+        scores = np.array([[v] * n_sims for v in const], dtype=np.float32)
+        source = np.array(["external"] * 4 + ["generated"] * 4)
+        return SelfPlaySlateContext(
+            lineups=[Lineup(player_ids=[i]) for i in range(8)],
+            source=source, scores=scores, n_external=4, n_sims=n_sims,
+        )
+
+    def _payout_arr(self, n=20):
+        return np.linspace(100.0, 1.0, n)
+
+    def test_cross_contest_no_double_entry_and_source_tags(self):
+        ctx = self._ctx()
+        contests = [
+            {"contest_id": "big", "n_field": 6, "fee": 0.0,
+             "payout_arr": self._payout_arr(), "k": 3},
+            {"contest_id": "small", "n_field": 3, "fee": 0.0,
+             "payout_arr": self._payout_arr(), "k": 2},
+        ]
+        alloc = self_play_allocate_contests(contests, ctx, rng_seed=0)
+
+        ids = [id(lu) for lu, _ in alloc.portfolio]
+        assert len(ids) == len(set(ids)) == 5  # 3 + 2, no repeats across contests
+        assert len(alloc.entry_plan) == 5
+        assert not alloc.unfilled
+        assert set(alloc.source) <= {"external", "generated"}
+        # "big" is processed first and both contests share one pool, so it
+        # claims the 3 globally-best candidates (idx 0, 4, 1 -- scores 40/35/30).
+        # Exact order isn't guaranteed here: idx 4-7 are opponent-eligible AND
+        # candidate-eligible, and refresh_every's default caches the drawn
+        # opponent set across rounds instead of redrawing fresh each round --
+        # if a candidate coincides with a still-cached opponent, it self-ties
+        # with itself in the field for the rest of that window, which can
+        # flip an implementation-defined tie-break (see test_gpp_portfolio.py
+        # for why exact ties split evenly rather than favoring either side).
+        first_contest_ids = {cid for cid, _ in alloc.entry_plan[:3]}
+        assert first_contest_ids == {"big"}
+        picked_idx = [ctx.lineups.index(lu) for lu, _ in alloc.portfolio]
+        assert set(picked_idx[:3]) == {0, 4, 1}
+        # "small" has only 1 opponent (field_size 3 - k 2), so most surviving
+        # candidates merely need to beat that single field member and
+        # legitimately TIE with each other on payout (a real, correct
+        # property of small fields, not a bug) -- check the set of winners,
+        # not an exact order the tie-break has no obligation to produce.
+        assert set(picked_idx[3:]) == {5, 2}
+
+    def test_pool_exhaustion_reports_unfilled(self):
+        ctx = self._ctx()
+        contests = [
+            {"contest_id": "c0", "n_field": 6, "fee": 0.0,
+             "payout_arr": self._payout_arr(), "k": 5},
+            {"contest_id": "c1", "n_field": 5, "fee": 0.0,
+             "payout_arr": self._payout_arr(), "k": 5},  # only 3 candidates left after c0
+        ]
+        alloc = self_play_allocate_contests(contests, ctx, rng_seed=0)
+        assert len(alloc.portfolio) == 8  # 5 (c0) + 3 (c1, pool exhausted)
+        assert len(alloc.unfilled) == 2
+        assert all(cid == "c1" for cid, _ in alloc.unfilled)
+
+    def test_round_log_covers_every_round_after_the_first(self):
+        ctx = self._ctx()
+        contests = [{"contest_id": "c0", "n_field": 6, "fee": 0.0,
+                     "payout_arr": self._payout_arr(), "k": 4}]
+        # No batching -- k=4 takes 4 rounds; round 0 is always the unlogged
+        # full rescore, so rounds 1-3 show up in the log.
+        alloc = self_play_allocate_contests(contests, ctx, rng_seed=0)
+        assert len(alloc.round_log) == 3
+        assert list(alloc.round_log["round"]) == [1, 2, 3]
+
+
 class TestComputePrjOwnEv:
     def test_formula(self):
         proj = np.array([100.0, 90.0])
@@ -2258,3 +2355,552 @@ def test_archive_external_inputs_copies_all_lineup_files(tmp_path):
     assert (d / lp_b.name).exists()
     assert (d / proj.name).exists()
     assert (d / "DKSalaries.csv").exists()
+
+
+# ---------------------------------------------------------------------------
+# self_play live-pipeline adapter: build_self_play_contests / remap_self_play_entry_plan
+# ---------------------------------------------------------------------------
+
+def _make_group(contest_id, contest_name, entry_fee_cents, prize_pool_cents, n_entries):
+    entries = [
+        (Path(f"/tmp/{contest_id}.csv"), EntryRecord(
+            entry_id=f"{contest_id}-{i}", contest_name=contest_name, contest_id=contest_id,
+            entry_fee_cents=entry_fee_cents, entry_fee_raw=f"${entry_fee_cents / 100:.0f}",
+            prize_pool_cents=prize_pool_cents, slot_players=[None] * 10,
+        ))
+        for i in range(n_entries)
+    ]
+    return ContestGroup(
+        contest_id=contest_id, contest_name=contest_name, entry_fee_cents=entry_fee_cents,
+        prize_pool_cents=prize_pool_cents, single_entry_tag=False, entries=entries,
+    )
+
+
+def test_build_self_play_contests_known_name_no_fallback():
+    g = _make_group("c1", "Mini-Max", 2000, 2_000_000, 3)
+    contests, fallback_rows = build_self_play_contests([g])
+    assert len(contests) == 1
+    assert fallback_rows == []
+    c = contests[0]
+    assert c["contest_id"] == "c1"
+    assert c["k"] == 3
+    assert c["fee"] == pytest.approx(20.0)
+    assert len(c["payout_arr"]) > 0
+
+
+def test_build_self_play_contests_unknown_name_falls_back_with_warning_row():
+    g = _make_group("c2", "Totally Unknown Contest", 500, 500_000, 5)
+    contests, fallback_rows = build_self_play_contests([g])
+    assert len(contests) == 1
+    assert len(fallback_rows) == 1
+    row = fallback_rows[0]
+    assert row["contest_name"] == "Totally Unknown Contest"
+    assert row["matched_total_entries"] > 0
+
+
+def test_build_self_play_contests_skips_empty_groups():
+    g_empty = _make_group("c3", "Mini-Max", 2000, 2_000_000, 0)
+    g_full = _make_group("c4", "Mini-Max", 2000, 2_000_000, 2)
+    contests, _ = build_self_play_contests([g_empty, g_full])
+    assert [c["contest_id"] for c in contests] == ["c4"]
+
+
+def test_build_self_play_contests_unparseable_prize_pool_still_falls_back_sanely():
+    # implied_field_size returns 0.0 for a missing prize pool -- no crash,
+    # falls back to nearest_payout_structure's own None-size handling and
+    # uses the matched table's own size rather than propagating 0.
+    g = _make_group("c5", "Totally Unknown Contest", 500, None, 2)
+    contests, fallback_rows = build_self_play_contests([g])
+    assert len(fallback_rows) == 1
+    assert contests[0]["n_field"] > 0
+
+
+def test_remap_self_play_entry_plan_matches_group_entries_by_position():
+    g1 = _make_group("c6", "Mini-Max", 2000, 2_000_000, 3)
+    g2 = _make_group("c7", "Skipper", 400, 40_000, 2)
+    entry_plan = [("c6", 0), ("c6", 2), ("c7", 1)]
+    remapped = remap_self_play_entry_plan(entry_plan, [g1, g2])
+    assert remapped == [g1.entries[0], g1.entries[2], g2.entries[1]]
+
+
+def _topn_pool(lineups):
+    return ExternalPool(
+        lineups=lineups, contests={}, n_dropped_unknown_players=0,
+        n_dropped_duplicates=0, n_dropped_near_duplicates=0,
+        source_paths=[Path("synthetic.csv")],
+    )
+
+
+def _topn_group(contest_id, k, entry_fee_cents=100, prize_pool_cents=420):
+    entries = [(Path("x/Entries.csv"), _rec(contest_id, "Test", entry_fee_cents, f"e{i}"))
+               for i in range(k)]
+    return ContestGroup(
+        contest_id=contest_id, contest_name="Test", entry_fee_cents=entry_fee_cents,
+        prize_pool_cents=prize_pool_cents, single_entry_tag=False, entries=entries,
+        roi_key="", roi_fallback=True,
+    )
+
+
+class TestTopnSimsForFieldSize:
+    def test_flat_fraction_default(self):
+        assert _topn_sims_for_field_size(500, n_sims=1000, sims_per_contest_fraction=0.5) == 500
+
+    def test_clips_to_n_sims(self):
+        assert _topn_sims_for_field_size(500, n_sims=1000, sims_per_contest_fraction=2.0) == 1000
+
+    def test_clips_to_at_least_one(self):
+        assert _topn_sims_for_field_size(500, n_sims=1000, sims_per_contest_fraction=0.0) == 1
+
+    def test_field_size_aware_formula_overrides_flat_fraction(self):
+        n = _topn_sims_for_field_size(
+            field_size_g=20_000, n_sims=100_000, sims_per_contest_fraction=0.5,
+            sims_min=1_000, sims_reference_field_size=1_000, sims_power=1.0,
+        )
+        assert n == 20_000  # clip(1000 * (20000/1000)^1, 1000, 100000)
+
+
+class TestSimWorldAllocator:
+    """Guarantees disjointness within a lap (unlike two independent random
+    draws, which merely make overlap less likely) and graceful reuse once
+    cumulative demand exceeds n_sims."""
+
+    def test_sequential_takes_are_pairwise_disjoint_within_one_lap(self):
+        alloc = _SimWorldAllocator(n_sims=1000, rng_seed=42)
+        a = alloc.take(300)
+        b = alloc.take(300)
+        c = alloc.take(300)
+        assert len(set(a) & set(b)) == 0
+        assert len(set(a) & set(c)) == 0
+        assert len(set(b) & set(c)) == 0
+        assert alloc.lap == 0  # 900 <= 1000, no wrap needed
+
+    def test_take_returns_requested_count_in_range(self):
+        alloc = _SimWorldAllocator(n_sims=1000, rng_seed=1)
+        idx = alloc.take(250)
+        assert len(idx) == 250
+        assert idx.min() >= 0
+        assert idx.max() < 1000
+        assert len(set(idx)) == 250  # no internal duplicates
+
+    def test_exact_fit_does_not_trigger_a_new_lap(self):
+        alloc = _SimWorldAllocator(n_sims=1000, rng_seed=7)
+        alloc.take(600)
+        alloc.take(400)  # 600 + 400 == 1000, exactly fits
+        assert alloc.lap == 0
+
+    def test_exceeding_capacity_starts_a_fresh_lap(self):
+        alloc = _SimWorldAllocator(n_sims=1000, rng_seed=7)
+        alloc.take(600)
+        assert alloc.lap == 0
+        alloc.take(600)  # 600 + 600 > 1000 -- must wrap
+        assert alloc.lap == 1
+
+    def test_take_larger_than_n_sims_is_clamped(self):
+        alloc = _SimWorldAllocator(n_sims=100, rng_seed=3)
+        idx = alloc.take(500)
+        assert len(idx) == 100
+
+    def test_lap_used_fraction_and_total_taken_track_exhaustion(self):
+        alloc = _SimWorldAllocator(n_sims=1000, rng_seed=5)
+        assert alloc.lap_used_fraction == 0.0
+        assert alloc.total_taken == 0
+        alloc.take(400)
+        assert alloc.lap_used_fraction == 0.4
+        assert alloc.total_taken == 400
+        alloc.take(600)  # exact fit -- no wrap
+        assert alloc.lap_used_fraction == 1.0
+        assert alloc.total_taken == 1000
+        alloc.take(1)  # can't fit anything in the exhausted lap -- wraps
+        assert alloc.lap == 1
+        assert alloc.lap_used_fraction == 0.001
+        assert alloc.total_taken == 1001  # cumulative across laps, not reset
+
+    def test_full_demand_sequence_across_many_contests_stays_disjoint_until_wrap(self):
+        # Mirrors a real multi-contest slate: repeatedly draw n_sims_g-sized
+        # slices, tracking cumulative usage, and assert disjointness holds
+        # exactly as long as cumulative demand hasn't exceeded n_sims.
+        n_sims = 5_000
+        alloc = _SimWorldAllocator(n_sims=n_sims, rng_seed=11)
+        demands = [1200, 800, 900, 1500, 700]  # cumsum: 1200,2000,2900,4400,5100 (wraps on last)
+        seen: set[int] = set()
+        cumulative = 0
+        for d in demands:
+            pre_lap = alloc.lap
+            idx = alloc.take(d)
+            cumulative += d
+            if cumulative <= n_sims:
+                assert alloc.lap == pre_lap  # still within capacity, no wrap
+                assert len(seen & set(idx.tolist())) == 0
+            seen |= set(idx.tolist())
+        assert alloc.lap == 1  # the last draw pushed cumulative demand past n_sims
+
+
+class TestTopnTotalSimsNeeded:
+    """Pre-simulation sim-demand preview (pipeline.py's topn_coverage
+    auto-sizing step) -- sums each contest's own n_sims_g so n_sims can be
+    grown to guarantee every contest a disjoint _SimWorldAllocator slice."""
+
+    def test_sums_across_contests_using_the_field_size_aware_formula(self):
+        g1 = _topn_group("c0", k=1, entry_fee_cents=100, prize_pool_cents=392 * 84)
+        g2 = _topn_group("c1", k=1, entry_fee_cents=100, prize_pool_cents=1000 * 84)
+        total = topn_total_sims_needed(
+            [g1, g2], field_pool_size=25_000, sims_per_contest_fraction=0.5,
+            sims_min=4_607, sims_reference_field_size=392, sims_power=0.222,
+        )
+        n1 = _topn_sims_for_field_size(392, 2**31 - 1, 0.5, 4_607, 392, 0.222)
+        n2 = _topn_sims_for_field_size(1000, 2**31 - 1, 0.5, 4_607, 392, 0.222)
+        assert total == n1 + n2
+
+    def test_skips_empty_groups(self):
+        g_empty = _topn_group("c0", k=0)
+        g_full = _topn_group("c1", k=1, entry_fee_cents=100, prize_pool_cents=392 * 84)
+        total_with_empty = topn_total_sims_needed(
+            [g_empty, g_full], field_pool_size=25_000, sims_per_contest_fraction=0.5,
+            sims_min=4_607, sims_reference_field_size=392, sims_power=0.222,
+        )
+        total_without = topn_total_sims_needed(
+            [g_full], field_pool_size=25_000, sims_per_contest_fraction=0.5,
+            sims_min=4_607, sims_reference_field_size=392, sims_power=0.222,
+        )
+        assert total_with_empty == total_without
+
+    def test_flat_fraction_path_is_not_capped_by_the_field_pool_size_placeholder(self):
+        # The internal n_sims placeholder passed to _topn_sims_for_field_size
+        # must be large enough to never artificially clip an individual
+        # contest's own uncapped need -- regression guard against
+        # accidentally reusing field_pool_size (small) as that placeholder.
+        g = _topn_group("c0", k=1, entry_fee_cents=100, prize_pool_cents=50_000 * 84)
+        total = topn_total_sims_needed(
+            [g], field_pool_size=1_000, sims_per_contest_fraction=0.9,
+        )
+        # flat-fraction path with n_sims placeholder >> field_pool_size:
+        # field_size_g clips to field_pool_size (1000), but n_sims_g's own
+        # clip bound must stay the huge placeholder, not 1000.
+        assert total > 1_000
+
+
+def _synthetic_sim_and_lineups(scores_by_name: dict) -> tuple:
+    """Builds a (SimulationResults, {name: Lineup}) pair such that each
+    named lineup's summed score in sim-world i exactly equals
+    scores_by_name[name][i]: one unique "value" player per name carries the
+    whole score, the other 9 roster slots are always-zero filler players
+    shared across every lineup (a 0-valued player never changes a sum).
+    Lets allocate_contests_topn_coverage's on-demand scoring (real
+    Lineup/SimulationResults objects, not precomputed score arrays -- see
+    the function's docstring for why it no longer accepts those) be driven
+    by hand-picked per-world scores in tests, the same way raw score arrays
+    used to."""
+    names = list(scores_by_name.keys())
+    n_sims = len(next(iter(scores_by_name.values())))
+    n_filler = 9
+    filler_ids = list(range(len(names), len(names) + n_filler))
+    player_ids = list(range(len(names))) + filler_ids
+    results_matrix = np.zeros((n_sims, len(player_ids)), dtype=np.float64)
+    for i, name in enumerate(names):
+        results_matrix[:, i] = scores_by_name[name]
+    sim_results = SimulationResults(player_ids=player_ids, results_matrix=results_matrix)
+    lineups = {name: Lineup(player_ids=[i] + filler_ids) for i, name in enumerate(names)}
+    return sim_results, lineups
+
+
+def _stack_field_lineups(lineups: list) -> np.ndarray:
+    """[Lineup, ...] -> (n, 10) int64 raw player-id array, the shape
+    allocate_contests_topn_coverage's `field_lineups` parameter expects."""
+    return np.array([lu.player_ids for lu in lineups], dtype=np.int64)
+
+
+class TestAugmentTopnPoolWithGenerated:
+    """augment_topn_pool_with_generated: adds candidates from the same
+    stacked-lineup generator the threshold field pool uses, so a
+    high-performing lineup visible in the simulated field but absent from
+    the real external export becomes pickable. build_topn_field_pool is
+    monkeypatched to return controlled rows -- the function under test is
+    the DEDUP/merge logic, which doesn't depend on realistic player data,
+    and no real players_df is needed to exercise it in isolation."""
+
+    def test_n_generated_zero_is_a_noop(self):
+        pool = _topn_pool([Lineup(player_ids=list(range(10)))])
+        augmented, generated_kept = augment_topn_pool_with_generated(pool, None, None, 0, rng_seed=1)
+        assert augmented is pool
+        assert generated_kept == []
+
+    def test_adds_genuinely_new_generated_lineups(self, monkeypatch):
+        existing = [Lineup(player_ids=list(range(10)))]
+        pool = _topn_pool(existing)
+        monkeypatch.setattr(
+            ep, "build_topn_field_pool",
+            lambda players_df, own_vec, n, seed, **kw: np.array([list(range(100, 110))]),
+        )
+        augmented, generated_kept = augment_topn_pool_with_generated(pool, None, None, 1, rng_seed=99)
+        assert len(generated_kept) == 1
+        assert len(augmented.lineups) == 2
+        assert augmented.lineups[0] is existing[0]  # real lineup preserved, unchanged
+        assert augmented.lineups[1].player_ids == list(range(100, 110))
+        assert augmented.lineups[1] is generated_kept[0]
+        assert augmented.lineups == pool.lineups + generated_kept
+
+    def test_generated_near_duplicate_of_existing_real_lineup_is_dropped(self, monkeypatch):
+        existing = [Lineup(player_ids=list(range(10)))]  # 0..9
+        pool = _topn_pool(existing)
+        near_dup = list(range(9)) + [99]  # 9/10 overlap with existing[0]
+        monkeypatch.setattr(
+            ep, "build_topn_field_pool",
+            lambda players_df, own_vec, n, seed, **kw: np.array([near_dup]),
+        )
+        augmented, generated_kept = augment_topn_pool_with_generated(pool, None, None, 1, rng_seed=99)
+        assert generated_kept == []
+        assert len(augmented.lineups) == 1  # the real lineup always wins the conflict
+        assert augmented.lineups[0] is existing[0]
+        assert augmented.n_dropped_near_duplicates == pool.n_dropped_near_duplicates + 1
+
+    def test_generated_vs_generated_near_duplicates_deduped_too(self, monkeypatch):
+        pool = _topn_pool([])
+        gen1 = list(range(10))
+        gen2 = list(range(9)) + [999]  # 9/10 overlap with gen1
+        monkeypatch.setattr(
+            ep, "build_topn_field_pool",
+            lambda players_df, own_vec, n, seed, **kw: np.array([gen1, gen2]),
+        )
+        augmented, generated_kept = augment_topn_pool_with_generated(pool, None, None, 2, rng_seed=99)
+        assert len(generated_kept) == 1
+
+
+class TestTopnCoverageAllocation:
+    """allocate_contests_topn_coverage: hard-threshold exact set-cover
+    greedy allocation. Uses field_size_g == field_pool_size (via a prize
+    pool/entry fee pair chosen so implied_field_size lands exactly on the
+    pool size) and sims_per_contest_fraction=1.0 so every per-contest field
+    draw/sim subsample is a full permutation of the pool/sim-matrix -- the
+    SET used is deterministic even though np.random.Generator.choice's
+    specific order isn't, which is what makes the expected thresholds/
+    crossings below computable by hand. Field/candidate scores are driven
+    via _synthetic_sim_and_lineups (real Lineup/SimulationResults objects,
+    on-demand-scored) rather than precomputed score arrays -- see
+    allocate_contests_topn_coverage's docstring for why those were dropped."""
+
+    def test_threshold_is_nth_largest_and_crossing_matches_naive_reference(self):
+        # 4 sim worlds, a 5-lineup field pool (== field_size_g, see class
+        # docstring), rank-2 ("top-2") threshold.
+        sim_results, lu = _synthetic_sim_and_lineups({
+            "f0": [10, 5, 1, 100], "f1": [20, 15, 2, 90], "f2": [30, 25, 3, 80],
+            "f3": [40, 35, 4, 70], "f4": [50, 45, 5, 60],
+            "c0": [45, 36, 5, 95],   # crosses all 4 (naive: score >= 2nd-largest/world)
+            "c1": [39, 34, 3, 89],   # crosses none
+            "c2": [40, 35, 4, 90],   # crosses all 4 (exact ties count as crossing)
+        })
+        expected_thresholds = np.array([40, 35, 4, 90], dtype=np.float32)  # 2nd-largest/world
+        # c0/c1/c2 are the 6th/7th/8th names inserted (after f0..f4), so
+        # their "value" player columns are indices 5, 6, 7.
+        naive = sim_results.results_matrix[:, 5:8].T  # (3 candidates, 4 worlds)
+        naive_crossings = (naive >= expected_thresholds[None, :])
+        assert naive_crossings.sum(axis=1).tolist() == [4, 0, 4]
+
+        field_lineups = _stack_field_lineups([lu["f0"], lu["f1"], lu["f2"], lu["f3"], lu["f4"]])
+        lineups = [lu["c0"], lu["c1"], lu["c2"]]
+        pool = _topn_pool(lineups)
+        group = _topn_group("c0", k=1)
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [group], field_lineups,
+            topn_rank=2, field_samples=1, sims_per_contest_fraction=1.0, rng_seed=42,
+        )
+        assert len(alloc.portfolio) == 1
+        picked_lu, ev = alloc.portfolio[0]
+        assert picked_lu is lineups[0]  # first of the tied 4-world coverage pair
+        assert ev == 4.0
+
+    def test_second_pick_covers_remaining_worlds_after_exhaustion_wave(self):
+        # Same data as above but k=2: pick 1 (lineup 0) covers all 4 worlds,
+        # exhausting `uncovered` before pick 2 -- exercises the wave reset.
+        sim_results, lu = _synthetic_sim_and_lineups({
+            "f0": [10, 5, 1, 100], "f1": [20, 15, 2, 90], "f2": [30, 25, 3, 80],
+            "f3": [40, 35, 4, 70], "f4": [50, 45, 5, 60],
+            "c0": [45, 36, 5, 95], "c1": [39, 34, 3, 89], "c2": [40, 35, 4, 90],
+        })
+        field_lineups = _stack_field_lineups([lu["f0"], lu["f1"], lu["f2"], lu["f3"], lu["f4"]])
+        lineups = [lu["c0"], lu["c1"], lu["c2"]]
+        pool = _topn_pool(lineups)
+        group = _topn_group("c0", k=2)
+        contest_done_events = []
+        # c2 tagged "generated" (see augment_topn_pool_with_generated): the
+        # known picks are lineups[0] (c0, real) then lineups[2] (c2,
+        # generated) -- n_generated_picks should count exactly the latter.
+        is_generated = np.array([False, False, True])
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [group], field_lineups,
+            topn_rank=2, field_samples=1, sims_per_contest_fraction=1.0, rng_seed=42,
+            is_generated=is_generated,
+            progress_cb=lambda info: contest_done_events.append(info)
+            if info.get("event") == "contest_done" else None,
+        )
+        assert len(alloc.portfolio) == 2
+        assert contest_done_events[0]["n_generated_picks"] == 1
+        picked = {id(x) for x, _ in alloc.portfolio}
+        assert picked == {id(lineups[0]), id(lineups[2])}
+        assert not alloc.unfilled
+
+        # Both picks cover all 4 (K=1) worlds (pick 2 only after the
+        # exhaustion wave resets `uncovered`) -- worlds_claimed is
+        # OR-accumulated across the wave reset (ever_covered), not summed
+        # per pick, so it stays bounded at n_sims_g (4), not double-counted
+        # to 8. The wave reset itself is reported separately via
+        # n_wave_resets instead of implied by a >100% figure.
+        assert len(contest_done_events) == 1
+        done = contest_done_events[0]
+        assert done["n_wave_resets"] == 1
+        assert done["n_sims_total"] == 4
+        assert done["n_sims_g"] == 4
+        assert done["worlds_claimed"] == 4
+        assert done["worlds_claimed_pct"] == 100.0
+
+    def test_relaxation_fires_when_nobody_crosses_and_terminates(self):
+        # Field always scores 100; no candidate ever reaches it without
+        # relaxation -- every pick must go through the deflate-and-retry path.
+        sim_results, lu = _synthetic_sim_and_lineups({
+            "f0": [100.0, 100.0, 100.0], "f1": [100.0, 100.0, 100.0], "f2": [100.0, 100.0, 100.0],
+            "c0": [90.0, 90.0, 90.0], "c1": [95.0, 80.0, 85.0],
+        })
+        field_lineups = _stack_field_lineups([lu["f0"], lu["f1"], lu["f2"]])
+        lineups = [lu["c0"], lu["c1"]]
+        pool = _topn_pool(lineups)
+        group = _topn_group("c0", k=2, entry_fee_cents=100, prize_pool_cents=252)
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [group], field_lineups,
+            topn_rank=1, field_samples=1, sims_per_contest_fraction=1.0,
+            relax_step=1.0, rng_seed=7,
+        )
+        assert len(alloc.portfolio) == 2
+        assert not alloc.unfilled
+        picked = {id(x) for x, _ in alloc.portfolio}
+        assert picked == {id(lineups[0]), id(lineups[1])}
+
+    def test_more_picks_than_slots_forces_multiple_coverage_waves(self):
+        # Only 2 (field-draw, world) slots total but 3 entries to fill from
+        # 4 fully-covering candidates -- every pick trivially covers both
+        # slots, so picks 2 and 3 can only be differentiated by repeated
+        # wave resets. Must still fill all 3 without error/hang.
+        sim_results, lu = _synthetic_sim_and_lineups({
+            "f0": [0.0, 0.0], "f1": [0.0, 0.0], "f2": [0.0, 0.0],
+            "c0": [10.0, 10.0], "c1": [10.0, 10.0], "c2": [10.0, 10.0], "c3": [10.0, 10.0],
+        })
+        field_lineups = _stack_field_lineups([lu["f0"], lu["f1"], lu["f2"]])
+        lineups = [lu["c0"], lu["c1"], lu["c2"], lu["c3"]]
+        pool = _topn_pool(lineups)
+        group = _topn_group("c0", k=3, entry_fee_cents=100, prize_pool_cents=252)
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [group], field_lineups,
+            topn_rank=1, field_samples=1, sims_per_contest_fraction=1.0, rng_seed=3,
+        )
+        assert len(alloc.portfolio) == 3
+        picked = [id(x) for x, _ in alloc.portfolio]
+        assert len(set(picked)) == 3  # no duplicate within the contest
+
+    def test_shared_removal_mask_no_duplicate_across_contests(self):
+        rng = np.random.default_rng(1)
+        M, n_sims, field_pool_size = 30, 50, 40
+        scores = {f"c{i}": rng.normal(100, 20, n_sims) for i in range(M)}
+        scores.update({f"f{i}": rng.normal(90, 15, n_sims) for i in range(field_pool_size)})
+        sim_results, lu = _synthetic_sim_and_lineups(scores)
+        field_lineups = _stack_field_lineups([lu[f"f{i}"] for i in range(field_pool_size)])
+        lineups = [lu[f"c{i}"] for i in range(M)]
+        pool = _topn_pool(lineups)
+        g1 = _topn_group("c0", k=5, entry_fee_cents=100, prize_pool_cents=field_pool_size * 84)
+        g2 = _topn_group("c1", k=5, entry_fee_cents=100, prize_pool_cents=field_pool_size * 84)
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [g1, g2], field_lineups,
+            topn_rank=10, field_samples=3, sims_per_contest_fraction=0.6, rng_seed=42,
+        )
+        assert len(alloc.portfolio) == 10
+        picked = [id(x) for x, _ in alloc.portfolio]
+        assert len(set(picked)) == 10
+
+    def test_proj_score_floor_excludes_below_floor_candidates(self):
+        rng = np.random.default_rng(2)
+        M, n_sims, field_pool_size = 20, 40, 30
+        scores = {f"c{i}": rng.normal(100, 10, n_sims) for i in range(M)}
+        # Make c0 the best possible coverage candidate (dominates every
+        # world) but give it the worst proj_score, so a floor must exclude it.
+        scores["c0"] = np.full(n_sims, 1000.0)
+        scores.update({f"f{i}": rng.normal(90, 15, n_sims) for i in range(field_pool_size)})
+        sim_results, lu = _synthetic_sim_and_lineups(scores)
+        field_lineups = _stack_field_lineups([lu[f"f{i}"] for i in range(field_pool_size)])
+        lineups = [lu[f"c{i}"] for i in range(M)]
+        pool = _topn_pool(lineups)
+        proj_scores = rng.uniform(50, 100, size=M)
+        proj_scores[0] = 0.0
+        group = _topn_group("c0", k=1, entry_fee_cents=100, prize_pool_cents=field_pool_size * 84)
+
+        unfloored = allocate_contests_topn_coverage(
+            pool, sim_results, [group], field_lineups,
+            topn_rank=5, field_samples=2, sims_per_contest_fraction=1.0, rng_seed=5,
+        )
+        assert unfloored.portfolio[0][0] is lineups[0]
+
+        floored = allocate_contests_topn_coverage(
+            pool, sim_results, [group], field_lineups,
+            proj_scores=proj_scores, proj_score_floor_percentile=40.0,
+            topn_rank=5, field_samples=2, sims_per_contest_fraction=1.0, rng_seed=5,
+        )
+        assert floored.portfolio[0][0] is not lineups[0]
+
+    def test_chunked_vs_unchunked_candidate_batching_equivalent(self):
+        rng = np.random.default_rng(9)
+        M, n_sims, field_pool_size = 50, 60, 45
+        scores = {f"c{i}": rng.normal(100, 20, n_sims) for i in range(M)}
+        scores.update({f"f{i}": rng.normal(90, 15, n_sims) for i in range(field_pool_size)})
+        sim_results, lu = _synthetic_sim_and_lineups(scores)
+        field_lineups = _stack_field_lineups([lu[f"f{i}"] for i in range(field_pool_size)])
+        lineups = [lu[f"c{i}"] for i in range(M)]
+        pool = _topn_pool(lineups)
+        group = _topn_group("c0", k=10, entry_fee_cents=100, prize_pool_cents=field_pool_size * 84)
+
+        def _run(batch_size):
+            return allocate_contests_topn_coverage(
+                pool, sim_results, [group], field_lineups,
+                topn_rank=10, field_samples=3, sims_per_contest_fraction=1.0,
+                candidate_batch_size=batch_size, rng_seed=42,
+            )
+
+        alloc_full = _run(M)       # single batch
+        alloc_small = _run(7)      # many small batches
+        picked_full = [id(x) for x, _ in alloc_full.portfolio]
+        picked_small = [id(x) for x, _ in alloc_small.portfolio]
+        assert picked_full == picked_small
+
+    def test_near_duplicate_cull_drops_one_swap_lineups(self):
+        # topn_coverage inherits _find_near_duplicate_removals via the
+        # shared parse_lineup_pool call every ev_type uses (see
+        # allocate_contests_topn_coverage's docstring) -- this exercises
+        # the underlying mechanism directly rather than the full CSV-parsing
+        # path, which needs real archived export files.
+        base = list(range(10))
+        one_swap = base[:9] + [99]  # 9/10 overlap with `base`
+        distinct = list(range(100, 110))
+        removals = _find_near_duplicate_removals(
+            [base, one_swap, distinct], primary_roi=np.array([1.0, 0.5, 2.0]),
+        )
+        assert removals == {1}  # lower-ROI member of the near-duplicate pair
+
+    def test_full_pipeline_end_to_end_real_sim_matrix(self):
+        sim_results, lineups, _roi = TestRiskSweepDifferentiation()._stacked_pool(
+            n_sims=3000, M=150, seed=21,
+        )
+        n_players = len(sim_results.player_ids)
+        pool = _topn_pool(lineups)
+
+        rng = np.random.default_rng(22)
+        field_lineups = _stack_field_lineups([
+            Lineup(player_ids=[int(p) + 1 for p in
+                               rng.choice(n_players, size=10, replace=False)])
+            for _ in range(400)
+        ])
+
+        k = 15
+        group = _topn_group("c0", k=k, entry_fee_cents=100, prize_pool_cents=400 * 84)
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [group], field_lineups,
+            topn_rank=10, field_samples=3, sims_per_contest_fraction=0.5, rng_seed=13,
+        )
+        assert len(alloc.portfolio) == k
+        assert not alloc.unfilled
+        picked = {id(lu) for lu, _ in alloc.portfolio}
+        assert len(picked) == k

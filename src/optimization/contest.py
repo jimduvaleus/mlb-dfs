@@ -431,8 +431,21 @@ class ContestSimulator:
         max_attempts_per_lineup: int = 200,
         progress_cb: Optional[Callable[[int, int], None]] = None,
         progress_chunk: int = 500,
+        stop_check: Optional[Callable[[], bool]] = None,
+        stop_check_chunk: int = 1_000,
     ) -> np.ndarray:
         """Generate n_lineups opponent lineups sampled by ownership.
+
+        `stop_check`, if given, is polled every `stop_check_chunk` ATTEMPTS
+        (not accepted lineups -- rejection sampling can burn many attempts
+        per acceptance, so gating on `len(field)` alone could leave a stop
+        request unnoticed for a long stretch when the accept rate is low).
+        On a stop, returns whatever's been accepted so far rather than
+        raising -- this is a large, otherwise-uninterruptible cost for
+        callers like topn_coverage's field-pool build (can run 100+s at
+        production scale), so callers with a real Stop button need this to
+        actually take effect promptly instead of only being checked once
+        this call returns.
 
         Returns
         -------
@@ -476,6 +489,13 @@ class ContestSimulator:
 
         while len(field) < n_lineups and total_attempts < max_total:
             total_attempts += 1
+            if (stop_check is not None and total_attempts % stop_check_chunk == 0
+                    and stop_check()):
+                logger.info(
+                    "generate_field: stop requested after %d attempts (%d/%d lineups).",
+                    total_attempts, len(field), n_lineups,
+                )
+                break
             try:
                 if rng.random() < stack_probability:
                     ids = _sample_stacked_lineup(
@@ -512,8 +532,14 @@ class ContestSimulator:
         sim_matrix: np.ndarray,
         col_map: dict[int, int],
         batch_size: int = 500,
+        stop_check: Optional[Callable[[], bool]] = None,
     ) -> np.ndarray:
         """Score all field lineups against the simulation matrix.
+
+        `stop_check`, if given, is polled once per batch; on a stop, returns
+        whatever's been scored so far (shape (n_sims, n_scored_so_far)) —
+        same "large otherwise-uninterruptible cost" rationale as
+        generate_field's stop_check.
 
         Parameters
         ----------
@@ -543,13 +569,17 @@ class ContestSimulator:
         n_valid = valid_lineups.shape[0]
         field_scores = np.zeros((n_sims, n_valid), dtype=np.float32)
 
+        n_scored = n_valid
         for start in range(0, n_valid, batch_size):
+            if stop_check is not None and stop_check():
+                n_scored = start
+                break
             end = min(start + batch_size, n_valid)
             batch_cols = valid_lineups[start:end]  # (batch, 10)
             # sim_matrix[:, batch_cols] has shape (n_sims, batch, 10)
             field_scores[:, start:end] = sim_matrix[:, batch_cols].sum(axis=2)
 
-        return field_scores
+        return field_scores[:, :n_scored]
 
     def eval_portfolio(
         self,

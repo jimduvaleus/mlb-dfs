@@ -163,7 +163,19 @@ class GppConfig(BaseModel):
     #               concentrated portfolio (far fewer distinct teams, high
     #               single-player exposure) that the needle metric doesn't
     #               price as a cost; use `risk` to dial diversity back in.
-    # Under "prj_own"/"p_win"/"proj_top" Saber's ROI is not consulted at all,
+    #   "topn_coverage" — greedy top-N field-coverage allocation: fills each
+    #               contest with whichever remaining candidate would have
+    #               finished top-`external_pool_topn_rank` most often against
+    #               a sub-sampled opponent field, across many simulated
+    #               worlds, then removes the worlds a pick "claimed" so later
+    #               picks have to prove themselves elsewhere (hard-threshold
+    #               exact set-cover, bit-packed popcount greedy — see
+    #               allocate_contests_topn_coverage in external_pool.py).
+    #               Produces a SINGLE portfolio (no risk sweep) since greedy
+    #               coverage is diversified by construction. Saber's ROI is
+    #               not consulted; the pool-wide external_pool_proj_score_pct
+    #               cull still applies.
+    # Under "prj_own"/"p_win"/"proj_top"/"topn_coverage" Saber's ROI is not consulted at all,
     # so external_pool_roi_floor_pct, external_pool_ceiling_weight and
     # external_pool_cash_anchor_fraction are all inert; the pool-wide
     # external_pool_proj_score_pct cull still applies.
@@ -306,6 +318,85 @@ class GppConfig(BaseModel):
     # underneath — leave the cap at 100/100 (off) when using this.
     external_pool_proj_top_ceiling_tiers: bool = False
     external_pool_proj_top_medium_large_boundary: float = 15000.0
+    # self_play: sims subsampled from the already-simulated matrix for each
+    # round-loop pick (see self_play._ROUND_N_SIMS_DEFAULT / the SHORTLIST
+    # RESTRICTION note in self_play.py for why this is small by default --
+    # tractability, not accuracy). Clamped to the actual live simulation's
+    # n_sims if configured higher.
+    external_pool_self_play_round_n_sims: int = 2_000
+    # self_play: sims for the bounded post-round-loop precision-refinement
+    # pass (see self_play._PRECISE_N_SIMS_DEFAULT / PRECISION REFINEMENT
+    # note). 0 disables refinement entirely. Also clamped to the live
+    # simulation's n_sims.
+    external_pool_self_play_precise_n_sims: int = 20_000
+    # self_play: candidates re-scored per round after round 0's mandatory
+    # full pass (see self_play.py's SHORTLIST RESTRICTION note).
+    external_pool_self_play_shortlist_size: int = 1_000
+    # topn_coverage: size of the one-time-per-slate opponent field pool
+    # (ContestSimulator.generate_field, ownership-weighted) every contest's
+    # per-contest field subsets are re-sliced from. Same order of magnitude
+    # as _PWIN_FIELD_CAP/self_play's _SELF_PLAY_POOL_CAP.
+    external_pool_topn_field_pool_size: int = 25_000
+    # topn_coverage: the literal rank (e.g. 10 = "top-10") a candidate must
+    # cross in a simulated world to count as covering it. Fixed per the
+    # design -- not derived from each contest's payout structure.
+    external_pool_topn_rank: int = 10
+    # topn_coverage: K independent field-pool column-subsets drawn per
+    # contest (cheap re-slices of the same already-scored field pool, not K
+    # separate field generations) -- avoids overfitting coverage to a single
+    # field snapshot's idiosyncrasies. Mirrors ContestScorer's n_field_samples.
+    external_pool_topn_field_samples: int = 5
+    # topn_coverage: additional candidates drawn from the same stacked-
+    # lineup generator the threshold field pool uses (see
+    # ep.augment_topn_pool_with_generated), merged into the real external
+    # pool after 9/10-overlap dedup (every real lineup always wins a
+    # conflict, so this only ever adds new shapes, never displaces one).
+    # Lets the greedy selector pick a high-performing lineup that's visible
+    # in the simulated field but wasn't in the real SaberSim export --
+    # previously structurally impossible (only pool.lineups was ever
+    # eligible to be picked). Drawn with an independently seeded call from
+    # the threshold field pool's own build, by design -- see that
+    # function's docstring for why that avoids needing a self_play-style
+    # "remove from field eligibility once picked" runtime guard. 0 (default)
+    # disables this entirely -- unvalidated idea, off until backtested, same
+    # posture as every other speculative topn_coverage/proj_top knob in this
+    # file.
+    external_pool_topn_generated_pool_size: int = 0
+    # topn_coverage: per-contest sim-world budget. Each contest draws its own
+    # random sim-world subsample (both to bound cost by n_sims_g and to keep
+    # two contests' coverage races from converging on near-duplicate lineups
+    # by racing for identical worlds).
+    #
+    # Fallback only -- see external_pool_topn_sims_min/_reference_field_size/
+    # _power below, which are the ACTIVE rule by default. This flat fraction
+    # is what _topn_sims_for_field_size falls back to if any of those three
+    # is left at 0 (e.g. a user clears one while experimenting).
+    external_pool_topn_sims_per_contest_fraction: float = 0.5
+    # topn_coverage field-size-aware sizing (ACTIVE by default -- all three
+    # must be > 0, which they are; set any to 0 to fall back to the flat
+    # fraction above instead):
+    #   n_sims_g = clip(round(sims_min * (field_size_g / reference_field_size)
+    #              ** power), sims_min, n_sims)
+    #
+    # CALIBRATED 2026-08-09 (scripts/calibrate_topn_sims_per_contest.py,
+    # archived slate 07222026, real correlated sim + the real ContestSimulator
+    # field generator + the slate's real 4,049-lineup external candidate
+    # pool -- an earlier calibration attempt using i.i.d.-noise synthetic
+    # data was discarded as a methodology artifact, see the script's
+    # CORRECTNESS NOTE). Measured field-size -> sims-needed-for-0.9-Spearman-
+    # convergence, monotonic across every field size tested: 392-1,189
+    # entries needed 5,000 sims; 5,945-17,835 entries needed 10,000. Fit via
+    # log-log regression across those points. Caveats: a single slate (6
+    # field-size points) and a coarse sim-count grid
+    # (250/500/1k/2k/5k/10k/25k, so "needed" is quantized, not finely
+    # resolved) -- re-run against more slates before trusting the exact
+    # numbers for anything beyond the compute-savings intent below. Not a
+    # correctness fix: the flat 0.5 fraction this replaces (12,500 sims at
+    # n_sims=25,000) already exceeded every measured "needed" point, so this
+    # is a compute-savings tune for small contests, not a bug fix.
+    external_pool_topn_sims_min: int = 4_607
+    external_pool_topn_sims_reference_field_size: int = 392
+    external_pool_topn_sims_power: float = 0.222
     # External pool mode: per-contest ROI percentile floor for the pre-Det
     # cull (see allocate_contests in src/api/external_pool.py). A raw ROI
     # cutoff doesn't generalize across contests of different sizes/payout

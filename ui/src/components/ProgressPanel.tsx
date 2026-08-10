@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppRescoreFieldProgressEvent, GppRescoreScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppRescoreFieldProgressEvent, GppRescoreScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent, SelfPlayPoolStartEvent, SelfPlayPoolDoneEvent, SelfPlayContestProgressEvent, SelfPlayPayoutFallbackEvent, TopnPoolStartEvent, TopnPoolProgressEvent, TopnPoolDoneEvent, TopnContestStartEvent, TopnPickProgressEvent, TopnContestDoneEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -50,6 +50,17 @@ const STAGE_LABELS: Record<string, string> = {
   gpp_rescore_done: 'Fresh re-score',
   gpp_field_inject: 'Field lineups',
   gpp_holdout: 'Holdout evaluation',
+  self_play_pool_start: 'Self-play: building pool',
+  self_play_pool_done: 'Self-play: pool built',
+  self_play_contest_progress: 'Self-play: contest filled',
+  self_play_payout_fallback: 'Self-play: approximate payout table',
+  topn_sims_autosize: 'Top-N coverage: sim count auto-sized',
+  topn_pool_start: 'Top-N coverage: building field pool',
+  topn_pool_done: 'Top-N coverage: field pool built',
+  topn_pool_augmented: 'Top-N coverage: candidate pool augmented',
+  topn_contest_start: 'Top-N coverage: contest started',
+  topn_pick_progress: 'Top-N coverage: covering worlds',
+  topn_contest_done: 'Top-N coverage: contest filled',
   complete: 'Complete',
   stopped: 'Stopped',
   error: 'Error',
@@ -107,6 +118,18 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_hybrid_select_progress' ||
       last?.stage === 'gpp_det_select_progress' ||
       last?.stage === 'gpp_det_risk_start' ||
+      last?.stage === 'self_play_pool_start' ||
+      last?.stage === 'self_play_pool_done' ||
+      last?.stage === 'self_play_contest_progress' ||
+      last?.stage === 'self_play_payout_fallback' ||
+      last?.stage === 'topn_sims_autosize' ||
+      last?.stage === 'topn_pool_start' ||
+      last?.stage === 'topn_pool_progress' ||
+      last?.stage === 'topn_pool_done' ||
+      last?.stage === 'topn_pool_augmented' ||
+      last?.stage === 'topn_contest_start' ||
+      last?.stage === 'topn_pick_progress' ||
+      last?.stage === 'topn_contest_done' ||
       (typeof last?.stage === 'string' && last.stage.startsWith('external_'))
     if (!isLiveProgressEvent) return
 
@@ -216,6 +239,111 @@ export function ProgressPanel({ events, running }: Props) {
       : 0
     return { pct, isComplete, isActive }
   }) : []
+
+  // --- Self-play: single sequential best-response allocation, no risk
+  // sweep (never emits gpp_* stages, so it's a sibling to isGpp/isDetEv
+  // rather than nested inside them) ---
+  const selfPlayPoolStartEvent = events.find(e => e.stage === 'self_play_pool_start') as unknown as SelfPlayPoolStartEvent | undefined
+  const selfPlayPoolDoneEvent = events.find(e => e.stage === 'self_play_pool_done') as unknown as SelfPlayPoolDoneEvent | undefined
+  const selfPlayContestEvents = events.filter(e => e.stage === 'self_play_contest_progress') as unknown as SelfPlayContestProgressEvent[]
+  const latestSelfPlayContest = selfPlayContestEvents[selfPlayContestEvents.length - 1]
+  const selfPlayFallbackEvents = events.filter(e => e.stage === 'self_play_payout_fallback') as unknown as SelfPlayPayoutFallbackEvent[]
+  const isSelfPlay = selfPlayPoolStartEvent !== undefined || selfPlayContestEvents.length > 0
+
+  let selfPlayPct = 0
+  let selfPlayLabel = ''
+  if (isSelfPlay) {
+    if (latestSelfPlayContest) {
+      selfPlayPct = Math.round((latestSelfPlayContest.contests_done / latestSelfPlayContest.contests_total) * 100)
+      selfPlayLabel = `Contest ${latestSelfPlayContest.contests_done} / ${latestSelfPlayContest.contests_total}: ${latestSelfPlayContest.contest_id} filled (${latestSelfPlayContest.n_rounds} rounds, ${latestSelfPlayContest.n_swaps} refinement swap${latestSelfPlayContest.n_swaps === 1 ? '' : 's'})`
+    } else if (selfPlayPoolDoneEvent) {
+      selfPlayPct = 0
+      selfPlayLabel = `Pool built (${selfPlayPoolDoneEvent.pool_size.toLocaleString()} lineups) — filling contests…`
+    } else if (selfPlayPoolStartEvent) {
+      selfPlayPct = 0
+      selfPlayLabel = `Building opponent pool for ${selfPlayPoolStartEvent.n_contests} contest${selfPlayPoolStartEvent.n_contests === 1 ? '' : 's'}…`
+    }
+  }
+
+  // --- Top-N coverage: single greedy set-cover allocation, no risk sweep
+  // (sibling to isSelfPlay -- never emits gpp_* stages). ETA follows the
+  // same "rate from a recent window of progress events" pattern as every
+  // other stage: per-pick rate within the current contest for the
+  // in-contest estimate, per-contest rate across completed contests for
+  // the overall slate estimate. ---
+  const topnPoolStartEvent = events.find(e => e.stage === 'topn_pool_start') as unknown as TopnPoolStartEvent | undefined
+  const topnPoolProgressEvents = events.filter(e => e.stage === 'topn_pool_progress') as unknown as TopnPoolProgressEvent[]
+  const latestTopnPoolProgress = topnPoolProgressEvents[topnPoolProgressEvents.length - 1]
+  const topnPoolDoneEvent = events.find(e => e.stage === 'topn_pool_done') as unknown as TopnPoolDoneEvent | undefined
+  const topnContestStartEvents = events.filter(e => e.stage === 'topn_contest_start') as unknown as TopnContestStartEvent[]
+  const topnPickEvents = events.filter(e => e.stage === 'topn_pick_progress') as unknown as TopnPickProgressEvent[]
+  const topnContestDoneEvents = events.filter(e => e.stage === 'topn_contest_done') as unknown as TopnContestDoneEvent[]
+  const latestTopnContestStart = topnContestStartEvents[topnContestStartEvents.length - 1]
+  const latestTopnPick = topnPickEvents[topnPickEvents.length - 1]
+  const latestTopnContestDone = topnContestDoneEvents[topnContestDoneEvents.length - 1]
+  const isTopnCoverage = topnPoolStartEvent !== undefined || topnContestStartEvents.length > 0
+
+  let topnPct = 0
+  let topnLabel = ''
+  let topnEtaMs: number | null = null
+  if (isTopnCoverage) {
+    const contestsDone = latestTopnContestDone?.contests_done ?? 0
+    const contestsTotal = latestTopnContestDone?.contests_total ?? latestTopnContestStart?.contests_total ?? 0
+    if (latestTopnPick && latestTopnContestStart && latestTopnPick.contest_id === latestTopnContestStart.contest_id) {
+      const covered = latestTopnPick.uncovered_total - latestTopnPick.uncovered_remaining
+      const coveredPct = latestTopnPick.uncovered_total > 0
+        ? Math.round((covered / latestTopnPick.uncovered_total) * 100) : 0
+      topnPct = contestsTotal > 0 ? Math.round((contestsDone / contestsTotal) * 100) : 0
+      topnLabel = `Contest ${contestsDone + 1} / ${contestsTotal}: ${latestTopnPick.contest_id} — `
+        + `pick ${latestTopnPick.pick_num} / ${latestTopnContestStart.k}, `
+        + `${coveredPct}% of ${latestTopnPick.uncovered_total.toLocaleString()} simulated worlds covered`
+        + (latestTopnPick.relaxations_so_far > 0 ? ` (${latestTopnPick.relaxations_so_far} relaxations)` : '')
+      // Within-contest ETA: rate of picks over the last few pick events.
+      const recentPicks = topnPickEvents.filter(e => e.contest_id === latestTopnPick.contest_id).slice(-5)
+      if (recentPicks.length >= 2) {
+        const dtMs = recentPicks[recentPicks.length - 1].timestamp - recentPicks[0].timestamp
+        const dPicks = recentPicks[recentPicks.length - 1].pick_num - recentPicks[0].pick_num
+        if (dPicks > 0 && dtMs > 0) {
+          const msPerPick = dtMs / dPicks
+          const picksRemainingHere = latestTopnContestStart.k - latestTopnPick.pick_num
+          const contestsRemaining = Math.max(contestsTotal - contestsDone - 1, 0)
+          // Cross-contest ETA: average completed-contest duration, when we have any.
+          let msPerContest = msPerPick * latestTopnContestStart.k
+          if (topnContestDoneEvents.length > 0) {
+            msPerContest = topnContestDoneEvents.reduce((s, e) => s + e.elapsed_s * 1000, 0) / topnContestDoneEvents.length
+          }
+          topnEtaMs = msPerPick * picksRemainingHere + msPerContest * contestsRemaining
+        }
+      }
+    } else if (latestTopnContestStart) {
+      topnPct = contestsTotal > 0 ? Math.round((contestsDone / contestsTotal) * 100) : 0
+      topnLabel = `Contest ${contestsDone + 1} / ${contestsTotal}: ${latestTopnContestStart.contest_id} `
+        + `(field ${latestTopnContestStart.field_size_g.toLocaleString()}, `
+        + `${latestTopnContestStart.n_sims_g.toLocaleString()} sim worlds)…`
+    } else if (latestTopnPoolProgress) {
+      // Single updating bar (not one row per chunk -- see buildDisplayEvents,
+      // which skips topn_pool_progress from the raw event list entirely).
+      topnPct = latestTopnPoolProgress.n_total > 0
+        ? Math.round((latestTopnPoolProgress.n_done / latestTopnPoolProgress.n_total) * 100) : 0
+      topnLabel = `Building opponent field pool: ${latestTopnPoolProgress.n_done.toLocaleString()} `
+        + `/ ${latestTopnPoolProgress.n_total.toLocaleString()} lineups generated…`
+      const recent = topnPoolProgressEvents.slice(-5)
+      if (recent.length >= 2) {
+        const dtMs = recent[recent.length - 1].timestamp - recent[0].timestamp
+        const dDone = recent[recent.length - 1].n_done - recent[0].n_done
+        if (dDone > 0 && dtMs > 0) {
+          const remaining = latestTopnPoolProgress.n_total - latestTopnPoolProgress.n_done
+          topnEtaMs = (dtMs / dDone) * remaining
+        }
+      }
+    } else if (topnPoolDoneEvent) {
+      topnPct = 0
+      topnLabel = `Field pool built (${topnPoolDoneEvent.field_pool_size.toLocaleString()} lineups) — filling contests…`
+    } else if (topnPoolStartEvent) {
+      topnPct = 0
+      topnLabel = `Building opponent field pool (${topnPoolStartEvent.field_pool_size.toLocaleString()} lineups)…`
+    }
+  }
 
   // --- External pool: p_win field generation + scoring (runs before the
   // Det-EV risk sweep, in this fixed order: field-gen A, field-gen B,
@@ -445,6 +573,24 @@ export function ProgressPanel({ events, running }: Props) {
         etaMs = avgMsPerRisk * (risksAfterCurrent + 1)
       }
     }
+  } else if (running && isSelfPlay && latestSelfPlayContest) {
+    // Rolling average wall time per COMPLETED contest, same chunked
+    // n_done/n_total pattern used elsewhere in this panel (e.g. the
+    // gpp_field_progress branch above). Per-contest cost is genuinely
+    // heterogeneous here (a 72-round mini-max-sized contest can cost ~100x
+    // a 1-round small one, see self_play.py), so unlike the other chunked
+    // ETAs in this panel this one can swing hard moment-to-moment,
+    // especially early in a slate before a large contest has been seen --
+    // a rough progress signal, not a precise one.
+    const remaining = latestSelfPlayContest.contests_total - latestSelfPlayContest.contests_done
+    if (remaining > 0 && selfPlayContestEvents.length >= 2) {
+      const recent = selfPlayContestEvents.slice(-4)
+      const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+      const recentDone = recent[recent.length - 1].contests_done - recent[0].contests_done
+      if (recentDone > 0) etaMs = (recentElapsed / recentDone) * remaining
+    }
+  } else if (running && isTopnCoverage) {
+    etaMs = topnEtaMs
   } else {
     if (running && current > 0 && total > current) {
       const recent = lineupEvents.slice(-4) // up to 4 events → 3 intervals
@@ -461,7 +607,7 @@ export function ProgressPanel({ events, running }: Props) {
   // start of the run rather than only once isGpp flips true partway
   // through (which for external mode doesn't happen until the risk sweep).
   const isExternalRun = events.some(e => typeof e.stage === 'string' && e.stage.startsWith('external_'))
-  const liveElapsedMs = running && first && (current > 0 || isGpp || isExternalRun) ? now - first.timestamp : null
+  const liveElapsedMs = running && first && (current > 0 || isGpp || isExternalRun || isSelfPlay || isTopnCoverage) ? now - first.timestamp : null
 
   return (
     <div className="progress-panel">
@@ -529,6 +675,39 @@ export function ProgressPanel({ events, running }: Props) {
         </div>
       )}
 
+      {/* Self-play progress bar */}
+      {isSelfPlay && running && selfPlayLabel && (
+        <div className="progress-bar-wrap">
+          <div className="progress-bar" style={{ width: `${selfPlayPct}%` }} />
+          <span className="progress-label">{selfPlayLabel}</span>
+        </div>
+      )}
+
+      {/* Top-N coverage progress bar */}
+      {isTopnCoverage && running && topnLabel && (
+        <div className="progress-bar-wrap">
+          <div className="progress-bar" style={{ width: `${topnPct}%` }} />
+          <span className="progress-label">{topnLabel}</span>
+        </div>
+      )}
+
+      {selfPlayFallbackEvents.length > 0 && (
+        <div className="progress-warning-list">
+          <div className="progress-warning-header">
+            Approximate payout table used (contest name not one of DK's known types) —
+            add a real one to <code>src/optimization/payout.py</code>'s{' '}
+            <code>CONTEST_STRUCTURES</code> / <code>data/payout_structures/</code> for
+            more accurate results:
+          </div>
+          {selfPlayFallbackEvents.map((ev, i) => (
+            <div key={i} className="progress-warning-row">
+              "{ev.contest_name}" (implied ~{Math.round(ev.implied_field_size).toLocaleString()} entries)
+              → matched a {ev.matched_total_entries.toLocaleString()}-entry table
+            </div>
+          ))}
+        </div>
+      )}
+
       <div className="event-list">
         {buildDisplayEvents(events).map((item, i) => (
           <div key={i} className={`event-row event-${item.stage}`}>
@@ -566,6 +745,22 @@ export function ProgressPanel({ events, running }: Props) {
               <span className="event-stage event-stage-lineup">{ev.round + 1}</span>
               <span className="event-detail">
                 EV ${ev.lineup_ev.toFixed(2)} · {ev.n_covered.toLocaleString()} sims ({ev.pct_covered.toFixed(1)}%)
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Self-play: one row per completed contest */}
+      {selfPlayContestEvents.length > 0 && (
+        <div className="event-list">
+          {selfPlayContestEvents.map((ev, i) => (
+            <div key={i} className="event-row event-self_play_contest_progress">
+              <span className="event-stage event-stage-lineup">{ev.contest_id}</span>
+              <span className="event-detail">
+                k={ev.k} · field {ev.n_field.toLocaleString()} · {ev.n_rounds} round{ev.n_rounds === 1 ? '' : 's'}
+                {' '}(round {ev.round_elapsed_s.toFixed(1)}s{ev.refine_elapsed_s > 0 ? ` + refine ${ev.refine_elapsed_s.toFixed(1)}s` : ''})
+                {' '}· {ev.n_swaps} refinement swap{ev.n_swaps === 1 ? '' : 's'}
               </span>
             </div>
           ))}
@@ -655,6 +850,18 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
   for (const e of events) {
     if (e.stage === 'optimize_lineup' || e.stage === 'upload_files') continue
     if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress' || e.stage === 'gpp_rescore_field_progress') continue
+    // self_play_contest_progress/self_play_payout_fallback each get their
+    // own dedicated list (per-contest row list / warning banner) below.
+    if (e.stage === 'self_play_contest_progress' || e.stage === 'self_play_payout_fallback') continue
+    // topn_pick_progress/topn_contest_start/topn_pool_progress each get
+    // their own live progress bar (see isTopnCoverage) rather than a row
+    // per event -- topn_pool_progress in particular can fire dozens of
+    // times during one field-pool build, so without this skip it spammed
+    // the event log with near-duplicate rows instead of showing one
+    // updating count.
+    if (e.stage === 'topn_pick_progress' || e.stage === 'topn_contest_start'
+        || e.stage === 'topn_pool_progress') continue
+    if (e.stage === 'topn_pool_start' && hasEvent('topn_pool_done')) continue
     // Per-chunk p_win progress (many events per stage, A and B) — no live
     // counter surface exists for it yet, same treatment as the gpp_*
     // _progress events above; the one-shot 'external_pwin' summary row
@@ -841,6 +1048,49 @@ function renderDetail(e: SSEEvent): string {
     case 'gpp_holdout': {
       const ev = e as unknown as { holdout_mean_payout: number }
       return `Holdout mean payout: ${ev.holdout_mean_payout.toFixed(4)}`
+    }
+    case 'self_play_pool_start': {
+      const ev = e as unknown as { n_contests: number }
+      return `${ev.n_contests} contest${ev.n_contests === 1 ? '' : 's'}…`
+    }
+    case 'self_play_pool_done': {
+      const ev = e as unknown as { pool_size: number; precise_n_sims: number | null; n_promoted: number }
+      const refine = ev.precise_n_sims
+        ? `refinement at ${ev.precise_n_sims.toLocaleString()} sims, ${ev.n_promoted.toLocaleString()} promoted candidates`
+        : 'refinement disabled'
+      return `${ev.pool_size.toLocaleString()} lineups · ${refine}`
+    }
+    case 'topn_sims_autosize': {
+      const ev = e as unknown as { configured_n_sims: number; total_demand: number; effective_n_sims: number }
+      return `${ev.configured_n_sims.toLocaleString()} configured → ${ev.effective_n_sims.toLocaleString()} `
+        + `(every contest needs a disjoint set totaling ${ev.total_demand.toLocaleString()} sim worlds)`
+    }
+    case 'topn_pool_start': {
+      const ev = e as unknown as { field_pool_size: number }
+      return `${ev.field_pool_size.toLocaleString()} lineups…`
+    }
+    case 'topn_pool_done': {
+      const ev = e as unknown as { field_pool_size: number; n_sims: number }
+      return `${ev.field_pool_size.toLocaleString()} lineups × ${ev.n_sims.toLocaleString()} sim worlds`
+    }
+    case 'topn_pool_augmented': {
+      const ev = e as unknown as { n_requested: number; n_added: number; pool_size: number }
+      return `+${ev.n_added.toLocaleString()} generated candidates added (of ${ev.n_requested.toLocaleString()} `
+        + `requested) — candidate pool now ${ev.pool_size.toLocaleString()}`
+    }
+    case 'topn_contest_done': {
+      const ev = e as unknown as {
+        contest_id: string; k: number; n_filled: number; n_relaxations: number; n_wave_resets: number
+        elapsed_s: number; sim_lap: number; sim_lap_used_pct: number; sim_total_taken: number
+        n_sims_total: number; n_sims_g: number; worlds_claimed: number; worlds_claimed_pct: number
+        n_generated_picks: number
+      }
+      return `${ev.contest_id}: ${ev.n_filled} / ${ev.k} filled${ev.n_relaxations > 0 ? `, ${ev.n_relaxations} relaxations` : ''}`
+        + `${ev.n_wave_resets > 0 ? `, ${ev.n_wave_resets} wave reset${ev.n_wave_resets === 1 ? '' : 's'}` : ''}`
+        + `${ev.n_generated_picks > 0 ? `, ${ev.n_generated_picks} generated pick${ev.n_generated_picks === 1 ? '' : 's'}` : ''} `
+        + `(${ev.elapsed_s.toFixed(1)}s) — used ${ev.n_sims_g.toLocaleString()} of ${ev.n_sims_total.toLocaleString()} `
+        + `sims, claimed ${ev.worlds_claimed.toLocaleString()} / ${ev.n_sims_g.toLocaleString()} `
+        + `(${ev.worlds_claimed_pct.toFixed(0)}%)`
     }
     case 'complete': {
       const ev = e as unknown as { n_lineups: number }
