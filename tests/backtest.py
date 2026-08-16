@@ -89,6 +89,7 @@ infrastructure worth keeping. It is NOT picked up by `pytest tests/`
 (doesn't match the test_*.py discovery pattern) and is not part of the
 `python -m pytest tests/` suite CLAUDE.md documents; run it directly.
 """
+import fcntl
 import os
 import sys
 import time
@@ -113,7 +114,26 @@ SEEDS = [int(s) for s in os.environ.get("BT_SEEDS", "42").split(",")]
 
 OUT_DIR = PROJECT_ROOT / "tests" / "backtest_output"
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-RESULTS_CSV = OUT_DIR / "results.csv"
+# BT_RESULTS=<name>.csv writes to a separate file under backtest_output/.
+# Rows are APPENDED with no dedup by (slate, seed, arm), so re-running an
+# arm/slate already present in the default results.csv would silently pool
+# two draws under one label -- point a new experiment at its own file.
+RESULTS_CSV = OUT_DIR / os.environ.get("BT_RESULTS", "results.csv")
+
+# One writer per results file. _append_and_reload is read-modify-write over
+# the WHOLE csv, so two concurrent runs sharing a BT_RESULTS silently drop
+# each other's rows as well as duplicating them -- corruption that looks
+# like ordinary data until someone tries to explain an arm's row count.
+# flock is released by the kernel on exit, including kill -9, so a crashed
+# run never leaves a stale lock behind.
+_LOCK_FH = open(RESULTS_CSV.with_suffix(RESULTS_CSV.suffix + ".lock"), "w")
+try:
+    fcntl.flock(_LOCK_FH, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(
+        f"another backtest already holds {RESULTS_CSV.name} -- set BT_RESULTS "
+        f"to a different file, or wait for that run to finish"
+    )
 SIM_CACHE_DIR = OUT_DIR / "sim_cache"
 SIM_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -121,9 +141,15 @@ N_SIMS = int(os.environ.get("BT_NSIMS", LIVE_CFG["simulation"]["n_sims"]))
 SHARPNESS = float(LIVE_CFG["gpp"].get("external_pool_pwin_sharpness", 0.05))
 FLOOR_PCT = float(LIVE_CFG["gpp"].get("external_pool_proj_score_pct", 30.0))
 
-# (uses_calibration, admit_floor, admit_mult, EVw)
+# (uses_calibration, admit_floor, admit_mult, EVw[, lane_fraction, lane_evw[, rank_normalize]])
 # EVw=None means "ignore p_win ranking entirely, draw uniformly" -- the cull
 # (admit_floor/admit_mult) still applies unless it's also zero.
+# The optional 5th/6th elements are the lane split (see the LANE SPLIT
+# section of DeterminantPortfolioSelector's docstring); omitted == (0.0, 0.0)
+# == no lane, byte-identical to every pre-lane arm. The optional 7th is
+# rank_normalize (see RANK NORMALISATION in the same docstring); omitted ==
+# False. A 7-element arm must spell out the lane pair even when it is
+# (0.0, 0.0) -- positional, so there is no way to skip it.
 ARMS: dict[str, tuple] = {
     "old":         (False, 250,  12.0, 0.25),  # 2026-07-28 to 07-30 era: uncalibrated grids, 250-floor/12x window
     "flat2000_uc": (False, 2000, 0.0,  0.25),  # 2026-07-27 17:16 to 07-28 11:22 era: uncalibrated grids, LITERAL flat-2000 window (no multiplier existed yet) -- the config actually being asked about here
@@ -140,6 +166,50 @@ ARMS: dict[str, tuple] = {
     "wide":        (True,    0,  0.0,  0.25),  # no cull at all, production EVw -- isolates the cull's effect
     "wide_lo":     (True,    0,  0.0,  0.10),  # no cull, heavy diversity
     "random":      (True,    0,  0.0,  None),  # no cull, no ranking signal -- the baseline that matters most
+
+    # --- lane split (2026-08-12) ------------------------------------------
+    # All share flat2000_uc's cull so the ONLY difference from that baseline
+    # arm is how the last alpha of each contest's entries is scored. The
+    # hypothesis under test: one EVw for every pick conflates "buy the
+    # ceiling the model can see" with "get exposure to a ceiling the model
+    # has mispriced", and the second job is only reachable at an EVw so low
+    # it taxes every other entry. Diagnosed on the 08/11 slate -- that
+    # pool's best realized lineup ranked 1512/1881 on p_win and 1520/1881
+    # on win-world novelty (its sim p99 was 167.6; it scored 186.85) while
+    # ranking 99.9th pctile on points-space orthogonality.
+    #
+    # lane10/25/50 hold the baseline EVw and vary alpha; lane25_hi raises
+    # the EV lane to 0.50 to test the other half of the claim -- that with
+    # a dedicated lane you can afford a GREEDIER EV lane than 0.25.
+    # No-lane controls sharing flat2000_uc's exact cull, so "lane split" is
+    # separable from "just move EVw". Without these, lane25_hi vs
+    # flat2000_uc confounds the lane with the 0.25->0.50 EV-lane change, and
+    # the existing cull_lo arm can't serve as the low-EVw control (it uses a
+    # different cull AND calibrated grids).
+    "evw10":       (False, 2000, 0.0,  0.10),
+    "evw50":       (False, 2000, 0.0,  0.50),
+    "lane10":      (False, 2000, 0.0,  0.25, 0.10, 0.0),
+    "lane25":      (False, 2000, 0.0,  0.25, 0.25, 0.0),
+    "lane50":      (False, 2000, 0.0,  0.25, 0.50, 0.0),
+    "lane25_hi":   (False, 2000, 0.0,  0.50, 0.25, 0.0),
+
+    # --- rank-normalised diversity (2026-08-12) ---------------------------
+    # Same cull as flat2000_uc; the only change is that EVn and DEn become
+    # percentile ranks among the remaining candidates instead of a
+    # max-normalised EV and a CLIPPED distance. Motivation and the
+    # split-half validation of the ordering are in the selector docstring.
+    #
+    # Swept across EVw rather than tested at the baseline's 0.25 alone:
+    # rank normalisation rescales the diversity term, so the same nominal
+    # EVw is NOT the same operating point as the baseline's. On the 08/11
+    # slate the rank arm at risk 3-4 behaved like production at risk 1
+    # (mean p_win rank 238 vs 133, mean ownership 78.7 vs 89.3) -- testing
+    # one EVw would compare the two at non-equivalent settings and could
+    # flatter or bury the change for the wrong reason.
+    "rank10":      (False, 2000, 0.0,  0.10, 0.0, 0.0, True),
+    "rank25":      (False, 2000, 0.0,  0.25, 0.0, 0.0, True),
+    "rank50":      (False, 2000, 0.0,  0.50, 0.0, 0.0, True),
+    "rank75":      (False, 2000, 0.0,  0.75, 0.0, 0.0, True),
 }
 
 # Frozen BEFORE any BT_ARMS filtering, because the random arms seed their RNG
@@ -245,7 +315,10 @@ def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
     hitter_only_corr; "full" (ctx["corr"]) is the unweighted baseline.
     _random_pick never reads ctx["corr"] at all, so corr_variant is simply
     unused for evw=None arms (random/cull_rnd/flat2000_rnd)."""
-    _, admit_floor, admit_mult, evw = ARMS[arm]
+    _spec = ARMS[arm]
+    _, admit_floor, admit_mult, evw = _spec[:4]
+    lane_fraction, lane_evw = (_spec[4], _spec[5]) if len(_spec) > 5 else (0.0, 0.0)
+    rank_normalize = bool(_spec[6]) if len(_spec) > 6 else False
     eff_floor_pct = FLOOR_PCT if floor_pct is None else floor_pct
     if evw is None:
         # offset by the arm's position (not hash(arm) -- string hashing is
@@ -273,6 +346,8 @@ def run_arm(ctx: dict, arm: str, seed: int, floor_pct: float = None,
         proj_scores=weighted_proj_scores(ctx, pitcher_weight), proj_score_floor_percentile=eff_floor_pct,
         ev_type="p_win", p_win_cull=ctx["p_win_cull"], p_win_select=ctx["p_win_select"],
         p_win_admit_n=admit_floor, p_win_admit_multiplier=admit_mult,
+        lane_fraction=lane_fraction, lane_evw=lane_evw,
+        rank_normalize=rank_normalize,
     )
     idx_of = {id(lu): i for i, lu in enumerate(ctx["pool"].lineups)}
     unfilled_by_contest: dict[str, int] = {}
@@ -355,9 +430,15 @@ def main() -> None:
         fpts = verify_slate(d, real, nm)
         print(f"{slate}: all zips verified against this slate's realized FPTS", flush=True)
 
+        # Only build the calibration contexts some ACTIVE arm actually
+        # reads. Each build is a full sim + corr + 2 opponent fields +
+        # p_win (minutes at production n_sims), so with BT_ARMS narrowed to
+        # one calibration flag the unconditional both-ways loop this
+        # replaced doubled the wall clock for nothing.
+        _needed_calib = {ARMS[a][0] for a in ARMS}
         for seed in SEEDS:
             ctxs = {}
-            for calib in (False, True):
+            for calib in sorted(_needed_calib):
                 t0 = time.time()
                 ctxs[calib] = build_slate_context(
                     d, seed, calib, real,

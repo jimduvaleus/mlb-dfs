@@ -333,12 +333,24 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                   elsewhere — diversity is a byproduct of the coverage race itself, so this
                   produces a single portfolio (no risk sweep).
                 </p>
-                <FieldRow label="Top-N rank">
+                <FieldRow label="Top-N rank (floor)">
                   <input type="number" step={1} min={1}
                     value={draft.gpp.external_pool_topn_rank ?? 10}
                     onChange={e => setGpp('external_pool_topn_rank', Number(e.target.value))}
                     disabled={disabled} />
                 </FieldRow>
+                <FieldRow label="Percentile floor for large fields (0 = off)">
+                  <input type="number" step="any" min={0} max={1}
+                    value={draft.gpp.external_pool_topn_percentile_floor ?? 0.001}
+                    onChange={e => setGpp('external_pool_topn_percentile_floor', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <p className="field-hint">
+                  Effective rank per contest = max(Top-N rank, ceil(percentile floor × field size)),
+                  clipped to field size. 0.001 ("top 0.1%") makes a 17,000-entry field effectively
+                  top-17 instead of a literal top-10, while fields under ~10,000 entries stay at the
+                  flat Top-N rank — keeps the bar's real difficulty comparable across contest sizes.
+                </p>
                 <FieldRow label="Field pool size">
                   <input type="number" step={1000} min={1000}
                     value={draft.gpp.external_pool_topn_field_pool_size ?? 25000}
@@ -363,6 +375,20 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                   (a real lineup always wins a conflict). Lets the selector pick a high-performing
                   lineup that's visible in the simulated field but wasn't in the real export.
                   Unvalidated — off by default.
+                </p>
+                <FieldRow label="Leverage weight for generated candidates (0 = ownership-only, 1 = pure leverage)">
+                  <input type="number" step={0.05} min={0} max={1}
+                    value={draft.gpp.external_pool_topn_generated_leverage_weight ?? 0}
+                    onChange={e => setGpp('external_pool_topn_generated_leverage_weight', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <p className="field-hint">
+                  Blends the generated candidates' sampling ownership toward game-theoretic
+                  "optimal ownership" (players whose true edge exceeds their projected ownership)
+                  instead of plain projected ownership, biasing extra candidates toward genuine
+                  leverage rather than mimicking the field. 0 = today's behavior (unaffected).
+                  Unvalidated as a generation-time bias — off by default; only has any effect when
+                  "Generated candidates to add" above is greater than 0.
                 </p>
                 <FieldRow label="Sims-needed floor (at reference field size)">
                   <input type="number" step={1} min={0}

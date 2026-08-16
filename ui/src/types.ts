@@ -109,8 +109,10 @@ export interface GppConfig {
   external_pool_self_play_shortlist_size: number
   external_pool_topn_field_pool_size: number
   external_pool_topn_rank: number
+  external_pool_topn_percentile_floor: number
   external_pool_topn_field_samples: number
   external_pool_topn_generated_pool_size: number
+  external_pool_topn_generated_leverage_weight: number
   external_pool_topn_sims_per_contest_fraction: number
   external_pool_topn_sims_min: number
   external_pool_topn_sims_reference_field_size: number
@@ -119,6 +121,7 @@ export interface GppConfig {
   external_pool_proj_score_pct: number
   external_pool_ceiling_weight: number
   external_pool_cash_anchor_fraction: number
+  external_pool_rank_normalize: boolean
 }
 
 export interface AppConfig {
@@ -533,6 +536,7 @@ export interface TopnContestStartEvent extends SSEEvent {
   k: number
   field_size_g: number
   n_sims_g: number
+  effective_rank: number
   contest_index: number
   contests_total: number
   contests_done: number

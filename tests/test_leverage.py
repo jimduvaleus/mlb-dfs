@@ -4,9 +4,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.optimization import leverage as leverage_module
 from src.optimization.leverage import (
     OWN_FLOOR_PCT,
     compute_candidate_p_opt,
+    compute_generation_ownership_vec,
     compute_leverage,
     compute_optimal_ownership,
 )
@@ -134,3 +136,60 @@ class TestComputeLeverage:
         diff, ratio = compute_leverage(np.array([2.0]), players_df)
         assert np.isfinite(ratio).all()
         assert ratio[0] == pytest.approx(2.0 / OWN_FLOOR_PCT)
+
+
+class TestComputeGenerationOwnershipVec:
+    def _players_df(self, player_ids):
+        rng = np.random.default_rng(42)
+        return pd.DataFrame({
+            "player_id": player_ids,
+            "ownership": rng.uniform(1.0, 30.0, size=len(player_ids)),
+        })
+
+    def test_zero_blend_weight_returns_raw_ownership_untouched(self, monkeypatch):
+        rng = np.random.default_rng(6)
+        lineups, sim_results = _pool(rng, n_lineups=6)
+        players_df = self._players_df(sim_results.player_ids)
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("compute_optimal_ownership should not be called at blend_weight=0")
+
+        monkeypatch.setattr(leverage_module, "compute_optimal_ownership", _boom)
+        out = compute_generation_ownership_vec(
+            lineups, sim_results, players_df, field_size=10.0, blend_weight=0.0,
+        )
+        np.testing.assert_array_equal(out, players_df["ownership"].to_numpy())
+
+    def test_degenerate_pool_falls_back_to_raw_ownership(self):
+        rng = np.random.default_rng(7)
+        lineups, sim_results = _pool(rng, n_lineups=1)
+        players_df = self._players_df(sim_results.player_ids)
+        out = compute_generation_ownership_vec(
+            lineups, sim_results, players_df, field_size=10.0, blend_weight=1.0,
+        )
+        np.testing.assert_array_equal(out, players_df["ownership"].to_numpy())
+
+    def test_full_blend_weight_matches_compute_optimal_ownership_exactly(self):
+        rng = np.random.default_rng(8)
+        lineups, sim_results = _pool(rng, n_lineups=8)
+        players_df = self._players_df(sim_results.player_ids)
+        out = compute_generation_ownership_vec(
+            lineups, sim_results, players_df, field_size=10.0, blend_weight=1.0, sharpness=0.1,
+        )
+        expected = compute_optimal_ownership(
+            lineups, sim_results, players_df, {"_gen": 10.0}, sharpness=0.1,
+        )["_gen"]
+        np.testing.assert_allclose(out, expected)
+
+    def test_intermediate_blend_weight_is_exact_arithmetic_midpoint(self):
+        rng = np.random.default_rng(9)
+        lineups, sim_results = _pool(rng, n_lineups=8)
+        players_df = self._players_df(sim_results.player_ids)
+        out = compute_generation_ownership_vec(
+            lineups, sim_results, players_df, field_size=10.0, blend_weight=0.5, sharpness=0.1,
+        )
+        optimal = compute_optimal_ownership(
+            lineups, sim_results, players_df, {"_gen": 10.0}, sharpness=0.1,
+        )["_gen"]
+        expected = 0.5 * players_df["ownership"].to_numpy() + 0.5 * optimal
+        np.testing.assert_allclose(out, expected)

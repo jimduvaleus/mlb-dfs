@@ -98,6 +98,73 @@ def _build_payout_lookup(gross_payout_arr: np.ndarray, N: int, entry_fee: float 
     return (_band_average(gross_payout_arr, N) - entry_fee).astype(np.float32)
 
 
+DUPE_REF_FIELD_SIZE = 14_863.0
+"""Field size the fitted dupe intercept is calibrated to -- must stay in sync
+with `scripts/fit_dupe_model.py`'s `N_REF`, which enters that fit as an
+`log(n_entries / N_REF)` offset so the intercept absorbs field size.
+
+`ContestScorer` never rescales by it: its whole run is one contest at the
+reference structure's size, so the intercept is already correct there. Any
+caller applying this model ACROSS contests of different sizes (e.g.
+`allocate_contests_topn_coverage`, whose per-slate field sizes span
+~750-18,000 entries) must scale E[dupes] by `field_size / DUPE_REF_FIELD_SIZE`
+-- E[copies] is linear in field size, so using the unscaled reference value in
+a 744-entry contest overstates duplication by ~20x."""
+
+
+def expected_dupes(
+    lineups: list,
+    own_map: dict,
+    sal_map: dict,
+    team_map: dict,
+    pos_map: dict,
+    *,
+    salary_cap: float,
+    intercept: float,
+    log_own_coef: float,
+    salary_coef: float,
+    stack_coef: float,
+) -> np.ndarray:
+    """(M,) float64 E[duplicate copies] per lineup, at the fitted model's
+    reference field size (`DUPE_REF_FIELD_SIZE`).
+
+    The log-linear zero-truncated-Poisson mean fitted by
+    `scripts/fit_dupe_model.py`: `exp(intercept + b_own*SUM log(own) -
+    b_sal*unused_hundreds + b_stack*(primary_stack - 4))`. Ownership is the
+    real-universe %drafted FRACTION (the field-generation vector), clipped to
+    [1e-4, 0.95] to match the fit's `OWN_CLIP`; `primary_stack` counts hitters
+    only (pitchers excluded), matching how the fit derives it from DKSalaries.
+
+    Extracted to module level so `ContestScorer._compute_dupe_scale` and the
+    external-pool topn_coverage allocator share ONE implementation of the
+    formula -- the coefficients are fitted against this exact expression, so a
+    second hand-rolled copy drifting from it would silently mis-price."""
+    e_dupes = np.zeros(len(lineups), dtype=np.float64)
+    for i, lu in enumerate(lineups):
+        sum_log_own = 0.0
+        salary_used = 0.0
+        team_counts: dict[str, int] = {}
+        for pid in lu.player_ids:
+            pid = int(pid)
+            own = float(np.clip(own_map.get(pid, 0.01), 1e-4, 0.95))
+            sum_log_own += np.log(own)
+            salary_used += sal_map.get(pid, 0.0)
+            if pos_map.get(pid, "") != "P":
+                t = team_map.get(pid, "")
+                if t:
+                    team_counts[t] = team_counts.get(t, 0) + 1
+        primary_stack = max(team_counts.values()) if team_counts else 0
+        unused_hundreds = max(salary_cap - salary_used, 0.0) / 100.0
+        log_dupes = (
+            intercept
+            + log_own_coef * sum_log_own
+            - salary_coef * unused_hundreds
+            + stack_coef * (primary_stack - 4)
+        )
+        e_dupes[i] = np.exp(np.clip(log_dupes, -20.0, 10.0))
+    return e_dupes
+
+
 def _build_dilutable_lookup(
     gross_payout_arr: np.ndarray, N: int, min_gross_payout: float
 ) -> np.ndarray:
@@ -898,32 +965,15 @@ class ContestScorer:
         team_map = dict(zip(pids, fdf["team"]))
         pos_map = dict(zip(pids, fdf["position"]))
 
-        scale = np.ones(M, dtype=np.float32)
-        e_dupes_all = np.zeros(M, dtype=np.float64)
-        for i, lu in enumerate(candidates):
-            sum_log_own = 0.0
-            salary_used = 0.0
-            team_counts: dict[str, int] = {}
-            for pid in lu.player_ids:
-                pid = int(pid)
-                own = float(np.clip(own_map.get(pid, 0.01), 1e-4, 0.95))
-                sum_log_own += np.log(own)
-                salary_used += sal_map.get(pid, 0.0)
-                if pos_map.get(pid, "") != "P":
-                    t = team_map.get(pid, "")
-                    if t:
-                        team_counts[t] = team_counts.get(t, 0) + 1
-            primary_stack = max(team_counts.values()) if team_counts else 0
-            unused_hundreds = max(self._salary_cap - salary_used, 0.0) / 100.0
-            log_dupes = (
-                self._dupe_intercept
-                + self._dupe_log_own_coef * sum_log_own
-                - self._dupe_salary_coef * unused_hundreds
-                + self._dupe_stack_coef * (primary_stack - 4)
-            )
-            e_dupes = float(np.exp(np.clip(log_dupes, -20.0, 10.0)))
-            e_dupes_all[i] = e_dupes
-            scale[i] = np.float32(1.0 / (1.0 + e_dupes))
+        e_dupes_all = expected_dupes(
+            candidates, own_map, sal_map, team_map, pos_map,
+            salary_cap=self._salary_cap,
+            intercept=self._dupe_intercept,
+            log_own_coef=self._dupe_log_own_coef,
+            salary_coef=self._dupe_salary_coef,
+            stack_coef=self._dupe_stack_coef,
+        )
+        scale = (1.0 / (1.0 + e_dupes_all)).astype(np.float32)
 
         logger.info(
             "Dupe model: E[dupes] min=%.3f  p50=%.3f  p90=%.3f  max=%.1f  "
@@ -972,6 +1022,30 @@ class ContestScorer:
 # ------------------------------------------------------------------ #
 #  DeterminantPortfolioSelector                                        #
 # ------------------------------------------------------------------ #
+
+def _rank_pct(x: np.ndarray) -> np.ndarray:
+    """Percentile rank of each element in [0, 1], ties sharing the average
+    rank. Used to put the selector's EV and diversity terms on a common
+    ordinal scale (see RANK NORMALISATION in
+    DeterminantPortfolioSelector's docstring). A length-1 input maps to
+    1.0 -- with a single candidate there is nothing to discriminate and
+    every term should be neutral rather than 0."""
+    n = len(x)
+    if n <= 1:
+        return np.ones(n, dtype=np.float64)
+    order = np.argsort(x, kind="stable")
+    ranks = np.empty(n, dtype=np.float64)
+    ranks[order] = np.arange(n, dtype=np.float64)
+    # average ranks within tie groups, so equal values score equally
+    xs = x[order]
+    start = 0
+    for i in range(1, n + 1):
+        if i == n or xs[i] != xs[start]:
+            if i - start > 1:
+                ranks[order[start:i]] = (start + i - 1) / 2.0
+            start = i
+    return ranks / (n - 1)
+
 
 class DeterminantPortfolioSelector:
     """Greedy portfolio construction via incremental correlation-distance maximisation.
@@ -1051,6 +1125,83 @@ class DeterminantPortfolioSelector:
     evw_max       : EVw at risk=5 (most EV-heavy)
     ev_floor      : candidates with mean robust_payout below this $ amount are
                     culled from the pool before selection begins
+    lane_fraction : 0.0 (default, no-op) .. 1.0 — fraction of the portfolio
+                    reserved for a second "orthogonality lane"
+    lane_evw      : the EV weight that lane is scored at
+
+    LANE SPLIT (lane_fraction / lane_evw)
+    -------------------------------------
+    One EVw applied to every pick forces a single answer to two different
+    questions. The EV term ranks on a simulated currency, so it can only
+    ever buy the ceiling the model can see; the diversity term reads how a
+    lineup MOVES (a composition fact, independent of the model's opinion
+    about its ceiling), so it is the only part of the score with any
+    exposure to a lineup the model has mispriced. Measured on the 08/11
+    slate: that slate's best realized lineup out of a 5,179-lineup pool
+    ranked 1512/1881 on p_win and 1520/1881 on win-world novelty — every
+    model-trusting currency agreed it was bad, because the sim itself put
+    its p99 at 167.6 and it scored 186.85 — while ranking 99.9th percentile
+    on points-space orthogonality. Buying it required EVw≈0.01 across the
+    WHOLE portfolio, taxing all 135 entries to hold one lineup.
+
+    The split instead fills the first (1-lane_fraction) of a contest's
+    entries at the caller's EVw and the remainder at `lane_evw` (0.0 = pure
+    orthogonality, no EV term). Because the lane runs LAST, its picks are
+    scored against a greedy state that already contains the EV lane, so
+    "orthogonal" means orthogonal to what was actually bought. Set
+    lane_fraction=0.0 for byte-identical pre-lane behaviour.
+
+    RANK NORMALISATION (rank_normalize)
+    -----------------------------------
+    Both cardinal terms are degenerate, at opposite ends, and the degeneracy
+    is structural rather than a tuning artefact.
+
+    `Dn`'s redundancy sum has k unbounded terms, so `Dn > 0` needs roughly
+    k < 1/rbar^2 (k < 44 at rbar=0.15): any large multi-entry contest
+    saturates with certainty, after which the clip maps every remaining
+    candidate to exactly 0 and the term orders nothing. Measured on the
+    08/11 mini-MAX fill: 0% of candidates clipped through pick 40, 84.8% by
+    pick 55, 99.8% by pick 66 of 79 -- the back half of that contest ran
+    with a diversity term that could not discriminate, which silently
+    promoted the HedgeN tie-breaker into the de facto discriminator.
+
+    `EVn` is COMPRESSED the other way, but -- measured, 08/11 mini-MAX at
+    risk 3 -- not degenerate: the median candidate's EV term sits at 43% of
+    the max and its IQR is 0.091 against the ranked form's 0.253, i.e. ~2.8x
+    narrower rather than collapsed. An earlier draft of this docstring
+    claimed max-normalised p_win "crushes nearly every candidate to ~0";
+    that is true of the whole post-floor pool (the redundancy-aware-cull
+    work measured it there) but NOT of what this selector actually sees,
+    because the stage-A p_win cull has already removed the heavy tail before
+    the greedy runs. Ranking EV here buys commensurability with the
+    diversity term, not the repair of a degeneracy.
+
+    So rank_normalize is predominantly a DIVERSITY-side change. If a ranked
+    arm diverges from a cardinal one, DEn is doing that work.
+
+    With rank_normalize=True both become percentile ranks among the
+    remaining candidates, so EVw finally means "how much do I weight EV
+    against diversity" instead of "how deep into the fill does diversity
+    survive before the scale collapse kills it", and it means the same thing
+    at pick 5, at pick 67, and across contests of different k.
+
+    DEn ranks the RAW, UNCLIPPED redundancy. That ordering was verified real
+    rather than sim noise before this was built: holding the already-picked
+    set fixed and recomputing redundancy from two disjoint sim halves gives
+    Spearman-Brown rho_full 0.976-0.999 at every pick step from 5 to 78
+    (negative control 0.020, positive control 0.998). Note the argmax is
+    still not reproducible run-to-run -- lowest-10 overlap is 5-9/10 even at
+    pick 5 where nothing is clipped -- because the leading candidates are
+    genuine near-ties. The MEASURE is stable; which specific near-tie wins
+    is not.
+
+    KNOWN CONSEQUENCE, deliberately not compensated here: rank-normalised
+    diversity never anneals. The old clip made diversity fade as the
+    portfolio grew, and a prior log-det experiment concluded "pure EV late"
+    was correct. If annealing is wanted, the principled restoration is a
+    noise gate (let the term act only while redundancy differences exceed
+    se(r) ~ 1/sqrt(n_sims)), NOT a return to the clip -- but that is a
+    separate change, kept out so its effect stays separable.
     """
 
     def __init__(
@@ -1066,6 +1217,9 @@ class DeterminantPortfolioSelector:
         precomputed: Optional[tuple] = None,
         ev_override: Optional[np.ndarray] = None,
         cash_anchor_fraction: float = 0.0,
+        lane_fraction: float = 0.0,
+        lane_evw: float = 0.0,
+        rank_normalize: bool = False,
     ) -> None:
         # robust_payout may be None when `precomputed` is supplied (external
         # pool mode passes (pool_idx, ROI vector, corr) directly): the greedy
@@ -1082,9 +1236,14 @@ class DeterminantPortfolioSelector:
         # scale down together as EVw rises across the risk sweep, keeping
         # their ratio (and so the safety margin against HedgeN rescuing a
         # redundant candidate) constant at every risk level.
-        diversity_w = 1.0 - self._evw
-        self._hedge_w = _HEDGE_WEIGHT_FRACTION * diversity_w
-        self._dew = diversity_w - self._hedge_w
+        self._evw, self._dew, self._hedge_w = self._weights_for_evw(self._evw)
+        # Lane split (see the class docstring): the LAST
+        # ceil(lane_fraction × portfolio_size) picks are scored at
+        # `lane_evw` instead of the risk-derived EVw. 0.0 is a literal
+        # no-op — every pick keeps the single risk-derived weight triple.
+        self._lane_fraction = float(lane_fraction)
+        self._lane_weights = self._weights_for_evw(float(lane_evw))
+        self._rank_normalize = bool(rank_normalize)
         self._ev_floor = ev_floor
         # Optional shared precompute from precompute_pool() — must have been
         # built from the same robust_payout/ev_floor. The risk sweep passes
@@ -1103,6 +1262,16 @@ class DeterminantPortfolioSelector:
             np.asarray(ev_override, dtype=np.float64) if ev_override is not None else None
         )
         self._cash_anchor_fraction = float(cash_anchor_fraction)
+
+    @staticmethod
+    def _weights_for_evw(evw: float) -> tuple[float, float, float]:
+        """(EVw, DEw, HedgeW) for one EV weight. The diversity budget
+        (1-EVw) always splits by _HEDGE_WEIGHT_FRACTION, so HedgeW <= DEw
+        holds at every EVw — the invariant that keeps a maxed-out hedge
+        bonus from outscoring a fully non-redundant candidate."""
+        diversity_w = 1.0 - evw
+        hedge_w = _HEDGE_WEIGHT_FRACTION * diversity_w
+        return evw, diversity_w - hedge_w, hedge_w
 
     @staticmethod
     def evw_for_risk(risk: float, evw_base: float = 0.10, evw_max: float = 0.40) -> float:
@@ -1190,7 +1359,20 @@ class DeterminantPortfolioSelector:
         )
 
         M_pool = len(pool_idx)
-        evw, dew, hedge_w = self._evw, self._dew, self._hedge_w
+        base_weights = (self._evw, self._dew, self._hedge_w)
+        # Lane split: the last n_lane picks switch to the lane weight triple.
+        # They come LAST, not first, so the lane is scored for orthogonality
+        # against everything the EV lane already bought — the opposite
+        # ordering from cash_anchor_fraction, which anchors the FIRST picks.
+        # Step 1 always uses the base weights: with an empty portfolio there
+        # is no diversity to measure, so the first pick is an EV argmax
+        # regardless (matters only at lane_fraction >= 1.0).
+        n_lane = (
+            int(np.ceil(self._lane_fraction * self._portfolio_size))
+            if self._lane_fraction > 0 else 0
+        )
+        first_lane_step = self._portfolio_size - n_lane + 1
+        evw, dew, hedge_w = base_weights
 
         # Selection-EV basis per pick: mean dollar EV for the cash-anchor
         # block (and everywhere when no override), the override vector after.
@@ -1228,6 +1410,11 @@ class DeterminantPortfolioSelector:
             if stop_check is not None and stop_check():
                 logger.info("DeterminantSelector: stop requested at step %d.", step)
                 break
+
+            evw, dew, hedge_w = (
+                self._lane_weights if (n_lane > 0 and step >= first_lane_step)
+                else base_weights
+            )
 
             remaining_pool_idx = np.where(remaining_mask)[0]  # (M_rem,)
             M_rem = len(remaining_pool_idx)
@@ -1281,6 +1468,18 @@ class DeterminantPortfolioSelector:
             # max-rescaling).
             DEn = distance
             HedgeN = hedge_bonus
+
+            if self._rank_normalize:
+                # Both cardinal terms are degenerate at opposite ends, so
+                # rank them instead (see RANK NORMALISATION in the class
+                # docstring). DEn ranks the RAW redundancy, not `distance` —
+                # the clip is precisely what destroys the ordering. HedgeN
+                # is left cardinal: it is already bounded [0, 1] and is
+                # genuinely ~0 for most candidates, so ranking it would
+                # promote a minor tie-breaker into a term that pays every
+                # median candidate half its weight.
+                EVn = _rank_pct(ev_rem)
+                DEn = 1.0 - _rank_pct(redundancy)
 
             score = evw * EVn + dew * DEn + hedge_w * HedgeN
             best_in_rem = int(np.argmax(score))

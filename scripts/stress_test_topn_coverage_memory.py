@@ -265,6 +265,7 @@ def main() -> None:
         ep.allocate_contests_topn_coverage(
             pool, sim_results, groups, field_lineups,
             topn_rank=_defaults.external_pool_topn_rank,
+            topn_percentile_floor=_defaults.external_pool_topn_percentile_floor,
             field_samples=_defaults.external_pool_topn_field_samples,
             sims_per_contest_fraction=_defaults.external_pool_topn_sims_per_contest_fraction,
             sims_min=_defaults.external_pool_topn_sims_min,

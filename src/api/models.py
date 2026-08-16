@@ -338,14 +338,36 @@ class GppConfig(BaseModel):
     # as _PWIN_FIELD_CAP/self_play's _SELF_PLAY_POOL_CAP.
     external_pool_topn_field_pool_size: int = 25_000
     # topn_coverage: the literal rank (e.g. 10 = "top-10") a candidate must
-    # cross in a simulated world to count as covering it. Fixed per the
-    # design -- not derived from each contest's payout structure.
+    # cross in a simulated world to count as covering it -- the FLOOR of the
+    # effective per-contest bar (see external_pool_topn_percentile_floor
+    # immediately below, which can push this UP for large fields; it never
+    # goes below this flat value).
     external_pool_topn_rank: int = 10
+    # topn_coverage: per-contest effective rank = max(external_pool_topn_rank,
+    # ceil(this fraction * field_size_g)), clipped to field_size_g -- e.g.
+    # 0.001 ("top 0.1%") makes a 17,000-entry field effectively top-17
+    # instead of a literal top-10, while fields under ~10,000 entries stay
+    # at the flat topn_rank floor (ceil(0.001 * field_size_g) < 10 there).
+    # A fixed top-10 bar is a vastly more extreme ask in a huge field (top
+    # 0.06% of 17,000) than a small one (top 2% of 500) -- this keeps the
+    # bar's real difficulty comparable across contest sizes instead of
+    # literally fixed. 0 disables this entirely (pure flat topn_rank, the
+    # original behavior). See _topn_effective_rank in external_pool.py.
+    external_pool_topn_percentile_floor: float = 0.001
     # topn_coverage: K independent field-pool column-subsets drawn per
     # contest (cheap re-slices of the same already-scored field pool, not K
     # separate field generations) -- avoids overfitting coverage to a single
     # field snapshot's idiosyncrasies. Mirrors ContestScorer's n_field_samples.
-    external_pool_topn_field_samples: int = 5
+    #
+    # 5 -> 3 (2026-08-11): scripts/diagnose_topn_variance_decomposition.py
+    # varied the sim-world slices and the field draws independently (via the
+    # allocator's field_rng_seed) and attributed ~95% of cross-seed portfolio
+    # variance to sim-world resampling vs ~36% to field draws -- K was buying
+    # little. Since field scoring is the dominant wall-clock cost and scales
+    # linearly with K while the (n_sims_g x field_size_g) transient does NOT
+    # scale with K at all, cutting K frees time to spend on sim worlds, which
+    # is where the variance actually lives.
+    external_pool_topn_field_samples: int = 3
     # topn_coverage: additional candidates drawn from the same stacked-
     # lineup generator the threshold field pool uses (see
     # ep.augment_topn_pool_with_generated), merged into the real external
@@ -362,6 +384,26 @@ class GppConfig(BaseModel):
     # posture as every other speculative topn_coverage/proj_top knob in this
     # file.
     external_pool_topn_generated_pool_size: int = 0
+    # topn_coverage: blend weight for generated candidates' sampling
+    # ownership vector, toward the self-referential "optimal ownership"
+    # game-theoretic signal (src/optimization/leverage.py) instead of plain
+    # projected ownership. 0.0 (default) = today's exact behavior --
+    # optimal-ownership computation is skipped entirely, not just weighted
+    # to zero. 1.0 = generated candidates drawn purely from optimal
+    # ownership. Reuses external_pool_pwin_sharpness (already validated for
+    # this self-referential-field mechanism, see
+    # scripts/analyze_optimal_ownership.py) as the p_opt exponent's
+    # sharpness, rather than adding a second unvalidated sharpness knob.
+    #
+    # UNVALIDATED as a candidate-GENERATION bias -- distinct from the
+    # SELECTION-time finding that giving leverage MORE weight as a primary
+    # EV/ranking term consistently hurt across 6+ tests (memory
+    # project-leverage-session-handoff, "THE PATTERN"). This changes what
+    # shapes are AVAILABLE to be picked, not how they're ranked once
+    # generated -- untested, not contradicted by that finding -- but same
+    # caution applies: off by default until backtested, dial not switch.
+    # Only takes effect when external_pool_topn_generated_pool_size > 0.
+    external_pool_topn_generated_leverage_weight: float = 0.0
     # topn_coverage: per-contest sim-world budget. Each contest draws its own
     # random sim-world subsample (both to bound cost by n_sims_g and to keep
     # two contests' coverage races from converging on near-duplicate lineups
@@ -394,7 +436,20 @@ class GppConfig(BaseModel):
     # correctness fix: the flat 0.5 fraction this replaces (12,500 sims at
     # n_sims=25,000) already exceeded every measured "needed" point, so this
     # is a compute-savings tune for small contests, not a bug fix.
-    external_pool_topn_sims_min: int = 4_607
+    #
+    # 4,607 -> 9,214 (2x) on 2026-08-11. The calibration above targeted the
+    # per-candidate SCORE ranking converging (0.9 Spearman); it did not check
+    # that the resulting PORTFOLIO is stable, and it isn't at 1x. Varying only
+    # the sim-world slices (scripts/sweep_topn_sim_budget.py, via the
+    # allocator's field_rng_seed) moved player-exposure rho 0.847 and
+    # stack rho 0.889 between two seeds. Doubling the budget lifts those to
+    # 0.883 / 0.942; tripling reaches 0.908 / 0.983. Divergence decays at
+    # ~1/sqrt(n) for exposure and faster for stack structure, so this keeps
+    # paying, but 2x is the shipped point rather than 3x for MEMORY headroom:
+    # peak RSS on the 08/10 slate ran 2.61 / 4.89 / 7.18 GB at 1x/2x/3x, and a
+    # slate whose field_size_g reaches the 25,000 field-pool cap would push 3x
+    # to ~9.5GB against a ~11GB budget. Wall clock 67s -> 156s there.
+    external_pool_topn_sims_min: int = 9_214
     external_pool_topn_sims_reference_field_size: int = 392
     external_pool_topn_sims_power: float = 0.222
     # External pool mode: per-contest ROI percentile floor for the pre-Det
@@ -404,9 +459,13 @@ class GppConfig(BaseModel):
     # contest's own ROI distribution" — computed independently per contest.
     external_pool_roi_floor_pct: float = 40.0
     # Pool-wide floor (distinct from the per-contest ROI floor above): culls
-    # the bottom N% of *projected score* (sum of each lineup's rostered
-    # players' projected mean) once across the entire pool, before any
-    # per-contest allocation runs — see compute_pool_proj_scores /
+    # the bottom N% of *ceiling* — each lineup's own SaberSim "99th"
+    # (99th-percentile simulated score) column, falling back to a
+    # mean+z*sigma proxy for any lineup without one — once across the
+    # entire pool, before any per-contest allocation runs, so the floor
+    # keeps high-upside lineups a mean-score floor would otherwise drop for
+    # being merely median, and drops median-ceiling lineups a mean-score
+    # floor would otherwise keep. See compute_pool_ceiling_scores /
     # allocate_contests in external_pool.py. 0 disables the cull.
     external_pool_proj_score_pct: float = 0.0
     # Ceiling lean: ranks the post-floor pool by roi + weight * (residualized,
@@ -420,6 +479,12 @@ class GppConfig(BaseModel):
     # accumulates more settled slates.
     external_pool_ceiling_weight: float = 0.25
     external_pool_cash_anchor_fraction: float = 0.25
+    # Rank-normalise the Det selector's EV and diversity terms instead of
+    # max-normalising EV and clipping the diversity distance -- see RANK
+    # NORMALISATION in DeterminantPortfolioSelector's docstring. Changing
+    # this changes what evw_base/evw_max MEAN, so the two move together
+    # (see config.yaml's note on the recalibrated sweep range).
+    external_pool_rank_normalize: bool = True
 
     # Zero-inflate the SaberSim quantile grids for batters: a DK hitter scores
     # exactly 0 when he never reaches base and drives nobody in, which happened

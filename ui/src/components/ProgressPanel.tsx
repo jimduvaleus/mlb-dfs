@@ -26,7 +26,7 @@ const STAGE_LABELS: Record<string, string> = {
   simulate: 'Simulate',
   ppd_applied: 'PPD applied',
   external_ppd_applied: 'PPD applied',
-  external_proj_score_floor: 'Proj-score floor',
+  external_proj_score_floor: 'Ceiling floor',
   external_owncap_cull: 'Ownership cap',
   external_load: 'External pool files',
   external_pool: 'External pool',
@@ -318,7 +318,7 @@ export function ProgressPanel({ events, running }: Props) {
     } else if (latestTopnContestStart) {
       topnPct = contestsTotal > 0 ? Math.round((contestsDone / contestsTotal) * 100) : 0
       topnLabel = `Contest ${contestsDone + 1} / ${contestsTotal}: ${latestTopnContestStart.contest_id} `
-        + `(field ${latestTopnContestStart.field_size_g.toLocaleString()}, `
+        + `(field ${latestTopnContestStart.field_size_g.toLocaleString()}, top-${latestTopnContestStart.effective_rank}, `
         + `${latestTopnContestStart.n_sims_g.toLocaleString()} sim worlds)…`
     } else if (latestTopnPoolProgress) {
       // Single updating bar (not one row per chunk -- see buildDisplayEvents,
@@ -943,7 +943,7 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'external_proj_score_floor': {
       const ev = e as unknown as { cutoff: number; n_culled: number; percentile: number; pool_size: number }
-      return `Bottom ${ev.percentile}% culled — ${ev.n_culled.toLocaleString()} of ${ev.pool_size.toLocaleString()} lineups below ${ev.cutoff.toFixed(1)} projected points`
+      return `Bottom ${ev.percentile}% by ceiling culled — ${ev.n_culled.toLocaleString()} of ${ev.pool_size.toLocaleString()} lineups below ${ev.cutoff.toFixed(1)} 99th-percentile points`
     }
     case 'external_owncap_cull': {
       const ev = e as unknown as {

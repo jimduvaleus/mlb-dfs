@@ -26,7 +26,11 @@ from src.api.external_pool import (
     compute_ceiling_ev,
     compute_lineup_scores,
     compute_p_win,
+    compute_pool_ceiling_proxy,
+    compute_pool_ceiling_scores,
     compute_pool_corr,
+    compute_pool_e_dupes,
+    topn_payout_rungs,
     compute_pool_ownership,
     compute_pool_proj_scores,
     compute_ppd_roi_adjustment,
@@ -47,6 +51,7 @@ from src.api.external_pool import (
     _find_near_duplicate_removals,
     _pava,
     _SimWorldAllocator,
+    _topn_effective_rank,
     _topn_sims_for_field_size,
     topn_total_sims_needed,
 )
@@ -533,6 +538,32 @@ class TestAllocation:
             assert id(pool.lineups[i]) not in picked
         assert len(alloc.portfolio) == 6
         assert len(alloc.unfilled) == 4
+
+    def test_floor_scores_overrides_proj_scores_as_the_cull_basis(self):
+        """When `floor_scores` is supplied it -- not `proj_scores` -- is
+        what the pool-wide floor culls on (the ceiling-based cull:
+        external_pool_proj_score_pct now floors on each lineup's own
+        SaberSim "99th" column via compute_pool_ceiling_scores, not summed
+        projected mean), even though `proj_scores` is still required (and
+        still used) for the reported EV under ev_type="prj_own"."""
+        pool = self._pool(M=10, n_contests=1)
+        key = next(iter(pool.contests))
+        pool.contests[key].roi = np.abs(pool.contests[key].roi) + 0.01
+        proj_scores = np.arange(10, dtype=np.float64)          # ascending: bottom 40% = 0..3
+        floor_scores = np.arange(9, -1, -1, dtype=np.float64)  # descending: bottom 40% = 6..9
+        own_scores = np.zeros(10)
+        corr = np.eye(10, dtype=np.float32)
+        groups = self._groups(pool, [10])
+        alloc = allocate_contests(
+            pool, corr, groups, risk=3.0, evw_base=0.1, evw_max=0.4,
+            ev_type="prj_own", proj_scores=proj_scores, own_scores=own_scores,
+            floor_scores=floor_scores, proj_score_floor_percentile=40.0,
+        )
+        picked = {id(lu) for lu, _ in alloc.portfolio}
+        for i in range(6, 10):
+            assert id(pool.lineups[i]) not in picked
+        for i in range(6):
+            assert id(pool.lineups[i]) in picked
 
     def test_proj_score_floor_disabled_by_default(self):
         """proj_score_floor_percentile=0.0 (the default) is a no-op even
@@ -1587,6 +1618,66 @@ class TestComputePoolOwnership:
         assert compute_pool_ownership(lineups, players_df).shape == (3,)
 
 
+class TestComputePoolCeilingScores:
+    def _players_df(self, n_players=20, seed=0):
+        rng = np.random.default_rng(seed)
+        return pd.DataFrame({
+            "player_id": list(range(1, n_players + 1)),
+            "mean": rng.uniform(5, 15, n_players),
+            "std_dev": rng.uniform(2, 6, n_players),
+        })
+
+    def _write_lineups_csv(self, path, rows):
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["P", "C", "1B", "2B", "3B", "SS", "OF", "OF", "OF", "P", "99th"])
+            for pids, p99 in rows:
+                w.writerow(list(pids) + [p99])
+
+    def test_prefers_native_p99_over_ceiling_proxy(self, tmp_path):
+        players_df = self._players_df()
+        lu = Lineup(player_ids=list(range(1, 11)))
+        path = tmp_path / "lineups.csv"
+        self._write_lineups_csv(path, [(lu.player_ids, 250.0)])
+        pool = ExternalPool(
+            lineups=[lu], contests={}, n_dropped_unknown_players=0,
+            n_dropped_duplicates=0, n_dropped_near_duplicates=0, source_paths=[path],
+        )
+        scores = compute_pool_ceiling_scores(pool, players_df)
+        assert scores.shape == (1,)
+        assert scores[0] == pytest.approx(250.0)
+
+    def test_falls_back_to_ceiling_proxy_when_lineup_has_no_native_p99(self, tmp_path):
+        """A lineup absent from the file's "99th" column (e.g. a generated
+        candidate augment_topn_pool_with_generated added, with no source
+        file of its own) gets compute_pool_ceiling_proxy's mean+z*sigma
+        estimate instead of NaN."""
+        players_df = self._players_df()
+        known = Lineup(player_ids=list(range(1, 11)))
+        unknown = Lineup(player_ids=list(range(2, 12)))
+        path = tmp_path / "lineups.csv"
+        self._write_lineups_csv(path, [(known.player_ids, 250.0)])
+        pool = ExternalPool(
+            lineups=[known, unknown], contests={}, n_dropped_unknown_players=0,
+            n_dropped_duplicates=0, n_dropped_near_duplicates=0, source_paths=[path],
+        )
+        scores = compute_pool_ceiling_scores(pool, players_df)
+        expected_proxy = compute_pool_ceiling_proxy([unknown], players_df)[0]
+        assert scores[0] == pytest.approx(250.0)
+        assert scores[1] == pytest.approx(expected_proxy)
+
+    def test_shape_matches_lineup_count(self, tmp_path):
+        players_df = self._players_df()
+        lineups = [Lineup(player_ids=list(range(1, 11)))] * 3
+        path = tmp_path / "lineups.csv"
+        self._write_lineups_csv(path, [])
+        pool = ExternalPool(
+            lineups=lineups, contests={}, n_dropped_unknown_players=0,
+            n_dropped_duplicates=0, n_dropped_near_duplicates=0, source_paths=[path],
+        )
+        assert compute_pool_ceiling_scores(pool, players_df).shape == (3,)
+
+
 class TestBuildExternalPlayersDfOwnership:
     """build_external_players_df must carry projected ownership through — it
     is the per-player input compute_pool_ownership sums for the prj_own EV
@@ -2459,6 +2550,35 @@ class TestTopnSimsForFieldSize:
         assert n == 20_000  # clip(1000 * (20000/1000)^1, 1000, 100000)
 
 
+class TestTopnEffectiveRank:
+    """max(topn_rank, ceil(percentile_floor * field_size_g)), clipped to
+    field_size_g -- the user's own worked example (mini-max at 17,000
+    entrants -> effective top-17) is the primary regression case."""
+
+    def test_large_field_gets_pushed_above_flat_rank(self):
+        # The user's own worked example: mini-max at 17,000 entrants.
+        assert _topn_effective_rank(10, 17_000, 0.001) == 17
+
+    def test_small_field_stays_at_flat_rank(self):
+        # Any field under 10,000 stays at the flat topn_rank=10.
+        assert _topn_effective_rank(10, 5_000, 0.001) == 10
+        assert _topn_effective_rank(10, 500, 0.001) == 10
+
+    def test_boundary_at_ten_thousand(self):
+        assert _topn_effective_rank(10, 10_000, 0.001) == 10   # ceil(10.0) == 10, ties to flat
+        assert _topn_effective_rank(10, 10_001, 0.001) == 11   # ceil(10.001) == 11
+
+    def test_zero_percentile_floor_disables_the_rule(self):
+        assert _topn_effective_rank(10, 17_000, 0.0) == 10
+
+    def test_clips_to_field_size_when_field_smaller_than_rank(self):
+        assert _topn_effective_rank(10, 3, 0.001) == 3
+
+    def test_very_large_field(self):
+        # A ~50,000-entry field: ceil(0.001 * 50000) = 50.
+        assert _topn_effective_rank(10, 50_000, 0.001) == 50
+
+
 class TestSimWorldAllocator:
     """Guarantees disjointness within a lap (unlike two independent random
     draws, which merely make overlap less likely) and graceful reuse once
@@ -2813,6 +2933,31 @@ class TestTopnCoverageAllocation:
         picked = [id(x) for x, _ in alloc.portfolio]
         assert len(set(picked)) == 10
 
+    def test_percentile_floor_raises_effective_rank_for_a_large_field(self):
+        # field_size_g=2000, percentile_floor=0.01 ("top 1%") ->
+        # ceil(0.01*2000)=20, above the flat topn_rank=10 -- confirms the
+        # effective (not flat) rank is what actually drives the contest,
+        # not just what _topn_effective_rank computes in isolation.
+        rng = np.random.default_rng(4)
+        M, n_sims, field_pool_size = 10, 30, 2_000
+        scores = {f"c{i}": rng.normal(100, 20, n_sims) for i in range(M)}
+        scores.update({f"f{i}": rng.normal(90, 15, n_sims) for i in range(field_pool_size)})
+        sim_results, lu = _synthetic_sim_and_lineups(scores)
+        field_lineups = _stack_field_lineups([lu[f"f{i}"] for i in range(field_pool_size)])
+        lineups = [lu[f"c{i}"] for i in range(M)]
+        pool = _topn_pool(lineups)
+        group = _topn_group("c0", k=1, entry_fee_cents=100, prize_pool_cents=field_pool_size * 84)
+        contest_start_events = []
+        allocate_contests_topn_coverage(
+            pool, sim_results, [group], field_lineups,
+            topn_rank=10, topn_percentile_floor=0.01,
+            field_samples=1, sims_per_contest_fraction=1.0, rng_seed=42,
+            progress_cb=lambda info: contest_start_events.append(info)
+            if info.get("event") == "contest_start" else None,
+        )
+        assert contest_start_events[0]["field_size_g"] == field_pool_size
+        assert contest_start_events[0]["effective_rank"] == 20
+
     def test_proj_score_floor_excludes_below_floor_candidates(self):
         rng = np.random.default_rng(2)
         M, n_sims, field_pool_size = 20, 40, 30
@@ -2904,3 +3049,507 @@ class TestTopnCoverageAllocation:
         assert not alloc.unfilled
         picked = {id(lu) for lu, _ in alloc.portfolio}
         assert len(picked) == k
+
+
+class TestTopnCoverageDupeDiscount:
+    """allocate_contests_topn_coverage(e_dupes=...): duplicate-discounted
+    coverage gain.
+
+    The top-N bar is a rank bar, not a payout -- the ownership-weighted field
+    pool already raises the bar in the worlds where a chalk play booms, but
+    nothing prices the fact that a heavily-duplicated lineup SPLITS whatever
+    it wins. `e_dupes` weights each pick's coverage gain by 1/(1 + E[dupes]),
+    rescaled to the contest's own field size.
+
+    Reuses TestTopnCoverageAllocation's hand-computable setup (see its
+    docstring): field f0..f4 gives per-world rank-2 thresholds
+    [40, 35, 4, 90], and `_topn_group`'s default 420c pool / 100c fee makes
+    field_size_g == 5."""
+
+    _FIELD = {"f0": [10, 5, 1, 100], "f1": [20, 15, 2, 90], "f2": [30, 25, 3, 80],
+              "f3": [40, 35, 4, 70], "f4": [50, 45, 5, 60]}
+
+    def _setup(self, c0, c1, c2):
+        sim_results, lu = _synthetic_sim_and_lineups({**self._FIELD, "c0": c0, "c1": c1, "c2": c2})
+        field_lineups = _stack_field_lineups([lu[f"f{i}"] for i in range(5)])
+        lineups = [lu["c0"], lu["c1"], lu["c2"]]
+        return sim_results, field_lineups, lineups, _topn_pool(lineups)
+
+    def _alloc(self, sim_results, field_lineups, pool, e_dupes, k=1):
+        return allocate_contests_topn_coverage(
+            pool, sim_results, [_topn_group("c0", k=k)], field_lineups,
+            topn_rank=2, field_samples=1, sims_per_contest_fraction=1.0, rng_seed=42,
+            e_dupes=e_dupes,
+        )
+
+    def test_discount_flips_a_coverage_tie_to_the_less_duplicated_candidate(self):
+        # c0 and c2 both cross all 4 worlds; undiscounted, c0 wins on the
+        # argmax's first-index tie-break (asserted by TestTopnCoverageAllocation).
+        # E[dupes]=30,000 at the 14,863-entry reference scales to ~10.1 copies
+        # in this 5-entry contest -> weight ~0.09, so c2 (undiplicated) wins.
+        sim_results, field_lineups, lineups, pool = self._setup(
+            c0=[45, 36, 5, 95], c1=[39, 34, 3, 89], c2=[40, 35, 4, 90],
+        )
+        alloc = self._alloc(sim_results, field_lineups, pool,
+                            e_dupes=np.array([30_000.0, 0.0, 0.0]))
+        assert alloc.portfolio[0][0] is lineups[2]
+
+    def test_reported_ev_stays_the_raw_slot_count(self):
+        # Only the argmax is weighted -- the dumped `ev` must remain the
+        # popcount of slots claimed, so pool dumps stay comparable across
+        # runs with and without the discount.
+        sim_results, field_lineups, lineups, pool = self._setup(
+            c0=[45, 36, 5, 95], c1=[39, 34, 3, 89], c2=[40, 35, 4, 90],
+        )
+        alloc = self._alloc(sim_results, field_lineups, pool,
+                            e_dupes=np.array([30_000.0, 0.0, 0.0]))
+        picked_lu, ev = alloc.portfolio[0]
+        assert picked_lu is lineups[2]
+        assert ev == 4.0  # not 4.0 * any weight
+
+    def test_e_dupes_is_rescaled_to_the_contest_field_size(self):
+        # REGRESSION: E[copies] is linear in field size and the fitted
+        # intercept is calibrated to DUPE_REF_FIELD_SIZE (14,863), so an
+        # implementation that used e_dupes RAW would overstate duplication
+        # here by ~3,000x.
+        #
+        # c0 crosses all 4 worlds, c2 only 3 (80 < the 90 threshold in world
+        # 3). With e_dupes=10: unscaled -> weight 1/11, c0 scores 4/11 = 0.36
+        # and LOSES to c2's 3.0; correctly scaled -> 10 * 5/14863 = 0.0034
+        # copies, weight 0.997, c0 scores 3.99 and keeps the pick.
+        sim_results, field_lineups, lineups, pool = self._setup(
+            c0=[45, 36, 5, 95], c1=[39, 34, 3, 89], c2=[40, 35, 4, 80],
+        )
+        alloc = self._alloc(sim_results, field_lineups, pool,
+                            e_dupes=np.array([10.0, 0.0, 0.0]))
+        assert alloc.portfolio[0][0] is lineups[0]
+
+    def test_all_zero_e_dupes_matches_the_undiscounted_allocation(self):
+        args = self._setup(c0=[45, 36, 5, 95], c1=[39, 34, 3, 89], c2=[40, 35, 4, 90])
+        sim_results, field_lineups, lineups, pool = args
+        base = self._alloc(sim_results, field_lineups, pool, e_dupes=None, k=2)
+        zeros = self._alloc(sim_results, field_lineups, pool,
+                            e_dupes=np.zeros(3), k=2)
+        assert [id(lu) for lu, _ in base.portfolio] == [id(lu) for lu, _ in zeros.portfolio]
+        assert [ev for _, ev in base.portfolio] == [ev for _, ev in zeros.portfolio]
+
+
+class TestComputePoolEDupes:
+    """compute_pool_e_dupes: adapter from an external-pool players_df to
+    gpp_portfolio.expected_dupes."""
+
+    @staticmethod
+    def _players_df(ownership_pct):
+        return pd.DataFrame({
+            "player_id": list(range(10)),
+            "ownership": [ownership_pct] * 10,
+            "salary": [5_000.0] * 10,
+            "team": ["AAA"] * 10,
+            "position": ["P", "P"] + ["OF"] * 8,
+        })
+
+    def test_ownership_is_converted_from_percentage_points_to_a_fraction(self):
+        # players_df["ownership"] is in PERCENTAGE POINTS for the external
+        # pool. Passing 20.0 straight into the model would make log(own)
+        # POSITIVE and invert its ranking, so this pins the /100.
+        lineups = [Lineup(player_ids=list(range(10)))]
+        got = compute_pool_e_dupes(
+            lineups, self._players_df(20.0),
+            intercept=3.698, log_own_coef=0.212, salary_coef=0.089, stack_coef=0.024,
+        )
+        # 10 players @ 20% own, 50,000 salary used (no unused), 8-hitter stack.
+        expected = np.exp(3.698 + 0.212 * 10 * np.log(0.20) + 0.024 * (8 - 4))
+        assert got == pytest.approx(np.array([expected]), rel=1e-9)
+
+    def test_chalkier_lineups_get_more_expected_dupes(self):
+        lineups = [Lineup(player_ids=list(range(10)))]
+        chalky = compute_pool_e_dupes(
+            lineups, self._players_df(40.0),
+            intercept=3.698, log_own_coef=0.212, salary_coef=0.089, stack_coef=0.024,
+        )
+        contrarian = compute_pool_e_dupes(
+            lineups, self._players_df(2.0),
+            intercept=3.698, log_own_coef=0.212, salary_coef=0.089, stack_coef=0.024,
+        )
+        assert chalky[0] > contrarian[0]
+
+
+class TestTopnPayoutRungs:
+    """topn_payout_rungs: the rank ladder's ranks + marginal-payout weights."""
+
+    @staticmethod
+    def _struct(amounts):
+        """A structure paying `amounts[i]` at rank i+1, nothing below."""
+        return {
+            "name": "synthetic", "entry_fee": 1.0, "total_entries": len(amounts),
+            "payouts": [{"start": i + 1, "end": i + 1, "amount": a}
+                        for i, a in enumerate(amounts)],
+        }
+
+    def _patch(self, monkeypatch, amounts):
+        import src.optimization.payout as payout_mod
+        monkeypatch.setattr(
+            payout_mod, "nearest_payout_structure",
+            lambda name, n=None: (self._struct(amounts), False),
+        )
+
+    def test_ranks_are_nested_and_span_one_to_effective_rank(self, monkeypatch):
+        self._patch(monkeypatch, [100.0, 50.0, 20.0, 10.0, 5.0, 2.0, 1.0, 1.0])
+        ranks, weights = topn_payout_rungs("Test", field_size_g=8, effective_rank=8, n_rungs=4)
+        assert ranks[0] == 1 and ranks[-1] == 8
+        assert list(ranks) == sorted(set(ranks))       # strictly increasing, deduped
+        assert weights.sum() == pytest.approx(1.0)
+
+    def test_weights_telescope_to_the_payout_at_each_rung(self, monkeypatch):
+        # The defining property: a candidate placing at realized rank rho
+        # clears every rung with rank >= rho, so its summed weight must equal
+        # that rung's own payout (normalized). Anything else double-counts.
+        amounts = [100.0, 50.0, 20.0, 10.0, 5.0, 2.0, 1.0, 1.0]
+        self._patch(monkeypatch, amounts)
+        ranks, weights = topn_payout_rungs("Test", field_size_g=8, effective_rank=8, n_rungs=4)
+        total = amounts[ranks[0] - 1]
+        for j, r in enumerate(ranks):
+            assert weights[j:].sum() == pytest.approx(amounts[r - 1] / total)
+
+    def test_tightest_rank_floors_the_innermost_rung(self, monkeypatch):
+        self._patch(monkeypatch, [100.0, 50.0, 20.0, 10.0, 5.0, 2.0, 1.0, 1.0])
+        ranks, _ = topn_payout_rungs(
+            "Test", field_size_g=8, effective_rank=8, n_rungs=4, tightest_rank=3,
+        )
+        assert ranks.min() == 3
+
+    def test_flat_payout_tier_collapses_the_ladder_onto_the_outer_rung(self, monkeypatch):
+        # A flat tier means finishing 1st really is worth no more than
+        # finishing 8th, so ALL the weight belongs on the outer rung -- the
+        # ladder correctly degenerates to the single bar rather than inventing
+        # resolution the payout curve doesn't have.
+        self._patch(monkeypatch, [7.0] * 8)
+        _, weights = topn_payout_rungs("Test", field_size_g=8, effective_rank=8, n_rungs=4)
+        assert weights.sum() == pytest.approx(1.0)
+        assert weights[-1] == pytest.approx(1.0)
+        assert weights[:-1] == pytest.approx(0.0)
+
+    def test_zero_payout_range_falls_back_to_equal_weights(self, monkeypatch):
+        # Nothing pays anywhere in range -> every marginal weight is 0, which
+        # would zero every gain and force endless relaxation. Equal weights
+        # degrade this to plain multi-rank coverage instead.
+        self._patch(monkeypatch, [0.0] * 8)
+        _, weights = topn_payout_rungs("Test", field_size_g=8, effective_rank=8, n_rungs=4)
+        assert weights.sum() == pytest.approx(1.0)
+        assert weights.min() == pytest.approx(weights.max())
+
+
+class TestTopnCoveragePayoutLadder:
+    """allocate_contests_topn_coverage(payout_rungs=...): payout-weighted
+    ladder. `topn_payout_rungs` is monkeypatched so these test the GREEDY's
+    weighting, not the shipped payout tables (covered above)."""
+
+    def _fixture(self):
+        # Field per world: w0 [10,20,30,40,50], w1 [5,15,25,35,45],
+        # w2 [1,2,3,4,5], w3 [100,90,80,70,60].
+        #   rank-1 threshold = [50, 45, 5, 100]; rank-5 = [10, 5, 1, 60].
+        # A clears rank-1 in w0 only. B clears rank-5 in all 4, rank-1 never.
+        sim_results, lu = _synthetic_sim_and_lineups({
+            "f0": [10, 5, 1, 100], "f1": [20, 15, 2, 90], "f2": [30, 25, 3, 80],
+            "f3": [40, 35, 4, 70], "f4": [50, 45, 5, 60],
+            "A": [55, 0, 0, 0], "B": [11, 6, 2, 61],
+        })
+        field_lineups = _stack_field_lineups([lu[f"f{i}"] for i in range(5)])
+        lineups = [lu["A"], lu["B"]]
+        return sim_results, field_lineups, lineups, _topn_pool(lineups)
+
+    def _run(self, monkeypatch, weights, sim_results, field_lineups, pool):
+        monkeypatch.setattr(
+            ep, "topn_payout_rungs",
+            lambda *a, **kw: (np.array([1, 5]), np.array(weights, dtype=float)),
+        )
+        return allocate_contests_topn_coverage(
+            pool, sim_results, [_topn_group("c0", k=1)], field_lineups,
+            topn_rank=5, field_samples=1, sims_per_contest_fraction=1.0, rng_seed=42,
+            payout_rungs=2,
+        )
+
+    def test_top_heavy_weights_prefer_the_lineup_that_WINS_a_world(self, monkeypatch):
+        # A: 1 slot at rung-1 + 1 at rung-5 = 0.8 + 0.2 = 1.0
+        # B: 4 slots at rung-5           = 4 * 0.2 = 0.8
+        # The flat single bar sees only the outer rung and would take B (4 > 1).
+        sim_results, field_lineups, lineups, pool = self._fixture()
+        alloc = self._run(monkeypatch, [0.8, 0.2], sim_results, field_lineups, pool)
+        assert alloc.portfolio[0][0] is lineups[0]
+
+    def test_bottom_heavy_weights_prefer_the_broader_min_cash_lineup(self, monkeypatch):
+        # Same geometry, weights flipped: A = 0.1 + 0.9 = 1.0, B = 4 * 0.9 = 3.6.
+        # Two-sided, so the assertion above can't pass for an unrelated reason.
+        sim_results, field_lineups, lineups, pool = self._fixture()
+        alloc = self._run(monkeypatch, [0.1, 0.9], sim_results, field_lineups, pool)
+        assert alloc.portfolio[0][0] is lineups[1]
+
+    def test_single_bar_takes_the_broader_lineup(self):
+        # payout_rungs=0 -> unchanged behavior: pure outer-rung popcount, B wins.
+        sim_results, field_lineups, lineups, pool = self._fixture()
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [_topn_group("c0", k=1)], field_lineups,
+            topn_rank=5, field_samples=1, sims_per_contest_fraction=1.0, rng_seed=42,
+            payout_rungs=0,
+        )
+        assert alloc.portfolio[0][0] is lineups[1]
+
+    def test_reported_ev_is_the_outer_rung_slot_count(self, monkeypatch):
+        # `ev` must stay the single-bar quantity so pool dumps and
+        # worlds_claimed remain comparable across ladder settings.
+        sim_results, field_lineups, lineups, pool = self._fixture()
+        alloc = self._run(monkeypatch, [0.8, 0.2], sim_results, field_lineups, pool)
+        picked, ev = alloc.portfolio[0]
+        assert picked is lineups[0]
+        assert ev == 1.0  # A crosses the rank-5 bar in w0 only
+
+    def test_ladder_fills_every_entry_without_relaxation_blowup(self, monkeypatch):
+        sim_results, field_lineups, lineups, pool = self._fixture()
+        monkeypatch.setattr(
+            ep, "topn_payout_rungs",
+            lambda *a, **kw: (np.array([1, 5]), np.array([0.8, 0.2])),
+        )
+        done = []
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [_topn_group("c0", k=2)], field_lineups,
+            topn_rank=5, field_samples=1, sims_per_contest_fraction=1.0, rng_seed=42,
+            payout_rungs=2,
+            progress_cb=lambda i: done.append(i) if i.get("event") == "contest_done" else None,
+        )
+        assert len(alloc.portfolio) == 2
+        assert not alloc.unfilled
+        assert {id(x) for x, _ in alloc.portfolio} == {id(lineups[0]), id(lineups[1])}
+
+
+class TestLaneSplit:
+    """`lane_fraction`/`lane_evw`: reserve the tail of each contest's fill
+    for a pure-orthogonality lane, scored against what the EV lane bought.
+
+    Fixture is a two-population pool: lineups 0-49 are mutually co-moving
+    (r=0.6) and carry high ROI; 50-59 are orthogonal to everything and carry
+    low ROI. A high-EVw selector takes only the first population; a lane at
+    lane_evw=0 must reach into the second.
+    """
+
+    N_HI, N_LO = 50, 10
+
+    def _pool(self):
+        M = self.N_HI + self.N_LO
+        lineups = [Lineup(player_ids=list(range(10 * i, 10 * i + 10))) for i in range(M)]
+        roi = np.concatenate([np.full(self.N_HI, 1.0), np.full(self.N_LO, 0.1)])
+        name = "MLB $5K Test"
+        contests = {normalize_contest_name(name): ExternalContest(
+            raw_name=name, norm_name=normalize_contest_name(name),
+            roi=roi, prize_pool_cents=500_000, single_entry=False,
+        )}
+        return ExternalPool(lineups=lineups, contests=contests,
+                            n_dropped_unknown_players=0, n_dropped_duplicates=0,
+                            n_dropped_near_duplicates=0,
+                            source_paths=[Path("synthetic.csv")])
+
+    def _corr(self):
+        M = self.N_HI + self.N_LO
+        corr = np.eye(M, dtype=np.float32)
+        corr[:self.N_HI, :self.N_HI] = 0.6
+        np.fill_diagonal(corr, 1.0)
+        return corr
+
+    def _groups(self, pool, k):
+        key = next(iter(pool.contests))
+        return [ContestGroup(
+            contest_id="c0", contest_name=pool.contests[key].raw_name,
+            entry_fee_cents=1000, prize_pool_cents=500_000, single_entry_tag=False,
+            entries=[(Path("x/Entries.csv"), _rec("c0", "n", 1000, f"e{i}"))
+                     for i in range(k)],
+            roi_key=key,
+        )]
+
+    def _picks(self, k=10, **kw):
+        pool = self._pool()
+        alloc = allocate_contests(
+            pool, self._corr(), self._groups(pool, k), risk=5.0,
+            evw_base=0.9, evw_max=0.9, roi_floor_percentile=0.0, **kw,
+        )
+        idx_of = {id(lu): i for i, lu in enumerate(pool.lineups)}
+        return [idx_of[id(lu)] for lu, _ in alloc.portfolio]
+
+    def test_zero_lane_fraction_is_a_no_op(self):
+        assert self._picks() == self._picks(lane_fraction=0.0, lane_evw=0.0)
+
+    def test_ev_lane_prefix_is_identical_to_the_unsplit_run(self):
+        """The lane runs LAST, so the greedy prefix it inherits must be
+        exactly what an unsplit run of the same EVw would have produced —
+        otherwise the split is silently changing the EV lane too."""
+        base = self._picks(k=10)
+        split = self._picks(k=10, lane_fraction=0.4, lane_evw=0.0)
+        assert split[:6] == base[:6]
+
+    def test_lane_reaches_the_orthogonal_low_ev_population(self):
+        base = self._picks(k=10)
+        split = self._picks(k=10, lane_fraction=0.4, lane_evw=0.0)
+        assert all(p < self.N_HI for p in base), "fixture: EV lane should stay in the hi block"
+        assert all(p >= self.N_HI for p in split[6:]), \
+            "lane picks should come from the orthogonal population"
+
+    def test_lane_size_rounds_up(self):
+        """ceil(): a lane fraction that doesn't divide k evenly still yields
+        at least one lane pick rather than silently rounding to zero."""
+        split = self._picks(k=10, lane_fraction=0.05, lane_evw=0.0)
+        assert split[9] >= self.N_HI
+        assert split[8] < self.N_HI
+
+    def test_full_lane_keeps_only_the_ev_argmax_first_pick(self):
+        """lane_fraction=1.0: step 1 has an empty portfolio and no diversity
+        to measure, so it stays an EV argmax; everything after is the lane."""
+        split = self._picks(k=6, lane_fraction=1.0, lane_evw=0.0)
+        assert split[0] < self.N_HI
+        assert all(p >= self.N_HI for p in split[1:])
+
+    def test_lane_applies_per_contest_not_only_to_the_last_one(self):
+        pool = self._pool()
+        key = next(iter(pool.contests))
+        groups = []
+        for j in range(2):
+            groups.append(ContestGroup(
+                contest_id=f"c{j}", contest_name=pool.contests[key].raw_name,
+                entry_fee_cents=1000 - j, prize_pool_cents=500_000,
+                single_entry_tag=False,
+                entries=[(Path("x/Entries.csv"), _rec(f"c{j}", "n", 1000 - j, f"e{j}-{i}"))
+                         for i in range(5)],
+                roi_key=key,
+            ))
+        alloc = allocate_contests(pool, self._corr(), groups, risk=5.0,
+                                  evw_base=0.9, evw_max=0.9, roi_floor_percentile=0.0,
+                                  lane_fraction=0.4, lane_evw=0.0)
+        idx_of = {id(lu): i for i, lu in enumerate(pool.lineups)}
+        picks = [idx_of[id(lu)] for lu, _ in alloc.portfolio]
+        # ceil(0.4*5) = 2 lane picks in EACH contest's block of 5
+        assert all(p >= self.N_HI for p in picks[3:5]), picks
+        assert all(p >= self.N_HI for p in picks[8:10]), picks
+        assert all(p < self.N_HI for p in picks[0:3] + picks[5:8]), picks
+
+
+class TestLaneWeights:
+    def test_hedge_weight_never_exceeds_the_diversity_weight(self):
+        from src.optimization.gpp_portfolio import DeterminantPortfolioSelector as DPS
+        for evw in (0.0, 0.01, 0.25, 0.5, 0.9, 1.0):
+            e, dew, hw = DPS._weights_for_evw(evw)
+            assert e == pytest.approx(evw)
+            assert e + dew + hw == pytest.approx(1.0)
+            assert hw <= dew + 1e-12
+
+
+class TestRankNormalize:
+    """`rank_normalize`: put EV and diversity on a common ordinal scale.
+
+    Fixture is the saturating case the flag exists for -- a portfolio big
+    enough that `1 - sum max(r,0)^2` clips to 0 for everything, so the
+    cardinal `Dn` can no longer order candidates at all.
+    """
+
+    def _corr_saturating(self, M, n_prior=None):
+        """EVERY pair co-moves at r in [0.30, 0.60], so redundancy passes 1
+        after ~5 picks no matter which lineups the greedy happens to take --
+        but by DIFFERENT amounts, which is exactly the ordering the clip
+        destroys. Correlating only a fixed block would not do: the selector
+        measures redundancy against what it has ALREADY SELECTED, not
+        against any particular index range, so it would simply walk into
+        the uncorrelated remainder and never saturate.
+
+        `n_prior` is accepted for call-site readability (how many columns
+        the caller then treats as the already-picked set) and does not
+        affect construction."""
+        rng = np.random.default_rng(7)
+        A = rng.uniform(0.30, 0.60, size=(M, M)).astype(np.float32)
+        corr = np.tril(A, -1)
+        corr = corr + corr.T
+        np.fill_diagonal(corr, 1.0)
+        return corr
+
+    def test_rank_pct_is_a_percentile_with_average_ties(self):
+        from src.optimization.gpp_portfolio import _rank_pct
+        r = _rank_pct(np.array([10.0, 30.0, 20.0, 40.0]))
+        assert list(r) == [0.0, 2 / 3, 1 / 3, 1.0]
+        t = _rank_pct(np.array([5.0, 5.0, 9.0]))
+        assert t[0] == t[1] == pytest.approx(0.25)   # tied ranks 0,1 -> 0.5
+        assert t[2] == pytest.approx(1.0)
+        assert list(_rank_pct(np.array([3.0]))) == [1.0]
+
+    def test_clipped_distance_cannot_order_but_ranked_redundancy_can(self):
+        """The premise: once redundancy > 1 everywhere, `distance` is a
+        constant 0 and carries no information, while the raw redundancy it
+        was derived from still varies."""
+        corr = self._corr_saturating(40, 12)
+        R = corr[12:, :12].astype(np.float64)
+        redundancy = np.sum(np.maximum(R, 0.0) ** 2, axis=1)
+        distance = np.clip(1.0 - redundancy, 0.0, 1.0)
+        assert np.all(distance == 0.0)
+        assert redundancy.std() > 0.1
+
+    def test_selector_still_discriminates_when_distance_is_all_zero(self):
+        """With the cardinal term dead, plain and rank-normalised selectors
+        must disagree -- if they agreed, the flag would be inert exactly
+        where it is supposed to matter."""
+        from src.optimization.gpp_portfolio import DeterminantPortfolioSelector as DPS
+        M = 60
+        corr = self._corr_saturating(M, 20)
+        rng = np.random.default_rng(3)
+        ev = rng.lognormal(0.0, 2.0, M)          # orders of magnitude, like p_win
+        lineups = [Lineup(player_ids=list(range(10 * i, 10 * i + 10))) for i in range(M)]
+        pre = (np.arange(M), ev, corr)
+        kw = dict(robust_payout=None, candidates=lineups, portfolio_size=30,
+                  risk=3.0, evw_base=0.25, evw_max=0.25, ev_floor=float("-inf"),
+                  precomputed=pre)
+        plain = [id(lu) for lu, _ in DPS(**kw).select()]
+        ranked = [id(lu) for lu, _ in DPS(**kw, rank_normalize=True).select()]
+        assert plain != ranked
+
+    def test_default_is_byte_identical(self):
+        from src.optimization.gpp_portfolio import DeterminantPortfolioSelector as DPS
+        M = 40
+        corr = self._corr_saturating(M, 8)
+        ev = np.linspace(1.0, 5.0, M)
+        lineups = [Lineup(player_ids=list(range(10 * i, 10 * i + 10))) for i in range(M)]
+        kw = dict(robust_payout=None, candidates=lineups, portfolio_size=15,
+                  risk=3.0, evw_base=0.25, evw_max=0.25, ev_floor=float("-inf"),
+                  precomputed=(np.arange(M), ev, corr))
+        a = [id(lu) for lu, _ in DPS(**kw).select()]
+        b = [id(lu) for lu, _ in DPS(**kw, rank_normalize=False).select()]
+        assert a == b
+
+    def test_pure_diversity_takes_the_least_redundant_candidate(self):
+        """EVw=0 with rank normalisation must pick strictly by ascending raw
+        redundancy -- the ordering the clip was erasing."""
+        from src.optimization.gpp_portfolio import DeterminantPortfolioSelector as DPS
+        M, n_prior = 50, 15
+        corr = self._corr_saturating(M, n_prior)
+        ev = np.zeros(M); ev[0] = 1.0        # forces pick 1, then EV is flat
+        lineups = [Lineup(player_ids=list(range(10 * i, 10 * i + 10))) for i in range(M)]
+        sel = DPS(robust_payout=None, candidates=lineups, portfolio_size=3,
+                  risk=1.0, evw_base=0.0, evw_max=0.0, ev_floor=float("-inf"),
+                  precomputed=(np.arange(M), ev, corr), rank_normalize=True)
+        picks = [id(lu) for lu, _ in sel.select()]
+        idx = [next(i for i, lu in enumerate(lineups) if id(lu) == p) for p in picks]
+        # after the first pick, each subsequent pick is the argmin of
+        # redundancy against everything already held
+        for step in range(1, len(idx)):
+            R = corr[:, idx[:step]].astype(np.float64)
+            red = np.sum(np.maximum(R, 0.0) ** 2, axis=1)
+            red[idx[:step]] = np.inf
+            assert idx[step] == int(np.argmin(red)), (step, idx)
+
+    def test_allocate_contests_threads_the_flag(self):
+        """Uses the SATURATING correlation fixture: the lane fixture's
+        50/10 block structure never drives redundancy past 1 at this k, so
+        both variants would legitimately agree there and the test would
+        pass for the wrong reason."""
+        lane = TestLaneSplit()
+        pool = lane._pool()
+        M = len(pool.lineups)
+        corr = self._corr_saturating(M, 20)
+        groups = lane._groups(pool, 25)
+        common = dict(risk=3.0, evw_base=0.25, evw_max=0.25, roi_floor_percentile=0.0)
+        idx_of = {id(lu): i for i, lu in enumerate(pool.lineups)}
+        a = allocate_contests(pool, corr, groups, **common)
+        b = allocate_contests(pool, corr, groups, rank_normalize=True, **common)
+        assert [idx_of[id(l)] for l, _ in a.portfolio] != [idx_of[id(l)] for l, _ in b.portfolio]

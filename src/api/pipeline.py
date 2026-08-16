@@ -2512,6 +2512,13 @@ class PipelineRunner:
             sim_p99_scores = np.percentile(lineup_scores, 99, axis=1)
         proj_scores = ep.compute_pool_proj_scores(pool.lineups, players_df)
         own_scores = ep.compute_pool_ownership(pool.lineups, players_df)
+        # Pool-wide floor cull basis: each lineup's own SaberSim "99th"
+        # (ceiling) column rather than proj_scores' summed projected mean,
+        # so the floor keeps high-ceiling lineups a mean-based cull would
+        # drop for being merely median, and drops median-ceiling lineups a
+        # mean-based cull would otherwise keep. proj_scores itself is left
+        # untouched -- it still feeds the prj_own/proj_top EV currencies.
+        _floor_scores = ep.compute_pool_ceiling_scores(pool, players_df)
         # Already percentage points here ("My Own" is not divided by 100 in
         # parse_player_projections), unlike the internal pipeline's fractions.
         self._ownership_pct = {
@@ -2529,7 +2536,7 @@ class PipelineRunner:
 
         _own_scale = float(gpp_cfg.get("external_pool_own_scale", 30_000.0)) or 30_000.0
         _proj_score_floor_pct = float(gpp_cfg.get("external_pool_proj_score_pct", 0.0))
-        _proj_floor = ep.compute_proj_score_floor(proj_scores, _proj_score_floor_pct)
+        _proj_floor = ep.compute_proj_score_floor(_floor_scores, _proj_score_floor_pct)
         if _proj_floor is not None:
             _proj_cutoff, _proj_n_culled = _proj_floor
             self._cb("external_proj_score_floor", {
@@ -2626,7 +2633,7 @@ class PipelineRunner:
             # honest answer to "how many lineups does this cap remove".
             _owncap_pool_mask = np.isfinite(proj_scores)
             if _proj_floor is not None:
-                _owncap_pool_mask &= proj_scores >= _proj_cutoff
+                _owncap_pool_mask &= np.isfinite(_floor_scores) & (_floor_scores >= _proj_cutoff)
             _owncap_basis = own_scores[_owncap_pool_mask & np.isfinite(own_scores)]
             if _owncap_basis.size > 0:
                 _owncap_threshold = ep._SMALL_FIELD_THRESHOLD
@@ -2839,6 +2846,7 @@ class PipelineRunner:
                 "external_pool_topn_field_pool_size", ep._TOPN_FIELD_POOL_CAP,
             ))
             _topn_rank = int(gpp_cfg.get("external_pool_topn_rank", 10))
+            _topn_percentile_floor = float(gpp_cfg.get("external_pool_topn_percentile_floor", 0.001))
             _topn_field_samples = int(gpp_cfg.get("external_pool_topn_field_samples", 5))
             _topn_sims_fraction = float(
                 gpp_cfg.get("external_pool_topn_sims_per_contest_fraction", 0.5)
@@ -2895,23 +2903,46 @@ class PipelineRunner:
             _topn_pool_for_alloc = pool
             _topn_is_generated = None
             _topn_proj_scores = proj_scores
+            _topn_floor_scores = _floor_scores
             if _topn_generated_pool_size > 0:
                 _n_real = len(pool.lineups)
+                _gen_leverage_weight = float(gpp_cfg.get(
+                    "external_pool_topn_generated_leverage_weight", 0.0,
+                ))
+                _gen_ownership_vec = _own_vec
+                if _gen_leverage_weight > 0:
+                    from src.optimization.leverage import compute_generation_ownership_vec
+
+                    _gen_field_size = ep.pwin_field_size(
+                        groups, floor=int(gpp_cfg.get("n_field_lineups", 5_000)),
+                    )
+                    _gen_ownership_vec = compute_generation_ownership_vec(
+                        pool.lineups, sim_results, players_df,
+                        field_size=float(_gen_field_size),
+                        blend_weight=_gen_leverage_weight,
+                        sharpness=float(gpp_cfg.get("external_pool_pwin_sharpness", 0.05)),
+                    )
                 _topn_pool_for_alloc, _topn_generated_kept = ep.augment_topn_pool_with_generated(
-                    pool, players_df, _own_vec, _topn_generated_pool_size, _rng_seed + 1,
+                    pool, players_df, _gen_ownership_vec, _topn_generated_pool_size, _rng_seed + 1,
                     stop_check=self._stop_check,
                 )
                 _topn_is_generated = np.zeros(len(_topn_pool_for_alloc.lineups), dtype=bool)
                 _topn_is_generated[_n_real:] = True
-                # proj_scores was sized for the ORIGINAL (smaller) pool --
-                # must be recomputed over the augmented lineup list before
-                # allocate_contests_topn_coverage's pool-wide floor cull
-                # indexes into it, or a shape mismatch (or worse, silent
-                # misalignment) follows. Generated lineups are built from
-                # this same players_df, so their proj_score is just as real
-                # as an external candidate's.
+                # proj_scores/floor_scores were sized for the ORIGINAL
+                # (smaller) pool -- both must be recomputed over the
+                # augmented lineup list before allocate_contests_topn_
+                # coverage's pool-wide floor cull indexes into them, or a
+                # shape mismatch (or worse, silent misalignment) follows.
+                # Generated lineups are built from this same players_df, so
+                # their proj_score is just as real as an external
+                # candidate's; compute_pool_ceiling_scores falls back to the
+                # mean+z*sigma proxy for them since they have no source file
+                # to carry a native "99th" cell.
                 _topn_proj_scores = ep.compute_pool_proj_scores(
                     _topn_pool_for_alloc.lineups, players_df,
+                )
+                _topn_floor_scores = ep.compute_pool_ceiling_scores(
+                    _topn_pool_for_alloc, players_df,
                 )
                 self._cb("topn_pool_augmented", {
                     "n_requested": _topn_generated_pool_size,
@@ -2941,7 +2972,9 @@ class PipelineRunner:
                 _topn_pool_for_alloc, sim_results, groups, _topn_field_lineups,
                 proj_scores=_topn_proj_scores,
                 proj_score_floor_percentile=_proj_score_floor_pct,
-                topn_rank=_topn_rank, field_samples=_topn_field_samples,
+                floor_scores=_topn_floor_scores,
+                topn_rank=_topn_rank, topn_percentile_floor=_topn_percentile_floor,
+                field_samples=_topn_field_samples,
                 sims_per_contest_fraction=_topn_sims_fraction,
                 sims_min=_topn_sims_min, sims_reference_field_size=_topn_sims_ref,
                 sims_power=_topn_sims_power, rng_seed=_rng_seed,
@@ -2956,6 +2989,7 @@ class PipelineRunner:
             _roi_floor_pct = float(gpp_cfg.get("external_pool_roi_floor_pct", 40.0))
             _ceiling_weight = float(gpp_cfg.get("external_pool_ceiling_weight", 0.25))
             _cash_anchor = float(gpp_cfg.get("external_pool_cash_anchor_fraction", 0.25))
+            _rank_normalize = bool(gpp_cfg.get("external_pool_rank_normalize", False))
             _risks = [1.0, 2.0, 3.0, 4.0, 5.0]
             allocations = {}
             for _risk_idx, _risk in enumerate(_risks):
@@ -2970,6 +3004,7 @@ class PipelineRunner:
                     roi_floor_percentile=_roi_floor_pct,
                     proj_scores=proj_scores,
                     proj_score_floor_percentile=_proj_score_floor_pct,
+                    floor_scores=_floor_scores,
                     ev_type=_ev_type,
                     own_scores=own_scores,
                     own_scale=_own_scale,
@@ -2985,6 +3020,7 @@ class PipelineRunner:
                     p_win_admit_multiplier=_p_win_admit_multiplier,
                     ceiling_weight=_ceiling_weight,
                     cash_anchor_fraction=_cash_anchor,
+                    rank_normalize=_rank_normalize,
                     stop_check=self._stop_check,
                     progress_cb=lambda data, r=_risk, ri=_risk_idx: self._cb(
                         "gpp_det_select_progress",

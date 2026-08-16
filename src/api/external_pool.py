@@ -1265,6 +1265,35 @@ def compute_pool_ceiling_proxy(lineups: list, players_df: pd.DataFrame, z: float
     return lineup_means.astype(np.float64) + z * np.sqrt(np.maximum(lineup_var, 0.0))
 
 
+def compute_pool_ceiling_scores(pool: "ExternalPool", players_df: pd.DataFrame) -> np.ndarray:
+    """(M,) float64 per-lineup ceiling estimate, aligned to `pool.lineups` --
+    the basis for the pool-wide `external_pool_proj_score_pct` floor cull in
+    place of summed projected mean, so the floor keeps high-ceiling lineups
+    a mean-based cull would otherwise drop for being merely median, and
+    drops median-ceiling lineups a mean-based cull would otherwise keep.
+
+    Prefers each lineup's own SaberSim "99th" column (`parse_pool_p99`) --
+    a real simulated ceiling, not an estimate. Falls back to the
+    independence-assuming `compute_pool_ceiling_proxy` for any lineup
+    without one: a generated lineup added by
+    `augment_topn_pool_with_generated` (no source file, so no "99th" cell
+    at all) or a real lineup whose file's "99th" cell was blank/
+    unparseable."""
+    valid_ids = set(players_df["player_id"].astype(int))
+    p99_lookup = parse_pool_p99(pool.source_paths, valid_ids)
+    p99 = np.array(
+        [p99_lookup.get(frozenset(lu.player_ids), np.nan) for lu in pool.lineups],
+        dtype=np.float64,
+    )
+    missing = ~np.isfinite(p99)
+    if missing.any():
+        proxy = compute_pool_ceiling_proxy(
+            [lu for lu, m in zip(pool.lineups, missing) if m], players_df,
+        )
+        p99[missing] = proxy
+    return p99
+
+
 _DK_RAKE = 0.16
 """DK's fixed take across contest sizes: prize_pool = entries * entry_fee *
 (1 - _DK_RAKE), i.e. the prize pool is only ~84% of collected entry fees
@@ -1547,6 +1576,7 @@ def allocate_contests(
     roi_floor_percentile: float = 40.0,
     proj_scores: Optional[np.ndarray] = None,
     proj_score_floor_percentile: float = 0.0,
+    floor_scores: Optional[np.ndarray] = None,
     ev_type: str = "roi",
     own_scores: Optional[np.ndarray] = None,
     own_scale: float = _DEFAULT_OWN_SCALE,
@@ -1563,6 +1593,9 @@ def allocate_contests(
     p_win_admit_multiplier: float = 0.0,
     ceiling_weight: float = 0.0,
     cash_anchor_fraction: float = 0.0,
+    lane_fraction: float = 0.0,
+    lane_evw: float = 0.0,
+    rank_normalize: bool = False,
     stop_check: Optional[Callable[[], bool]] = None,
     progress_cb: Optional[Callable[[dict], None]] = None,
 ) -> ExternalAllocation:
@@ -1601,12 +1634,13 @@ def allocate_contests(
       post-floor pool on p_win_select alone). Requires both `p_win_cull` and
       `p_win_select`, each `{contest_id: (M,) array}`, built from the same
       underlying sims via two calls to compute_p_win.
-    * `"proj_top"` — rank directly on `proj_scores` (plain projected mean,
-      the same array the pool-wide floor already culls on), no ROI/ownership
-      currency at all. Like `prj_own`/`p_win`, Saber's ROI plays no part, so
-      `roi_floor_percentile` and the ceiling lean are inert; the pool-wide
-      `proj_score_floor_percentile` cull is the only cull. Requires
-      `proj_scores`.
+    * `"proj_top"` — rank directly on `proj_scores` (plain projected mean;
+      note the pool-wide floor below culls on `floor_scores`, ceiling by
+      default, not this same array, when the caller passes both), no
+      ROI/ownership currency at all. Like `prj_own`/`p_win`, Saber's ROI
+      plays no part, so `roi_floor_percentile` and the ceiling lean are
+      inert; the pool-wide `proj_score_floor_percentile` cull is the only
+      cull. Requires `proj_scores`.
 
       Backtested (tests/backtest_needle.py, 14 archived slates 07/19-08/02):
       the single best-performing currency found for recovering a slate's own
@@ -1706,14 +1740,19 @@ def allocate_contests(
     selection, the diversity/hedge terms, the shared-removal `mask` and the
     returned `(lineup, ev)` pairs all work off whichever vector was built.
 
-    `proj_score_floor_percentile` (with `proj_scores`, a `(M,)` per-lineup
-    summed-projected-mean array from `compute_pool_proj_scores`) is a
-    second, pool-wide floor distinct from the per-contest ROI floor below:
-    it culls the bottom N% of projected score once, across the *entire*
-    pool, before any contest is processed, by seeding the shared-removal
-    `mask` with the exclusion up front — so a lineup that fails it is
-    unavailable to every contest, not just the one currently being filled.
-    No-op when `proj_score_floor_percentile <= 0` or `proj_scores` is None.
+    `proj_score_floor_percentile` (with `floor_scores`, a `(M,)` per-lineup
+    array — pass `compute_pool_ceiling_scores(pool, players_df)`, each
+    lineup's own SaberSim "99th" column with a ceiling-proxy fallback, to
+    floor on ceiling rather than `compute_pool_proj_scores`'s summed
+    projected mean) is a second, pool-wide floor distinct from the
+    per-contest ROI floor below: it culls the bottom N% of `floor_scores`
+    once, across the *entire* pool, before any contest is processed, by
+    seeding the shared-removal `mask` with the exclusion up front — so a
+    lineup that fails it is unavailable to every contest, not just the one
+    currently being filled. `floor_scores` defaults to `proj_scores` when
+    not given, so a caller that only supplies `proj_scores` keeps the old
+    mean-based floor unchanged. No-op when `proj_score_floor_percentile <=
+    0` or both `floor_scores` and `proj_scores` are None.
 
     ceiling_weight > 0 (with cash_anchor_fraction, mirroring the internal
     pipeline's ceiling-first `selector_score: tail` pattern) leans the
@@ -1722,6 +1761,20 @@ def allocate_contests(
     correlation/diversity term, or the reported per-lineup EV — all three
     stay on plain roi. No-ops (falls back to plain roi ranking) when the
     pool's ExternalContest has no roi_stddev (older exports).
+
+    `lane_fraction`/`lane_evw` (both 0.0 = off) reserve the LAST
+    ceil(lane_fraction x k) of each contest's entries for a second
+    orthogonality lane scored at `lane_evw` — see the LANE SPLIT section of
+    DeterminantPortfolioSelector's docstring for why one EVw across the
+    whole portfolio conflates two different jobs. Applied per contest, so
+    every contest gets both lanes in proportion to its own entry count
+    rather than the split falling entirely on whichever contests happen to
+    be filled last. Contests with k == 1 take the plain EV argmax and are
+    unaffected (there is nothing to be diverse from).
+
+    `rank_normalize` (default False = byte-identical) puts the selector's
+    EV and diversity terms on a common ordinal scale -- see RANK
+    NORMALISATION in DeterminantPortfolioSelector's docstring.
 
     A raw ROI cutoff (e.g. >= 0.0) doesn't generalize across contests of
     different sizes/payout structures, so the floor is a percentile of
@@ -1784,11 +1837,12 @@ def allocate_contests(
 
     M = len(pool.lineups)
     mask = np.ones(M, dtype=bool)
-    if proj_scores is not None:
-        floor = compute_proj_score_floor(proj_scores, proj_score_floor_percentile)
+    _floor_basis = floor_scores if floor_scores is not None else proj_scores
+    if _floor_basis is not None:
+        floor = compute_proj_score_floor(_floor_basis, proj_score_floor_percentile)
         if floor is not None:
             proj_floor, _ = floor
-            mask &= np.isfinite(proj_scores) & (proj_scores >= proj_floor)
+            mask &= np.isfinite(_floor_basis) & (_floor_basis >= proj_floor)
 
     # Ownership cap (proj_top, large fields only) -- percentile basis and the
     # "largest field seen today" anchor, both computed ONCE here (not per
@@ -1932,6 +1986,9 @@ def allocate_contests(
                 ),
                 ev_override=ev_override,
                 cash_anchor_fraction=eff_cash_anchor,
+                lane_fraction=lane_fraction,
+                lane_evw=lane_evw,
+                rank_normalize=rank_normalize,
             )
             pairs = sel.select(stop_check=stop_check, progress_cb=progress_cb)
             picks = [idx_of[id(lu)] for lu, _ in pairs]
@@ -2334,6 +2391,24 @@ def _topn_sims_for_field_size(
     return int(np.clip(n, 1, n_sims))
 
 
+def _topn_effective_rank(topn_rank: int, field_size_g: int, percentile_floor: float) -> int:
+    """The literal rank a candidate must cross in THIS contest: whichever is
+    LOOSER (larger -- easier to clear) of the fixed configured `topn_rank`
+    and `percentile_floor` (a fraction, e.g. 0.001 = "top 0.1%") of this
+    contest's own field size, rounded up. A flat top-10 bar is a much more
+    extreme ask in a 17,000-entry field (top 0.06%) than a 500-entry one
+    (top 2%) -- this keeps the bar's real-world difficulty comparable
+    across contest sizes instead of literally fixed, while leaving small/
+    medium contests (`percentile_floor * field_size_g < topn_rank`)
+    untouched at the flat `topn_rank`. `percentile_floor <= 0` disables
+    this entirely (pure flat `topn_rank`, the original behavior). Clipped
+    to `field_size_g` itself either way (can't rank Nth in a field smaller
+    than N)."""
+    percentile_rank = int(np.ceil(percentile_floor * field_size_g)) if percentile_floor > 0 else 0
+    effective = max(int(topn_rank), percentile_rank)
+    return min(effective, field_size_g)
+
+
 class _SimWorldAllocator:
     """Hands out DISJOINT slices of a shared shuffled permutation of
     `range(n_sims)` to successive `take()` callers, one per contest.
@@ -2464,6 +2539,107 @@ def _score_field_cols_batched(
     return out
 
 
+def topn_payout_rungs(
+    contest_name: str, field_size_g: int, effective_rank: int, n_rungs: int,
+    tightest_rank: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """`(ranks, weights)` for the payout-weighted rank ladder — the refinement
+    that turns the single top-N RANK bar into a PAYOUT-shaped objective.
+
+    The flat bar can't tell "won the contest" from "scraped in at rank N": both
+    are one covered slot. This returns `n_rungs` ranks geometrically spaced
+    from 1 to `effective_rank` (the bar the single-threshold version already
+    uses, so the ladder is a strict REFINEMENT — same outer admission
+    boundary, more resolution inside it — not a change of scope; extending the
+    rungs down to the cash line would drag the min-cash plateau back into an
+    objective built to exclude it).
+
+    `weights[j] = payout(ranks[j]) - payout(ranks[j+1])` (last rung keeps its
+    own payout). Because the rungs are NESTED — clearing rank 1 implies
+    clearing every looser rank — a candidate placing at realized rank rho
+    clears exactly the rungs with `rank >= rho`, so its summed weight
+    telescopes to `payout(rank_j)` for the tightest rung it cleared: a
+    conservative step approximation of the real payout curve that becomes
+    exact as `n_rungs -> effective_rank`. No double counting.
+
+    Weights are normalized to sum to 1. Only their RATIOS matter — gains are
+    only ever compared between candidates inside one contest — so the absolute
+    dollars (and any mismatch between the matched structure's `total_entries`
+    and this contest's real `field_size_g`) scale out entirely. That's why
+    `nearest_payout_structure`'s approximation flag is not fatal here.
+    """
+    from src.optimization.payout import nearest_payout_structure, payout_table_to_array
+
+    n_rungs = max(1, int(n_rungs))
+    effective_rank = max(1, int(effective_rank))
+    # `tightest_rank` floors how extreme the innermost rung may be. Rank 1 is
+    # the rarest event on the ladder AND carries its largest weight, so at a
+    # fixed sim budget it is also the least-settled -- a per-candidate claim
+    # rate estimated from a handful of worlds, weighted most heavily. Raising
+    # this trades payout resolution for estimator stability; see
+    # scripts/diagnose_topn_rung_settling.py, which measures the split-half
+    # stability of each rung at the production per-contest sim budget.
+    lo = int(np.clip(tightest_rank, 1, effective_rank))
+    ranks = np.unique(
+        np.round(np.geomspace(lo, effective_rank, num=min(n_rungs, effective_rank - lo + 1)))
+    ).astype(np.int64)
+
+    struct, approx = nearest_payout_structure(contest_name, field_size_g)
+    gross = payout_table_to_array(struct)
+    if approx:
+        logger.info(
+            "topn_coverage ladder: no exact payout table for %r (field ~%d) — "
+            "using %r's curve for rung WEIGHTS only (ratios, not dollars).",
+            contest_name, field_size_g, struct.get("name", "?"),
+        )
+    # Rank r -> index r-1, clipped: a rung rank past the table's length keeps
+    # the last (smallest) tier rather than indexing out of bounds.
+    pay = gross[np.clip(ranks - 1, 0, len(gross) - 1)]
+    weights = pay - np.concatenate([pay[1:], [0.0]])
+    total = weights.sum()
+    if not np.isfinite(total) or total <= 0:
+        # Degenerate table (e.g. every rung inside one flat tier): fall back to
+        # equal weights so the ladder degrades to plain multi-rank coverage
+        # rather than producing all-zero gains and forcing endless relaxation.
+        weights = np.ones(len(ranks), dtype=np.float64)
+        total = weights.sum()
+    return ranks, (weights / total)
+
+
+def compute_pool_e_dupes(
+    lineups: list,
+    players_df: pd.DataFrame,
+    intercept: float,
+    log_own_coef: float,
+    salary_coef: float,
+    stack_coef: float,
+    salary_cap: float = 50_000.0,
+) -> np.ndarray:
+    """(M,) E[duplicate copies] per lineup at the dupe model's reference field
+    size, ready to hand to `allocate_contests_topn_coverage(e_dupes=...)`.
+
+    Thin adapter: builds the four id->attribute maps
+    `gpp_portfolio.expected_dupes` needs out of an external-pool `players_df`
+    and delegates. `players_df["ownership"]` is in PERCENTAGE POINTS for this
+    pool (parse_player_projections doesn't divide "My Own"/"Adj Own" by 100 --
+    see the note in pipeline.py's external branch), while the fitted model
+    takes ownership as a FRACTION, so it's divided by 100 here. Getting that
+    wrong is silent: percentages would push every `log(own)` positive and
+    invert the model's ranking."""
+    from src.optimization.gpp_portfolio import expected_dupes
+
+    pids = players_df["player_id"].astype(int).to_numpy()
+    own_map = dict(zip(pids, players_df["ownership"].astype(float).to_numpy() / 100.0))
+    sal_map = dict(zip(pids, players_df["salary"].astype(float).to_numpy()))
+    team_map = dict(zip(pids, players_df["team"]))
+    pos_map = dict(zip(pids, players_df["position"]))
+    return expected_dupes(
+        lineups, own_map, sal_map, team_map, pos_map,
+        salary_cap=salary_cap, intercept=intercept, log_own_coef=log_own_coef,
+        salary_coef=salary_coef, stack_coef=stack_coef,
+    )
+
+
 def allocate_contests_topn_coverage(
     pool: ExternalPool,
     sim_results,
@@ -2471,7 +2647,9 @@ def allocate_contests_topn_coverage(
     field_lineups: np.ndarray,
     proj_scores: Optional[np.ndarray] = None,
     proj_score_floor_percentile: float = 0.0,
+    floor_scores: Optional[np.ndarray] = None,
     topn_rank: int = 10,
+    topn_percentile_floor: float = 0.001,
     field_samples: int = 5,
     sims_per_contest_fraction: float = 0.5,
     sims_min: int = 0,
@@ -2480,7 +2658,11 @@ def allocate_contests_topn_coverage(
     relax_step: float = 1.0,
     candidate_batch_size: int = 2_000,
     rng_seed: int = 42,
+    field_rng_seed: Optional[int] = None,
     pick_progress_chunk: int = 25,
+    e_dupes: Optional[np.ndarray] = None,
+    payout_rungs: int = 0,
+    payout_tightest_rank: int = 1,
     is_generated: Optional[np.ndarray] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     progress_cb: Optional[Callable[[dict], None]] = None,
@@ -2511,10 +2693,11 @@ def allocate_contests_topn_coverage(
     contest's own `(n_sims_g, field_size_g)` need instead of the whole
     slate's, freed again once that contest's picks are done.
 
-    `proj_scores`/`proj_score_floor_percentile` mirror `allocate_contests`'s
-    own pool-wide projected-score floor exactly (`compute_proj_score_floor`,
-    seeded into the shared-removal `mask` once, before any contest is
-    processed) -- coverage alone has no notion of "good lineup," only
+    `proj_scores`/`proj_score_floor_percentile`/`floor_scores` mirror
+    `allocate_contests`'s own pool-wide projected-score floor exactly
+    (`compute_proj_score_floor`, seeded into the shared-removal `mask` once,
+    before any contest is processed; `floor_scores` defaults to `proj_scores`
+    when not given) -- coverage alone has no notion of "good lineup," only
     "differentiated lineup," so this keeps the mechanism choosing among
     already-viable candidates. The pool's existing 9/10-player-overlap
     near-duplicate cull (`_find_near_duplicate_removals`, applied once in
@@ -2545,8 +2728,16 @@ def allocate_contests_topn_coverage(
        this contest's `n_sims_g` sim-world slice
        (`_score_field_cols_batched`), then discarded once its threshold row
        is extracted.
-    4. Per-(field-draw, world) rank-`topn_rank` thresholds are computed via
-       `np.partition` (avoids a full sort).
+    4. Per-(field-draw, world) rank-N thresholds are computed via
+       `np.partition` (avoids a full sort), where N = `_topn_effective_rank`
+       (whichever is LOOSER of the fixed `topn_rank` and
+       `topn_percentile_floor` fraction of this contest's own
+       `field_size_g`, e.g. `topn_rank=10, topn_percentile_floor=0.001`
+       makes a 17,000-entry field effectively top-17 rather than a literal
+       top-10, while smaller fields stay at the flat `topn_rank`) --
+       keeps the bar's real difficulty comparable across wildly different
+       field sizes instead of a fixed rank being a vastly more extreme ask
+       in a huge field than a small one.
     5. Crossing bits (`candidate_score >= threshold`) are computed chunked
        over candidates and bit-packed, in the same shape
        `CoveragePortfolioSelector` consumes.
@@ -2567,6 +2758,54 @@ def allocate_contests_topn_coverage(
     this pick add" figure for display/logging, paralleling every other
     ev_type's `(Lineup, ev)` return shape.
 
+    `payout_rungs`, when > 1, replaces the single rank-N bar with a
+    PAYOUT-WEIGHTED LADDER of that many nested rank bars (see
+    `topn_payout_rungs`). Each pick's gain becomes
+    `sum_j w_j * popcount(bits_j & uncovered_j)` instead of a flat popcount,
+    so claiming a world at rank 1 is worth more than scraping in at rank N —
+    the single bar scores those identically, which is the "rank bar, not a
+    payout" gap. `0`/`1` keeps the original single-threshold behavior exactly.
+
+    Each rung carries its OWN `uncovered` plane, so a world can still be
+    claimed once per rung. Known limitation, inherited from the flat version:
+    those planes are binary, so once a lineup wins a world outright (clearing
+    every rung there) a second lineup in the same world adds nothing, even
+    though a second entry really would be paid separately — today's wave-reset
+    is still what covers that case. Making a rung's slot depletable by its
+    rank WIDTH is the principled fix and is deliberately not attempted here.
+
+    Cost is `R x` the crossing-bit build and `R x` the per-pick popcount;
+    threshold extraction is unchanged (one multi-kth `np.partition` over the
+    field-score array that was already materialized and is still discarded
+    immediately). Memory grows only in the bit-plane array, which is small
+    relative to the transient field-score array that already dominates.
+
+    `e_dupes`, if given, is a `(M,)` array of expected duplicate copies per
+    candidate at the dupe model's reference field size
+    (`gpp_portfolio.expected_dupes` / `DUPE_REF_FIELD_SIZE`), aligned with
+    `pool.lineups`. It turns each pick's coverage gain into a
+    DUPLICATE-DISCOUNTED gain: `gain x 1/(1 + E[dupes_g])`, where
+    `E[dupes_g] = e_dupes * field_size_g / DUPE_REF_FIELD_SIZE` rescales the
+    reference-size expectation to THIS contest's field (E[copies] is linear in
+    field size; the fitted intercept absorbs the reference size, so skipping
+    this overstates duplication by ~20x in a 744-entry contest).
+
+    Rationale: the top-N bar is a RANK bar, not a payout. The field pool is
+    ownership-weighted, so the bar already rises in the worlds where a chalk
+    play booms -- what it cannot see is that a heavily-duplicated lineup
+    SPLITS whatever it wins. Two candidates that claim the same number of
+    (draw, world) slots are worth different amounts when one of them is a
+    build hundreds of opponents also submitted. This is the cheapest
+    available correction: a per-candidate scalar, no per-world cost and no
+    extra memory, reusing the already-fitted production model rather than a
+    second notion of crowding.
+
+    Only the ARGMAX is weighted. The raw popcount still drives control flow
+    (relaxation triggers on nothing crossing, which is a property of the
+    thresholds, not of duplication) and is still what's reported as each
+    pick's `ev`, so the dumped "slots claimed" figure keeps its meaning and
+    stays comparable across runs with and without the discount.
+
     `is_generated`, if given, is a `(M,)` boolean mask aligned with
     `pool.lineups` (see `augment_topn_pool_with_generated`, which builds
     `pool.lineups` as `real_lineups + generated_lineups` so `is_generated =
@@ -2574,7 +2813,7 @@ def allocate_contests_topn_coverage(
     progress reporting (`contest_done`'s `n_generated_picks`), no effect on
     selection itself; a generated lineup competes on identical footing to a
     real one once it's in `pool.lineups`."""
-    from src.optimization.gpp_portfolio import _POPCOUNT_LUT
+    from src.optimization.gpp_portfolio import DUPE_REF_FIELD_SIZE, _POPCOUNT_LUT
     from src.optimization import self_play as _sp
 
     _sp._tune_malloc_for_large_arrays()
@@ -2613,11 +2852,12 @@ def allocate_contests_topn_coverage(
     I_pool = _lineup_indicator_matrix(pool.lineups, sim_results.player_ids)  # (n_players, M)
 
     mask = np.ones(M, dtype=bool)
-    if proj_scores is not None:
-        floor = compute_proj_score_floor(proj_scores, proj_score_floor_percentile)
+    _floor_basis = floor_scores if floor_scores is not None else proj_scores
+    if _floor_basis is not None:
+        floor = compute_proj_score_floor(_floor_basis, proj_score_floor_percentile)
         if floor is not None:
             proj_floor, _ = floor
-            mask &= np.isfinite(proj_scores) & (proj_scores >= proj_floor)
+            mask &= np.isfinite(_floor_basis) & (_floor_basis >= proj_floor)
 
     portfolio: list = []
     entry_plan: list = []
@@ -2641,7 +2881,17 @@ def allocate_contests_topn_coverage(
             field_size_g, n_sims, sims_per_contest_fraction,
             sims_min, sims_reference_field_size, sims_power,
         )
-        rng = np.random.default_rng(rng_seed + contest_index)  # used below for the K field draws
+        # `field_rng_seed` defaults to rng_seed (so a single seed still drives
+        # everything, unchanged), but can be set independently to separate the
+        # allocator's TWO noise sources: which sim worlds a contest gets
+        # (rng_seed, via _SimWorldAllocator) versus which field lineups form
+        # its K threshold draws (this rng). They cost very different amounts to
+        # buy down -- more sim worlds scale the (n_sims_g x field_size_g)
+        # field-score transient linearly, more field samples do not -- so
+        # knowing which one drives portfolio variance decides which knob is
+        # worth paying for. See scripts/diagnose_topn_variance_decomposition.py.
+        _field_seed = rng_seed if field_rng_seed is None else field_rng_seed
+        rng = np.random.default_rng(_field_seed + contest_index)  # the K field draws
         sim_idx_g = sim_allocator.take(n_sims_g)
 
         # Slice down to this contest's sim-world subsample FIRST, then score
@@ -2654,39 +2904,81 @@ def allocate_contests_topn_coverage(
         sim_sub_matrix = sim_results.results_matrix[sim_idx_g].astype(np.float32)  # (n_sims_g, n_players)
         cand_sub = (sim_sub_matrix @ I_pool[:, rem_all]).T                          # (len(rem_all), n_sims_g)
 
-        N = min(topn_rank, field_size_g)
+        N = _topn_effective_rank(topn_rank, field_size_g, topn_percentile_floor)
         n_slots = K * n_sims_g
         n_bytes_g = -(-n_slots // 8)
         pad = n_bytes_g * 8 - n_slots
 
+        # Rung ranks + payout weights. The single-bar path is the R == 1 case
+        # (one rung at rank N, weight 1.0), so everything below is one code
+        # path -- no parallel implementation to drift out of sync.
+        if payout_rungs and payout_rungs > 1:
+            rung_ranks, rung_weights = topn_payout_rungs(
+                g.contest_name, field_size_g, N, payout_rungs,
+                tightest_rank=payout_tightest_rank,
+            )
+        else:
+            rung_ranks = np.array([N], dtype=np.int64)
+            rung_weights = np.array([1.0], dtype=np.float64)
+        R = len(rung_ranks)
+
         def _draw_thresholds() -> np.ndarray:
-            thr = np.empty((K, n_sims_g), dtype=np.float32)
+            """(R, K, n_sims_g) float32 -- one threshold plane per rung.
+
+            All R order statistics come from ONE `np.partition` call per field
+            draw (it accepts a sequence of kth), so adding rungs costs no extra
+            passes over the big field-score array; that array is still built
+            and discarded exactly as before."""
+            thr = np.empty((R, K, n_sims_g), dtype=np.float32)
+            kths = np.unique(-rung_ranks)  # negative == from the top
             for kk in range(K):
                 subset = rng.choice(field_pool_size, size=field_size_g, replace=False)
                 field_batch_scores = _score_field_cols_batched(
                     sim_sub_matrix, field_lineup_cols[subset],
                 )  # (n_sims_g, field_size_g) -- scored on demand, discarded after this line
-                thr[kk] = np.partition(field_batch_scores, -N, axis=1)[:, -N]
+                part = np.partition(field_batch_scores, kths, axis=1)
+                for r, rank in enumerate(rung_ranks):
+                    thr[r, kk] = part[:, -int(rank)]
+                del part
             return thr
 
         def _crossing_bits(thr: np.ndarray) -> np.ndarray:
-            """(len(rem_all), n_bytes_g) uint8, chunked over candidates."""
+            """(len(rem_all), R, n_bytes_g) uint8, chunked over candidates.
+
+            Rung-major so each rung's plane stays contiguous for the popcount
+            below. The per-batch bool scratch is built one rung at a time --
+            materializing (b, R, K, n_sims_g) at once would multiply the single
+            largest transient in this function by R for no benefit."""
             n_cand = cand_sub.shape[0]
-            bits = np.zeros((n_cand, n_bytes_g), dtype=np.uint8)
+            bits = np.zeros((n_cand, R, n_bytes_g), dtype=np.uint8)
             for start in range(0, n_cand, candidate_batch_size):
                 end = min(start + candidate_batch_size, n_cand)
                 batch = cand_sub[start:end]                   # (b, n_sims_g)
                 cross = np.empty((end - start, K, n_sims_g), dtype=bool)
-                for kk in range(K):
-                    cross[:, kk, :] = batch >= thr[kk][None, :]
-                bits[start:end] = np.packbits(cross.reshape(end - start, n_slots), axis=1)
+                for r in range(R):
+                    for kk in range(K):
+                        cross[:, kk, :] = batch >= thr[r, kk][None, :]
+                    bits[start:end, r, :] = np.packbits(
+                        cross.reshape(end - start, n_slots), axis=1,
+                    )
             return bits
 
         def _fresh_uncovered() -> np.ndarray:
-            u = np.full(n_bytes_g, 0xFF, dtype=np.uint8)
+            """(R, n_bytes_g) -- one uncovered plane per rung."""
+            u = np.full((R, n_bytes_g), 0xFF, dtype=np.uint8)
             if pad:
-                u[-1] = np.uint8((0xFF << pad) & 0xFF)
+                u[:, -1] = np.uint8((0xFF << pad) & 0xFF)
             return u
+
+        # Duplicate discount for THIS contest's field size (see the e_dupes
+        # paragraph in the docstring). Computed once per contest -- a plain
+        # (len(rem_all),) float vector, no per-world or per-pick cost.
+        dupe_weight = None
+        if e_dupes is not None:
+            _ed_g = np.asarray(e_dupes, dtype=np.float64)[rem_all] * (
+                field_size_g / DUPE_REF_FIELD_SIZE
+            )
+            dupe_weight = 1.0 / (1.0 + _ed_g)
 
         thresholds = _draw_thresholds()
         bits = _crossing_bits(thresholds)
@@ -2697,7 +2989,7 @@ def allocate_contests_topn_coverage(
         # across the whole contest, wave resets included -- the persistent
         # record of which (draw, world) slots were claimed by ANY pick,
         # ever, used for the world-level "claimed" summary at contest_done.
-        ever_covered = np.zeros(n_bytes_g, dtype=np.uint8)
+        ever_covered = np.zeros((R, n_bytes_g), dtype=np.uint8)
 
         picks_local: list[int] = []
         picks_ev: list[float] = []
@@ -2709,18 +3001,35 @@ def allocate_contests_topn_coverage(
             progress_cb({
                 "event": "contest_start", "contest_id": g.contest_id, "k": k,
                 "field_size_g": field_size_g, "n_sims_g": n_sims_g,
+                "effective_rank": N,
                 "contest_index": contest_index, "contests_total": len(groups),
                 "sim_lap": sim_allocator.lap,
             })
         while len(picks_local) < target:
             if stop_check is not None and stop_check():
                 break
-            new_bits = np.bitwise_and(bits, uncovered[None, :])
-            gains = _POPCOUNT_LUT[new_bits].sum(axis=1).astype(np.int64)
+            # (n_cand, R) raw popcounts, one column per rung. `per_rung` drives
+            # control flow and reporting; `score` (payout-weighted, then dupe-
+            # discounted) drives only the argmax.
+            new_bits = np.bitwise_and(bits, uncovered[None, :, :])
+            per_rung = _POPCOUNT_LUT[new_bits].sum(axis=2).astype(np.int64)
+            # Total across rungs, NOT the outer rung alone: the planes deplete
+            # independently, so a candidate can have nothing left to claim at
+            # rank N while still being the only one able to claim an unclaimed
+            # rank-1 slot. Triggering relaxation on the outer rung alone would
+            # throw those picks away.
+            gains = per_rung.sum(axis=1)
+            score = per_rung @ rung_weights
             gains[~remaining_local] = -1
-            best_local = int(np.argmax(gains))
-            f = int(gains[best_local])
-            if f <= 0:
+            score[~remaining_local] = -1.0
+            if dupe_weight is not None:
+                # Every weight is in (0, 1] and non-remaining rows are already
+                # -1, so scaling preserves their "never selected" status.
+                score = score * dupe_weight
+            best_local = int(np.argmax(score))
+            f = int(per_rung[best_local, R - 1])  # outer-rung slots == the
+            # single-bar `ev`, so this stays comparable across ladder settings
+            if gains[best_local] <= 0:
                 if not uncovered.any():
                     # Every slot already claimed by earlier picks in this
                     # contest -- start a fresh coverage wave rather than
@@ -2733,8 +3042,15 @@ def allocate_contests_topn_coverage(
                 # equivalent to (and far cheaper than) repeating the literal
                 # "deflate by relax_step, retry" rule that many times.
                 max_score_per_world = cand_sub[remaining_local].max(axis=0)  # (n_sims_g,)
-                uncovered_mask = np.unpackbits(uncovered)[:n_slots].reshape(K, n_sims_g).astype(bool)
-                gaps = thresholds - max_score_per_world[None, :]
+                # Min gap across EVERY rung's still-uncovered slots, deflating
+                # all rungs by that one amount -- keeps the ladder's relative
+                # spacing (and so its payout ordering) intact, where relaxing
+                # each rung independently would let the rungs cross over.
+                uncovered_mask = (
+                    np.unpackbits(uncovered, axis=1)[:, :n_slots]
+                    .reshape(R, K, n_sims_g).astype(bool)
+                )
+                gaps = thresholds - max_score_per_world[None, None, :]
                 gaps = np.where(uncovered_mask, gaps, np.inf)
                 min_gap = float(gaps.min())
                 steps = max(1, int(np.ceil(min_gap / relax_step))) if np.isfinite(min_gap) else 1
@@ -2754,7 +3070,7 @@ def allocate_contests_topn_coverage(
                     "event": "pick", "contest_id": g.contest_id,
                     "pick_num": len(picks_local), "k": k,
                     "uncovered_remaining": int(_POPCOUNT_LUT[uncovered].sum()),
-                    "uncovered_total": n_slots, "relaxations_so_far": n_relaxations,
+                    "uncovered_total": n_slots * R, "relaxations_so_far": n_relaxations,
                     "elapsed_s": time.time() - t0,
                 })
 
@@ -2780,7 +3096,13 @@ def allocate_contests_topn_coverage(
             # auto-sized n_sims -- and worlds_claimed_pct is always in
             # [0, 100], with n_wave_resets called out separately instead of
             # (mis)implied by a >100% figure.
-            ever_covered_mask = np.unpackbits(ever_covered)[:n_slots].reshape(K, n_sims_g).astype(bool)
+            # Outer rung (rank N) only -- that plane IS the single-bar
+            # ever_covered, so worlds_claimed keeps its exact meaning and stays
+            # comparable between ladder and single-bar runs. The inner rungs
+            # are a strict subset of it by nesting, so they'd add nothing here.
+            ever_covered_mask = (
+                np.unpackbits(ever_covered[R - 1])[:n_slots].reshape(K, n_sims_g).astype(bool)
+            )
             worlds_claimed = int(ever_covered_mask.any(axis=0).sum())
             n_generated_picks = (
                 int(is_generated[picks_global].sum()) if is_generated is not None and len(picks_global)

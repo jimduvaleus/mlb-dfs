@@ -81,8 +81,8 @@ gpp:
   selector_mode: det
   kelly_bankroll_mult: 1.0
   final_rescore_top: 20000
-  evw_base: 0.15
-  evw_max: 0.45
+  evw_base: 0.10
+  evw_max: 0.30
   ev_floor: 0.25
   field_source: simulated
   historical_n_slates: 10
@@ -107,14 +107,41 @@ gpp:
   external_pool_proj_score_pct: 0.0
   external_pool_ceiling_weight: 0.25
   external_pool_cash_anchor_fraction: 0.25
+  # --- Det selector: rank-normalised terms + recalibrated sweep ---------
+  # external_pool_rank_normalize makes EVn and DEn percentile ranks among the
+  # remaining candidates instead of a max-normalised EV and a CLIPPED
+  # distance. The clip was the problem: Dn's redundancy sum needs
+  # k < 1/rbar^2 to stay above 0, so in a large multi-entry contest it
+  # saturates and the diversity term stops ordering anything (measured on
+  # 08/11 mini-MAX: term IQR exactly 0.0000 by pick 66 of 79).
+  #
+  # THIS CHANGES WHAT evw_base/evw_max MEAN, so they are recalibrated with
+  # it. Under the old clip, a very low EVw was needed just to keep the
+  # collapsing diversity term relevant deep into a fill; ranked, the term
+  # has full spread at every EVw, so the sweep no longer needs an extreme
+  # low end. 0.10 -> 0.30 puts risk 1 exactly on the backtested "rank10"
+  # setting and keeps all five tiers inside the tested band (rank10 +0.223pp
+  # top-1%, rank25 +0.043pp; both non-negative on both ladder rungs).
+  # Deliberately NOT reaching the old 0.50-1.00 range: rank50/rank75
+  # regressed top-0.1% (-0.070/-0.093pp) and cardinal EVw 0.50 was the worst
+  # arm tested. Note risk 5 is no longer a pure-EV portfolio.
+  #
+  # Status: 10-slate backtest returned NO EVIDENCE at conventional
+  # significance (all four rank arms beat baseline on top-1%, 3 of 4 with
+  # positive LOSO minimums, but every bootstrap CI includes 0). Shipped on
+  # the mechanism argument -- the clip is a defect, not a design -- with a
+  # forward shadow comparison against the previous settings pending.
+  external_pool_rank_normalize: true
   external_pool_self_play_round_n_sims: 2000     # self_play: sims per round-loop pick (see self_play._ROUND_N_SIMS_DEFAULT). Clamped to the actual simulated n_sims if higher
   external_pool_self_play_precise_n_sims: 20000  # self_play: sims for the post-round-loop precision-refinement pass. 0 disables refinement entirely
   external_pool_self_play_shortlist_size: 1000   # self_play: candidates re-scored per round after round 0's full pass (see self_play.py's SHORTLIST RESTRICTION note)
   external_pool_topn_field_pool_size: 25000  # topn_coverage: one-time-per-slate opponent field pool size (ContestSimulator.generate_field)
-  external_pool_topn_rank: 10                # topn_coverage: literal rank a candidate must cross to "cover" a simulated world (top-10)
-  external_pool_topn_field_samples: 5        # topn_coverage: K independent field-pool draws per contest (anti-overfitting to one field snapshot)
+  external_pool_topn_rank: 10                # topn_coverage: literal rank a candidate must cross to "cover" a simulated world (top-10) -- floor of the effective per-contest bar, see below
+  external_pool_topn_percentile_floor: 0.001 # topn_coverage: effective rank = max(topn_rank, ceil(this * field_size_g)) -- e.g. 0.001 makes a 17,000-entry field effectively top-17. 0 = off (pure flat topn_rank)
+  external_pool_topn_field_samples: 3        # topn_coverage: K independent field-pool draws per contest (anti-overfitting to one field snapshot). 5 -> 3 on 2026-08-11: the variance decomposition (scripts/diagnose_topn_variance_decomposition.py) attributed ~95% of cross-seed portfolio variance to sim-world resampling and only ~36% to field draws, while field scoring is the dominant wall-clock cost and scales with K -- so K buys little and the freed time funds more sim worlds instead
   external_pool_topn_generated_pool_size: 0  # topn_coverage: extra candidates from the same generator the field pool uses, merged in after 9/10-overlap dedup. 0 = off (unvalidated, see models.py)
-  external_pool_topn_sims_min: 4607                     # topn_coverage sim-budget formula (ACTIVE default -- see models.py's calibration note). n_sims_g = clip(round(sims_min*(field_size/reference)^power), sims_min, n_sims)
+  external_pool_topn_generated_leverage_weight: 0.0  # topn_coverage: blend generated candidates' sampling ownership toward self-referential "optimal ownership" (leverage.py) instead of plain projected ownership. 0 = off (today's behavior, unvalidated as a generation bias -- see models.py)
+  external_pool_topn_sims_min: 9214                     # topn_coverage sim-budget formula (ACTIVE default -- see models.py's calibration note). n_sims_g = clip(round(sims_min*(field_size/reference)^power), sims_min, n_sims). 4607 -> 9214 (2x) on 2026-08-11: selector stability is monotone in sim budget (scripts/sweep_topn_sim_budget.py)
   external_pool_topn_sims_reference_field_size: 392     # topn_coverage sim-budget formula reference field size
   external_pool_topn_sims_power: 0.222                  # topn_coverage sim-budget formula power. CALIBRATED 2026-08-09 against archived slate 07222026 (single slate -- see scripts/calibrate_topn_sims_per_contest.py)
   external_pool_topn_sims_per_contest_fraction: 0.5  # topn_coverage: fallback flat fraction, used only if any of the three formula knobs above is 0

@@ -95,3 +95,39 @@ Results (2026-08-02, joint grading, 9 slates × 3 seeds, baseline
 - Dollar/ROI columns remain outlier-dominated at n=9 (baseline +99% ROI
   rests on outright contest wins); the gates, not the ROI column, are the
   decision instrument.
+
+## Backlog — open questions (not yet pre-registered)
+
+### Bit-packing density waste in topn_coverage (raised 2026-08-11)
+
+`allocate_contests_topn_coverage` stores every candidate's crossing set as a
+dense bit-plane, `(n_cand, R, K x n_sims_g / 8)` uint8. That is the right
+representation for the loose outer rung, where a large fraction of slots are
+set. It is badly wrong for tight ranks: on the 08/10 mini-MAX contest a
+rank-1 crossing set holds **1.9 set bits out of 53,775 slots — density
+3.5e-5**, i.e. ~6.7 KB spent to store ~2 bits of information (~900x waste).
+
+That waste is what makes "just raise the sim budget" look infeasible for the
+payout ladder: at the ~10x sims rank-1 would need to settle, the dense bit
+array alone is ~26 GB, against a ~11 GB ceiling.
+
+Questions to answer:
+
+1. What is the actual density-vs-rank curve across contest sizes, and where
+   does the crossover sit at which a sparse index list beats a dense bitset
+   (both in bytes and in gain-evaluation speed)?
+2. What sim headroom does a hybrid buy — sparse index lists for tight rungs,
+   dense bit-planes for loose ones — holding peak RSS at ~11 GB?
+3. `_draw_thresholds` materializes an `(n_sims_g x field_size_g)` float32
+   array (~768 MB for mini-MAX, plus an `np.partition` copy) purely to
+   extract a few per-world order statistics. Threshold extraction is
+   per-world independent, so this is chunkable over WORLDS with identical
+   results. How much does that alone decouple n_sims from peak memory?
+4. Does the greedy's per-pick popcount stay the fastest option under a
+   sparse representation, or does a lazy/priority-queue greedy (exact for
+   monotone submodular coverage) become the better lever?
+
+Not a pre-registered experiment — this is a capability question (what can we
+afford?), not a currency question (does it make money?). Its value is
+entirely instrumental: it only matters if more sim worlds turn out to buy
+real stability, which the 1x/2x/3x sweep is testing.

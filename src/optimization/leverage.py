@@ -106,3 +106,36 @@ def compute_leverage(
     diff = optimal_ownership - own
     ratio = diff / np.maximum(own, OWN_FLOOR_PCT)
     return diff, ratio
+
+
+def compute_generation_ownership_vec(
+    pool_lineups: list, sim_results, players_df: pd.DataFrame,
+    field_size: float, blend_weight: float, sharpness: float = 0.05,
+    resolution_cap: Optional[float] = None,
+) -> np.ndarray:
+    """(P,) float64 ownership vector to steer ContestSimulator.generate_field
+    when drawing GENERATED candidates for topn_coverage, aligned to
+    players_df row order.
+
+    blend_weight <= 0, or fewer than 2 lineups in pool_lineups (the
+    self-referential p_opt score is degenerate on a 0/1-lineup pool -- every
+    percentile trivially resolves to 1.0), returns players_df["ownership"]
+    unchanged, skipping compute_optimal_ownership entirely.
+
+    Otherwise returns (1 - blend_weight) * projected + blend_weight *
+    optimal, where optimal = compute_optimal_ownership(pool_lineups,
+    sim_results, players_df, {"_gen": field_size}, sharpness,
+    resolution_cap)["_gen"].
+
+    pool_lineups should be the REAL external pool (pool.lineups), not an
+    already-augmented one -- it must exist before the generated candidates
+    it's informing.
+    """
+    projected = players_df["ownership"].astype(float).to_numpy()
+    if blend_weight <= 0 or len(pool_lineups) < 2:
+        return projected
+    optimal = compute_optimal_ownership(
+        pool_lineups, sim_results, players_df, {"_gen": field_size},
+        sharpness, resolution_cap,
+    )["_gen"]
+    return (1.0 - blend_weight) * projected + blend_weight * optimal
