@@ -195,14 +195,42 @@ def main() -> None:
     # (n_half x field_n) float32 -- ~1.25 GB at production scale -- so they are
     # built and released ONE AT A TIME, keeping only the reduced (M,) p_win
     # vectors. Materializing all four would be ~5 GB for no reason.
-    pw = {}
+    pw, se2 = {}, {}
     for ftag in ("A", "B"):
         for stag in ("A", "B"):
             t0 = time.time()
             fsc = cs.score_field(fields[ftag], sims[stag], col_map)   # (n_half, field_n)
-            pw[(ftag, stag)] = ep.compute_p_win(scores[stag], fsc, exponents)
+            pw[(ftag, stag)], se2[(ftag, stag)] = ep.compute_p_win(
+                scores[stag], fsc, exponents, return_var=True,
+            )
             del fsc
             print(f"  p_win field={ftag} sims={stag}: {time.time()-t0:.0f}s")
+
+    # SHRINKAGE ARMS. Each is a deterministic per-draw transform, applied
+    # independently to both draws, so the comparison stays honest -- nothing
+    # here lets one draw see the other.
+    #
+    # Both metrics below (Spearman rho, top-k overlap) are RANK-based and so
+    # are invariant to the uniform component of the shrinkage. That is what
+    # makes this test well posed: shrinking everything harder cannot inflate
+    # them, and any movement must come from the heteroscedastic reordering.
+    #
+    # `shuffled` is the NEGATIVE CONTROL: identical marginal shrinkage, but
+    # the candidate<->variance pairing is destroyed. If it moves the metrics
+    # as much as the real arms, the effect is an artifact of shrinking rather
+    # than of shrinking the right candidates.
+    ARMS = ["raw", "shrunk_raw", "shrunk_log", "shuffled_raw"]
+    shrunk: dict = {a: {} for a in ARMS}
+    ctrl_rng = np.random.default_rng(seed + 77)
+    for combo, per_contest in pw.items():
+        for cid, vec in per_contest.items():
+            v = se2[combo][cid]
+            shrunk["raw"][(combo, cid)] = vec
+            shrunk["shrunk_raw"][(combo, cid)] = ep.shrink_p_win(vec, v, "raw")[0]
+            shrunk["shrunk_log"][(combo, cid)] = ep.shrink_p_win(vec, v, "log")[0]
+            shrunk["shuffled_raw"][(combo, cid)] = ep.shrink_p_win(
+                vec, v, "raw", se2_override=ctrl_rng.permutation(v),
+            )[0]
 
     COMPARISONS = [
         ("both",       ("A", "A"), ("B", "B")),   # production's cull vs select
@@ -224,9 +252,17 @@ def main() -> None:
         eff_admit = max(admit_n, int(round(admit_mult * len(g.entries)))) if admit_mult > 0 else admit_n
         rows = []
         for label, ka, kb in COMPARISONS:
-            a, b = pw[ka][g.contest_id], pw[kb][g.contest_id]
+          for arm in ARMS:
+            a = shrunk[arm][(ka, g.contest_id)]
+            b = shrunk[arm][(kb, g.contest_id)]
             rho = float(spearmanr(a, b).statistic) if a.std() > 0 and b.std() > 0 else float("nan")
+            _w = ep.shrink_p_win(
+                pw[ka][g.contest_id], se2[ka][g.contest_id],
+                "log" if arm == "shrunk_log" else "raw",
+            )[1]
             rows.append({
+                "arm": arm,
+                "mean_shrink_w": round(float(np.mean(_w)), 4),
                 "contest_id": g.contest_id, "contest": g.contest_name,
                 "k": len(g.entries), "implied_entries": round(implied[g.contest_id]),
                 "exponent": round(n_exp, 1), "field_n": field_n,
@@ -240,22 +276,47 @@ def main() -> None:
                 "admit_n": eff_admit,
             })
         _append_and_reload(RESULTS_CSV, g.contest_id, rows)
-        d = {r["comparison"]: r for r in rows}
+        d = {(r["comparison"], r["arm"]): r for r in rows}
         print(f"{g.contest_name[:40]:<42} k={len(g.entries):<4} n={n_exp:<7.0f} "
               f"F/n={field_n/n_exp:<7.1f}")
-        for lab in ("both", "worlds_only", "field_only"):
-            print(f"    {lab:<12} rho={d[lab]['rho']:.3f}  "
-                  f"top{eff_admit}={d[lab]['top_admit_overlap']*100:.1f}%  "
-                  f"top50={d[lab]['top50_overlap']*100:.1f}%")
+        for arm in ARMS:
+            r = d[("both", arm)]
+            base = d[("both", "raw")]
+            print(f"    both/{arm:<13} rho={r['rho']:.4f} ({r['rho']-base['rho']:+.4f})  "
+                  f"top50={r['top50_overlap']*100:5.1f}% ({(r['top50_overlap']-base['top50_overlap'])*100:+5.1f})  "
+                  f"top{eff_admit}={r['top_admit_overlap']*100:.1f}%  w={r['mean_shrink_w']:.3f}")
 
     df = pd.read_csv(RESULTS_CSV)
-    print("\n=== p_win reliability by comparison (entry-weighted) ===")
-    for lab, sub in df.groupby("comparison"):
+    print("\n=== SHRINKAGE TEST: agreement between the two independent draws ===")
+    print("    (comparison='both' = production's p_win_cull vs p_win_select)")
+    b = df[df.comparison == "both"]
+    base_rho = np.average(b[b.arm == "raw"]["rho"], weights=b[b.arm == "raw"]["k"])
+    base_t50 = np.average(b[b.arm == "raw"]["top50_overlap"], weights=b[b.arm == "raw"]["k"])
+    for arm in ["raw", "shrunk_raw", "shrunk_log", "shuffled_raw"]:
+        sub = b[b.arm == arm]
+        if sub.empty:
+            continue
+        w = sub["k"]
+        r = np.average(sub["rho"], weights=w)
+        t = np.average(sub["top50_overlap"], weights=w)
+        a = np.average(sub["top_admit_overlap"], weights=w)
+        print(f"  {arm:<14} rho {r:.4f} ({r-base_rho:+.4f})   "
+              f"top50 {t*100:5.1f}% ({(t-base_t50)*100:+5.1f})   "
+              f"top_admit {a*100:5.1f}%   mean w {sub['mean_shrink_w'].mean():.3f}")
+    print("\n  VERDICT KEY: a real effect needs shrunk_* > raw AND "
+          "shrunk_* > shuffled_raw.\n  Rank metrics are invariant to uniform "
+          "shrinkage, so movement can only come from reordering.")
+    print("\n=== per-contest, by exponent (comparison='both') ===")
+    piv = b.pivot_table(index=["contest", "k", "exponent"], columns="arm",
+                        values="rho").sort_index(level="exponent")
+    print(piv.round(4).to_string())
+    print("\n=== axis decomposition (arm='raw') ===")
+    for lab, sub in df[df.arm == "raw"].groupby("comparison"):
         w = sub["k"]
         print(f"  {lab:<12} rho {np.average(sub['rho'], weights=w):.3f}   "
               f"top_admit {np.average(sub['top_admit_overlap'], weights=w)*100:5.1f}%   "
               f"top50 {np.average(sub['top50_overlap'], weights=w)*100:5.1f}%")
-    both = df[df.comparison == "both"].sort_values("exponent")
+    both = df[(df.comparison == "both") & (df.arm == "raw")].sort_values("exponent")
     print("\n=== predicted vs observed, by contest (comparison='both') ===")
     print(both[["contest", "k", "exponent", "field_lineups_above_bar",
                 "predicted_rel_err", "rho", "top_admit_overlap"]].to_string(index=False))

@@ -1540,7 +1540,8 @@ def compute_p_win(
     chunk: int = 1000,
     stop_check: Optional[Callable[[], bool]] = None,
     progress_cb: Optional[Callable[[int, int], None]] = None,
-) -> dict[str, np.ndarray]:
+    return_var: bool = False,
+):
     """The `p_win` EV currency: `{key: (M,) float64}` of
     `mean_over_worlds(percentile ** exponents[key])` for every requested
     exponent, computed in one pass over the simulated worlds.
@@ -1561,10 +1562,25 @@ def compute_p_win(
     (M, C) pool scores, (C, F) sorted field scores and (M, C) percentiles —
     tens of MB — accumulating mean(q**n) per exponent into one (M,) float64
     each, mirroring ContestScorer's rule that tail metrics stay reduced
-    accumulators, never a second (M, n_sims) matrix."""
+    accumulators, never a second (M, n_sims) matrix.
+
+    `return_var=True` returns `(means, se2)` instead of just `means`, where
+    `se2[key]` is the SQUARED STANDARD ERROR of each candidate's own
+    `mean_over_worlds(q**n)` -- `Var_w(q**n) / n_worlds`. It costs one extra
+    reduced `(M,)` accumulator per exponent (a sum of squares alongside the
+    sum already taken): ~16% on this function's inner loop, nothing
+    meaningful in memory, so one pass yields both.
+
+    This has to be PER CANDIDATE rather than a single per-contest reliability
+    number, because the selector ranks `EVn = _rank_pct(ev)` and a scalar
+    shrinkage is a MONOTONE transform -- it leaves every percentile rank
+    untouched and so cannot reorder anything. Only the heteroscedastic part
+    (candidates differing in `se`) moves the ranking. See `shrink_p_win`.
+    """
     M, S = pool_scores.shape
     F = field_scores.shape[1]
     acc = {k: np.zeros(M, dtype=np.float64) for k in exponents}
+    acc_sq = {k: np.zeros(M, dtype=np.float64) for k in exponents} if return_var else None
     n_chunks = (S + chunk - 1) // chunk
     n_done = 0
     for ci, s0 in enumerate(range(0, S, chunk)):
@@ -1579,7 +1595,11 @@ def compute_p_win(
         np.clip(q, 0.5 / (F + 1), 1.0 - 0.5 / (F + 1), out=q)
         qd = q.astype(np.float64)
         for key, n_exp in exponents.items():
-            acc[key] += np.power(qd, n_exp).sum(axis=1)
+            pk = np.power(qd, n_exp)
+            acc[key] += pk.sum(axis=1)
+            if acc_sq is not None:
+                acc_sq[key] += np.square(pk).sum(axis=1)
+            del pk
         n_done += c
         if progress_cb is not None:
             progress_cb(ci + 1, n_chunks)
@@ -1589,7 +1609,121 @@ def compute_p_win(
     if n_done > 0:
         for key in acc:
             acc[key] /= n_done
-    return acc
+    if acc_sq is None:
+        return acc
+    se2 = {}
+    for key in acc:
+        if n_done > 1:
+            # Unbiased world-level variance, then the standard error OF THE
+            # MEAN over the worlds actually processed (n_done, not S -- a
+            # stop_check interruption must not under-divide here either).
+            var_w = (acc_sq[key] - n_done * acc[key] ** 2) / (n_done - 1)
+            se2[key] = np.maximum(var_w, 0.0) / n_done
+        else:
+            se2[key] = np.zeros_like(acc[key])
+    return acc, se2
+
+
+def shrink_p_win(
+    ev: np.ndarray, se2: np.ndarray, scale: str = "raw",
+    se2_override: Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-candidate empirical-Bayes shrinkage of a p_win vector.
+    Returns `(shrunk_ev, weights)`.
+
+    **DISCONFIRMED 2026-08-17 -- NOT WIRED, DO NOT RE-PROPOSE.** Built to fix
+    the winner's curse at the top of a noisy p_win ranking (two independent
+    draws agree on only 37.5% of their top 50). Measured with
+    scripts/eval_pwin_reliability.py on the 08/17 slate, 9 contests,
+    entry-weighted agreement between production's own `p_win_cull` and
+    `p_win_select` draws:
+
+        raw            rho 0.8797   top50 37.5%
+        shrunk_raw     rho 0.8793   top50 36.3%
+        shrunk_log     rho 0.8792   top50 37.2%
+        shuffled_raw   rho 0.8781   top50 33.9%   (negative control)
+
+    Neither arm beats raw, on any contest, on either metric. The negative
+    control confirms the machinery works -- real variances beat shuffled ones
+    by 1.2-2.4pp of top-50 overlap -- so this is a genuine null, not a bug.
+
+    WHY it fails, which is the useful part: the mean shrinkage weight is
+    0.93, i.e. between-candidate spread in true p_win already exceeds
+    sampling variance ~13x, so EB says "keep 93% of the observed signal" and
+    there is almost no heteroscedasticity left to exploit. Shrinkage trades
+    bias for variance; with the variance saving that small, the bias from any
+    slight misspecification (p_win's skew) costs more than it saves. That is
+    exactly the observed sign.
+
+    WHAT SURVIVES: the `se2` accumulator this needs
+    (`compute_p_win(return_var=True)`) is an excellent free RELIABILITY METER.
+    Per contest, `mean(weights)` tracks the measured split-half rho with
+    Spearman +1.000 across all 9 contests and mean |w - rho| = 0.006 -- so a
+    single pass now yields what previously required the whole two-draw A/B
+    comparison. Keep that; the shrinkage itself is dead.
+
+    Model: `true_i ~ N(m, tau^2)` and `observed_i | true_i ~ N(true_i, se_i^2)`,
+    so the posterior mean is
+
+        shrunk_i = m + [ tau^2 / (tau^2 + se_i^2) ] * (observed_i - m)
+
+    with `tau^2` by method of moments: `Var(observed) - mean(se_i^2)`, floored
+    at 0. No tuning knob -- the shrinkage calibrates itself from the same pass
+    that produced `ev` (`compute_p_win(return_var=True)`).
+
+    WHY PER CANDIDATE. A single per-contest reliability factor is a monotone
+    transform of `ev`, and the selector ranks `EVn = _rank_pct(ev)` -- so a
+    uniform shrinkage provably cannot change a single pick. Only the
+    HETEROSCEDASTIC part reorders. That is also why any evaluation of this
+    must use rank-based statistics (Spearman, top-k overlap): they are
+    invariant to the uniform component by construction, so an improvement in
+    them cannot be manufactured by simply shrinking everything harder.
+
+    Direction is right for this currency rather than generically: `q**n` is
+    bounded in [0,1] and rare, so `Var_w(q**n)` grows with `E[q**n]` and the
+    highest-p_win candidates carry the largest absolute `se`. They are
+    therefore shrunk hardest -- which is exactly the winner's-curse
+    correction the top of a noisy ranking needs.
+
+    `scale`:
+      "raw"  shrink on the p_win scale directly.
+      "log"  shrink `log(ev)` instead, with the delta-method variance
+             `se2 / ev^2`. p_win is violently right-skewed (`q**n` spans
+             orders of magnitude), which is the assumption the Gaussian model
+             is most likely to violate; the log scale is far closer to normal.
+             Both are provided because deciding between them is an empirical
+             question, not a modelling preference.
+
+    `se2_override` substitutes an alternative variance vector, used only by
+    the NEGATIVE CONTROL in scripts/eval_pwin_reliability.py (a shuffled
+    `se2`, which keeps the shrinkage's marginal distribution identical while
+    destroying the candidate<->variance pairing). If a shuffled control moves
+    the agreement metrics as much as the real thing, the effect is an
+    artifact of shrinking per se and not of shrinking the RIGHT candidates.
+    """
+    ev = np.asarray(ev, dtype=np.float64)
+    v = np.asarray(se2 if se2_override is None else se2_override, dtype=np.float64)
+    if scale == "log":
+        # Delta method: Var(log X) ~ Var(X) / X^2. Floor `ev` at the smallest
+        # strictly positive value present (q**n underflows to exactly 0 for
+        # hopeless candidates) so the log is finite and those candidates stay
+        # at the bottom rather than becoming -inf and dragging m with them.
+        pos = ev[ev > 0]
+        floor = float(pos.min()) if pos.size else 1.0
+        ev_f = np.maximum(ev, floor)
+        v = v / np.square(ev_f)
+        ev = np.log(ev_f)
+    m = float(ev.mean())
+    tau2 = float(ev.var(ddof=1) - v.mean())
+    if not np.isfinite(tau2) or tau2 <= 0:
+        # Every bit of observed spread is explainable as sampling noise, so
+        # the model says there is no signal to keep. Collapsing to a constant
+        # would hand the selector an EV term that orders nothing, which is a
+        # worse failure than doing nothing -- return the input untouched and
+        # let the caller see weights of 1.
+        return ev, np.ones_like(ev)
+    w = tau2 / (tau2 + v)
+    return m + w * (ev - m), w
 
 
 def allocate_contests(

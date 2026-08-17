@@ -3323,6 +3323,101 @@ class TestTopnCoveragePayoutLadder:
         assert {id(x) for x, _ in alloc.portfolio} == {id(lineups[0]), id(lineups[1])}
 
 
+class TestComputePWinReturnVar:
+    """compute_p_win(return_var=True): the extra reduced accumulator that feeds
+    per-candidate shrinkage."""
+
+    def _fixture(self, S=400, M=6, F=50):
+        rng = np.random.default_rng(11)
+        pool_scores = rng.normal(130, 20, size=(M, S)).astype(np.float32)
+        field_scores = rng.normal(120, 20, size=(S, F)).astype(np.float32)
+        return pool_scores, field_scores, {"c": 8.0}
+
+    def test_means_are_unchanged_by_asking_for_variance(self):
+        ps, fs, exps = self._fixture()
+        plain = compute_p_win(ps, fs, exps)
+        means, _ = compute_p_win(ps, fs, exps, return_var=True)
+        np.testing.assert_allclose(plain["c"], means["c"], rtol=0, atol=0)
+
+    def test_se2_matches_the_direct_world_variance(self):
+        ps, fs, exps = self._fixture()
+        _, se2 = compute_p_win(ps, fs, exps, return_var=True)
+        # Recompute q**n explicitly and take Var/n over worlds.
+        S, F = fs.shape
+        q = np.empty((ps.shape[0], S))
+        srt = np.sort(fs, axis=1)
+        for j in range(S):
+            q[:, j] = np.searchsorted(srt[j], ps[:, j], side="left") / F
+        q = np.clip(q, 0.5 / (F + 1), 1.0 - 0.5 / (F + 1))
+        expected = (q ** exps["c"]).var(axis=1, ddof=1) / S
+        np.testing.assert_allclose(se2["c"], expected, rtol=1e-6, atol=1e-12)
+
+    def test_se2_is_never_negative(self):
+        # The (sumsq - n*mean^2) form can go slightly negative on a
+        # near-constant candidate through float cancellation; it is clamped.
+        ps, fs, exps = self._fixture()
+        ps[:] = 130.0                      # every candidate identical
+        _, se2 = compute_p_win(ps, fs, exps, return_var=True)
+        assert (se2["c"] >= 0).all()
+
+
+class TestShrinkPWin:
+    """shrink_p_win: per-candidate empirical-Bayes shrinkage."""
+
+    def test_uniform_variance_cannot_change_the_ranking(self):
+        # THE LOAD-BEARING PROPERTY. With equal se the shrinkage is a monotone
+        # transform, and the selector ranks EVn = _rank_pct(ev), so a uniform
+        # shrinkage provably cannot move a single pick.
+        ev = np.array([0.001, 0.004, 0.002, 0.010, 0.003])
+        se2 = np.full(5, 1e-7)
+        out, w = ep.shrink_p_win(ev, se2)
+        assert np.allclose(w, w[0])
+        np.testing.assert_array_equal(np.argsort(ev), np.argsort(out))
+
+    def test_heteroscedastic_variance_does_reorder(self):
+        # Two candidates close in ev but far apart in se must swap.
+        ev = np.array([0.010, 0.0099, 0.002, 0.003, 0.004, 0.005])
+        se2 = np.array([9e-6, 1e-12, 1e-12, 1e-12, 1e-12, 1e-12])
+        out, w = ep.shrink_p_win(ev, se2)
+        assert w[0] < w[1]                       # the noisy one is shrunk harder
+        assert ev[0] > ev[1] and out[0] < out[1]  # ...and loses the top spot
+
+    def test_shrinkage_pulls_toward_the_mean_and_never_past_it(self):
+        rng = np.random.default_rng(4)
+        ev = rng.lognormal(-6, 1.5, size=500)
+        se2 = rng.uniform(1e-9, 1e-7, size=500)
+        out, w = ep.shrink_p_win(ev, se2)
+        m = ev.mean()
+        assert ((0.0 <= w) & (w <= 1.0)).all()
+        assert (np.abs(out - m) <= np.abs(ev - m) + 1e-12).all()
+        assert np.sign(out - m) @ np.sign(ev - m) == len(ev)  # never crosses m
+
+    def test_no_signal_returns_the_input_untouched(self):
+        # When every bit of spread is explainable as sampling noise, tau^2 <= 0.
+        # Collapsing to a constant would give the selector an EV term that
+        # orders nothing, so the input is returned instead.
+        ev = np.array([0.001, 0.0011, 0.0009, 0.00105])
+        out, w = ep.shrink_p_win(ev, np.full(4, 1.0))
+        np.testing.assert_array_equal(ev, out)
+        assert np.allclose(w, 1.0)
+
+    def test_log_scale_is_finite_when_some_candidates_underflow_to_zero(self):
+        # q**n underflows to exactly 0 for hopeless candidates; the log arm
+        # must floor rather than produce -inf.
+        ev = np.array([0.0, 0.0, 1e-8, 1e-6, 1e-4])
+        se2 = np.array([1e-20, 1e-20, 1e-18, 1e-14, 1e-11])
+        out, w = ep.shrink_p_win(ev, se2, scale="log")
+        assert np.isfinite(out).all() and np.isfinite(w).all()
+        assert out[-1] == out.max()   # ordering of the live candidates survives
+
+    def test_se2_override_drives_the_weights(self):
+        # The negative control's mechanism: same ev, permuted variances.
+        ev = np.array([0.01, 0.008, 0.006, 0.004, 0.002])
+        se2 = np.array([1e-6, 1e-9, 1e-9, 1e-9, 1e-9])
+        _, w_real = ep.shrink_p_win(ev, se2)
+        _, w_ctrl = ep.shrink_p_win(ev, se2, se2_override=se2[::-1])
+        assert np.argmin(w_real) == 0 and np.argmin(w_ctrl) == len(ev) - 1
+
 class TestPoolCorrMaxSims:
     """compute_pool_corr(max_sims=...): caps the worlds the DIVERSITY term's
     correlation is estimated from, so simulation.n_sims can be raised for
