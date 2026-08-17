@@ -452,6 +452,24 @@ class GppConfig(BaseModel):
     external_pool_topn_sims_min: int = 9_214
     external_pool_topn_sims_reference_field_size: int = 392
     external_pool_topn_sims_power: float = 0.222
+    # topn_coverage: SMOOTHED EXCEEDANCE. 0.0 (default) = the original hard
+    # crossing indicator `1[score >= threshold]`. > 0 replaces it with
+    # `P(threshold <= score)` under the rank-N order statistic's own sampling
+    # distribution, whose sd in FPTS is
+    # `sqrt(N*(1-N/F)) * dScore/dRank` -- a Rao-Blackwellization of the
+    # indicator (strictly lower variance, unbiased for "would this cross a
+    # freshly drawn field"). This attacks the binding constraint on every
+    # top-heavy objective here: at rank 1 the hard indicator fires ~1.9 times
+    # per candidate, split-half rho_full ~0.30
+    # (scripts/diagnose_topn_rung_settling.py).
+    # 1.0 = the statistically implied width; < 1 sharper, > 1 more aggressive.
+    # See allocate_contests_topn_coverage's docstring in external_pool.py.
+    # Set external_pool_topn_field_samples: 1 alongside this -- the K draws
+    # Monte-Carlo the same threshold noise tau integrates analytically, so
+    # keeping K > 1 only multiplies the soft array's memory.
+    # DEFAULT OFF pending walk-forward validation, same posture as every other
+    # speculative topn_coverage knob here.
+    external_pool_topn_smooth_tau_scale: float = 0.0
     # External pool mode: per-contest ROI percentile floor for the pre-Det
     # cull (see allocate_contests in src/api/external_pool.py). A raw ROI
     # cutoff doesn't generalize across contests of different sizes/payout

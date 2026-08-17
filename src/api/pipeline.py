@@ -2978,6 +2978,7 @@ class PipelineRunner:
                 sims_per_contest_fraction=_topn_sims_fraction,
                 sims_min=_topn_sims_min, sims_reference_field_size=_topn_sims_ref,
                 sims_power=_topn_sims_power, rng_seed=_rng_seed,
+                smooth_tau_scale=float(gpp_cfg.get("external_pool_topn_smooth_tau_scale", 0.0)),
                 is_generated=_topn_is_generated,
                 stop_check=self._stop_check, progress_cb=_topn_progress,
             )

@@ -26,6 +26,7 @@ from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
+from scipy.special import expit as _expit
 from scipy.stats import norm
 
 from src.api.dk_entries import EntryRecord, _parse_prize_pool_cents
@@ -2640,6 +2641,83 @@ def compute_pool_e_dupes(
     )
 
 
+# Logistic approximation to the standard normal CDF: `expit(1.702 * z)` is
+# within ~0.01 of `Phi(z)` everywhere, and is roughly an order of magnitude
+# cheaper than `scipy.stats.norm.cdf` over the (n_cand x R x n_slots) array
+# `_soft_crossing` builds. The 1.702 lives here rather than being folded into
+# tau so that tau keeps its literal meaning: one standard deviation of the
+# threshold's own sampling distribution, in FPTS.
+_LOGISTIC_NORMAL_SCALE = 1.702
+# Floor on tau so a degenerate bracket (ties in the field scores, or a field
+# too small to bracket the rung) divides by a tiny positive number instead of
+# zero. `expit` saturates cleanly at that point, so the smoothed crossing
+# degrades to the exact hard indicator rather than producing NaNs.
+_SMOOTH_TAU_FLOOR = 1e-6
+
+
+def _rung_bracket_ranks(rank: int, field_size: int) -> tuple[int, int]:
+    """`(lo, hi)` ranks bracketing `rank`, used to finite-difference the field's
+    local score-vs-rank slope at the threshold.
+
+    Geometric (`rank/2`, `2*rank`) rather than additive because the field's
+    score-vs-rank curve is far steeper at rank 1 than at rank 100 -- a fixed
+    +/-5 window is most of the curve at the top and a pinprick further down.
+    Clipped to `[1, field_size]`, and widened by one if the clip collapses the
+    bracket (tiny fields), so the caller's `hi - lo` denominator is never 0."""
+    F = max(int(field_size), 1)
+    # Clip the rank itself first: a rung rank past the field size would make
+    # `lo` index past the end of the partitioned score array.
+    rank = int(np.clip(int(rank), 1, F))
+    lo = max(1, rank // 2)
+    hi = min(F, rank * 2)
+    if hi <= lo:
+        # `hi` cannot widen past the field, so widen DOWNWARD instead. F == 1
+        # is genuinely degenerate (a one-lineup field has no second order
+        # statistic to difference against) and returns lo == hi; the caller
+        # differences equal values there, getting slope 0 -> tau 0 -> the exact
+        # hard indicator, which is the right behaviour for "no slope
+        # information available".
+        lo = max(1, hi - 1)
+    return lo, hi
+
+
+def smoothing_tau(
+    part: np.ndarray, rank: int, field_size: int, tau_scale: float = 1.0,
+) -> np.ndarray:
+    """Per-world smoothing width tau (FPTS) for the rank-`rank` threshold.
+
+    `part`: `(n_worlds, field_size)` array of that world's field scores, already
+    passed through `np.partition` with (at least) the kth positions
+    `-rank`, `-lo`, `-hi` for this rank's `_rung_bracket_ranks` bracket --
+    i.e. `part[:, -r]` is the r-th LARGEST score. Only those positions are read,
+    so a partially-partitioned array is fine (which is the point: the caller
+    already has one, and a full sort would cost far more).
+
+    The rank-`rank` threshold is a sampled ORDER STATISTIC, not a constant. Its
+    rank has sampling sd `sqrt(rank * (1 - rank/field_size))`; multiplying by
+    the field's local score-vs-rank slope converts that to FPTS:
+
+        tau = tau_scale * sqrt(rank * (1 - rank/F)) * dScore/dRank|_rank
+
+    Returned as float32 and clamped at 0 -- a non-monotone bracket (exact ties
+    in the field scores) or a degenerate one (`lo == hi`, only possible for a
+    one-lineup field) yields tau 0, which the caller's logistic saturates into
+    the exact hard indicator. That is the correct degradation for "no slope
+    information available", not an error case.
+
+    Shared by `allocate_contests_topn_coverage`'s smoothed path and
+    `scripts/eval_topn_smoothed_exceedance.py`, so the measured variance
+    reduction is measured on the formula production actually uses."""
+    F = max(int(field_size), 1)
+    r = int(np.clip(int(rank), 1, F))
+    lo, hi = _rung_bracket_ranks(r, F)
+    # max(hi - lo, 1): when the bracket degenerates the numerator is exactly 0,
+    # so this yields slope 0 rather than dividing by zero.
+    slope = (part[:, -lo] - part[:, -hi]) / float(max(hi - lo, 1))
+    rank_sd = np.sqrt(max(r * (1.0 - r / F), 0.0))
+    return (float(tau_scale) * rank_sd * np.maximum(slope, 0.0)).astype(np.float32)
+
+
 def allocate_contests_topn_coverage(
     pool: ExternalPool,
     sim_results,
@@ -2663,6 +2741,7 @@ def allocate_contests_topn_coverage(
     e_dupes: Optional[np.ndarray] = None,
     payout_rungs: int = 0,
     payout_tightest_rank: int = 1,
+    smooth_tau_scale: float = 0.0,
     is_generated: Optional[np.ndarray] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     progress_cb: Optional[Callable[[dict], None]] = None,
@@ -2806,6 +2885,66 @@ def allocate_contests_topn_coverage(
     pick's `ev`, so the dumped "slots claimed" figure keeps its meaning and
     stays comparable across runs with and without the discount.
 
+    `smooth_tau_scale > 0` switches the objective from HARD crossing
+    indicators to SMOOTHED EXCEEDANCE, the variance-reduction fix for the
+    rare-event estimator this whole mechanism rests on. `0.0` (the default)
+    keeps the exact bit-packed hard-indicator behavior described above.
+
+    The problem: `1[candidate_score >= threshold]` throws away everything
+    except a Bernoulli draw whose success probability is ~1e-4 at a tight
+    rung. Nearly every world contributes a literal 0, so a candidate's whole
+    claim rate rests on a handful of events -- measured at ~1.9 events per
+    candidate at rank 1, split-half `rho_full` ~0.30 (see
+    scripts/diagnose_topn_rung_settling.py). No amount of downstream
+    objective design survives an input that noisy.
+
+    The fix: the rank-N threshold is itself a SAMPLED order statistic, not a
+    constant. Its sampling distribution is asymptotically normal with
+    `sd(rank) = sqrt(N * (1 - N/F))` in RANK units; multiplying by the field's
+    local score-vs-rank slope (finite-differenced across
+    `_rung_bracket_ranks`) converts that to FPTS:
+
+        tau = smooth_tau_scale * sqrt(N * (1 - N/F)) * dScore/dRank|_N
+
+    Replacing the indicator with `P(threshold <= candidate_score)` --
+    `Phi((score - thr) / tau)`, via the logistic approximation -- is a
+    Rao-Blackwellization: it is the conditional expectation of the indicator
+    given the estimated threshold distribution, so by the law of total
+    variance it has strictly lower variance and is UNBIASED for the quantity
+    we actually care about ("would this cross a freshly drawn field of this
+    size", rather than "did it cross the one field we happened to draw").
+    Every world now contributes a graded margin instead of an almost-always-
+    zero bit.
+
+    `smooth_tau_scale` scales that derived width: `1.0` is the statistically
+    implied smoothing, below 1 is sharper (closer to hard), above 1 is more
+    aggressive. As it approaches 0 the logistic saturates and this reproduces
+    the hard indicator exactly.
+
+    Two structural consequences, both deliberate:
+
+    * `field_samples` (K) becomes largely redundant and should be set to 1.
+      The K draws were a MONTE CARLO integration over exactly the threshold
+      noise that tau now integrates analytically. Keeping K > 1 still works
+      (it also samples field COMPOSITION, not just the order statistic) but
+      multiplies the soft array's memory by K for little added information.
+    * Relaxation and coverage-wave resets stop firing. Both exist because a
+      hard bar leaves most candidates crossing in exactly ZERO worlds, so the
+      greedy runs out of anything to distinguish; a smoothed gain is strictly
+      positive everywhere, so the mechanism self-relaxes. The loop keeps a
+      `gain <= 0` guard for the fully-depleted case but reports 0 for both
+      counters.
+
+    Coverage bookkeeping becomes soft to match: `resid` starts at 1.0 per
+    (rung, draw, world) and each pick multiplies it by `(1 - p)`, so
+    `1 - resid` reads as P(at least one selected entry crosses here) under an
+    independence approximation -- the same soft-coverage depletion rule
+    `allocate_contests_coverage` already uses, and the direct generalization
+    of the hard version's AND-NOT. Cost: the soft array is float32 rather
+    than bit-packed (32x the crossing-bit array, which is not the dominant
+    transient -- the `(n_sims_g, field_size_g)` field-score array is), and
+    each pick's gain is one BLAS matvec rather than a popcount.
+
     `is_generated`, if given, is a `(M,)` boolean mask aligned with
     `pool.lineups` (see `augment_topn_pool_with_generated`, which builds
     `pool.lineups` as `real_lineups + generated_lineups` so `is_generated =
@@ -2821,6 +2960,14 @@ def allocate_contests_topn_coverage(
     M = len(pool.lineups)
     n_sims = sim_results.results_matrix.shape[0]
     K = max(1, int(field_samples))
+    use_smooth = float(smooth_tau_scale) > 0.0
+    if use_smooth and K > 1:
+        logger.info(
+            "topn_coverage: smooth_tau_scale=%.3g with field_samples=%d -- the K "
+            "draws integrate the same threshold noise tau handles analytically, "
+            "so K=1 is the intended setting (K=%d multiplies the soft array by %d).",
+            smooth_tau_scale, K, K, K,
+        )
 
     # Resolve field_lineups' player_ids to sim-matrix column indices ONCE
     # (cheap -- doesn't scale with n_sims) rather than re-resolving them on
@@ -2922,15 +3069,33 @@ def allocate_contests_topn_coverage(
             rung_weights = np.array([1.0], dtype=np.float64)
         R = len(rung_ranks)
 
-        def _draw_thresholds() -> np.ndarray:
-            """(R, K, n_sims_g) float32 -- one threshold plane per rung.
+        # Bracket ranks for the local score-vs-rank slope behind tau. Computed
+        # once per contest (they depend only on the rung ranks and this
+        # contest's field size), and folded into the SAME partition call that
+        # already extracts the thresholds -- so smoothing costs no extra pass
+        # over the big field-score array, only a couple more kth positions.
+        _brackets = [_rung_bracket_ranks(int(r), field_size_g) for r in rung_ranks]
 
-            All R order statistics come from ONE `np.partition` call per field
-            draw (it accepts a sequence of kth), so adding rungs costs no extra
-            passes over the big field-score array; that array is still built
-            and discarded exactly as before."""
+        def _draw_thresholds() -> tuple[np.ndarray, Optional[np.ndarray]]:
+            """`(thr, tau)`, each `(R, K, n_sims_g)` float32 -- one plane per
+            rung. `tau` is None unless smoothing is on.
+
+            All order statistics come from ONE `np.partition` call per field
+            draw (it accepts a sequence of kth), so adding rungs -- or the
+            bracket ranks smoothing needs -- costs no extra passes over the big
+            field-score array; that array is still built and discarded exactly
+            as before.
+
+            tau is the threshold's own sampling standard deviation in FPTS:
+            `sd(rank) * dScore/dRank`, finite-differenced across the rung's
+            bracket. Clamped at 0 because a non-monotone bracket (exact ties in
+            the field scores) would otherwise produce a negative width."""
             thr = np.empty((R, K, n_sims_g), dtype=np.float32)
-            kths = np.unique(-rung_ranks)  # negative == from the top
+            tau = np.empty((R, K, n_sims_g), dtype=np.float32) if use_smooth else None
+            wanted = set(int(r) for r in rung_ranks)
+            if use_smooth:
+                wanted |= {b for pair in _brackets for b in pair}
+            kths = np.unique(-np.array(sorted(wanted), dtype=np.int64))  # negative == from the top
             for kk in range(K):
                 subset = rng.choice(field_pool_size, size=field_size_g, replace=False)
                 field_batch_scores = _score_field_cols_batched(
@@ -2939,8 +3104,12 @@ def allocate_contests_topn_coverage(
                 part = np.partition(field_batch_scores, kths, axis=1)
                 for r, rank in enumerate(rung_ranks):
                     thr[r, kk] = part[:, -int(rank)]
+                    if use_smooth:
+                        tau[r, kk] = smoothing_tau(
+                            part, int(rank), field_size_g, smooth_tau_scale,
+                        )
                 del part
-            return thr
+            return thr, tau
 
         def _crossing_bits(thr: np.ndarray) -> np.ndarray:
             """(len(rem_all), R, n_bytes_g) uint8, chunked over candidates.
@@ -2963,6 +3132,36 @@ def allocate_contests_topn_coverage(
                     )
             return bits
 
+        def _soft_crossing(thr: np.ndarray, tau: np.ndarray) -> np.ndarray:
+            """(len(rem_all), R, n_slots) float32 -- the smoothed counterpart of
+            `_crossing_bits`, holding P(cross) in [0, 1] instead of a packed bit.
+
+            Same rung-major, (K, n_sims_g)-flattened slot layout as the bit
+            version, so `resid` and the reporting code index it identically.
+            Chunked over candidates for the same reason `_crossing_bits` is: the
+            per-batch scratch is the only thing that scales with the batch, and
+            materializing the whole (n_cand, R, K, n_sims_g) z-array at once
+            would double this function's peak for no benefit.
+
+            Note the output itself is NOT transient -- it is held for the whole
+            contest's pick loop, which is what makes float32 (vs the bit
+            version's 1 bit/slot) the real memory cost of smoothing."""
+            n_cand = cand_sub.shape[0]
+            soft = np.empty((n_cand, R, n_slots), dtype=np.float32)
+            tau_eff = np.maximum(tau, _SMOOTH_TAU_FLOOR)
+            for start in range(0, n_cand, candidate_batch_size):
+                end = min(start + candidate_batch_size, n_cand)
+                batch = cand_sub[start:end]                   # (b, n_sims_g)
+                z = np.empty((end - start, K, n_sims_g), dtype=np.float32)
+                for r in range(R):
+                    for kk in range(K):
+                        np.subtract(batch, thr[r, kk][None, :], out=z[:, kk, :])
+                        np.divide(z[:, kk, :], tau_eff[r, kk][None, :], out=z[:, kk, :])
+                    soft[start:end, r, :] = _expit(
+                        _LOGISTIC_NORMAL_SCALE * z.reshape(end - start, n_slots)
+                    )
+            return soft
+
         def _fresh_uncovered() -> np.ndarray:
             """(R, n_bytes_g) -- one uncovered plane per rung."""
             u = np.full((R, n_bytes_g), 0xFF, dtype=np.uint8)
@@ -2980,8 +3179,29 @@ def allocate_contests_topn_coverage(
             )
             dupe_weight = 1.0 / (1.0 + _ed_g)
 
-        thresholds = _draw_thresholds()
-        bits = _crossing_bits(thresholds)
+        thresholds, taus = _draw_thresholds()
+        soft = bits = None
+        if use_smooth:
+            _soft_gb = len(rem_all) * R * n_slots * 4 / 1e9
+            logger.info(
+                "topn_coverage smooth: contest %s -- soft array %d cand x %d rung x "
+                "%d slots = %.2f GB (tau median %.3f FPTS)",
+                g.contest_id, len(rem_all), R, n_slots, _soft_gb,
+                float(np.median(taus)),
+            )
+            soft = _soft_crossing(thresholds, taus)
+            # `resid[r, s]` = P(no entry picked so far crosses rung r in slot s).
+            # Starts at 1 (nothing covered) and is multiplied down by (1 - p) on
+            # every pick, so `1 - resid` is the accumulated coverage probability
+            # -- the soft analogue of BOTH `uncovered` and `ever_covered` at
+            # once, since it neither resets (no waves) nor loses history.
+            resid = np.ones((R, n_slots), dtype=np.float32)
+            # Flattened rung-major view (free -- `soft` is C-contiguous), so each
+            # pick's gain is one (n_cand, R*n_slots) @ (R*n_slots,) matvec
+            # instead of an einsum over three axes.
+            soft_flat = soft.reshape(soft.shape[0], R * n_slots)
+        else:
+            bits = _crossing_bits(thresholds)
         remaining_local = np.ones(len(rem_all), dtype=bool)
         uncovered = _fresh_uncovered()
         # Unlike `uncovered` (reset to all-1s on every coverage wave, so it
@@ -3005,7 +3225,51 @@ def allocate_contests_topn_coverage(
                 "contest_index": contest_index, "contests_total": len(groups),
                 "sim_lap": sim_allocator.lap,
             })
-        while len(picks_local) < target:
+        while use_smooth and len(picks_local) < target:
+            if stop_check is not None and stop_check():
+                break
+            # Soft gain: expected number of (rung, draw, world) slots this
+            # candidate newly covers, payout-weighted across rungs. One matvec
+            # over the flattened soft array -- the direct analogue of the hard
+            # path's `popcount(bits & uncovered)`, with `resid` (a probability)
+            # in place of `uncovered` (a bit).
+            rw = (resid * rung_weights[:, None].astype(np.float32)).ravel()
+            score = soft_flat @ rw
+            score[~remaining_local] = -1.0
+            if dupe_weight is not None:
+                # Same invariant as the hard path: weights are in (0, 1] and
+                # non-remaining rows are already -1, so this preserves them.
+                score = score * dupe_weight
+            best_local = int(np.argmax(score))
+            if score[best_local] <= 0:
+                # Only reachable once `resid` has been driven to ~0 everywhere
+                # (or every candidate is spent). Unlike the hard path there is
+                # nothing to relax -- a smoothed gain is positive wherever any
+                # residual remains -- so stop filling rather than spin.
+                break
+            # Reported `ev`: the outer rung's newly covered mass at pick time,
+            # in the same (draw, world) slot units as the hard path's popcount,
+            # so the dumped figure stays comparable between the two modes.
+            f = float(soft[best_local, R - 1] @ resid[R - 1])
+            picks_local.append(best_local)
+            picks_ev.append(f)
+            remaining_local[best_local] = False
+            # Soft depletion: independent-coverage update, identical in spirit
+            # to `uncovered &= ~bits[best]` and to allocate_contests_coverage's
+            # own `resid *= 1 - p`.
+            resid *= (1.0 - soft[best_local])
+            if progress_cb is not None and (
+                len(picks_local) % max(1, pick_progress_chunk) == 0 or len(picks_local) == target
+            ):
+                progress_cb({
+                    "event": "pick", "contest_id": g.contest_id,
+                    "pick_num": len(picks_local), "k": k,
+                    "uncovered_remaining": int(round(float(resid[R - 1].sum()))),
+                    "uncovered_total": n_slots * R, "relaxations_so_far": 0,
+                    "elapsed_s": time.time() - t0,
+                })
+
+        while not use_smooth and len(picks_local) < target:
             if stop_check is not None and stop_check():
                 break
             # (n_cand, R) raw popcounts, one column per rung. `per_rung` drives
@@ -3100,10 +3364,20 @@ def allocate_contests_topn_coverage(
             # ever_covered, so worlds_claimed keeps its exact meaning and stays
             # comparable between ladder and single-bar runs. The inner rungs
             # are a strict subset of it by nesting, so they'd add nothing here.
-            ever_covered_mask = (
-                np.unpackbits(ever_covered[R - 1])[:n_slots].reshape(K, n_sims_g).astype(bool)
-            )
-            worlds_claimed = int(ever_covered_mask.any(axis=0).sum())
+            if use_smooth:
+                # Soft analogue: `1 - resid` is P(at least one selected entry
+                # crosses here), so a world counts as claimed when that passes
+                # 0.5 in any draw -- the natural probabilistic reading of the
+                # hard path's "some pick's bit is set here". Same units
+                # (raw sim-world count out of n_sims_g), so the two modes'
+                # worlds_claimed_pct stay directly comparable.
+                _cov = (1.0 - resid[R - 1]).reshape(K, n_sims_g)
+                worlds_claimed = int((_cov >= 0.5).any(axis=0).sum())
+            else:
+                ever_covered_mask = (
+                    np.unpackbits(ever_covered[R - 1])[:n_slots].reshape(K, n_sims_g).astype(bool)
+                )
+                worlds_claimed = int(ever_covered_mask.any(axis=0).sum())
             n_generated_picks = (
                 int(is_generated[picks_global].sum()) if is_generated is not None and len(picks_global)
                 else 0
@@ -3127,7 +3401,9 @@ def allocate_contests_topn_coverage(
         # can be sizable for a large contest, and this is exactly the
         # alloc/free-many-different-sized-arrays pattern that comment
         # documents glibc handling poorly without the tuning below.
-        del sim_sub_matrix, cand_sub, bits
+        del sim_sub_matrix, cand_sub, bits, soft
+        if use_smooth:
+            del soft_flat, resid
         _sp._release_free_memory()
         if len(picks_global) < k and stop_check is not None and stop_check():
             break

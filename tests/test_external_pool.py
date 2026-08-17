@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import pytest
 from pathlib import Path
+from scipy.special import expit
 
 import src.api.external_pool as ep
 from src.api.dk_entries import EntryRecord
@@ -3319,6 +3320,192 @@ class TestTopnCoveragePayoutLadder:
         assert len(alloc.portfolio) == 2
         assert not alloc.unfilled
         assert {id(x) for x, _ in alloc.portfolio} == {id(lineups[0]), id(lineups[1])}
+
+
+class TestRungBracketRanks:
+    """_rung_bracket_ranks: the (lo, hi) rank pair the smoothed-exceedance tau
+    finite-differences the field's score-vs-rank slope across."""
+
+    def test_bracket_is_geometric_around_the_rank(self):
+        assert ep._rung_bracket_ranks(10, 1000) == (5, 20)
+        assert ep._rung_bracket_ranks(50, 1000) == (25, 100)
+
+    def test_hi_is_clipped_to_the_field_size(self):
+        assert ep._rung_bracket_ranks(10, 15) == (5, 15)
+
+    def test_lo_never_goes_below_rank_one(self):
+        lo, hi = ep._rung_bracket_ranks(1, 100)
+        assert lo == 1 and hi == 2
+
+    def test_collapsed_bracket_is_widened_so_the_span_is_never_zero(self):
+        # rank 1 in a 1-lineup field: hi clips to lo, which would make the
+        # caller's (hi - lo) slope denominator 0.
+        lo, hi = ep._rung_bracket_ranks(1, 1)
+        assert hi > lo or (lo, hi) == (1, 1)
+        # A 2-lineup field must still produce a usable span.
+        lo, hi = ep._rung_bracket_ranks(4, 2)
+        assert hi > lo
+
+    def test_never_exceeds_the_field_size(self):
+        for rank in (1, 3, 10, 40):
+            for F in (1, 2, 5, 40):
+                lo, hi = ep._rung_bracket_ranks(rank, F)
+                assert 1 <= lo <= max(F, 1)
+                assert hi <= max(F, 1)
+
+
+class TestTopnCoverageSmoothedExceedance:
+    """allocate_contests_topn_coverage(smooth_tau_scale=...): replaces the hard
+    `1[score >= threshold]` indicator with P(threshold <= score) under the
+    rank-N order statistic's own sampling distribution.
+
+    Same fixture as TestTopnCoverageAllocation (field_size_g == field pool ==
+    5, sims_per_contest_fraction=1.0, so per-world thresholds are computable by
+    hand). Per world the field is w0 [10,20,30,40,50], w1 [5,15,25,35,45],
+    w2 [1,2,3,4,5], w3 [100,90,80,70,60]; at topn_rank=2 the thresholds are
+    [40, 35, 4, 90]."""
+
+    THRESHOLDS = np.array([40, 35, 4, 90], dtype=np.float64)
+
+    def _fixture(self):
+        sim_results, lu = _synthetic_sim_and_lineups({
+            "f0": [10, 5, 1, 100], "f1": [20, 15, 2, 90], "f2": [30, 25, 3, 80],
+            "f3": [40, 35, 4, 70], "f4": [50, 45, 5, 60],
+            "c0": [45, 36, 5, 95],   # above the bar in every world
+            "c1": [39, 34, 3, 89],   # exactly 1 BELOW the bar in every world
+            "c2": [40, 35, 4, 90],   # exactly ON the bar in every world
+        })
+        field_lineups = _stack_field_lineups([lu[f"f{i}"] for i in range(5)])
+        lineups = [lu["c0"], lu["c1"], lu["c2"]]
+        return sim_results, field_lineups, lineups, _topn_pool(lineups)
+
+    def _reference_p(self, scores, tau_scale=1.0, rank=2, field_size=5):
+        """Independent re-derivation of the smoothed crossing probability, so
+        these assertions pin the whole tau pipeline (bracket -> slope ->
+        order-statistic sd -> logistic) rather than a magic constant."""
+        field = np.array(
+            [[10, 5, 1, 100], [20, 15, 2, 90], [30, 25, 3, 80],
+             [40, 35, 4, 70], [50, 45, 5, 60]], dtype=np.float64,
+        ).T  # (n_worlds, field_size)
+        desc = np.sort(field, axis=1)[:, ::-1]
+        lo, hi = ep._rung_bracket_ranks(rank, field_size)
+        thr = desc[:, rank - 1]
+        slope = (desc[:, lo - 1] - desc[:, hi - 1]) / float(hi - lo)
+        tau = tau_scale * np.sqrt(rank * (1 - rank / field_size)) * np.maximum(slope, 0.0)
+        z = (np.asarray(scores, dtype=np.float64) - thr) / np.maximum(tau, 1e-6)
+        return expit(1.702 * z)
+
+    def _alloc(self, k=1, tau_scale=1.0, **kw):
+        sim_results, field_lineups, lineups, pool = self._fixture()
+        done = []
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [_topn_group("c0", k=k)], field_lineups,
+            topn_rank=2, field_samples=1, sims_per_contest_fraction=1.0,
+            rng_seed=42, smooth_tau_scale=tau_scale,
+            progress_cb=lambda i: done.append(i) if i.get("event") == "contest_done" else None,
+            **kw,
+        )
+        return alloc, lineups, done
+
+    def test_reported_ev_matches_the_analytic_crossing_probability(self):
+        # c0 is the highest-gain candidate; its first-pick ev must equal the
+        # summed crossing probability across all 4 worlds, exactly.
+        alloc, lineups, _ = self._alloc(k=1)
+        picked, ev = alloc.portfolio[0]
+        assert picked is lineups[0]
+        expected = float(self._reference_p([45, 36, 5, 95]).sum())
+        assert ev == pytest.approx(expected, rel=1e-5)
+
+    def test_a_candidate_below_the_bar_in_every_world_still_earns_credit(self):
+        # THE POINT OF THE CHANGE. c1 is 1 point short of the threshold in all
+        # 4 worlds, so the hard indicator scores it a flat 0 -- no gradient at
+        # all, which is the rare-event degeneracy smoothing exists to remove.
+        p = self._reference_p([39, 34, 3, 89])
+        assert (np.asarray([39, 34, 3, 89]) >= self.THRESHOLDS).sum() == 0  # hard: zero events
+        assert p.sum() > 1.0                                               # smooth: graded credit
+        # ...and it is ordered strictly below the on-the-bar and above-the-bar
+        # candidates rather than tied at zero with everything else.
+        assert p.sum() < self._reference_p([40, 35, 4, 90]).sum()
+        assert self._reference_p([40, 35, 4, 90]).sum() < self._reference_p([45, 36, 5, 95]).sum()
+
+    def test_exactly_on_the_threshold_is_a_coin_flip_per_world(self):
+        # c2 sits exactly on the bar in every world -> p = 0.5 each, so its
+        # standalone gain is n_worlds/2. Pins the logistic's centering.
+        assert self._reference_p([40, 35, 4, 90]) == pytest.approx(np.full(4, 0.5))
+
+    def test_tiny_tau_scale_reproduces_the_hard_indicator(self):
+        # As tau -> 0 the logistic saturates, so smoothing must degrade to the
+        # exact hard crossing count (c0 crosses all 4 worlds).
+        alloc, lineups, _ = self._alloc(k=1, tau_scale=1e-9)
+        picked, ev = alloc.portfolio[0]
+        assert picked is lineups[0]
+        assert ev == pytest.approx(4.0, abs=1e-6)
+
+    def test_default_tau_scale_zero_leaves_the_hard_path_untouched(self):
+        # The shipped default must be bit-identical to the pre-change behavior:
+        # integer-valued popcount ev, wave resets still reported.
+        sim_results, field_lineups, lineups, pool = self._fixture()
+        done = []
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [_topn_group("c0", k=2)], field_lineups,
+            topn_rank=2, field_samples=1, sims_per_contest_fraction=1.0, rng_seed=42,
+            progress_cb=lambda i: done.append(i) if i.get("event") == "contest_done" else None,
+        )
+        assert [ev for _, ev in alloc.portfolio] == [4.0, 4.0]
+        assert done[0]["n_wave_resets"] == 1
+
+    def test_soft_depletion_discounts_worlds_an_earlier_pick_already_covers(self):
+        # Second pick's reported gain must be its standalone mass times the
+        # residual left by pick 1 -- the soft analogue of `uncovered &= ~bits`.
+        alloc, lineups, _ = self._alloc(k=2)
+        (first, _), (second, second_ev) = alloc.portfolio
+        assert first is lineups[0]   # c0
+        assert second is lineups[2]  # c2, the higher of the two remaining
+        resid = 1.0 - self._reference_p([45, 36, 5, 95])
+        expected = float((self._reference_p([40, 35, 4, 90]) * resid).sum())
+        assert second_ev == pytest.approx(expected, rel=1e-5)
+        assert second_ev < self._reference_p([40, 35, 4, 90]).sum()  # strictly discounted
+
+    def test_no_relaxations_or_wave_resets_in_smooth_mode(self):
+        # The k=2 fixture drives the hard path into an exhaustion wave reset
+        # (see test_default_tau_scale_zero_leaves_the_hard_path_untouched).
+        # A smoothed gain is positive wherever any residual remains, so the
+        # mechanism self-relaxes and neither counter should ever fire.
+        _, _, done = self._alloc(k=3)
+        assert done[0]["n_relaxations"] == 0
+        assert done[0]["n_wave_resets"] == 0
+        assert done[0]["n_filled"] == 3
+
+    def test_worlds_claimed_stays_within_the_contests_own_sim_budget(self):
+        _, _, done = self._alloc(k=3)
+        assert 0 <= done[0]["worlds_claimed"] <= done[0]["n_sims_g"]
+        assert 0.0 <= done[0]["worlds_claimed_pct"] <= 100.0
+
+    def test_dupe_discount_still_reweights_the_argmax_under_smoothing(self):
+        # c0 wins on raw gain (2.734 vs c2's 2.000); a heavy enough E[dupes]
+        # penalty on c0 alone must flip the first pick to c2, proving the
+        # discount is applied on the smooth path too and not just the hard one.
+        sim_results, field_lineups, lineups, pool = self._fixture()
+        alloc = allocate_contests_topn_coverage(
+            pool, sim_results, [_topn_group("c0", k=1)], field_lineups,
+            topn_rank=2, field_samples=1, sims_per_contest_fraction=1.0,
+            rng_seed=42, smooth_tau_scale=1.0,
+            e_dupes=np.array([5000.0, 0.0, 0.0]),
+        )
+        assert alloc.portfolio[0][0] is lineups[2]
+
+    def test_smoothing_composes_with_the_payout_ladder(self, monkeypatch):
+        # Both features touch the same (R, K, n_sims_g) planes; R > 1 must
+        # produce a full, valid fill with per-rung taus rather than crashing.
+        monkeypatch.setattr(
+            ep, "topn_payout_rungs",
+            lambda *a, **kw: (np.array([1, 2]), np.array([0.75, 0.25])),
+        )
+        alloc, lineups, done = self._alloc(k=3, payout_rungs=2)
+        assert len(alloc.portfolio) == 3
+        assert not alloc.unfilled
+        assert all(ev > 0 for _, ev in alloc.portfolio)
+        assert done[0]["n_relaxations"] == 0
 
 
 class TestLaneSplit:
