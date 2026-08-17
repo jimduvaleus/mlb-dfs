@@ -470,6 +470,26 @@ class GppConfig(BaseModel):
     # DEFAULT OFF pending walk-forward validation, same posture as every other
     # speculative topn_coverage knob here.
     external_pool_topn_smooth_tau_scale: float = 0.0
+    # Caps how many simulated worlds the DIVERSITY term's pool correlation is
+    # estimated from (evenly strided, so it spans the full world range). 0 =
+    # use every world.
+    #
+    # This exists so `simulation.n_sims` can be raised for p_win's benefit
+    # without the correlation dragging peak memory up with it. The two
+    # consumers want opposite things: p_win concentrates its weight on the few
+    # worlds where a candidate tops the field, so more worlds directly buy it
+    # reliability (split-half rho 0.880 at 12,500 worlds/stage -> 0.935 at
+    # 25,000); the diversity ordering is a bulk statistic that is already
+    # settled at split-half rho_full 0.976-0.999 and gains nothing. Meanwhile
+    # precompute_pool is the single largest allocation in the path -- 5.73 GB
+    # above baseline for a (5,139 x 50,000) float32 score matrix.
+    #
+    # 25,000 is a NO-OP at the shipped simulation.n_sims of 25,000 (step=1,
+    # byte-identical), and only binds if n_sims is raised above it.
+    # Measured, 08/17 slate, n_sims=50,000: 7.24 GB -> 4.24 GB peak together
+    # with the p_win-stage interleave and score_field's byte-bounded batching.
+    # See scripts/scalecheck_pwin_n_sims.py and compute_pool_corr.
+    external_pool_corr_max_sims: int = 25_000
     # External pool mode: per-contest ROI percentile floor for the pre-Det
     # cull (see allocate_contests in src/api/external_pool.py). A raw ROI
     # cutoff doesn't generalize across contests of different sizes/payout

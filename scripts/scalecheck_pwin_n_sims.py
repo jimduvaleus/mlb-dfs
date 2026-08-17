@@ -115,13 +115,14 @@ def run_arm(arm: str) -> dict:
     from src.optimization.contest import ContestSimulator
     from src.simulation.engine import SimulationEngine
 
-    interleaved = "interleaved" in arm
+    interleaved = "interleaved" in arm or "shipped" in arm
     # "_lean" adds the two cost fixes the probe isolated (see the module
     # docstring's memory note): score_field against a float32 view of the sim
     # matrix, a smaller batch, and an explicit malloc_trim after freeing each
     # field-score array.
     lean = "lean" in arm
     corrsub = "corrsub" in arm
+    shipped = "shipped" in arm
     n_sims = int(arm.split("_")[0])
 
     cfg = _yaml.safe_load((PROJECT_ROOT / "config.yaml").read_text())
@@ -185,7 +186,15 @@ def run_arm(arm: str) -> dict:
     # score matrix -- so this is where raising n_sims actually costs.
     corr_scores = lineup_scores[:, :25_000] if corrsub else lineup_scores
     t = time.time()
-    corr = ep.compute_pool_corr(pool.lineups, sim_results, scores=corr_scores)  # (M, M) f32
+    if shipped:
+        # Production path: the cap lives inside compute_pool_corr and is fed
+        # from config, and the subsample is STRIDED (not a leading block).
+        corr = ep.compute_pool_corr(
+            pool.lineups, sim_results, scores=lineup_scores,
+            max_sims=int(gpp.get("external_pool_corr_max_sims", 25_000)),
+        )
+    else:
+        corr = ep.compute_pool_corr(pool.lineups, sim_results, scores=corr_scores)  # (M, M) f32
     timings["pool_corr"] = time.time() - t
     peak_after["pool_corr"] = rss_gb()
 
@@ -217,13 +226,16 @@ def run_arm(arm: str) -> dict:
     # off a float64 results_matrix that is a 1.0 GB transient, allocated and
     # freed ~50 times -- the peak driver, and the alloc/free churn that leaves
     # glibc holding the arena afterwards.
-    sf_kw = {} if not lean else {"batch_size": 125}
-    if lean:
+    # `shipped` passes nothing: score_field now bounds its own batch by bytes
+    # and scores in float32 internally, so the harness must NOT override it --
+    # that is the behaviour under test.
+    sf_kw = {} if (not lean or shipped) else {"batch_size": 125}
+    if lean and not shipped:
         sims_A = sims_A.astype(np.float32)
         sims_B = sims_B.astype(np.float32)
 
     def _free():
-        if lean:
+        if lean or shipped:
             _release_free_memory()
 
     t = time.time()
@@ -252,7 +264,7 @@ def run_arm(arm: str) -> dict:
     return {
         "arm": arm, "n_sims": n_sims, "worlds_per_stage": n_half,
         "interleaved": interleaved, "lean": lean, "corrsub": corrsub,
-        "field_n": field_n,
+        "shipped": shipped, "field_n": field_n,
         "pool_M": len(pool.lineups), "n_contests": len(groups),
         "peak_rss_gb": round(overall.peak, 2),
         "total_s": round(sum(timings.values()), 1),

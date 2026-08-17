@@ -56,6 +56,7 @@ from src.api.external_pool import (
     _topn_sims_for_field_size,
     topn_total_sims_needed,
 )
+from src.optimization.contest import ContestSimulator
 from src.optimization.lineup import Lineup
 from src.optimization.payout import payout_table_to_array
 from src.optimization.self_play import SelfPlaySlateContext
@@ -3320,6 +3321,167 @@ class TestTopnCoveragePayoutLadder:
         assert len(alloc.portfolio) == 2
         assert not alloc.unfilled
         assert {id(x) for x, _ in alloc.portfolio} == {id(lineups[0]), id(lineups[1])}
+
+
+class TestPoolCorrMaxSims:
+    """compute_pool_corr(max_sims=...): caps the worlds the DIVERSITY term's
+    correlation is estimated from, so simulation.n_sims can be raised for
+    p_win's benefit without precompute_pool -- the largest allocation in the
+    external-pool path -- scaling with it."""
+
+    def _fixture(self, n_sims=300, n_lineups=30):
+        rng = np.random.default_rng(5)
+        sim_results = SimulationResults(
+            player_ids=list(range(1, 51)),
+            results_matrix=rng.normal(10, 3, size=(n_sims, 50)).astype(np.float32),
+        )
+        lineups = [
+            Lineup(player_ids=list(rng.choice(range(1, 51), size=10, replace=False)))
+            for _ in range(n_lineups)
+        ]
+        return sim_results, lineups
+
+    def test_default_is_byte_identical_to_using_every_world(self):
+        # The default (0) must not perturb any existing caller.
+        sim_results, lineups = self._fixture()
+        np.testing.assert_array_equal(
+            compute_pool_corr(lineups, sim_results),
+            compute_pool_corr(lineups, sim_results, max_sims=0),
+        )
+
+    def test_cap_above_n_sims_is_a_noop(self):
+        # The shipped default (25,000) sits at exactly simulation.n_sims, so
+        # this is the case that must stay byte-identical on today's config.
+        sim_results, lineups = self._fixture(n_sims=300)
+        np.testing.assert_array_equal(
+            compute_pool_corr(lineups, sim_results),
+            compute_pool_corr(lineups, sim_results, max_sims=300),
+        )
+        np.testing.assert_array_equal(
+            compute_pool_corr(lineups, sim_results),
+            compute_pool_corr(lineups, sim_results, max_sims=100_000),
+        )
+
+    def test_cap_uses_a_stride_spanning_every_world_not_a_leading_block(self):
+        # A leading block would hand the diversity term exactly the p_win A/B
+        # split's stage-A worlds when n_sims is doubled; a stride cannot.
+        sim_results, lineups = self._fixture(n_sims=300)
+        scores = compute_lineup_scores(lineups, sim_results)
+        capped = compute_pool_corr(lineups, sim_results, scores=scores, max_sims=100)
+        strided = compute_pool_corr(lineups, sim_results, scores=scores[:, ::3])
+        leading = compute_pool_corr(lineups, sim_results, scores=scores[:, :100])
+        np.testing.assert_allclose(capped, strided, rtol=1e-6, atol=1e-6)
+        assert not np.allclose(capped, leading, rtol=1e-3, atol=1e-3)
+
+    def test_cap_never_exceeds_the_requested_world_count(self):
+        # ceil division, so a non-dividing cap rounds the stride UP and lands
+        # at or under max_sims rather than over it.
+        _, lineups = self._fixture(n_sims=10)
+        rng = np.random.default_rng(1)
+        for n_sims in (100, 250, 999):
+            for cap in (7, 33, 100):
+                scores = rng.normal(size=(len(lineups), n_sims)).astype(np.float32)
+                step = -(-n_sims // cap)
+                assert scores[:, ::step].shape[1] <= cap
+
+    def test_capped_correlation_still_ranks_overlap_the_same_way(self):
+        # The cap is only defensible if it preserves the ORDERING the
+        # diversity term consumes -- more overlap must still mean more
+        # correlation.
+        sim_results = SimulationResults(
+            player_ids=list(range(1, 21)),
+            results_matrix=np.random.default_rng(7).normal(
+                10, 3, size=(2000, 20)).astype(np.float32),
+        )
+        lineups = [
+            Lineup(player_ids=list(range(1, 11))),
+            Lineup(player_ids=list(range(2, 12))),   # 9/10 overlap
+            Lineup(player_ids=list(range(6, 16))),   # 5/10
+            Lineup(player_ids=list(range(11, 21))),  # 0/10
+        ]
+        corr = compute_pool_corr(lineups, sim_results, max_sims=200)
+        assert corr[0, 1] > corr[0, 2] > corr[0, 3]
+
+
+class TestScoreFieldBatchBounding:
+    """ContestSimulator.score_field: the per-batch `sim_matrix[:, batch_cols]`
+    intermediate is (n_sims, batch, 10) and was the dominant allocation of the
+    p_win stage at large n_sims. It is now bounded by BYTES, with `batch_size`
+    kept as the upper bound, and scored in float32."""
+
+    def _fixture(self, n_sims, n_field=40, n_players=30):
+        rng = np.random.default_rng(3)
+        sim = rng.normal(10, 3, size=(n_sims, n_players))          # float64, as production
+        field = np.array([rng.choice(n_players, size=10, replace=False)
+                          for _ in range(n_field)], dtype=np.int64)
+        col_map = {i: i for i in range(n_players)}
+        return sim, field, col_map
+
+    def test_scores_match_a_naive_reference(self):
+        sim, field, col_map = self._fixture(n_sims=200)
+        out = ContestSimulator().score_field(field, sim, col_map)
+        expected = np.stack([sim[:, row].sum(axis=1) for row in field], axis=1)
+        assert out.shape == (200, len(field))
+        assert out.dtype == np.float32
+        np.testing.assert_allclose(out, expected, rtol=1e-5, atol=1e-3)
+
+    def test_float64_and_float32_inputs_agree(self):
+        # score_field's output was ALREADY declared float32, so doing the sum
+        # in float32 only changes the final rounding of a truncated value.
+        sim, field, col_map = self._fixture(n_sims=200)
+        cs = ContestSimulator()
+        np.testing.assert_allclose(
+            cs.score_field(field, sim, col_map),
+            cs.score_field(field, sim.astype(np.float32), col_map),
+            rtol=1e-5, atol=1e-3,
+        )
+
+    def test_batch_size_is_the_upper_bound_at_small_n_sims(self):
+        # Under ~12,800 sims the byte budget does not bind, so existing callers
+        # keep their exact previous batching. Verified via the batch boundary:
+        # a stop_check that fires after the first batch returns exactly
+        # batch_size columns.
+        sim, field, col_map = self._fixture(n_sims=100, n_field=40)
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 1        # allow batch 1, stop before batch 2
+
+        out = ContestSimulator().score_field(field, sim, col_map, batch_size=10, stop_check=stop)
+        assert out.shape[1] == 10
+
+    def test_byte_budget_shrinks_the_batch_at_large_n_sims(self):
+        # At n_sims large enough for the 128 MB budget to bind, the effective
+        # batch must drop below the requested batch_size -- the whole point.
+        from src.optimization.contest import _SCORE_FIELD_BATCH_BYTES
+        n_sims = 40_000
+        expected_batch = _SCORE_FIELD_BATCH_BYTES // (n_sims * 10 * 4)
+        assert expected_batch < 500
+        sim, field, col_map = self._fixture(n_sims=n_sims, n_field=expected_batch * 3)
+        calls = {"n": 0}
+
+        def stop():
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        out = ContestSimulator().score_field(
+            field, sim, col_map, batch_size=500, stop_check=stop,
+        )
+        assert out.shape[1] == expected_batch
+
+    def test_unmapped_players_are_still_dropped(self):
+        # Regression guard on the pre-existing contract, which the dtype/batch
+        # change must not disturb.
+        sim, field, col_map = self._fixture(n_sims=50, n_field=5)
+        gone = int(field[2][0])
+        col_map.pop(gone, None)
+        # The fixture's lineups overlap heavily, so removing one player id can
+        # invalidate several lineups -- count them rather than assuming one.
+        expected = int(sum(gone not in row for row in field.tolist()))
+        assert 0 < expected < len(field)
+        out = ContestSimulator().score_field(field, sim, col_map)
+        assert out.shape[1] == expected
 
 
 class TestRungBracketRanks:

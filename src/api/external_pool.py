@@ -1153,8 +1153,30 @@ def compute_lineup_scores(lineups: list, sim_results) -> np.ndarray:
 
 def compute_pool_corr(
     lineups: list, sim_results, scores: Optional[np.ndarray] = None,
+    max_sims: int = 0,
 ) -> np.ndarray:
     """(M, M) float32 correlation of simulated lineup scores (points-space).
+
+    `max_sims > 0` caps how many simulated worlds the correlation is estimated
+    from, taking an evenly-STRIDED subsample (`scores[:, ::step]`, a view, so
+    the slice itself allocates nothing) rather than a leading block -- a stride
+    spans the whole world range and cannot accidentally align with the p_win
+    A/B world split, which hands stage A's worlds to the diversity term if you
+    take the first N. `0` (the default) uses every world and is byte-identical
+    to the previous behaviour.
+
+    Why this cap exists: `precompute_pool` is the single largest allocation in
+    the external-pool path -- measured at 5.73 GB above baseline for a
+    (5,139 x 50,000) float32 score matrix, ~5.6x the matrix itself -- and it
+    scales linearly in n_sims. But the diversity ORDERING it feeds is a bulk
+    statistic over all worlds and is already fully settled: split-half
+    rho_full 0.976-0.999 at every pick step. So extra worlds buy the diversity
+    term nothing while costing the most memory of anything here. p_win is the
+    opposite -- it concentrates its weight on the few worlds where a candidate
+    tops the field, so it genuinely wants every world it can get. Capping this
+    one consumer is what makes raising `simulation.n_sims` for p_win's sake
+    affordable (7.24 GB -> 4.24 GB at n_sims=50,000, with the two p_win-stage
+    fixes; see scripts/scalecheck_pwin_n_sims.py).
 
     `scores` may be passed precomputed (compute_lineup_scores) to avoid
     repeating the indicator matmul when the caller also needs the raw
@@ -1191,6 +1213,9 @@ def compute_pool_corr(
     M = len(lineups)
     if scores is None:
         scores = compute_lineup_scores(lineups, sim_results)
+    if max_sims and max_sims > 0 and scores.shape[1] > max_sims:
+        step = -(-scores.shape[1] // max_sims)  # ceil, so the result is <= max_sims
+        scores = scores[:, ::step]
     pre = DeterminantPortfolioSelector.precompute_pool(scores, float("-inf"))
     assert pre is not None and len(pre[0]) == M
     return pre[2]

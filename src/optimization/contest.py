@@ -418,6 +418,13 @@ def _sample_random_lineup(
     return ids
 
 
+# Byte budget for score_field's per-batch (n_sims, batch, 10) intermediate.
+# 128 MB keeps that transient flat as n_sims grows while leaving the default
+# batch_size=500 in force for anything under ~12,800 sims (so no existing
+# caller's batching changes). See score_field for the measurement.
+_SCORE_FIELD_BATCH_BYTES = 128 * 1024 * 1024
+
+
 class ContestSimulator:
     """Generates simulated GPP fields and evaluates portfolio EV against them."""
 
@@ -553,6 +560,33 @@ class ContestSimulator:
         """
         n_field = field_lineups.shape[0]
         n_sims = sim_matrix.shape[0]
+
+        # The batch loop below evaluates `sim_matrix[:, batch_cols]`, which
+        # materializes an (n_sims, batch, 10) intermediate. Two things make
+        # that the dominant allocation of this function at large n_sims, and
+        # both are handled here rather than at the ~14 call sites:
+        #
+        # 1. dtype. `sim_matrix` is normally SimulationResults.results_matrix,
+        #    which is float64, so the intermediate is 8 bytes/element even
+        #    though `field_scores` below is declared float32 and the result is
+        #    truncated to it anyway. Summing 10 already-float32-representable
+        #    per-player scores in float32 changes only the final rounding of a
+        #    value that was being truncated to float32 regardless. Measured on
+        #    a (25,000 x 25,000) field score: peak-above-baseline 3.35 -> 2.84 GB
+        #    and 41.7s -> 28.1s, so this is mostly a SPEED win.
+        # 2. batch size. A fixed `batch_size` makes the intermediate scale
+        #    linearly in n_sims -- 1.0 GB at n_sims=25,000/batch=500 off
+        #    float64, allocated and freed ~50 times, which is also the
+        #    alloc/free churn glibc handles poorly (see self_play's
+        #    _MMAP_THRESHOLD_BYTES comment). Bounding the intermediate by BYTES
+        #    instead keeps it flat as n_sims grows. `batch_size` stays the
+        #    upper bound, so anything under ~12,800 sims is unaffected and every
+        #    existing caller keeps its exact previous batching.
+        sim_matrix = np.asarray(sim_matrix, dtype=np.float32)  # no copy if already f32
+        _bytes_per_lineup = max(n_sims * 10 * 4, 1)
+        batch_size = int(
+            np.clip(_SCORE_FIELD_BATCH_BYTES // _bytes_per_lineup, 1, max(batch_size, 1))
+        )
 
         # Convert player_ids to column indices; drop lineups with unmapped players
         col_lineups = np.full((n_field, 10), -1, dtype=np.int32)

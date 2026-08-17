@@ -118,6 +118,7 @@ export interface GppConfig {
   external_pool_topn_sims_reference_field_size: number
   external_pool_topn_sims_power: number
   external_pool_topn_smooth_tau_scale: number
+  external_pool_corr_max_sims: number
   external_pool_roi_floor_pct: number
   external_pool_proj_score_pct: number
   external_pool_ceiling_weight: number

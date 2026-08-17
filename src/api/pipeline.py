@@ -2501,7 +2501,10 @@ class PipelineRunner:
             lineup_scores = corr = sim_p95_scores = sim_p99_scores = None
         else:
             lineup_scores = ep.compute_lineup_scores(pool.lineups, sim_results)
-            corr = ep.compute_pool_corr(pool.lineups, sim_results, scores=lineup_scores)
+            corr = ep.compute_pool_corr(
+                pool.lineups, sim_results, scores=lineup_scores,
+                max_sims=int(gpp_cfg.get("external_pool_corr_max_sims", 25_000)),
+            )
             # Field-blind percentiles of the already-computed simulated score
             # matrix -- cheap (no new simulation), only consulted when proj_top's
             # ceiling-tier ranking signal is enabled (see external_pool_proj_top_
@@ -2727,8 +2730,6 @@ class PipelineRunner:
                         f"lineups (wanted {_field_n})"
                     )
 
-                _field_scores_A = _cs.score_field(_field_A, _sims_A, _col_map)
-                _field_scores_B = _cs.score_field(_field_B, _sims_B, _col_map)
                 # Flat exponent by default (external_pool_pwin_flat_reference):
                 # beat per-contest scaling on 8/8 archived slates, +0.95%,
                 # p=0.0063. See pwin_exponents for the measurement and why the
@@ -2744,6 +2745,23 @@ class PipelineRunner:
                     "exponent": (max(_exponents.values()) if _exponents else 0.0)
                     if _flat_ref > 0 else None,
                 })
+                # Score and consume ONE stage at a time. `_p_win_cull` only
+                # ever reads field A's scores and `_p_win_select` only field
+                # B's, so B need not exist while A is in use -- and each of
+                # those arrays is (n_sims/2 x field_n) float32, 2.5 GB apiece
+                # at n_sims=50,000/field_n=25,000. Holding both was 2.5 GB of
+                # pure overlap.
+                #
+                # The explicit del + _release_free_memory() is load-bearing,
+                # not decoration: without the malloc_trim the reorder saves
+                # nothing measurable (7.24 -> 7.15 GB), because glibc keeps the
+                # freed arena -- the arena having been grown by score_field's
+                # own batch churn in the first place. Same rationale as
+                # self_play's _MMAP_THRESHOLD_BYTES comment and
+                # allocate_contests_topn_coverage's per-contest cleanup.
+                from src.optimization.self_play import _release_free_memory
+
+                _field_scores_A = _cs.score_field(_field_A, _sims_A, _col_map)
                 _p_win_cull = ep.compute_p_win(
                     _scores_A, _field_scores_A, _exponents,
                     stop_check=self._stop_check,
@@ -2751,6 +2769,10 @@ class PipelineRunner:
                         "external_pwin_score", {"phase": "A", "n_done": done, "n_total": total},
                     ),
                 )
+                del _field_scores_A
+                _release_free_memory()
+
+                _field_scores_B = _cs.score_field(_field_B, _sims_B, _col_map)
                 _p_win_select = ep.compute_p_win(
                     _scores_B, _field_scores_B, _exponents,
                     stop_check=self._stop_check,
@@ -2758,6 +2780,8 @@ class PipelineRunner:
                         "external_pwin_score", {"phase": "B", "n_done": done, "n_total": total},
                     ),
                 )
+                del _field_scores_B
+                _release_free_memory()
                 # compute_p_win is keyed by whatever `_exponents` is keyed
                 # by — contest_id here — so both dicts already match the
                 # {contest_id: (M,) array} shape allocate_contests expects.
