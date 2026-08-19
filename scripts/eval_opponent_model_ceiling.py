@@ -20,7 +20,12 @@ ARMS, all graded identically with bt_core.grade_portfolio on realized scores
     mrp_realfield  MRP greedy against the REAL field's lineups, scored through
                    our own sims -- i.e. it knows W_op exactly but still does
                    not know delta. This is the paper's Experiment 2.
-    oracle         top-k by REALIZED dollars -- the pool's ceiling
+    oracle         top-k by REALIZED score -- the pool's ceiling. NOTE this is
+                   a LOWER bound on the true ceiling: the best lineups are
+                   handed to contests in list order rather than routed to the
+                   contests where they are worth most, so a genuine oracle
+                   would score higher still. Conservative in the direction
+                   that matters (it cannot overstate the headroom).
     random         the null
 
 HOW TO READ IT, and this is the whole point:
@@ -424,6 +429,8 @@ def report(df: pd.DataFrame) -> None:
     g = g.set_index("arm").loc[order].reset_index()
     print(g[["arm", "slates", "entries", "$/entry", "cash%", "top1%", "top01%"]]
           .to_string(index=False, float_format=lambda v: f"{v:8.3f}"))
+    print("  (oracle routes its best lineups to contests in list order, not to "
+          "where they are\n   worth most, so it is a LOWER bound on the ceiling.)")
 
     per = df.groupby(["arm", "slate"]).apply(
         lambda x: (x["gross"].sum() - x["fees"].sum()) / max(x["n_entries"].sum(), 1),

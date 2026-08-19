@@ -131,3 +131,82 @@ Not a pre-registered experiment — this is a capability question (what can we
 afford?), not a currency question (does it make money?). Its value is
 entirely instrumental: it only matters if more sim worlds turn out to buy
 real stability, which the 1x/2x/3x sweep is testing.
+
+---
+
+## 2026-08-19 — MRP (marginal-reward portfolio), opponent-model ceiling
+
+**PROTOCOL NOTE, recorded rather than tidied away:** this entry was written
+AFTER the run, not before. That violates the mining-control rule in
+`PROSPECTIVE_PROTOCOL.md`, and the result below should carry the reduced
+weight that implies. Mitigating context: the user's chosen validation posture
+for this build is "build fully, then live A/B", under which archive runs are
+explicitly sizing/no-blowup checks rather than the verdict. Future MRP archive
+runs get pre-registered here first.
+
+**Hypothesis.** Haugh & Singal 2019 formulation (2) adds a term production
+lacks: our own entries inside the order statistic (self-competition +
+demotion). Before spending further on the FIELD side of that formulation
+(Dirichlet ownership, crowding recalibration, a better ownership model), size
+the prize: how much would PERFECT knowledge of the opponent field be worth?
+
+**Design.** `scripts/eval_opponent_model_ceiling.py`, 9 backtest slates, seed
+42, n_sims 4,000, sim field 10,000. Arms graded through
+`bt_core.grade_portfolio` (exact self-displacement and prize splitting):
+`shipped` / `mrp_sim` / `mrp_realfield` / `oracle` / `random`. `mrp_realfield`
+knows W_op exactly — real entrants' rosters, re-scored through our own sims —
+so `mrp_realfield − mrp_sim` is the ceiling on every field-model improvement.
+Real-field reconstruction retained 96.9% of entries (min 87.8%).
+
+**Failure condition (as it would have been registered):** the delta's sign
+does not survive drop-largest, or is positive on ≤5/9 slates.
+
+### Result: FAILED, and decisively
+
+| arm | $/entry | cash% | top1% | top01% |
+|---|---|---|---|---|
+| shipped | +14.46 | 19.73 | 0.994 | 0.142 |
+| mrp_sim | −1.36 | 17.23 | 1.046 | 0.209 |
+| mrp_realfield | +6.09 | 21.48 | 1.395 | 0.418 |
+| oracle (lower bound) | +78.78 | 100.0 | 39.47 | 2.650 |
+| random | +33.91 | 21.97 | 1.674 | 0.209 |
+
+Both headline columns are single-slate artefacts:
+
+- **Dollars.** Field-knowledge delta mean +$9.99/entry, **median +$0.39**,
+  drop-largest **+$0.13**, LOSO min +$0.13, positive 5/9. Random's +$33.91
+  is entirely slate 07/26 (+$305.43); shipped's +$14.46 is 07/26 and 07/25.
+  The dollar column is uninterpretable at n=9, as documented.
+- **Rate ladder.** mrp_realfield's top-1% edge is +5 finishes (20 vs 15) over
+  nine slates — but **drops to −2 (12 vs 14), a sign flip**, on removing
+  07/28 alone, and is positive on only **2/9** slates.
+
+**Conclusion: perfect knowledge of the entire opponent field is worth
+approximately nothing measurable on this archive**, on either instrument.
+
+### Consequences
+
+1. **M4 (Dirichlet ownership + crowding recalibration) is DESCOPED.** It is
+   bounded above by a quantity that measures as ~zero. The module and its
+   tests stay (they are correct and cheap to keep); it is not fitted, not
+   wired, and not tuned. This also retires the H3(b) tension as moot rather
+   than resolved. Consistent with the paper's own §7.1: the stochastic
+   refinement over a deterministic ownership estimate bought only ~10% there.
+2. **dR itself is NOT validated by this run and is not claimed to be.**
+   `mrp_sim` sits at production's top-1% level (1.046 vs 0.994), ties it on
+   top-0.1% at 0.209 vs 0.142, and is the only negative dollar arm. Random
+   beating production on top-1% is a PRE-EXISTING documented pattern
+   (`backtest_lab` docstring: production 1.00% vs random 1.28%), reproduced
+   here, not something dR introduced.
+3. Oracle headroom is undiminished — 39.5% top-1%, and that is a LOWER bound
+   (it routes best-lineups-to-contests in list order, not optimally). The room
+   is real; the opponent model is not where it lives.
+
+### Limits on this result
+
+Single seed 42 — memory `project-seed-is-a-lottery-ticket` and
+`project-topn-selector-reproducibility` both say single-seed comparisons carry
+noise comparable to the effect being measured. n_sims 4,000 is low for rank-1
+events. `oracle` and `mrp_realfield` are look-ahead by construction: they
+bound, they never validate. This result can retire a direction (it does); it
+cannot promote one.

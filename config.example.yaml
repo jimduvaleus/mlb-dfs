@@ -170,3 +170,57 @@ gpp:
   external_pool_scratch_prob: 0.0      # flat, projection-independent late-scratch rate
   external_pool_mean_calib_batter: 1.0
   external_pool_mean_calib_pitcher: 1.0
+
+# ---------------------------------------------------------------------------
+# Marginal-Reward Portfolio (MRP) -- parallel track, Haugh & Singal 2019.
+# Deliberately NOT under gpp.*: this is a separate allocator that shares the
+# sim/field/payout substrate but none of the funnel, and gpp.* is already at
+# the edge of manageability. Nothing in the live pipeline reads this block yet
+# -- it is wired only into scripts/eval_*. Per the build plan, UI/models.py
+# sync is deferred until the live A/B decides whether this path ships.
+# ---------------------------------------------------------------------------
+marginal_reward:
+  enabled: false
+
+  # Overlap governance. Three rules doing three different jobs -- see
+  # src/optimization/mrp/allocator.py::AllocationRules.
+  gamma_in: 7           # max shared players vs entries in the SAME contest.
+                        # EV rule: the same-contest set is the only set our
+                        # entries compete with. Haugh & Singal swept {5,6,7}
+                        # of C=9 and found C-3 best; C=10 here, so 7.
+  gamma_out: 8          # max shared players vs entries in ANY OTHER contest.
+                        # NOT an EV rule -- separate contests never compete --
+                        # so this is bankroll-variance control only. 8 is a
+                        # no-op against a pool already through the 9/10 cull;
+                        # the knob only bites at 7 or lower.
+  allow_cross_contest_duplicates: false   # user decision. Under the paper's
+                        # logic this costs EV (a lineup that is the best
+                        # marginal addition in two separate contests has no
+                        # competitive reason not to be played twice); it is
+                        # kept as a risk choice, not an optimisation.
+
+  # Estimator. 0.0 = the exact rank-lookup path. > 0 swaps in smoothed
+  # exceedance at that width (1.0 = the derived width). Measured on dR:
+  # tau 0.5 -> rho vs exact 0.988 / level ratio 1.045; tau 1.0 -> 0.966 /
+  # 1.235. Default off, matching gpp.external_pool_topn_smooth_tau_scale:
+  # the derivation justifies the width, only a walk-forward justifies
+  # enabling it.
+  smooth_tau_scale: 0.0
+
+  # Stochastic ownership (paper footnote 7: a fixed, known p caused
+  # over-certainty and poor portfolios). inf = today's behaviour, one point
+  # estimate reused across all K field draws.
+  # WARNING: do not turn this on alone. EVIDENCE_LOG H3(b) came back INVERTED
+  # -- our simulated field is ALREADY more crowded than the real top band on
+  # 6/9 slates -- and a plain Dirichlet-multinomial makes within-draw crowding
+  # worse, since every opponent in a draw shares the same perturbed p. Pair it
+  # with a crowding recalibration of the stack probabilities in contest.py.
+  ownership_concentration: .inf
+
+  # Targeted generation along the sigma_dG frontier. 0 = off. GATED: run
+  # scripts/eval_field_covariance.py first -- if the external pool already
+  # spans the low-sigma region, generation buys nothing and this repo's prior
+  # negative on augmentation (ILP supplements at 0.57-0.68x pool p_win, zero
+  # reaching the combined top 1% across 7 slates) stands unchallenged.
+  sigma_frontier_per_lambda: 0
+  sigma_frontier_lambdas: [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
