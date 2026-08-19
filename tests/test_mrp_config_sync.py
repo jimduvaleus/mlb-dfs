@@ -142,3 +142,67 @@ def test_roi_requirement_is_not_written_as_an_exclusion_list():
     src = (ROOT / "src" / "api" / "server.py").read_text()
     assert "_roi_required = external_roi_blocks_required(" in src
     assert '_ev_type not in ("prj_own"' not in src, "exclusion list reintroduced"
+
+
+# ---------------------------------------------------------------------------
+# config.yaml round trip
+# ---------------------------------------------------------------------------
+
+def test_every_appconfig_section_survives_a_read_write_round_trip(tmp_path, monkeypatch):
+    """read_config used to list sections by hand, so a section added to the
+    model later was written to disk by write_config and then silently dropped
+    on the next read. The UI showed the default and its next save wrote that
+    default back over the real value -- a setting could not persist at all,
+    while the pipeline (which reads raw YAML) was meanwhile honouring it.
+    """
+    import yaml as _yaml
+
+    from src.api import config_io
+
+    cfg_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_io, "CONFIG_PATH", cfg_path)
+
+    config_io.write_config(AppConfig())
+    raw = _yaml.safe_load(cfg_path.read_text())
+    assert set(AppConfig.model_fields) <= set(raw), "write_config dropped a section"
+
+    # Set a non-default in every section we care about, then round-trip twice:
+    # once for the read, once for a subsequent unrelated Save.
+    raw["marginal_reward"]["smooth_tau_scale"] = 0.5
+    raw["marginal_reward"]["gamma_in"] = 6
+    raw["simulation"]["n_sims"] = 4321
+    cfg_path.write_text(_yaml.safe_dump(raw, sort_keys=False))
+
+    first = config_io.read_config()
+    assert first.marginal_reward.smooth_tau_scale == 0.5
+    assert first.marginal_reward.gamma_in == 6
+    assert first.simulation.n_sims == 4321
+
+    config_io.write_config(first)
+    second = config_io.read_config()
+    assert second.marginal_reward.smooth_tau_scale == 0.5, "value lost on re-save"
+    assert second.marginal_reward.gamma_in == 6
+    assert second.simulation.n_sims == 4321
+
+
+def test_read_config_is_not_a_hand_written_section_list(tmp_path):
+    """Guard the shape: the enumeration is what went stale."""
+    src = (ROOT / "src" / "api" / "config_io.py").read_text()
+    assert "AppConfig.model_fields" in src, "sections must be derived from the model"
+    assert 'gpp=raw.get("gpp"' not in src, "hand-written section list reintroduced"
+
+
+def test_empty_section_falls_back_to_defaults(tmp_path, monkeypatch):
+    """`gpp:` with nothing under it parses as None, which Pydantic rejects."""
+    import yaml as _yaml
+
+    from src.api import config_io
+
+    cfg_path = tmp_path / "config.yaml"
+    monkeypatch.setattr(config_io, "CONFIG_PATH", cfg_path)
+    cfg_path.write_text(_yaml.safe_dump({"platform": "draftkings", "gpp": None,
+                                         "marginal_reward": None}, sort_keys=False))
+
+    got = config_io.read_config()
+    assert got.gpp.n_candidates == AppConfig().gpp.n_candidates
+    assert got.marginal_reward.smooth_tau_scale == 0.0
