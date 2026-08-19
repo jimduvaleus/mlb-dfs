@@ -82,7 +82,10 @@ from src.optimization.mrp.runner import (  # noqa: E402
     allocate_marginal_reward,
     publish_portfolio,
 )
-from src.optimization.mrp.slate_inputs import build_slate_inputs  # noqa: E402
+from src.optimization.mrp.slate_inputs import (  # noqa: E402
+    SimCalibration,
+    build_slate_inputs,
+)
 
 
 def load_preassigned(path: Path, pool, groups) -> dict:
@@ -140,7 +143,9 @@ def main() -> int:
     ap.add_argument("--max-sims-per-contest", type=int, default=12_500)
     ap.add_argument("--field-pool", type=int, default=25_000)
     ap.add_argument("--no-calibration", action="store_true",
-                    help="disable the shipped sim calibration (matches the backtest harness)")
+                    help="force raw SaberSim grids, overriding config. By default the "
+                         "gpp.external_pool_* calibration keys are read from config.yaml "
+                         "so this path simulates identically to the UI/pipeline run.")
     ap.add_argument("--sim-cache", default="outputs/replay/sim_cache")
     ap.add_argument("--dry-run", action="store_true", help="write nothing")
     ap.add_argument("--publish", action="store_true",
@@ -155,14 +160,18 @@ def main() -> int:
     entries_dir = Path(args.entries) if args.entries else slate_dir
 
     print(f"slate      {slate_dir}")
-    print(f"n_sims     {args.n_sims}  seed {args.seed}  "
-          f"calibration {'off' if args.no_calibration else 'on'}")
 
     si = build_slate_inputs(
         slate_dir, n_sims=args.n_sims, seed=args.seed,
-        calibrated=not args.no_calibration,
+        # None = read config, matching the pipeline. Only --no-calibration
+        # overrides, and it says so on the line below so a run that does not
+        # match the UI is never silent about it.
+        calibration=SimCalibration() if args.no_calibration else None,
         sim_cache_dir=PROJECT_ROOT / args.sim_cache,
     )
+    print(f"n_sims     {args.n_sims}  seed {args.seed}")
+    print(f"sim calib  {si.calibration.describe()}"
+          f"{'   [OVERRIDDEN by --no-calibration]' if args.no_calibration else '   [from config.yaml]'}")
     print(f"pool       {len(si.pool.lineups):,} lineups   players {len(si.players_df)}")
 
     entry_files = scan_entry_files(str(entries_dir))
@@ -228,6 +237,7 @@ def main() -> int:
         "mode": "marginal_reward",
         "slate": slate_dir.name,
         "config": vars(args),
+        "sim_calibration": si.calibration.__dict__,
         "total_reward": diag.total_reward,
         "n_unfilled": diag.n_unfilled,
         "per_contest": diag.per_contest,

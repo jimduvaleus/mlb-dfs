@@ -9,12 +9,27 @@ This is the same external-pool ingest production uses -- `discover_external_file
 -> `parse_lineup_pool` -> `build_external_players_df` -> `SimulationEngine` --
 with nothing added.
 
-CALIBRATION DEFAULTS TO ON, matching what production ships (memory
-project-external-sim-calibration: batter zero-inflation plus the 0.88 mean
-calibration, which together moved lineup mean PIT from 0.405 to 0.497). Note
-the MRP archive evaluations were run with calibration OFF, following the
-backtest harness's default -- so a live run and those measurements are not on
-identical inputs, and a like-for-like comparison must pin this flag explicitly.
+SIM CALIBRATION IS READ FROM CONFIG, never hardcoded. The four
+`gpp.external_pool_*` keys below are the same ones `pipeline.py` reads, so this
+path and the UI path simulate identically:
+
+    external_pool_zero_inflate        SHAPE. A DK hitter scores exactly 0 when
+                                      he never reaches base and drives nobody
+                                      in: 2.19% of the time in the raw grids,
+                                      20.6% measured across 10 archived slates.
+    external_pool_mean_calib_batter   LOCATION. Realized/grid mean ratio 0.878
+                                      for batters (p=0.009). Pitchers measured
+                                      0.935 at p=0.30, so left at 1.0 rather
+                                      than fitting noise.
+    external_pool_scratch_prob        P(a rostered player is scratched).
+
+An earlier version of this file defaulted calibration ON on the belief that
+production shipped it. It does not -- the live config and the `flat2000_uc`
+production backtest arm ("uc" = uncalibrated) both run with it off. Hardcoding
+made this path and the pipeline produce DIFFERENT portfolios from the same
+slate, which silently breaks the one thing the CLI is for: `--preassign-from`
+runs MRP against a production portfolio, and the two arms have to be built on
+the same sim to be comparable at all.
 """
 from __future__ import annotations
 
@@ -29,6 +44,38 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 @dataclass
+class SimCalibration:
+    """The four grid-calibration knobs, exactly as pipeline.py reads them."""
+
+    zero_inflate: bool = False
+    scratch_prob: float = 0.02
+    mean_calib_batter: float = 1.0
+    mean_calib_pitcher: float = 1.0
+
+    @classmethod
+    def from_config(cls, cfg: dict) -> "SimCalibration":
+        g = cfg.get("gpp", {}) or {}
+        return cls(
+            zero_inflate=bool(g.get("external_pool_zero_inflate", False)),
+            scratch_prob=float(g.get("external_pool_scratch_prob", 0.02)),
+            mean_calib_batter=float(g.get("external_pool_mean_calib_batter", 1.0)),
+            mean_calib_pitcher=float(g.get("external_pool_mean_calib_pitcher", 1.0)),
+        )
+
+    def cache_key(self) -> str:
+        """Part of the sim-cache filename: two runs under different calibration
+        are different sims and must never share a cached matrix."""
+        return (f"z{int(self.zero_inflate)}s{self.scratch_prob:g}"
+                f"b{self.mean_calib_batter:g}p{self.mean_calib_pitcher:g}")
+
+    def describe(self) -> str:
+        on = self.zero_inflate or self.mean_calib_batter != 1.0 or self.mean_calib_pitcher != 1.0
+        return (f"{'on' if on else 'off'} (zero_inflate={self.zero_inflate}, "
+                f"scratch={self.scratch_prob:g}, batter={self.mean_calib_batter:g}, "
+                f"pitcher={self.mean_calib_pitcher:g})")
+
+
+@dataclass
 class SlateInputs:
     pool: object
     players_df: object
@@ -36,14 +83,14 @@ class SlateInputs:
     slate_dir: Path
     n_sims: int
     seed: int
-    calibrated: bool
+    calibration: SimCalibration
 
 
 def build_slate_inputs(
     slate_dir: Path,
     n_sims: int = 25_000,
     seed: int = 42,
-    calibrated: bool = True,
+    calibration: Optional[SimCalibration] = None,
     sim_cache_dir: Optional[Path] = None,
     config_path: Optional[Path] = None,
 ) -> SlateInputs:
@@ -52,6 +99,9 @@ def build_slate_inputs(
     `slate_dir` holds DKSalaries.csv plus the SaberSim export pair
     (lineups_*.csv + its companion projections file) -- true of both
     `data/raw` on a live slate and any `archive/MMDDYYYY`.
+
+    `calibration` defaults to whatever config.yaml says, so this path matches
+    the pipeline. Pass an explicit SimCalibration only to override deliberately.
     """
     from src.api import external_pool as ep
     from src.api.pipeline import PipelineRunner
@@ -62,6 +112,7 @@ def build_slate_inputs(
 
     slate_dir = Path(slate_dir)
     cfg = yaml.safe_load(open(config_path or (PROJECT_ROOT / "config.yaml")))
+    calib = calibration if calibration is not None else SimCalibration.from_config(cfg)
 
     found = ep.discover_external_files(str(slate_dir))
     if not found["lineups_paths"] or not found["projections_path"]:
@@ -83,7 +134,7 @@ def build_slate_inputs(
     if sim_cache_dir is not None:
         sim_cache_dir = Path(sim_cache_dir)
         sim_cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_path = sim_cache_dir / f"{slate_dir.name}_{n_sims}_{seed}_calib{calibrated}.npz"
+        cache_path = sim_cache_dir / f"{slate_dir.name}_{n_sims}_{seed}_{calib.cache_key()}.npz"
         if cache_path.exists():
             z = np.load(cache_path, allow_pickle=False)
             return SlateInputs(
@@ -92,14 +143,15 @@ def build_slate_inputs(
                     player_ids=[int(p) for p in z["player_ids"]],
                     results_matrix=z["results_matrix"],
                 ),
-                slate_dir=slate_dir, n_sims=n_sims, seed=seed, calibrated=calibrated,
+                slate_dir=slate_dir, n_sims=n_sims, seed=seed, calibration=calib,
             )
 
     copula = EmpiricalCopula(str(PROJECT_ROOT / cfg["paths"]["copula"]))
     grids = ep.build_quantile_grids(
         proj_ext,
-        zero_inflate=calibrated, scratch_prob=0.02 if calibrated else 0.0,
-        mean_calib_batter=0.88 if calibrated else 1.0, mean_calib_pitcher=1.0,
+        zero_inflate=calib.zero_inflate, scratch_prob=calib.scratch_prob,
+        mean_calib_batter=calib.mean_calib_batter,
+        mean_calib_pitcher=calib.mean_calib_pitcher,
     )
     engine = SimulationEngine(copula, players_df, batter_pca_model=None,
                               score_grid=None, quantile_grids=grids)
@@ -118,4 +170,4 @@ def build_slate_inputs(
         )
     return SlateInputs(pool=pool, players_df=players_df, sim_results=sim_results,
                        slate_dir=slate_dir, n_sims=n_sims, seed=seed,
-                       calibrated=calibrated)
+                       calibration=calib)
