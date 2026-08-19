@@ -221,3 +221,49 @@ def tier_form_payout(rank: np.ndarray, tier_ranks: np.ndarray,
     a = np.asarray(tier_amounts, dtype=np.float64)
     steps = a - np.concatenate((a[1:], [0.0]))          # R_d - R_{d+1}
     return (rank[..., None] <= r).astype(np.float64) @ steps
+
+
+def tier_ev_shares(own_scores: np.ndarray, field_sorted: np.ndarray,
+                   payout_arr: np.ndarray, chunk: int = 2048):
+    """Where a portfolio's expected dollars actually come from, tier by tier.
+
+    Returns `(tier_ranks, ev_per_tier)`: tier d contributes
+    `(R_d - R_{d+1}) . P(rank <= r_d)`, and the contributions sum to the
+    portfolio's total E[$]. Uses `tier_form_payout`'s decomposition, so it is
+    the same quantity `R(S)` maximises -- not a re-derivation.
+
+    SCOPE: ranks here are against the FIELD ONLY -- self-displacement is not
+    applied, so the total is the sum of independent per-lineup EVs rather than
+    R(S). That is deliberate: this answers "which tiers carry the dollars",
+    a question about the payout structure and where our lineups land in it,
+    not about how our entries interact. Use `ContestDeltaState.reward()` when
+    you want R(S).
+
+    This exists because "maximise expected dollars" is NOT automatically a
+    ceiling objective. Whether it chases the top or the min-cash plateau
+    depends on where our candidates' rank distribution actually sits, which is
+    an empirical question about the pool and the contest, not something the
+    formulation settles. Measure it rather than assuming either way -- the
+    repo's whole `funnel_mode: tail_first` / `tail_ev` apparatus exists because
+    mean EV was found to be dominated by the min-cash plateau.
+    """
+    from src.optimization.mrp.field_covariance import tier_boundary_ranks
+
+    own_scores = np.asarray(own_scores, dtype=np.float64)
+    payout_arr = np.asarray(payout_arr, dtype=np.float64)
+    ranks = tier_boundary_ranks(payout_arr)
+    amounts = payout_arr[np.clip(ranks - 1, 0, len(payout_arr) - 1)]
+    steps = amounts - np.concatenate((amounts[1:], [0.0]))
+
+    k, S = own_scores.shape
+    F = field_sorted.shape[1]
+    hits = np.zeros(len(ranks), dtype=np.float64)
+    for s0 in range(0, S, chunk):
+        s1 = min(s0 + chunk, S)
+        block = field_sorted[s0:s1]
+        for j in range(s1 - s0):
+            v = own_scores[:, s0 + j]
+            n_above = F - np.searchsorted(block[j], v, side="right")
+            rank = n_above + 1
+            hits += (rank[:, None] <= ranks[None, :]).sum(axis=0)
+    return ranks, steps * (hits / S)

@@ -212,3 +212,72 @@ def test_tier_form_equals_rank_lookup_on_every_real_payout_table():
             tier_form_payout(all_ranks, ranks, amounts), arr,
             rtol=0, atol=1e-9, err_msg=f"tier form != rank lookup for {name}",
         )
+
+
+def test_tier_ev_shares_sum_to_the_independent_ev_total():
+    """The decomposition must be exhaustive: tier contributions add up to the
+    same expected dollars a straight per-lineup rank lookup gives."""
+    from src.optimization.mrp.marginal_reward import tier_ev_shares
+
+    rng = np.random.default_rng(21)
+    payout = _payout_arr()
+    S, F, k = 120, 150, 5
+    field_sorted = np.sort(rng.normal(120.0, 20.0, size=(S, F)).astype(np.float32), axis=1)
+    own = rng.normal(130.0, 20.0, size=(k, S))
+
+    _ranks, ev = tier_ev_shares(own, field_sorted, payout)
+
+    # Reference: independent per-lineup EV, no self-displacement.
+    total = 0.0
+    for s in range(S):
+        n_above = F - np.searchsorted(field_sorted[s], own[:, s], side="right")
+        total += payout[np.clip(n_above, 0, len(payout) - 1)].sum()
+    total /= S
+    assert ev.sum() == pytest.approx(total, rel=1e-9)
+
+
+def test_tier_ev_share_ceiling_is_the_payout_table_own_step_weights():
+    """An always-wins portfolio reproduces the TABLE's step weights exactly.
+
+    This pins the scale on which the decomposition must be read: the rank-1 EV
+    share cannot exceed the table's own rank-1 step weight (a median of 50%
+    across the archived DK tables), so a share of "only" 50% is not a weak
+    ceiling result -- it is the maximum attainable. Comparing the observed
+    share against this ceiling is the meaningful reading; comparing it against
+    100% is not.
+    """
+    from src.optimization.mrp.field_covariance import tier_boundary_ranks
+    from src.optimization.mrp.marginal_reward import tier_ev_shares
+
+    rng = np.random.default_rng(22)
+    payout = _payout_arr()
+    S, F = 400, 200
+    field_sorted = np.sort(rng.normal(100.0, 10.0, size=(S, F)).astype(np.float32), axis=1)
+    elite = rng.normal(160.0, 5.0, size=(3, S))          # rank 1 in every world
+
+    ranks, ev = tier_ev_shares(elite, field_sorted, payout)
+    tier_ranks = tier_boundary_ranks(payout)
+    amounts = payout[tier_ranks - 1]
+    steps = amounts - np.concatenate((amounts[1:], [0.0]))
+
+    np.testing.assert_allclose(ev / ev.sum(), steps / steps.sum(), rtol=1e-9)
+    assert float(ev[ranks <= 1].sum()) / ev.sum() == pytest.approx(steps[0] / steps.sum())
+
+
+def test_a_mediocre_portfolio_draws_more_of_its_ev_from_the_plateau():
+    """The contrast that makes a high plateau share on real data interpretable."""
+    from src.optimization.mrp.marginal_reward import tier_ev_shares
+
+    rng = np.random.default_rng(23)
+    payout = _payout_arr()
+    S, F = 600, 200
+    field_sorted = np.sort(rng.normal(100.0, 10.0, size=(S, F)).astype(np.float32), axis=1)
+
+    elite = rng.normal(160.0, 5.0, size=(3, S))
+    ok = rng.normal(112.0, 10.0, size=(3, S))            # cashes often, rarely wins
+
+    def rank1_share(scores):
+        r, e = tier_ev_shares(scores, field_sorted, payout)
+        return float(e[r <= 1].sum()) / e.sum()
+
+    assert rank1_share(ok) < rank1_share(elite)
