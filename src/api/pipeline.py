@@ -3092,10 +3092,19 @@ class PipelineRunner:
             logger.info("MRP: R(S)=$%.2f across %d contests, %d unfilled",
                         _mrp_diag.total_reward, len(_mrp_diag.per_contest),
                         _mrp_diag.n_unfilled)
+            _mrp_warnings = _mrp_diag.warnings()
+            for _w in _mrp_warnings:
+                logger.warning("MRP: %s", _w)
+            # Persisted onto the sweep payload below, not just emitted: a
+            # warning that vanishes on page refresh is not a warning, and
+            # unfilled/relaxed entries are real money.
+            self._mrp_warnings = _mrp_warnings
             self._cb("mrp_done", {
                 "total_reward": _mrp_diag.total_reward,
                 "n_unfilled": _mrp_diag.n_unfilled,
                 "per_contest": _mrp_diag.per_contest,
+                "relaxations": _mrp_diag.relaxations,
+                "warnings": _mrp_warnings,
             })
             allocations = {1.0: _mrp_alloc}
         else:
@@ -3217,6 +3226,9 @@ class PipelineRunner:
                     "active_risk": _first_risk,
                     "mode": "external",
                     "ev_type": _ev_type,
+                    # Survives a page refresh; the Portfolio tab renders these
+                    # as a banner. Empty for every other ev_type.
+                    "warnings": getattr(self, "_mrp_warnings", []),
                     "sweep": _sweep_payload,
                 }, _f)
         except Exception as _e:

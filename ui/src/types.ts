@@ -966,6 +966,10 @@ export interface MrpPickProgressEvent extends SSEEvent {
 
 export interface MrpDoneEvent extends SSEEvent {
   stage: 'mrp_done'
+  /** Money-relevant allocation problems: purchased entries left unfilled, or
+   *  overlap caps relaxed to fill them. Rendered as a Portfolio-tab banner. */
+  warnings?: string[]
+  relaxations?: { contest_id: string; rule: string; frm: number; to: number; step: number }[]
   /** R(S): expected total gross dollars for the whole slate's portfolio. */
   total_reward: number
   n_unfilled: number

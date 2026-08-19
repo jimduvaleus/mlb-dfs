@@ -322,3 +322,119 @@ def test_publish_can_be_told_not_to_back_up(tmp_path):
 
     res = publish_portfolio(alloc, diag, df, salaries, tmp_path, backup=False)
     assert res["backup_paths"] == []
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight capacity check
+# ---------------------------------------------------------------------------
+
+def test_preflight_passes_on_a_comfortable_pool():
+    from src.optimization.mrp.runner import preflight_overlap_capacity
+
+    rng = np.random.default_rng(30)
+    df = _players_df()
+    lineups = _legal_lineups(df, 60, rng)
+    rep = preflight_overlap_capacity(lineups, df.player_id.tolist(),
+                                     max_slots=5, gamma_in=7)
+    assert rep["ok"] is True
+    assert rep["capacity"] >= 5
+
+
+def test_preflight_detects_a_pool_that_cannot_meet_the_requirement():
+    """gamma_in=0 means fully disjoint lineups, so capacity is bounded by
+    players/roster_size -- far below a large contest."""
+    from src.optimization.mrp.runner import preflight_overlap_capacity
+
+    rng = np.random.default_rng(31)
+    df = _players_df()
+    lineups = _legal_lineups(df, 60, rng)
+    rep = preflight_overlap_capacity(lineups, df.player_id.tolist(),
+                                     max_slots=50, gamma_in=0)
+    assert rep["ok"] is False
+    assert rep["capacity"] < 50
+    assert rep["required"] == 50
+
+
+def test_preflight_stops_early_once_the_requirement_is_met():
+    """It must not enumerate the whole pool on a healthy slate -- the point is
+    that it costs ~nothing in the common case."""
+    from src.optimization.mrp.runner import preflight_overlap_capacity
+
+    rng = np.random.default_rng(32)
+    df = _players_df()
+    lineups = _legal_lineups(df, 60, rng)
+    rep = preflight_overlap_capacity(lineups, df.player_id.tolist(),
+                                     max_slots=3, gamma_in=7)
+    assert rep["ok"] is True
+    assert rep["capacity"] == 3, "probed past the requirement"
+    assert rep["probe_exhaustive"] is False
+
+
+def test_preflight_is_a_noop_when_gamma_in_cannot_bind():
+    from src.optimization.mrp.runner import preflight_overlap_capacity
+
+    rng = np.random.default_rng(33)
+    df = _players_df()
+    lineups = _legal_lineups(df, 20, rng)
+    rep = preflight_overlap_capacity(lineups, df.player_id.tolist(),
+                                     max_slots=10, gamma_in=10)
+    assert rep["ok"] is True
+    assert rep["capacity"] == len(lineups)
+
+
+# ---------------------------------------------------------------------------
+# The warnings the Portfolio banner renders
+# ---------------------------------------------------------------------------
+
+def test_warnings_are_empty_on_a_clean_allocation():
+    df, sim, pool = _fixture()
+    groups = [_group("c1", "Four-Seamer", 4)]
+    _alloc, diag = allocate_marginal_reward(pool, df, sim, groups, CFG)
+    assert diag.warnings() == []
+
+
+def test_unfilled_entries_produce_a_money_warning():
+    from src.optimization.mrp.runner import MRPDiagnostics
+
+    w = MRPDiagnostics(n_unfilled=4).warnings()
+    assert len(w) == 1
+    assert "4 purchased entries" in w[0]
+    assert "unused" in w[0], "must say the fees are spent, not just that slots are empty"
+
+
+def test_relaxations_produce_their_own_warning():
+    from src.optimization.mrp.runner import MRPDiagnostics
+
+    diag = MRPDiagnostics(relaxations=[
+        {"contest_id": "c1", "rule": "gamma_out", "frm": 8, "to": 9, "step": 3},
+        {"contest_id": "c1", "rule": "gamma_in", "frm": 7, "to": 8, "step": 4},
+        {"contest_id": "c2", "rule": "gamma_in", "frm": 7, "to": 8, "step": 9},
+    ])
+    w = diag.warnings()
+    assert len(w) == 1
+    assert "gamma_in in 2 contests" in w[0]
+    assert "gamma_out in 1 contest" in w[0]
+    assert "overlap more than intended" in w[0]
+
+
+def test_relaxation_actually_reaches_the_diagnostics_end_to_end():
+    """The banner is only as good as the plumbing behind it."""
+    rng = np.random.default_rng(34)
+    df = _players_df()
+    # Force a thin, heavily-overlapping pool so a tight cap must relax.
+    lineups = _legal_lineups(df, 25, rng)
+    pool = ExternalPool(lineups=lineups, contests={}, source_paths=[],
+                        n_dropped_unknown_players=0, n_dropped_duplicates=0,
+                        n_dropped_near_duplicates=0)
+    pids = df.player_id.tolist()
+    mat = rng.normal(df["mean"].to_numpy(), 5.0, size=(200, len(pids)))
+    sim = SimulationResults(player_ids=pids, results_matrix=mat)
+
+    cfg = MRPConfig(field_pool_size=300, max_sims_per_contest=200, seed=1,
+                    gamma_in=2, gamma_out=2)
+    alloc, diag = allocate_marginal_reward(pool, df, sim, [_group("c1", "Four-Seamer", 6)], cfg)
+
+    assert len(alloc.portfolio) == 6, "should relax rather than under-fill"
+    assert diag.relaxations, "relaxations never reached the diagnostics"
+    assert any("Overlap limits were relaxed" in w for w in diag.warnings())
+    assert diag.preflight, "preflight verdict not recorded"

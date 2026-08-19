@@ -67,9 +67,21 @@ class Pick:
 
 
 @dataclass
+class Relaxation:
+    """An overlap cap that had to be loosened to fill a purchased slot."""
+
+    contest_id: object
+    rule: str          # "gamma_out" | "gamma_in"
+    frm: int
+    to: int
+    step: int
+
+
+@dataclass
 class AllocationResult:
     picks: list[Pick] = _field(default_factory=list)
     unfilled: dict = _field(default_factory=dict)
+    relaxations: list = _field(default_factory=list)
 
     def by_contest(self) -> dict:
         out: dict = {}
@@ -127,19 +139,59 @@ def allocate(
     result = AllocationResult()
     total_slots = sum(remaining.values())
 
+    # Per-contest effective caps. A purchased slot is money already spent, so
+    # leaving it empty is a strictly worse outcome than exceeding an overlap
+    # cap -- when a contest runs out of eligible candidates we loosen ITS caps
+    # rather than dropping the entry. Only that contest is affected; the others
+    # keep the configured caps.
+    eff_in = {cid: rules.gamma_in for cid in contest_ids}
+    eff_out = {cid: rules.gamma_out for cid in contest_ids}
+
+    def _eligible(cid, step):
+        """Eligible mask for `cid`, relaxing its caps until something qualifies.
+
+        gamma_out is relaxed FIRST and exhausted before gamma_in is touched:
+        separate contests never compete for the same prizes, so cross-contest
+        overlap costs nothing in expectation, while gamma_in governs the set
+        our entries actually run against. Give up the free constraint before
+        the one that carries EV.
+
+        Returns None only when no unused lineup remains at all -- genuinely
+        fewer distinct candidates than purchased slots, which no relaxation can
+        fix.
+        """
+        while True:
+            ok = ~used_in[cid]
+            if not rules.allow_cross_contest_duplicates:
+                ok &= ~used_any
+            if not ok.any():
+                return None                      # pool truly exhausted
+            capped = ok.copy()
+            if eff_in[cid] < C:
+                capped &= max_in[cid] <= eff_in[cid]
+            if eff_out[cid] < C:
+                capped &= max_out[cid] <= eff_out[cid]
+            if capped.any():
+                return capped
+            if eff_out[cid] < C:
+                result.relaxations.append(Relaxation(cid, "gamma_out", eff_out[cid],
+                                                     eff_out[cid] + 1, step))
+                eff_out[cid] += 1
+                continue
+            if eff_in[cid] < C:
+                result.relaxations.append(Relaxation(cid, "gamma_in", eff_in[cid],
+                                                     eff_in[cid] + 1, step))
+                eff_in[cid] += 1
+                continue
+            return ok            # both caps fully open; only reuse still blocked
+
     for step in range(total_slots):
         best = None
         for cid in contest_ids:
             if remaining[cid] <= 0:
                 continue
-            ok = ~used_in[cid]
-            if not rules.allow_cross_contest_duplicates:
-                ok &= ~used_any
-            if rules.gamma_in < C:
-                ok &= max_in[cid] <= rules.gamma_in
-            if rules.gamma_out < C:
-                ok &= max_out[cid] <= rules.gamma_out
-            if not ok.any():
+            ok = _eligible(cid, step)
+            if ok is None:
                 continue
             g = np.where(ok, gains[cid], -np.inf)
             j = int(np.argmax(g))

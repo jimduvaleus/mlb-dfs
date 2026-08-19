@@ -3039,3 +3039,35 @@ button { cursor: pointer; }
 .lineup-card.lateswap-card { overflow: visible; }
 .lateswap-card .lineup-card-header { border-radius: 7px 7px 0 0; }
 .lineup-player-name.lateswap-swapped-cell { overflow: visible; }
+
+/* ── Allocation warning banner (Portfolio tab) ──
+   Unfilled purchased entries, or overlap caps relaxed to fill them. These are
+   money problems, so the styling matches the app's existing warning tokens
+   (.doubleheader-warning) rather than a muted informational note. */
+
+.allocation-warning {
+  padding: 10px 14px;
+  margin-bottom: 14px;
+  background: #5a3a1a;
+  color: #fbd38d;
+  border: 1px solid #9c6a1f;
+  border-radius: 6px;
+  font-size: 0.82rem;
+}
+
+.allocation-warning-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 6px;
+}
+
+.allocation-warning-list {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.allocation-warning-list li + li {
+  margin-top: 4px;
+}

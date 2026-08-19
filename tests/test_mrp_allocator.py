@@ -216,3 +216,88 @@ def test_unfilled_reported_when_constraints_exhaust_the_pool():
     res = allocate(states, {"c0": 20}, ind, AllocationRules())
     assert res.unfilled.get("c0", 0) > 0
     assert len(res.picks) == M
+
+
+# ---------------------------------------------------------------------------
+# Relaxation: a purchased slot is money already spent
+# ---------------------------------------------------------------------------
+
+def test_relaxes_rather_than_leaving_a_purchased_slot_empty():
+    """A tight gamma_in on a thin pool must loosen, not silently drop entries.
+    An unfilled entry is an entry fee paid for nothing."""
+    rng = np.random.default_rng(20)
+    M = 60
+    # 14 players over 10-player rosters => every pair shares >= 6, so gamma_in=3
+    # is unsatisfiable for a second lineup and MUST relax.
+    ids, ind = _pool(rng, M, n_players=14)
+    arrays = _arrays(rng, 1, M)
+
+    res = allocate(_build(arrays), {"c0": 5}, ind,
+                   AllocationRules(gamma_in=3, gamma_out=ROSTER))
+
+    assert not res.unfilled, f"left {res.unfilled} unfilled instead of relaxing"
+    assert len(res.by_contest()["c0"]) == 5
+    assert res.relaxations, "relaxed silently -- the loosening must be recorded"
+    assert all(r.contest_id == "c0" for r in res.relaxations)
+
+
+def test_gamma_out_is_surrendered_before_gamma_in():
+    """gamma_out is bankroll-variance control; gamma_in is the actual
+    competition rule. Give up the free constraint first."""
+    rng = np.random.default_rng(21)
+    M = 60
+    ids, ind = _pool(rng, M, n_players=14)
+    arrays = _arrays(rng, 2, M)
+
+    res = allocate(_build(arrays), {"c0": 4, "c1": 4}, ind,
+                   AllocationRules(gamma_in=3, gamma_out=3))
+
+    assert res.relaxations, "expected relaxations on this pool"
+    # Caps are PER CONTEST, so the global sequence interleaves contests. The
+    # ordering claim is within each contest.
+    for cid in {r.contest_id for r in res.relaxations}:
+        seq = [r.rule for r in res.relaxations if r.contest_id == cid]
+        first_in = next((i for i, r in enumerate(seq) if r == "gamma_in"), len(seq))
+        assert all(r == "gamma_out" for r in seq[:first_in]), (
+            f"{cid}: gamma_in relaxed before gamma_out was exhausted: {seq}")
+        # And gamma_out must be fully open by the time gamma_in moves.
+        if first_in < len(seq):
+            out_steps = sum(1 for r in seq[:first_in] if r == "gamma_out")
+            assert out_steps == ROSTER - 3, (
+                f"{cid}: only {out_steps} gamma_out steps before gamma_in moved")
+
+
+def test_relaxation_is_scoped_to_the_starved_contest():
+    rng = np.random.default_rng(22)
+    M = 400
+    # Wide pool: c0 is starved only because we give it an impossible cap.
+    ids, ind = _pool(rng, M, n_players=14)
+    arrays = _arrays(rng, 2, M)
+    res = allocate(_build(arrays), {"c0": 6, "c1": 6}, ind,
+                   AllocationRules(gamma_in=3, gamma_out=ROSTER))
+    touched = {r.contest_id for r in res.relaxations}
+    assert touched <= {"c0", "c1"}
+    # Whichever contests relaxed, every slot still got filled.
+    assert not res.unfilled
+
+
+def test_genuine_exhaustion_still_reports_unfilled():
+    """Relaxation cannot invent lineups: with fewer distinct candidates than
+    slots, the shortfall must still be reported rather than hidden."""
+    rng = np.random.default_rng(23)
+    M = 6
+    _, ind = _pool(rng, M)
+    states = _states(rng, 1, M)
+    res = allocate(states, {"c0": 20}, ind, AllocationRules())
+    assert res.unfilled.get("c0", 0) == 14
+    assert len(res.picks) == 6
+
+
+def test_no_relaxations_when_the_pool_is_comfortable():
+    rng = np.random.default_rng(24)
+    M = 200
+    _, ind = _pool(rng, M, n_players=60)
+    arrays = _arrays(rng, 1, M)
+    res = allocate(_build(arrays), {"c0": 5}, ind,
+                   AllocationRules(gamma_in=7, gamma_out=8))
+    assert res.relaxations == [], "relaxed with plenty of headroom"

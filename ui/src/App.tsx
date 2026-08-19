@@ -1,5 +1,5 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
-import type { AppConfig, CacheStatus, LineupResult, MergeInfo, PortfolioSweepEntry, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification, MrpPayoutFallbackEvent } from './types'
+import type { AppConfig, CacheStatus, LineupResult, MergeInfo, PortfolioSweepEntry, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification, MrpPayoutFallbackEvent, MrpDoneEvent } from './types'
 import { answerRunConfirmation, dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchOptimalLineups, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, lockLineup, parseTwitterLineup, refreshLineup, replaceLineup, saveTwitterLineup, stopRun, unlockLineup, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
@@ -11,6 +11,7 @@ import { MetricsPanel } from './components/MetricsPanel'
 import { SlatePanel } from './components/SlatePanel'
 import { StopUploadDialog } from './components/StopUploadDialog'
 import { PayoutFallbackDialog } from './components/PayoutFallbackDialog'
+import { AllocationWarningBanner } from './components/AllocationWarningBanner'
 import { RunOptionsDialog } from './components/RunOptionsDialog'
 import { DeleteConfirmModal } from './components/DeleteConfirmModal'
 import { LineupParserDialog } from './components/LineupParserDialog'
@@ -111,6 +112,10 @@ export default function App() {
   const [projFetching, setProjFetching] = useState(false)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
   const [payoutFallback, setPayoutFallback] = useState<MrpPayoutFallbackEvent | null>(null)
+  // Allocation warnings (unfilled entries, relaxed overlap caps). Sourced
+  // from the persisted sweep on load and refreshed by mrp_done during a run,
+  // so a refresh mid-slate does not lose them.
+  const [allocWarnings, setAllocWarnings] = useState<string[]>([])
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
   const [stopPending, setStopPending] = useState(false)
   const [showRunOptionsDialog, setShowRunOptionsDialog] = useState(false)
@@ -197,6 +202,7 @@ export default function App() {
       })
       .then(([portfolio, optimalLineups, sweepData]) => {
         const sweep: PortfolioSweepEntry[] = sweepData.sweep ?? []
+        setAllocWarnings(sweepData.warnings ?? [])
         const activeRisk: number = sweepData.active_risk ?? 1
         if (sweep.length > 0) {
           dispatch({ type: 'set_portfolio_sweep', sweep })
@@ -343,6 +349,8 @@ export default function App() {
         dispatch({ type: 'set_portfolio_sweep', sweep: [] })
       } else if (event.stage === 'error') {
         dispatch({ type: 'set_run_status', status: 'error' })
+      } else if (event.stage === 'mrp_done') {
+        setAllocWarnings(((event as unknown as MrpDoneEvent).warnings) ?? [])
       } else if (event.stage === 'mrp_payout_fallback') {
         // The run is BLOCKED in the executor thread until POST /api/run/confirm
         // answers this, so the dialog is not optional chrome.
@@ -639,6 +647,12 @@ export default function App() {
           <ProgressPanel events={events} running={running} />
         )}
 
+        {state.activeTab === 'portfolio' && (
+          <AllocationWarningBanner
+            warnings={allocWarnings}
+            onDismiss={() => setAllocWarnings([])}
+          />
+        )}
         {state.activeTab === 'portfolio' && (
           <PortfolioTable
             lineups={state.portfolio}

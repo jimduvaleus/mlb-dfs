@@ -3709,7 +3709,11 @@ def get_portfolio_sweep():
             return {"sweep": [], "active_risk": 1}
 
         return {"sweep": data.get("sweep", []), "active_risk": data.get("active_risk", 1),
-                "mode": data.get("mode"), "ev_type": data.get("ev_type")}
+                "mode": data.get("mode"), "ev_type": data.get("ev_type"),
+                # Allocation warnings (unfilled entries, relaxed overlap caps).
+                # Passed through so they survive a refresh rather than living
+                # only in the transient SSE stream.
+                "warnings": data.get("warnings", [])}
     except Exception:
         return {"sweep": [], "active_risk": 1}
 
