@@ -61,6 +61,12 @@ const STAGE_LABELS: Record<string, string> = {
   topn_contest_start: 'Top-N coverage: contest started',
   topn_pick_progress: 'Top-N coverage: covering worlds',
   topn_contest_done: 'Top-N coverage: contest filled',
+  mrp_start: 'Marginal reward: building contest states',
+  mrp_build_progress: 'Marginal reward: building contest states',
+  // One global greedy over (candidate, contest) pairs, so picks count across
+  // the whole slate rather than per contest.
+  mrp_pick_progress: 'Marginal reward: picking entries',
+  mrp_done: 'Marginal reward: allocation complete',
   complete: 'Complete',
   stopped: 'Stopped',
   error: 'Error',
@@ -130,6 +136,10 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'topn_contest_start' ||
       last?.stage === 'topn_pick_progress' ||
       last?.stage === 'topn_contest_done' ||
+      last?.stage === 'mrp_start' ||
+      last?.stage === 'mrp_build_progress' ||
+      last?.stage === 'mrp_pick_progress' ||
+      last?.stage === 'mrp_done' ||
       (typeof last?.stage === 'string' && last.stage.startsWith('external_'))
     if (!isLiveProgressEvent) return
 

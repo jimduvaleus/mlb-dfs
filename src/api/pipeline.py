@@ -2363,7 +2363,8 @@ class PipelineRunner:
 
         gpp_cfg = cfg.get("gpp", {})
         _ev_type = str(gpp_cfg.get("external_pool_ev_type", "roi")).strip().lower()
-        if _ev_type not in ("roi", "prj_own", "p_win", "proj_top", "self_play", "topn_coverage"):
+        if _ev_type not in ("roi", "prj_own", "p_win", "proj_top", "self_play",
+                            "topn_coverage", "marginal_reward"):
             logger.warning(
                 "External pool: unknown external_pool_ev_type %r — falling back to 'roi'.",
                 _ev_type,
@@ -3007,6 +3008,61 @@ class PipelineRunner:
                 stop_check=self._stop_check, progress_cb=_topn_progress,
             )
             allocations = {1.0: _topn_alloc}
+        elif _ev_type == "marginal_reward":
+            # --- MRP: one global greedy over (candidate, contest) pairs by
+            # marginal expected dollars, with our own entries inside the order
+            # statistic. No risk sweep: risk is an EVw dial belonging to the
+            # Det selector, and dR has no such knob -- diversity falls out of
+            # self-competition instead. See src/optimization/mrp/. -----------
+            from src.optimization.mrp.runner import (
+                MRPConfig,
+                allocate_marginal_reward,
+            )
+
+            # _rng_seed is assigned inside the p_win/topn branches, neither of
+            # which runs here, so derive it independently rather than relying
+            # on a sibling branch having executed.
+            _mrp_seed = int(gpp_cfg.get("rng_seed") or 42)
+            _mr_cfg = cfg.get("marginal_reward", {}) or {}
+            _mrp_conf = MRPConfig(
+                gamma_in=int(_mr_cfg.get("gamma_in", 7)),
+                gamma_out=int(_mr_cfg.get("gamma_out", 8)),
+                allow_cross_contest_duplicates=bool(
+                    _mr_cfg.get("allow_cross_contest_duplicates", False)),
+                smooth_tau_scale=float(_mr_cfg.get("smooth_tau_scale", 0.0)),
+                field_pool_size=int(_mr_cfg.get("field_pool_size", 25_000)),
+                max_sims_per_contest=int(_mr_cfg.get("max_sims_per_contest", 12_500)),
+                seed=_mrp_seed,
+            )
+            self._cb("mrp_start", {
+                "n_contests": len(groups), "n_pool": len(pool.lineups),
+                "n_entries": sum(len(g.entries) for g in groups),
+                "gamma_in": _mrp_conf.gamma_in, "gamma_out": _mrp_conf.gamma_out,
+                "smooth_tau_scale": _mrp_conf.smooth_tau_scale,
+            })
+
+            def _mrp_progress(info: dict) -> None:
+                stage = info.get("stage")
+                if stage == "mrp_build":
+                    self._cb("mrp_build_progress",
+                             {"done": info["done"], "total": info["total"]})
+                elif stage == "mrp_pick":
+                    self._cb("mrp_pick_progress",
+                             {"done": info["done"], "total": info["total"]})
+
+            _mrp_alloc, _mrp_diag = allocate_marginal_reward(
+                pool, players_df, sim_results, groups, _mrp_conf,
+                progress_cb=_mrp_progress, stop_check=self._stop_check,
+            )
+            logger.info("MRP: R(S)=$%.2f across %d contests, %d unfilled",
+                        _mrp_diag.total_reward, len(_mrp_diag.per_contest),
+                        _mrp_diag.n_unfilled)
+            self._cb("mrp_done", {
+                "total_reward": _mrp_diag.total_reward,
+                "n_unfilled": _mrp_diag.n_unfilled,
+                "per_contest": _mrp_diag.per_contest,
+            })
+            allocations = {1.0: _mrp_alloc}
         else:
             # --- 5-risk sweep: independent per-contest allocations ---------
             _evw_base = float(gpp_cfg.get("evw_base", 0.10))

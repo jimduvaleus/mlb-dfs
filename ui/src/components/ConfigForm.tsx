@@ -224,8 +224,73 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <option value="proj_top">PROJ TOP</option>
                 <option value="self_play">SELF-PLAY</option>
                 <option value="topn_coverage">TOP-N COVERAGE</option>
+                <option value="marginal_reward">MARGINAL REWARD</option>
               </select>
             </FieldRow>
+            {draft.gpp.external_pool_ev_type === 'marginal_reward' && (
+              <>
+                <p className="field-hint">
+                  Fills every purchased slot by one global greedy over (lineup, contest)
+                  pairs, ranked by the marginal expected dollars each would add — with our
+                  OWN entries inside the ranking, so a near-duplicate of something already
+                  picked is penalised because it cannot also take first place. Contest
+                  routing falls out of the objective instead of a fixed fee/prize-pool sort.
+                  Produces a single portfolio: risk is an EVw dial belonging to the Det
+                  selector, and this objective has no such knob.
+                </p>
+                <p className="field-hint">
+                  Not yet validated against production — the archive read it at production's
+                  top-1% level and it was the only negative dollar arm, on a single seed.
+                  Treat it as the A/B challenger it is, not a replacement.
+                </p>
+                <FieldRow label="Max overlap within a contest (γ_in)">
+                  <input type="number" step={1} min={1} max={10}
+                    value={draft.marginal_reward?.gamma_in ?? 7}
+                    onChange={e => set('marginal_reward', 'gamma_in', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Max overlap across contests (γ_out)">
+                  <input type="number" step={1} min={1} max={10}
+                    value={draft.marginal_reward?.gamma_out ?? 8}
+                    onChange={e => set('marginal_reward', 'gamma_out', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <p className="field-hint">
+                  γ_in is the EV rule — entries in the same contest are the only ones that
+                  compete. γ_out is bankroll-variance control only, and 8 is a no-op against
+                  a pool already through the 9/10 near-duplicate cull.
+                </p>
+                <FieldRow label="Allow the same lineup in two contests">
+                  <input type="checkbox"
+                    checked={draft.marginal_reward?.allow_cross_contest_duplicates ?? false}
+                    onChange={e => set('marginal_reward', 'allow_cross_contest_duplicates', e.target.checked)}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Smoothing width (0 = exact estimator)">
+                  <input type="number" step="any" min={0}
+                    value={draft.marginal_reward?.smooth_tau_scale ?? 0}
+                    onChange={e => set('marginal_reward', 'smooth_tau_scale', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Opponent field pool size">
+                  <input type="number" step={1000} min={1000}
+                    value={draft.marginal_reward?.field_pool_size ?? 25000}
+                    onChange={e => set('marginal_reward', 'field_pool_size', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Max sim worlds per contest">
+                  <input type="number" step={500} min={500}
+                    value={draft.marginal_reward?.max_sims_per_contest ?? 12500}
+                    onChange={e => set('marginal_reward', 'max_sims_per_contest', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <p className="field-hint">
+                  Every contest's state is held in memory at once (the greedy compares across
+                  them), so this caps the world axis rather than letting n_sims multiply by
+                  the contest count.
+                </p>
+              </>
+            )}
             {draft.gpp.external_pool_ev_type === 'proj_top' && (
               <>
                 <p className="field-hint">

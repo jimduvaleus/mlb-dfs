@@ -40,7 +40,7 @@ export interface PortfolioConfig {
 
 // External-pool EV currency: Saber's per-contest ROI, our own projected
 // score minus ownership scaled by implied field size, or simulated P(win).
-export type ExternalEvType = 'roi' | 'prj_own' | 'p_win' | 'proj_top' | 'self_play' | 'topn_coverage'
+export type ExternalEvType = 'roi' | 'prj_own' | 'p_win' | 'proj_top' | 'self_play' | 'topn_coverage' | 'marginal_reward'
 
 export interface GppConfig {
   n_candidates: number
@@ -126,6 +126,23 @@ export interface GppConfig {
   external_pool_rank_normalize: boolean
 }
 
+/** Marginal-Reward Portfolio allocator knobs. Selected by
+ *  gpp.external_pool_ev_type = 'marginal_reward'; kept out of GppConfig
+ *  because that type is already ~140 fields describing a funnel this
+ *  allocator does not use. Must stay in sync with
+ *  src/api/models.py MarginalRewardConfig and config.yaml. */
+export interface MarginalRewardConfig {
+  /** Max shared players vs entries in the SAME contest (the EV rule). */
+  gamma_in: number
+  /** Max shared players vs entries in ANY OTHER contest (bankroll variance only). */
+  gamma_out: number
+  allow_cross_contest_duplicates: boolean
+  /** 0 = exact estimator; >0 = smoothed exceedance at that width. */
+  smooth_tau_scale: number
+  field_pool_size: number
+  max_sims_per_contest: number
+}
+
 export interface AppConfig {
   platform: PlatformType
   paths: PathsConfig
@@ -133,6 +150,7 @@ export interface AppConfig {
   optimizer: OptimizerConfig
   portfolio: PortfolioConfig
   gpp: GppConfig
+  marginal_reward: MarginalRewardConfig
 }
 
 export interface PlayerRow {
@@ -256,6 +274,10 @@ export type SSEStage =
   | 'topn_contest_start'
   | 'topn_pick_progress'
   | 'topn_contest_done'
+  | 'mrp_start'
+  | 'mrp_build_progress'
+  | 'mrp_pick_progress'
+  | 'mrp_done'
   | 'complete'
   | 'stopped'
   | 'error'
@@ -914,4 +936,46 @@ export interface LateSwapOverrideResponse {
   entry: LateSwapEntry
   written_files: string[]
   last_run_at?: string | null
+}
+
+/** Marginal-Reward Portfolio allocator progress. One global greedy over
+ *  (candidate, contest) pairs, so there is no per-contest phase to report —
+ *  `mrp_pick_progress` counts picks across the whole slate. */
+export interface MrpStartEvent extends SSEEvent {
+  stage: 'mrp_start'
+  n_contests: number
+  n_pool: number
+  n_entries: number
+  gamma_in: number
+  gamma_out: number
+  smooth_tau_scale: number
+}
+
+export interface MrpBuildProgressEvent extends SSEEvent {
+  stage: 'mrp_build_progress'
+  done: number
+  total: number
+}
+
+export interface MrpPickProgressEvent extends SSEEvent {
+  stage: 'mrp_pick_progress'
+  done: number
+  total: number
+}
+
+export interface MrpDoneEvent extends SSEEvent {
+  stage: 'mrp_done'
+  /** R(S): expected total gross dollars for the whole slate's portfolio. */
+  total_reward: number
+  n_unfilled: number
+  per_contest: {
+    contest_id: string
+    contest_name: string
+    k: number
+    field_size: number
+    reward: number
+    first_delta: number
+    last_delta: number
+    payout_approx: boolean
+  }[]
 }

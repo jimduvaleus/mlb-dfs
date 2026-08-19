@@ -180,9 +180,12 @@ gpp:
 # sync is deferred until the live A/B decides whether this path ships.
 # ---------------------------------------------------------------------------
 marginal_reward:
-  enabled: false
+  # Selected by gpp.external_pool_ev_type: marginal_reward. These are only the
+  # tuning knobs -- the mode switch lives with every other mode switch.
+  # Must stay in sync with src/api/models.py MarginalRewardConfig and
+  # ui/src/types.ts MarginalRewardConfig (tests/test_mrp_config_sync.py).
 
-  # Overlap governance. Three rules doing three different jobs -- see
+  # Overlap governance. Two rules doing two different jobs -- see
   # src/optimization/mrp/allocator.py::AllocationRules.
   gamma_in: 7           # max shared players vs entries in the SAME contest.
                         # EV rule: the same-contest set is the only set our
@@ -207,20 +210,22 @@ marginal_reward:
   # enabling it.
   smooth_tau_scale: 0.0
 
-  # Stochastic ownership (paper footnote 7: a fixed, known p caused
-  # over-certainty and poor portfolios). inf = today's behaviour, one point
-  # estimate reused across all K field draws.
-  # WARNING: do not turn this on alone. EVIDENCE_LOG H3(b) came back INVERTED
-  # -- our simulated field is ALREADY more crowded than the real top band on
-  # 6/9 slates -- and a plain Dirichlet-multinomial makes within-draw crowding
-  # worse, since every opponent in a draw shares the same perturbed p. Pair it
-  # with a crowding recalibration of the stack probabilities in contest.py.
-  ownership_concentration: .inf
+  # Opponent field pool, generated once per slate and subsampled per contest
+  # to that contest's implied entrant count.
+  field_pool_size: 25000
+  # The global greedy compares across contests, so EVERY contest's state is
+  # alive at once and the dominant (M x S) uint16 array multiplies by the
+  # contest count. This caps the world axis (evenly strided) instead.
+  max_sims_per_contest: 12500
 
-  # Targeted generation along the sigma_dG frontier. 0 = off. GATED: run
-  # scripts/eval_field_covariance.py first -- if the external pool already
-  # spans the low-sigma region, generation buys nothing and this repo's prior
-  # negative on augmentation (ILP supplements at 0.57-0.68x pool p_win, zero
-  # reaching the combined top 1% across 7 slates) stands unchallenged.
-  sigma_frontier_per_lambda: 0
-  sigma_frontier_lambdas: [0.0, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0]
+# NOTE: stochastic (Dirichlet) ownership and sigma_dG-targeted generation were
+# BUILT AND THEN DESCOPED BY MEASUREMENT, so they have no config here:
+#   * Perfect knowledge of the entire opponent field measured worth ~nothing
+#     (median +$0.39/entry, +$0.13 drop-largest; on the rate ladder its top-1%
+#     edge flips sign when one slate is removed, positive 2/9). Ownership
+#     modelling is bounded above by that.
+#   * sigma_dG measured rho +0.907 with ownership (16.1% of variance new), so
+#     a "low-sigma frontier the pool lacks" is a low-OWNERSHIP frontier the
+#     pool lacks -- already disconfirmed here.
+# Both modules and their tests remain as measurement tools. See EVIDENCE_LOG.md
+# 2026-08-19 entries before re-adding either knob.

@@ -558,6 +558,38 @@ class GppConfig(BaseModel):
     external_pool_mean_calib_pitcher: float = 1.0
 
 
+class MarginalRewardConfig(BaseModel):
+    """Knobs for the Marginal-Reward Portfolio allocator (Haugh & Singal 2019).
+
+    Selected by `gpp.external_pool_ev_type = "marginal_reward"`; these are only
+    the tuning parameters. Deliberately its own section rather than more
+    `gpp.external_pool_*` fields -- GppConfig is already ~140 fields and this
+    allocator shares none of the funnel those describe.
+    """
+
+    # Max shared players against entries ALREADY IN THE SAME CONTEST. The EV
+    # rule: the same-contest set is the only set our entries compete with.
+    # Haugh & Singal swept {5,6,7} of C=9 and found C-3 best; C=10 here.
+    gamma_in: int = 7
+    # Max shared players against entries in ANY OTHER contest. NOT an EV rule --
+    # separate contests never compete -- so this is bankroll-variance control.
+    # 8 is a no-op against a pool already through the 9/10 near-duplicate cull.
+    gamma_out: int = 8
+    # Playing one lineup in two contests costs no EV (they never compete), so
+    # this too is a risk choice. Off by default, matching production behaviour.
+    allow_cross_contest_duplicates: bool = False
+    # 0 = the exact rank-lookup estimator. >0 swaps in smoothed exceedance at
+    # that width (1.0 = the derived width). Default off, matching
+    # gpp.external_pool_topn_smooth_tau_scale.
+    smooth_tau_scale: float = 0.0
+    # Opponent field pool, subsampled per contest to that contest's implied size.
+    field_pool_size: int = 25000
+    # The dominant retained array is (M x S) uint16 PER CONTEST and the global
+    # greedy needs every contest's state alive at once, so the world axis is
+    # capped (evenly strided) rather than multiplying by the contest count.
+    max_sims_per_contest: int = 12500
+
+
 class AppConfig(BaseModel):
     platform: Platform = Platform.DRAFTKINGS
     paths: PathsConfig = PathsConfig()
@@ -565,6 +597,7 @@ class AppConfig(BaseModel):
     optimizer: OptimizerConfig = OptimizerConfig()
     portfolio: PortfolioConfig = PortfolioConfig()
     gpp: GppConfig = GppConfig()
+    marginal_reward: MarginalRewardConfig = MarginalRewardConfig()
 
 
 class PlayerRow(BaseModel):
