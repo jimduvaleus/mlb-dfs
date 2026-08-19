@@ -78,6 +78,32 @@ _state: dict = {
 
 _stop_event = threading.Event()
 
+# Mid-run confirmation gate. The pipeline runs in an executor thread, so it can
+# block on `_confirm_event` while the event loop stays free to serve
+# POST /api/run/confirm. `_confirm_state` is what the UI polls/receives via SSE
+# to know a dialog is owed; `_confirm_answer` carries the reply back.
+_confirm_event = threading.Event()
+_confirm_state: dict = {"pending": None}   # None | {"kind": str, "payload": dict}
+_confirm_answer: dict = {"proceed": False}
+
+
+def _await_confirmation(kind: str, payload: dict) -> bool:
+    """Block the pipeline thread until the user answers, or the run is stopped.
+
+    Returning False aborts the gated step. A Stop during the wait also returns
+    False, so hitting Stop at a dialog behaves like declining rather than
+    hanging the run.
+    """
+    _confirm_answer["proceed"] = False
+    _confirm_state["pending"] = {"kind": kind, "payload": payload}
+    _confirm_event.clear()
+    while not _confirm_event.wait(timeout=0.5):
+        if _stop_event.is_set():
+            _confirm_state["pending"] = None
+            return False
+    _confirm_state["pending"] = None
+    return bool(_confirm_answer["proceed"])
+
 # ---------------------------------------------------------------------------
 # X/Twitter notification store
 # ---------------------------------------------------------------------------
@@ -3363,7 +3389,30 @@ def stop_run():
     if _state["status"] != "running":
         raise HTTPException(400, "No run in progress")
     _stop_event.set()
+    # Release anything blocked on a confirmation gate; _await_confirmation
+    # treats a stop as a decline, so Stop at a dialog ends the run rather than
+    # leaving the executor thread parked forever.
+    _confirm_event.set()
     return {"ok": True}
+
+
+@app.get("/api/run/confirm")
+def get_pending_confirmation():
+    """What, if anything, the run is currently waiting to be asked.
+
+    The SSE event carries the same payload; this exists so a page refresh
+    mid-dialog can recover the pending question instead of stranding the run.
+    """
+    return {"pending": _confirm_state["pending"]}
+
+
+@app.post("/api/run/confirm")
+def answer_confirmation(body: dict):
+    if _confirm_state["pending"] is None:
+        raise HTTPException(400, "Nothing is awaiting confirmation")
+    _confirm_answer["proceed"] = bool(body.get("proceed", False))
+    _confirm_event.set()
+    return {"ok": True, "proceed": _confirm_answer["proceed"]}
 
 
 @app.post("/api/run/write_upload")
@@ -3485,6 +3534,8 @@ async def run_stream(
         raise HTTPException(409, "A run is already in progress")
 
     _state["status"] = "running"
+    _confirm_state["pending"] = None
+    _confirm_event.clear()
     _state["portfolio"] = None
     _state["error"] = None
     _stop_event.clear()
@@ -3543,6 +3594,7 @@ async def run_stream(
                 use_cached_candidates=use_candidates,
                 use_cached_field=use_field,
                 use_external_pool=use_external_pool,
+                await_confirmation=_await_confirmation,
             )
             portfolio = runner.run()
             _state["portfolio"] = portfolio

@@ -322,3 +322,72 @@ def publish_portfolio(
     sweep_path.write_text(json.dumps(payload))
     return {"sweep_path": str(sweep_path), "csv_path": str(csv_path),
             "backup_paths": backed_up, "n_lineups": len(lineups)}
+
+
+def check_payout_coverage(groups: list, field_pool_cap: int = _FIELD_POOL_CAP) -> list[dict]:
+    """Resolve each contest's payout table and flag approximate matches.
+
+    A pure inspection of what `allocate_marginal_reward` WILL use, so a caller
+    can gate on it before committing to a run. No side effects, no blocking --
+    whether an approximate table is acceptable is the caller's decision.
+
+    WHY THIS DESERVES A GATE AT ALL. `nearest_payout_structure` never returns
+    None: an unregistered contest silently falls back to the closest-size table
+    of ANY registered type. That is tolerable for a per-contest allocator, where
+    a wrong curve misranks candidates inside one contest. It is not tolerable
+    here, because dR is denominated in DOLLARS and the greedy compares marginal
+    dollars ACROSS contests -- so a wrong table does not just misrank within a
+    contest, it misallocates entries between them, silently and slate-wide.
+
+    The backtest path already treats this as a hard stop (`load_real_contests`
+    raises SystemExit on an unmapped contest, and PROSPECTIVE_PROTOCOL says not
+    to silence it). This gives the live path the same detector.
+
+    Returns one row per contest with `exact=False` where the fallback fired.
+    """
+    from src.optimization.payout import structure_for_contest
+
+    rows = []
+    for g in groups:
+        implied = int(implied_field_size(g)) or field_pool_cap
+        f_size = int(np.clip(implied, 1, field_pool_cap))
+        structure, approx = nearest_payout_structure(g.contest_name, n_entries=f_size)
+        exact = structure_for_contest(g.contest_name, n_entries=f_size) is not None
+        payout_total = float(payout_table_to_array(structure).sum())
+        rows.append({
+            "contest_id": g.contest_id,
+            "contest_name": g.contest_name,
+            "k": len(g.entries),
+            "implied_field_size": f_size,
+            "table_name": structure.get("name", "?"),
+            "table_entries": int(structure.get("total_entries", 0)),
+            "table_entry_fee": float(structure.get("entry_fee", 0.0)),
+            "table_prize_pool": payout_total,
+            "entry_fee": g.entry_fee_cents / 100.0,
+            "exact": bool(exact and not approx),
+        })
+    return rows
+
+
+def describe_payout_fallbacks(rows: list[dict]) -> str:
+    """Human-readable summary of the approximate matches, for a prompt."""
+    bad = [r for r in rows if not r["exact"]]
+    if not bad:
+        return ""
+    lines = [f"{len(bad)} of {len(rows)} contests have no registered payout table "
+             f"and will fall back to another contest's structure:"]
+    for r in bad:
+        lines.append(
+            f"  {r['contest_name']}  ({r['k']} entries, ~{r['implied_field_size']:,} field, "
+            f"${r['entry_fee']:.2f} entry)\n"
+            f"      -> will use: {r['table_name']} "
+            f"({r['table_entries']:,} entries, ${r['table_entry_fee']:.2f} entry, "
+            f"${r['table_prize_pool']:,.0f} prize pool)"
+        )
+    lines.append(
+        "Marginal reward is denominated in dollars and compares contests against "
+        "each other, so a wrong payout table misallocates entries BETWEEN contests, "
+        "not just within one. Register the real table in data/payout_structures/ "
+        "and add it to payout.CONTEST_STRUCTURES to fix this properly."
+    )
+    return "\n".join(lines)

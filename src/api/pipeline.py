@@ -220,7 +220,12 @@ class PipelineRunner:
         persist_caches: bool = True,
         sim_cache_path: Optional[str] = None,
         use_external_pool: bool = False,
+        await_confirmation: Optional[Callable[[str, dict], bool]] = None,
     ):
+        # Mid-run gate: called as (kind, payload) and must return True to
+        # proceed. When absent the run ABORTS at a gate rather than proceeding
+        # -- a non-interactive caller must not silently take the risky branch.
+        self._await_confirmation = await_confirmation
         self._config_path = config_path
         self._cb = progress_cb or (lambda stage, data: None)
         self._stop_check = stop_check
@@ -3017,7 +3022,37 @@ class PipelineRunner:
             from src.optimization.mrp.runner import (
                 MRPConfig,
                 allocate_marginal_reward,
+                check_payout_coverage,
+                describe_payout_fallbacks,
             )
+
+            # GATE: an unregistered contest silently borrows another contest's
+            # payout curve (nearest_payout_structure never returns None). dR is
+            # denominated in dollars and compares contests against each other,
+            # so a wrong table misallocates entries BETWEEN contests, slate-wide
+            # and invisibly. Stop and ask rather than guess.
+            _pay_rows = check_payout_coverage(groups)
+            _pay_bad = [r for r in _pay_rows if not r["exact"]]
+            if _pay_bad:
+                _desc = describe_payout_fallbacks(_pay_rows)
+                logger.warning("MRP payout fallback:\n%s", _desc)
+                self._cb("mrp_payout_fallback", {
+                    "n_missing": len(_pay_bad), "n_contests": len(_pay_rows),
+                    "description": _desc, "contests": _pay_bad,
+                })
+                if self._await_confirmation is None:
+                    raise RuntimeError(
+                        "Marginal reward: no registered payout table for "
+                        f"{len(_pay_bad)} of {len(_pay_rows)} contests, and this "
+                        "run has no way to ask. Register the tables in "
+                        "data/payout_structures/ (see PROSPECTIVE_PROTOCOL.md) "
+                        f"or run from the UI to confirm.\n\n{_desc}"
+                    )
+                if not self._await_confirmation("mrp_payout_fallback", {
+                        "n_missing": len(_pay_bad), "n_contests": len(_pay_rows),
+                        "description": _desc, "contests": _pay_bad}):
+                    self._cb("stopped", {"reason": "payout fallback declined"})
+                    return []
 
             # _rng_seed is assigned inside the p_win/topn branches, neither of
             # which runs here, so derive it independently rather than relying

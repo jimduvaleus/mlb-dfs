@@ -278,6 +278,7 @@ export type SSEStage =
   | 'mrp_build_progress'
   | 'mrp_pick_progress'
   | 'mrp_done'
+  | 'mrp_payout_fallback'
   | 'complete'
   | 'stopped'
   | 'error'
@@ -978,4 +979,31 @@ export interface MrpDoneEvent extends SSEEvent {
     last_delta: number
     payout_approx: boolean
   }[]
+}
+
+/** A contest with no registered payout table, about to borrow another's. */
+export interface PayoutFallbackContest {
+  contest_id: string
+  contest_name: string
+  k: number
+  implied_field_size: number
+  table_name: string
+  table_entries: number
+  table_entry_fee: number
+  table_prize_pool: number
+  entry_fee: number
+  exact: boolean
+}
+
+/** Emitted when MRP cannot resolve every contest's real payout table. The run
+ *  BLOCKS on this until POST /api/run/confirm answers, because dR is
+ *  denominated in dollars and compares contests against each other -- a
+ *  borrowed payout curve misallocates entries between contests, not just
+ *  within one. */
+export interface MrpPayoutFallbackEvent extends SSEEvent {
+  stage: 'mrp_payout_fallback'
+  n_missing: number
+  n_contests: number
+  description: string
+  contests: PayoutFallbackContest[]
 }

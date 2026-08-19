@@ -328,3 +328,18 @@ export async function resetLateSwap(): Promise<LateSwapState> {
   if (!res.ok) throw new Error(`Failed to reset late swap: ${res.statusText}`)
   return res.json()
 }
+
+/**
+ * Answer a mid-run confirmation gate.
+ *
+ * The pipeline thread is BLOCKED waiting on this, so failing to call it leaves
+ * the run parked. `proceed: false` aborts the gated step and ends the run.
+ */
+export async function answerRunConfirmation(proceed: boolean): Promise<void> {
+  const r = await fetch('/api/run/confirm', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ proceed }),
+  })
+  if (!r.ok) throw new Error(`confirm failed: ${r.status}`)
+}

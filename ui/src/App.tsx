@@ -1,6 +1,6 @@
 import { useEffect, useReducer, useRef, useState } from 'react'
-import type { AppConfig, CacheStatus, LineupResult, MergeInfo, PortfolioSweepEntry, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification } from './types'
-import { dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchOptimalLineups, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, lockLineup, parseTwitterLineup, refreshLineup, replaceLineup, saveTwitterLineup, stopRun, unlockLineup, writeUploadFiles } from './api'
+import type { AppConfig, CacheStatus, LineupResult, MergeInfo, PortfolioSweepEntry, ProjectionPlayerRow, RunStatus, CompleteEvent, StoppedEvent, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterNotification, MrpPayoutFallbackEvent } from './types'
+import { answerRunConfirmation, dismissNotification, dismissTwitterLineup, fetchCacheStatus, fetchConfig, fetchNotifications, fetchOptimalLineups, fetchPortfolio, fetchProjectionPlayers, fetchTeamTotals, fetchTwitterLineups, fetchUnconfirmedPlayerIds, lockLineup, parseTwitterLineup, refreshLineup, replaceLineup, saveTwitterLineup, stopRun, unlockLineup, writeUploadFiles } from './api'
 import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
@@ -10,6 +10,7 @@ import { ProjectionsTable } from './components/ProjectionsTable'
 import { MetricsPanel } from './components/MetricsPanel'
 import { SlatePanel } from './components/SlatePanel'
 import { StopUploadDialog } from './components/StopUploadDialog'
+import { PayoutFallbackDialog } from './components/PayoutFallbackDialog'
 import { RunOptionsDialog } from './components/RunOptionsDialog'
 import { DeleteConfirmModal } from './components/DeleteConfirmModal'
 import { LineupParserDialog } from './components/LineupParserDialog'
@@ -109,6 +110,7 @@ export default function App() {
   const twitterLineupsRef = useRef<TwitterLineupRecord[]>([])
   const [projFetching, setProjFetching] = useState(false)
   const [showUploadDialog, setShowUploadDialog] = useState(false)
+  const [payoutFallback, setPayoutFallback] = useState<MrpPayoutFallbackEvent | null>(null)
   const [stoppedLineupCount, setStoppedLineupCount] = useState(0)
   const [stopPending, setStopPending] = useState(false)
   const [showRunOptionsDialog, setShowRunOptionsDialog] = useState(false)
@@ -341,9 +343,22 @@ export default function App() {
         dispatch({ type: 'set_portfolio_sweep', sweep: [] })
       } else if (event.stage === 'error') {
         dispatch({ type: 'set_run_status', status: 'error' })
+      } else if (event.stage === 'mrp_payout_fallback') {
+        // The run is BLOCKED in the executor thread until POST /api/run/confirm
+        // answers this, so the dialog is not optional chrome.
+        setPayoutFallback(event as unknown as MrpPayoutFallbackEvent)
       }
     }
   }, [events])
+
+  // The run thread is blocked until this returns, so a failure here must not
+  // leave the dialog dismissed with the pipeline still parked.
+  const answerConfirm = (proceed: boolean) => {
+    answerRunConfirmation(proceed).catch(err => {
+      console.error('failed to answer run confirmation', err)
+      if (proceed) stopRun().catch(() => {})
+    })
+  }
 
   const _doStartRun = (useCandidates: boolean, useField: boolean, seedOptimal: boolean = false, seedSimOptimal: boolean = false, useExternalPool: boolean = false) => {
     setShowRunOptionsDialog(false)
@@ -665,6 +680,15 @@ export default function App() {
           parseResult={parseResult}
           onConfirm={handleConfirmTwitterLineup}
           onCancel={() => { setParsingNotification(null); setParseResult(null) }}
+        />
+      )}
+
+      {payoutFallback && (
+        <PayoutFallbackDialog
+          contests={payoutFallback.contests}
+          nContests={payoutFallback.n_contests}
+          onProceed={() => { answerConfirm(true); setPayoutFallback(null) }}
+          onCancel={() => { answerConfirm(false); setPayoutFallback(null) }}
         />
       )}
 

@@ -66,6 +66,7 @@ const STAGE_LABELS: Record<string, string> = {
   // label for them would be dead code.
   mrp_start: 'Marginal reward: allocating',
   mrp_done: 'Marginal reward: allocation complete',
+  mrp_payout_fallback: 'Marginal reward: MISSING PAYOUT STRUCTURE',
   complete: 'Complete',
   stopped: 'Stopped',
   error: 'Error',
@@ -1099,6 +1100,11 @@ function renderDetail(e: SSEEvent): string {
       }
       return `${ev.n_entries} entries across ${ev.n_contests} contests `
         + `from ${ev.n_pool.toLocaleString()} lineups (γ_in ${ev.gamma_in}, γ_out ${ev.gamma_out})`
+    }
+    case 'mrp_payout_fallback': {
+      const ev = e as unknown as { n_missing: number; n_contests: number }
+      return `${ev.n_missing} of ${ev.n_contests} contests have no registered payout `
+        + `table -- run paused for confirmation`
     }
     case 'mrp_done': {
       const ev = e as unknown as {
