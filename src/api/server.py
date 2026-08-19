@@ -293,6 +293,28 @@ def _upload_order_players(players: list[dict]) -> list[dict]:
         return players
 
 
+def external_roi_blocks_required(ev_type: str) -> bool:
+    """Does this external-pool currency need Saber's per-contest ROI columns?
+
+    Only "roi" consults them. Every other currency -- prj_own, p_win,
+    proj_top, self_play, topn_coverage, marginal_reward -- sources contest
+    identity from the DK entries file and EV from our own sim/projections,
+    which is why `parse_lineup_pool` is called with
+    `require_roi_blocks=(_ev_type == "roi")` in pipeline.py.
+
+    Deliberately a positive test against the ONE mode that needs them rather
+    than a list of the ones that do not. The exclusion-list form silently went
+    stale every time a currency was added: the run itself worked, but
+    /api/run/cache-status reported the external pool unavailable with "no
+    contest ROI blocks found", which greys out the "External candidate pool
+    (SaberSim)" checkbox in RunOptionsDialog -- so the mode could be selected
+    in config and then not be startable. Exports commonly carry no ROI blocks
+    at all (the live 08/18 export has 10,066 lineups and zero), so this is the
+    normal case, not an edge one.
+    """
+    return str(ev_type or "roi").strip().lower() == "roi"
+
+
 def _load_portfolio_from_csv(platform_val: str) -> list[dict] | None:
     """Load a persisted portfolio from a platform-specific CSV. Returns None if unavailable."""
     import pandas as pd
@@ -3398,7 +3420,7 @@ def run_cache_status():
     try:
         from .external_pool import discover_external_files
         _ev_type = str(getattr(cfg.gpp, "external_pool_ev_type", "roi") or "roi").strip().lower()
-        _roi_required = _ev_type not in ("prj_own", "p_win", "proj_top", "self_play", "topn_coverage")
+        _roi_required = external_roi_blocks_required(_ev_type)
         raw_dir = str((PROJECT_ROOT / slate_path).parent) if slate_path else ""
         found = discover_external_files(raw_dir) if raw_dir else {}
         if found.get("lineups_paths") and found.get("projections_path"):

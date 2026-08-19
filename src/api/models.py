@@ -175,10 +175,14 @@ class GppConfig(BaseModel):
     #               coverage is diversified by construction. Saber's ROI is
     #               not consulted; the pool-wide external_pool_proj_score_pct
     #               cull still applies.
-    # Under "prj_own"/"p_win"/"proj_top"/"topn_coverage" Saber's ROI is not consulted at all,
-    # so external_pool_roi_floor_pct, external_pool_ceiling_weight and
-    # external_pool_cash_anchor_fraction are all inert; the pool-wide
-    # external_pool_proj_score_pct cull still applies.
+    # Under EVERY currency other than "roi" -- prj_own / p_win / proj_top /
+    # self_play / topn_coverage / marginal_reward -- Saber's ROI is not
+    # consulted at all, so external_pool_roi_floor_pct,
+    # external_pool_ceiling_weight and external_pool_cash_anchor_fraction are
+    # all inert; the pool-wide external_pool_proj_score_pct cull still applies.
+    # Contest ROI blocks are likewise not required in the export (see
+    # server.py's _roi_required and pipeline.py's require_roi_blocks, both
+    # written as `== "roi"` so they cannot go stale as currencies are added).
     external_pool_ev_type: str = "roi"
     # prj_own calibration constant: the field size at which one point of
     # summed lineup ownership costs one projected point. Calibrated
