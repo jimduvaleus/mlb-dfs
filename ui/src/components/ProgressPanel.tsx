@@ -61,11 +61,10 @@ const STAGE_LABELS: Record<string, string> = {
   topn_contest_start: 'Top-N coverage: contest started',
   topn_pick_progress: 'Top-N coverage: covering worlds',
   topn_contest_done: 'Top-N coverage: contest filled',
-  mrp_start: 'Marginal reward: building contest states',
-  mrp_build_progress: 'Marginal reward: building contest states',
-  // One global greedy over (candidate, contest) pairs, so picks count across
-  // the whole slate rather than per contest.
-  mrp_pick_progress: 'Marginal reward: picking entries',
+  // mrp_build_progress / mrp_pick_progress are deliberately absent: they are
+  // skipped from the log (see the flooding note in the row builder), so a
+  // label for them would be dead code.
+  mrp_start: 'Marginal reward: allocating',
   mrp_done: 'Marginal reward: allocation complete',
   complete: 'Complete',
   stopped: 'Stopped',
@@ -877,6 +876,11 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
     // _progress events above; the one-shot 'external_pwin' summary row
     // below is what's shown.
     if (e.stage === 'external_pwin_field' || e.stage === 'external_pwin_score') continue
+    // MRP fires one event per pick (114 on a typical slate) and one per
+    // contest state built — same flooding problem as topn_pick_progress
+    // above. They still drive the live elapsed timer; only the log rows go.
+    if (e.stage === 'mrp_pick_progress' || e.stage === 'mrp_build_progress') continue
+    if (e.stage === 'mrp_start' && hasEvent('mrp_done')) continue
     // Skip start event once done event is present (collapse into one row)
     if (e.stage === 'gpp_optimal_start' && hasEvent('gpp_optimal_done')) continue
     if (e.stage === 'gpp_sim_optimal_start' && hasEvent('gpp_sim_optimal_done')) continue
@@ -1087,6 +1091,23 @@ function renderDetail(e: SSEEvent): string {
       const ev = e as unknown as { n_requested: number; n_added: number; pool_size: number }
       return `+${ev.n_added.toLocaleString()} generated candidates added (of ${ev.n_requested.toLocaleString()} `
         + `requested) — candidate pool now ${ev.pool_size.toLocaleString()}`
+    }
+    case 'mrp_start': {
+      const ev = e as unknown as {
+        n_contests: number; n_pool: number; n_entries: number
+        gamma_in: number; gamma_out: number
+      }
+      return `${ev.n_entries} entries across ${ev.n_contests} contests `
+        + `from ${ev.n_pool.toLocaleString()} lineups (γ_in ${ev.gamma_in}, γ_out ${ev.gamma_out})`
+    }
+    case 'mrp_done': {
+      const ev = e as unknown as {
+        total_reward: number; n_unfilled: number
+        per_contest: { contest_name: string; k: number; reward: number }[]
+      }
+      const n = ev.per_contest?.length ?? 0
+      return `R(S) = $${ev.total_reward.toFixed(2)} across ${n} contest${n === 1 ? '' : 's'}`
+        + `${ev.n_unfilled > 0 ? `, ${ev.n_unfilled} entries UNFILLED (constraints exhausted the pool)` : ''}`
     }
     case 'topn_contest_done': {
       const ev = e as unknown as {
