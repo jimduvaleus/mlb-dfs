@@ -38,6 +38,16 @@ import numpy as np
 from numba import njit, prange
 
 from src.optimization.mrp.marginal_reward import _payout_cumsum, precompute_field_ranks
+from src.optimization.mrp.smoothing import (
+    _smooth_incumbent_deltas,
+    _smooth_main_term,
+    build_tier_smoothing,
+)
+
+# Beyond this many sigma below a rung, a candidate's smoothed crossing
+# probability is < 1e-8 and every tighter rung's is smaller still, so the
+# kernel stops walking tiers. Purely a speed cut-off, not a model choice.
+_SMOOTH_CUTOFF_Z = -12.0
 
 
 @njit(cache=True, inline="always")
@@ -112,9 +122,14 @@ class ContestDeltaState:
         NOT retained.
     payout_arr : (L,) gross dollars by rank (index r-1), from
         `payout.payout_table_to_array`.
+    smooth_tau_scale : 0.0 (default) uses the EXACT rank-lookup estimator.
+        > 0 swaps in the smoothed-exceedance estimator at that width (1.0 =
+        the derived width) -- same target, lower variance on the tight rungs
+        that carry most of this objective's weight. See smoothing.py.
     """
 
-    def __init__(self, cand_scores, field_sorted, payout_arr, chunk: int = 512):
+    def __init__(self, cand_scores, field_sorted, payout_arr, chunk: int = 512,
+                 smooth_tau_scale: float = 0.0):
         self.cand_scores = np.ascontiguousarray(cand_scores, dtype=np.float32)
         self.M, self.S = self.cand_scores.shape
         self.payout_arr = np.asarray(payout_arr, dtype=np.float64)
@@ -131,8 +146,18 @@ class ContestDeltaState:
         self.own_ties = np.zeros((self.M, self.S), dtype=np.uint8)
         self.selected: list[int] = []
 
+        # Built while field_sorted is still alive; retains only (T, S) arrays,
+        # so the caller can drop the multi-GB field array right after.
+        self.smooth_tau_scale = float(smooth_tau_scale)
+        self.smoothing = (
+            build_tier_smoothing(field_sorted, self.payout_arr, self.smooth_tau_scale)
+            if self.smooth_tau_scale > 0.0 else None
+        )
+
     def marginal_gains(self) -> np.ndarray:
-        """(M,) exact dR(j | S) for every candidate."""
+        """(M,) dR(j | S) for every candidate."""
+        if self.smoothing is not None:
+            return self._marginal_gains_smooth()
         gains = _main_term(
             self.n_above_field, self.f_ties, self.own_above, self.own_ties,
             self.payout_cum, self.L,
@@ -145,6 +170,33 @@ class ContestDeltaState:
                     self.cand_scores, w, sc, d_gt, d_eq, self.M, self.S
                 )
         return gains
+
+    def _marginal_gains_smooth(self) -> np.ndarray:
+        sm = self.smoothing
+        gains = _smooth_main_term(
+            self.cand_scores, self.own_above, self.own_ties,
+            sm.thr, sm.slope, sm.tau, sm.steps, _SMOOTH_CUTOFF_Z,
+        )
+        if not self.selected:
+            return gains
+        idx = np.asarray(self.selected, dtype=np.int64)
+        d_gt, d_eq = _smooth_incumbent_deltas(
+            self.cand_scores[idx], self.own_above[idx], self.own_ties[idx],
+            sm.thr, sm.slope, sm.tau, sm.steps, _SMOOTH_CUTOFF_Z,
+        )
+        # The kernel's early exit leaves untouched cells at exactly 0.0, so the
+        # nonzero set is already sparse without an arbitrary epsilon.
+        nz = np.nonzero((d_gt != 0.0) | (d_eq != 0.0))
+        if nz[0].size == 0:
+            return gains
+        rows, worlds = nz
+        return gains + _demotion_term(
+            self.cand_scores,
+            worlds.astype(np.int64),
+            self.cand_scores[idx[rows], worlds].astype(np.float32),
+            d_gt[rows, worlds], d_eq[rows, worlds],
+            self.M, self.S,
+        )
 
     def _demotion_cells(self):
         """Sparse (world, incumbent score, delta_gt, delta_eq) cells.
