@@ -138,6 +138,18 @@ def run_slate(d: Path, slate: str) -> list[dict]:
     rho_own = float(spearmanr(pool_sigma, pool_own).statistic)
     rho_proj = float(spearmanr(pool_sigma, pool_proj).statistic)
 
+    # How much of sigma_dG is just ownership (plus projection) wearing a hat?
+    # This repo has been here before: SaberSim's "ROI StDev" correlated r=0.833
+    # with ROI itself, and the RESIDUAL was the only genuinely new signal
+    # (memory project-external-pool-theory). A high rho against ownership is
+    # expected here on mechanism -- a player moves the cutoff largely because
+    # the field rosters him -- so the question is what is left after removing
+    # it, not whether the raw correlation is high.
+    X = np.column_stack([np.ones(len(pool_sigma)), pool_own, pool_proj])
+    beta, *_ = np.linalg.lstsq(X, pool_sigma, rcond=None)
+    resid = pool_sigma - X @ beta
+    r2 = 1.0 - float(resid.var() / max(pool_sigma.var(), 1e-12))
+
     # --- Q2: does the pool span the frontier? --------------------------------
     pdf = players_df.copy()
     if "eligible_positions" not in pdf.columns:
@@ -162,6 +174,8 @@ def run_slate(d: Path, slate: str) -> list[dict]:
         "contest": biggest["contest"], "n_field_real": len(biggest["sorted_scores"]),
         "rho_sigma_vs_own": round(rho_own, 4),
         "rho_sigma_vs_proj": round(rho_proj, 4),
+        "r2_on_own_proj": round(r2, 4),
+        "pct_variance_new": round(100 * (1 - r2), 2),
         "is_new_signal": bool(abs(rho_own) < 0.9 and abs(rho_proj) < 0.9),
         "decision": cov["decision"],
     }
@@ -219,6 +233,9 @@ def report(df: pd.DataFrame) -> None:
     n_new = int(df["is_new_signal"].sum())
     print(f"               distinct on {n_new}/{len(df)} slates"
           + ("" if n_new == len(df) else "   <-- NOT distinct everywhere"))
+    if "pct_variance_new" in df:
+        print(f"               variance NOT explained by (ownership, proj_score): "
+              f"{df['pct_variance_new'].mean():.1f}%  <-- this is the genuinely new part")
 
     print(f"\nQ2 POOL COVERAGE: " + ", ".join(
         f"{k}={v}" for k, v in df["decision"].value_counts().items()))

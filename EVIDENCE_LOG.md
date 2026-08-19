@@ -210,3 +210,63 @@ noise comparable to the effect being measured. n_sims 4,000 is low for rank-1
 events. `oracle` and `mrp_realfield` are look-ahead by construction: they
 bound, they never validate. This result can retire a direction (it does); it
 cannot promote one.
+
+---
+
+## 2026-08-19 — MRP: is sigma_dG new information? (gates M5)
+
+Pre-registration note: as with the entry above, written after the run. Same
+reduced weight applies.
+
+**Hypothesis.** Haugh & Singal's `sigma_{delta,G}` -- per-player covariance
+with the field's payout cutoff -- is field-aware in a way our currencies are
+not, and the external pool does not span the low-covariance region, so targeted
+ILP generation along a lambda-swept sigma frontier would reach lineups dR
+cannot otherwise select.
+
+**Design.** `scripts/eval_field_covariance.py`, 9 slates, seed 42, n_sims
+4,000, field 10,000, lambda grid 0.0-1.0, 20 lineups per lambda.
+
+**Failure conditions (as they would have been registered):** |rho| > 0.9
+against ownership or proj_score (the currency is a re-parameterisation), or
+`decision == "pool-already-spans"` (generation is redundant).
+
+### Result: SPLIT, and it nets out to "do not build M5"
+
+- **Q1 IS IT NEW? Largely NO.** rho vs ownership mean **+0.907** (max 0.960),
+  distinct on only **4/9** slates. A linear fit on (ownership, proj_score)
+  leaves just **16.1%** of pool-level sigma variance unexplained. This is the
+  same shape as SaberSim's "ROI StDev" (r=0.833 with ROI itself), where the
+  residual was the only new signal
+  ([[project-external-pool-theory]]). Mechanically unsurprising: a player moves
+  the cutoff mostly because the field rosters him.
+- **Q2 POOL COVERAGE: "generate" on 9/9.** The ILP frontier reaches strictly
+  below the entire ~5,000-lineup pool on every slate (frontier minimum sits at
+  pool percentile 0.000).
+- **Q3 ASSUMPTION 5.2 HOLDS.** Median relative spread across tiers 0.100, min
+  column correlation 0.970 -- the (P, T) block does collapse to one vector per
+  slate. (A single-slate run at n_sims 2,000 gave 0.217/0.701; that was a
+  low-sim artefact, corrected by re-running at 4,000.)
+
+**Adjudication.** Q2 alone would say build it. Q1 says what we would be
+reaching for is ~84% ownership, so a "low-sigma frontier the pool does not
+contain" is, to first order, a low-OWNERSHIP frontier the pool does not
+contain. This repo has already tested that: ownership fade is DISCONFIRMED
+([[project-ownership-fade-disconfirmed]], 5/9 and 3/9 slates, 98-100% of lift
+from a single slate) and field-blind contrarian play measured anti-correlated
+with results ([[project-external-pool-currency-comparison]]).
+
+### Consequences
+
+1. **M5 (sigma_dG-targeted generation) is NOT BUILT into any production path.**
+   The gate's coverage arm passes, but the region it reaches is one already
+   disconfirmed under a different name. Module and tests stay as a measurement
+   tool.
+2. **sigma_dG is not wired as a selector currency.** It was never planned as
+   one (dR is evaluated directly, so the mean-variance surrogate it belongs to
+   is unnecessary) and Q1 removes the residual case for it.
+3. If revisited, the only defensible form is the RESIDUAL after removing
+   ownership and projection -- 16.1% of the variance -- not raw sigma. That is
+   a thin base and should be pre-registered properly first.
+4. Assumption 5.2 holding is a small genuine positive: any future use can
+   collapse the tier block to one payout-weighted vector without loss.
