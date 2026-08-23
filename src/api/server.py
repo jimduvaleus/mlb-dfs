@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -989,7 +990,7 @@ async def refresh_lineup(team: str):
 
     cfg = read_config()
     platform_val = cfg.platform.value if hasattr(cfg, "platform") else "draftkings"
-    python = PROJECT_ROOT / "venv" / "bin" / "python"
+    python = Path(sys.executable)
     rw_script = PROJECT_ROOT / "scripts" / "fetch_rotowire_projections.py"
 
     platform_args: list[str] = ["--platform", platform_val]
@@ -1985,7 +1986,7 @@ async def projections_ownership_sync():
         return {"status": "unavailable", "reason": "date_parse_error"}
 
     # Run the dry-run subprocess — writes ownership_projections.csv to archive_dir
-    python = PROJECT_ROOT / "venv" / "bin" / "python"
+    python = Path(sys.executable)
     eval_script = PROJECT_ROOT / "scripts" / "evaluate_ownership.py"
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -2246,7 +2247,7 @@ async def projections_fetch(request: Request):
             preferred_label = "RotoWire"
             fallback_label  = "Daily Fantasy Fuel"
 
-        python     = PROJECT_ROOT / "venv" / "bin" / "python"
+        python     = Path(sys.executable)
         dff_script = PROJECT_ROOT / "scripts" / "fetch_dff_projections.py"
         rw_script  = PROJECT_ROOT / "scripts" / "fetch_rotowire_projections.py"
         mo_script  = PROJECT_ROOT / "scripts" / "fetch_market_odds_projections.py"

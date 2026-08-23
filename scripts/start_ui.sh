@@ -32,8 +32,20 @@ fi
 export HTTP_PROXY="${HTTP_PROXY:-http://localhost:3128}"
 export HTTPS_PROXY="${HTTPS_PROXY:-http://localhost:3128}"
 
-# Activate virtualenv and start the server
-source "$REPO_ROOT/venv/bin/activate"
+# Activate virtualenv and start the server.
+# Honour an already-active venv; otherwise take whichever of .venv/ or venv/ exists.
+if [ -z "$VIRTUAL_ENV" ]; then
+    for _vdir in "$REPO_ROOT/.venv" "$REPO_ROOT/venv"; do
+        if [ -f "$_vdir/bin/activate" ]; then
+            source "$_vdir/bin/activate"
+            break
+        fi
+    done
+    if [ -z "$VIRTUAL_ENV" ]; then
+        echo "ERROR: no virtualenv found at $REPO_ROOT/.venv or $REPO_ROOT/venv" >&2
+        exit 1
+    fi
+fi
 
 echo "Starting MLB DFS Optimizer UI on http://localhost:$PORT"
 uvicorn src.api.server:app \

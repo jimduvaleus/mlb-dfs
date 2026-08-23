@@ -19,10 +19,12 @@ At production scale (`n_sims` ~25,000; pools of tens of thousands of lineups), a
 
 ## Commands
 
-All commands must be run inside the virtualenv:
+All commands must be run inside the virtualenv. The venv directory is named
+`.venv/` on some machines and `venv/` on others (both are gitignored), so use
+whichever exists:
 
 ```bash
-source venv/bin/activate
+source .venv/bin/activate   # or: source venv/bin/activate
 ```
 
 **Run all tests:**

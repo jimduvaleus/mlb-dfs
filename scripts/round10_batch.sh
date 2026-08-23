@@ -20,7 +20,7 @@ rm -f "$STOP"
 exec systemd-run --user --scope --unit=round10-batch \
   -p MemoryHigh=10G -p MemoryMax=12G --collect \
   nice -n 10 bash -c '
-    source venv/bin/activate
+    for _vdir in .venv venv; do [ -f "$_vdir/bin/activate" ] && { source "$_vdir/bin/activate"; break; }; done
     for attempt in 1 2 3; do
       python scripts/replay_slate.py --all --variants plans/variants_round10.yaml --portfolio-size 150
       rc=$?
