@@ -34,6 +34,7 @@ from src.api.external_pool import (
     ExternalAllocation,
     _lineup_indicator_matrix,
     compute_lineup_scores,
+    compute_proj_score_floor,
     implied_field_size,
 )
 from src.optimization.contest import ContestSimulator
@@ -80,6 +81,8 @@ class MRPDiagnostics:
     # Overlap caps loosened to fill purchased slots, and the pre-flight verdict.
     relaxations: list = _field(default_factory=list)
     preflight: dict = _field(default_factory=dict)
+    # Pool-wide floor cull, empty when disabled.
+    floor: dict = _field(default_factory=dict)
 
     def warnings(self) -> list[str]:
         """User-facing warnings, worst first. Empty when nothing went wrong."""
@@ -132,6 +135,50 @@ def _world_slice(n_sims: int, cap: int) -> np.ndarray:
     return np.arange(0, n_sims, step)
 
 
+def _floor_keep_indices(
+    n: int,
+    floor_scores: Optional[np.ndarray],
+    percentile: float,
+    preassigned: Optional[dict],
+) -> tuple[np.ndarray, dict]:
+    """(keep_idx, diag) for the pool-wide floor cull.
+
+    Delegates the cutoff to `external_pool.compute_proj_score_floor` and
+    reproduces `allocate_contests`' mask expression exactly, so the two paths
+    cull the same lineups from the same basis rather than merely similar ones
+    (`tests/test_mrp_floor.py` asserts the agreement on a shared basis).
+    """
+    all_idx = np.arange(n)
+    if floor_scores is None or percentile <= 0:
+        return all_idx, {}
+    basis = np.asarray(floor_scores, dtype=np.float64)
+    if basis.shape != (n,):
+        raise ValueError(
+            f"floor_scores has shape {basis.shape}, expected ({n},) to align "
+            "with pool.lineups"
+        )
+    floor = compute_proj_score_floor(basis, percentile)
+    if floor is None:
+        return all_idx, {}
+    cutoff, n_culled = floor
+    keep = np.isfinite(basis) & (basis >= cutoff)
+    n_exempt = 0
+    for idxs in (preassigned or {}).values():
+        for j in idxs:
+            if not keep[int(j)]:
+                keep[int(j)] = True
+                n_exempt += 1
+    keep_idx = np.flatnonzero(keep)
+    return keep_idx, {
+        "cutoff": float(cutoff),
+        "percentile": float(percentile),
+        "pool_size": n,
+        "n_culled": int(n - len(keep_idx)),
+        "n_culled_before_exempt": int(n_culled),
+        "n_preassigned_exempt": n_exempt,
+    }
+
+
 def allocate_marginal_reward(
     pool,
     players_df,
@@ -140,6 +187,8 @@ def allocate_marginal_reward(
     cfg: Optional[MRPConfig] = None,
     *,
     preassigned: Optional[dict] = None,
+    floor_scores: Optional[np.ndarray] = None,
+    proj_score_floor_percentile: float = 0.0,
     progress_cb: Optional[Callable[[dict], None]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[ExternalAllocation, MRPDiagnostics]:
@@ -153,6 +202,17 @@ def allocate_marginal_reward(
     preassigned : {contest_id: [pool index]} already committed to that contest
         (an A/B's production half). Those entries become incumbents and their
         pool indices are removed from consideration.
+    floor_scores : (M,) per-lineup floor basis aligned to `pool.lineups` --
+        pass `compute_pool_ceiling_scores(pool, players_df)`, the same array
+        every other ev_type floors on.
+    proj_score_floor_percentile : cull the bottom N% of `floor_scores`
+        pool-wide before any scoring, with `allocate_contests`' exact
+        semantics (`isfinite(basis) & basis >= cutoff`, so a lineup with no
+        finite score is culled too). 0 disables. Applied by SUBSETTING the
+        candidate axis rather than masking it, so the (M x S) per-contest
+        rank arrays shrink with the cull instead of carrying dead columns.
+        `preassigned` indices are exempt: an A/B's other arm already bought
+        those entries, so they stay as incumbents whatever their ceiling.
     """
     cfg = cfg or MRPConfig()
     groups = [g for g in groups if g.entries]
@@ -163,23 +223,47 @@ def allocate_marginal_reward(
             unfilled=[e for g in groups for e in g.entries],
         ), MRPDiagnostics(n_unfilled=n_missing)
 
+    # POOL-WIDE FLOOR, before the pre-flight: the cull changes how many
+    # mutually-compatible lineups the pool can supply, so a capacity verdict
+    # taken on the uncut pool would answer a question about a pool that is
+    # not the one being allocated from.
+    keep_idx, floor_diag = _floor_keep_indices(
+        len(pool.lineups), floor_scores, proj_score_floor_percentile, preassigned,
+    )
+    lineups = [pool.lineups[i] for i in keep_idx]
+    if not lineups:
+        n_missing = sum(len(g.entries) for g in groups)
+        return ExternalAllocation(
+            portfolio=[], entry_plan=[],
+            unfilled=[e for g in groups for e in g.entries],
+        ), MRPDiagnostics(n_unfilled=n_missing, floor=floor_diag)
+    # Pool indices -> candidate-axis positions, for `preassigned` in and picks
+    # back out. Every downstream index is a position in `lineups` from here.
+    pos_of = {int(orig): new for new, orig in enumerate(keep_idx)}
+    preassigned = {
+        cid: [pos_of[int(j)] for j in idxs if int(j) in pos_of]
+        for cid, idxs in (preassigned or {}).items()
+    }
+    if floor_diag.get("n_culled") and progress_cb is not None:
+        progress_cb({"stage": "mrp_floor", **floor_diag})
+
     # PRE-FLIGHT, before any simulation-sized work: can the pool even supply
     # the biggest contest under this gamma_in? Composition-only, so it costs
     # ~a second and fails fast instead of ten minutes in.
     _max_slots = max(len(g.entries) for g in groups)
     preflight = preflight_overlap_capacity(
-        pool.lineups, sim_results.player_ids, _max_slots,
+        lineups, sim_results.player_ids, _max_slots,
         cfg.gamma_in, roster_size=cfg.rules().roster_size,
     )
     if progress_cb is not None:
         progress_cb({"stage": "mrp_preflight", **preflight})
 
     rng = np.random.default_rng(cfg.seed)
-    scores_full = compute_lineup_scores(pool.lineups, sim_results)        # (M, S)
+    scores_full = compute_lineup_scores(lineups, sim_results)             # (M, S)
     keep = _world_slice(scores_full.shape[1], cfg.max_sims_per_contest)
     cand_scores = np.ascontiguousarray(scores_full[:, keep])
     del scores_full
-    indicator = _lineup_indicator_matrix(pool.lineups, sim_results.player_ids)
+    indicator = _lineup_indicator_matrix(lineups, sim_results.player_ids)
 
     sim_matrix = sim_results.results_matrix.astype(np.float32)[keep]
     col_map = {int(p): i for i, p in enumerate(sim_results.player_ids)}
@@ -245,12 +329,13 @@ def allocate_marginal_reward(
         n_pre = len((preassigned or {}).get(g.contest_id, []))
         take = g.entries[n_pre:n_pre + len(picks)]
         for idx, ent in zip(picks, take):
-            portfolio.append((pool.lineups[idx], float(delta_by[g.contest_id].pop(0))))
+            portfolio.append((lineups[idx], float(delta_by[g.contest_id].pop(0))))
             entry_plan.append(ent)
         unfilled.extend(g.entries[n_pre + len(picks):])
 
     diag = MRPDiagnostics(
         n_unfilled=len(unfilled),
+        floor=floor_diag,
         relaxations=[{"contest_id": r.contest_id, "rule": r.rule,
                       "frm": r.frm, "to": r.to, "step": r.step}
                      for r in res.relaxations],

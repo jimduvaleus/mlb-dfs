@@ -3084,9 +3084,23 @@ class PipelineRunner:
                 elif stage == "mrp_pick":
                     self._cb("mrp_pick_progress",
                              {"done": info["done"], "total": info["total"]})
+                elif stage == "mrp_floor":
+                    # Re-report the ceiling floor with the count MRP actually
+                    # applied. The pool-wide `external_proj_score_floor` event
+                    # above is emitted before any branch runs and knows nothing
+                    # about A/B incumbents, which are exempt from the cull.
+                    if info.get("n_preassigned_exempt"):
+                        self._cb("external_proj_score_floor", {
+                            "cutoff": info["cutoff"],
+                            "n_culled": info["n_culled"],
+                            "percentile": info["percentile"],
+                            "pool_size": info["pool_size"],
+                        })
 
             _mrp_alloc, _mrp_diag = allocate_marginal_reward(
                 pool, players_df, sim_results, groups, _mrp_conf,
+                floor_scores=_floor_scores,
+                proj_score_floor_percentile=_proj_score_floor_pct,
                 progress_cb=_mrp_progress, stop_check=self._stop_check,
             )
             logger.info("MRP: R(S)=$%.2f across %d contests, %d unfilled",

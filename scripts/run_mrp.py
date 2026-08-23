@@ -68,6 +68,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import yaml
 
 sys.stdout.reconfigure(line_buffering=True)
 
@@ -142,6 +143,11 @@ def main() -> int:
     ap.add_argument("--smooth-tau", type=float, default=0.0)
     ap.add_argument("--max-sims-per-contest", type=int, default=12_500)
     ap.add_argument("--field-pool", type=int, default=25_000)
+    ap.add_argument("--proj-score-pct", type=float, default=None,
+                    help="pool-wide ceiling floor: cull the bottom N%% of lineups "
+                         "by SaberSim 99th (default: gpp.external_pool_proj_score_pct "
+                         "from config.yaml, so the CLI and the pipeline cull alike; "
+                         "0 disables)")
     ap.add_argument("--no-calibration", action="store_true",
                     help="force raw SaberSim grids, overriding config. By default the "
                          "gpp.external_pool_* calibration keys are read from config.yaml "
@@ -195,8 +201,18 @@ def main() -> int:
         field_pool_size=args.field_pool,
         max_sims_per_contest=args.max_sims_per_contest,
     )
+    _floor_pct = args.proj_score_pct
+    if _floor_pct is None:
+        _floor_pct = float(
+            (yaml.safe_load(open(PROJECT_ROOT / "config.yaml")).get("gpp", {}) or {})
+            .get("external_pool_proj_score_pct", 0.0)
+        )
+    _floor_scores = (
+        ep.compute_pool_ceiling_scores(si.pool, si.players_df) if _floor_pct > 0 else None
+    )
     alloc, diag = allocate_marginal_reward(
         si.pool, si.players_df, si.sim_results, groups, cfg, preassigned=preassigned,
+        floor_scores=_floor_scores, proj_score_floor_percentile=_floor_pct,
         progress_cb=lambda d: (
             print(f"  {d['stage']} {d['done']}/{d['total']}", end="\r")
             if d["done"] % 25 == 0 or d["done"] == d["total"] else None),
