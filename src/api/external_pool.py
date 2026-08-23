@@ -514,6 +514,13 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     df = pd.read_csv(path)
     mean_col = "fd_points" if platform == "fanduel" else "dk_points"
     std_col = "fd_std" if platform == "fanduel" else "dk_std"
+    # DK means come from "My Proj" (SaberSim's projection as edited in the
+    # user's own board) rather than the raw dk_points model output, matching
+    # what external-pool mode already reads via parse_player_projections --
+    # the two paths consume the same export and must not disagree on a
+    # player's projected mean. "My Proj" is DK-scored, so the FanDuel
+    # platform keeps fd_points; rows the column leaves blank fall back to
+    # the platform column.
     # SaberSim's Pos column is inconsistent across export files -- some days
     # it uses "SP"/"RP", others plain "P" (unlike the DK slate's ingested
     # `position`, which DraftKingsSlateIngestor always normalizes to "P" --
@@ -522,6 +529,8 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     confirmed = df["Status"].astype(str) == "Confirmed"
     order = pd.to_numeric(df.get("Order"), errors="coerce")
     mean_raw = pd.to_numeric(df[mean_col], errors="coerce")
+    if platform != "fanduel" and "My Proj" in df.columns:
+        mean_raw = pd.to_numeric(df["My Proj"], errors="coerce").fillna(mean_raw)
     lineup_slot = pd.Series(np.nan, index=df.index, dtype=float)
     lineup_slot.loc[is_pitcher] = 10
     lineup_slot.loc[~is_pitcher] = order.loc[~is_pitcher]
