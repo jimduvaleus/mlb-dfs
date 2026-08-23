@@ -702,7 +702,19 @@ both running ~13% hot on hitters.
 Deliberately SEPARATE from the zero-inflation above. Zero-inflation is a pure
 shape fix and holds the projected mean; this is the location fix. Keeping them
 apart means each can be re-fitted or disabled on its own, and neither silently
-absorbs the other's error."""
+absorbs the other's error.
+
+DENOMINATOR WARNING. This is realized / RAW GRID mean, so it is the right
+constant only when `rescale_to_file_mean` is OFF. With the rescale on the sim is
+anchored to the file's "My Proj" instead, and the grids run ~6% above that
+(measured 1.061 own-weighted over starting batters, 8/23 export) purely as an
+interpolation artifact -- six sparse knots plus a linear p99->p100 extrapolation
+over-integrate the right tail. The rescale therefore already delivers about half
+this haircut, and the residual is 0.878 x 1.061 = 0.934: config ships 0.93 on
+that path. Do NOT copy 0.88 into `external_pool_mean_calib_batter` while the
+rescale is on. The clean replacement for both numbers is one regression of
+realized FPTS against "My Proj" directly, which needs the slate archive and
+standings zips this repo no longer carries."""
 
 _MEAN_CALIB_PITCHER_SS = 1.0
 """No calibration for SaberSim PITCHER projections: the same fit gives 0.935
