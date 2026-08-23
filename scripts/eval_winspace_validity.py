@@ -21,6 +21,25 @@ Higher = more redundant = more likely a diversity term suppresses it. Reported
 for both arms; `delta = winspace - bulk`, so POSITIVE delta means win-space is
 the more hostile of the two to lineups that actually won.
 
+REFERENCE-SET ARMS. The whole comparison is relative to an "already-picked"
+set, so the choice of that set is the main way this screen could mislead. Four
+are run per slate:
+
+    ceiling    top-50 by pool ceiling score. CHALK-HEAVY -- ceiling ranking is
+               known chalk-buying (rho 0.91 with proj_score, -0.77 with
+               prj_own). Kept as the original baseline.
+    prj_own    top-50 by the leverage currency. Deliberately ANTI-chalk, so it
+               is the direct adversarial check on the ceiling arm.
+    shipped    the ACTUAL production portfolio from the archived
+               portfolio_sweep_draftkings.json at its active risk, matched to
+               pool lineups by exact 10-player set. The realistic case: in
+               production the reference IS whatever the selector already
+               picked.
+    random     a uniform draw. Neutral control -- no selection pressure at all.
+
+If the sign holds across all four, "win-space only looks good against a chalk
+block" is closed. If it holds only for `ceiling`, that is the real answer.
+
 WHAT THIS CAN AND CANNOT CONCLUDE. Selecting the top-K by REALIZED score
 conditions on the outcome, so this is look-ahead by construction. It is a
 SAFETY SCREEN: it can kill the idea, it can never validate it. A pass here
@@ -96,16 +115,48 @@ def _append_and_reload(csv_path: Path, slate: str, rows: list[dict]) -> pd.DataF
     return pd.read_csv(csv_path, dtype={"slate": str})
 
 
-def _redundancy(X: np.ndarray, ref_idx: np.ndarray) -> np.ndarray:
-    """production's `sum_i max(r_i, 0)^2` against a fixed reference set."""
+def _normalize(X: np.ndarray) -> np.ndarray:
+    """Row-centre and unit-normalise once, so each extra reference set costs
+    only an (M, 50) matmul instead of renormalising a ~1 GB (M, S) array."""
     A = X.astype(np.float32)
-    A = A - A.mean(axis=1, keepdims=True)
+    A -= A.mean(axis=1, keepdims=True)
     sd = np.sqrt((A * A).sum(axis=1))
     sd[sd <= 0] = np.inf
     A /= sd[:, None]
+    return A
+
+
+def _redundancy(A: np.ndarray, ref_idx: np.ndarray) -> np.ndarray:
+    """production's `sum_i max(r_i, 0)^2` against a fixed reference set.
+    `A` must already be `_normalize`d."""
     R = A @ A[ref_idx].T
     np.maximum(R, 0.0, out=R)
     return np.square(R).sum(axis=1)
+
+
+def _shipped_reference(adir: Path, lineups: list, limit: int) -> np.ndarray:
+    """Pool indices of the ACTUAL shipped portfolio, matched by exact
+    10-player set. Returns an empty array when the archive has no usable
+    overlap (e.g. a portfolio built from generated lineups absent from this
+    pool), which the caller reports rather than silently substituting."""
+    f = adir / "portfolio_sweep_draftkings.json"
+    if not f.exists():
+        return np.empty(0, dtype=np.int64)
+    d = json.loads(f.read_text())
+    risk = d.get("active_risk")
+    entries = [e for e in d.get("sweep", []) if e.get("risk") == risk] or d.get("sweep", [])
+    by_set = {frozenset(int(p) for p in lu.player_ids): i for i, lu in enumerate(lineups)}
+    out, seen = [], set()
+    for e in entries:
+        for lu in e.get("lineups", []):
+            key = frozenset(int(pl["player_id"]) for pl in lu.get("players", []))
+            i = by_set.get(key)
+            if i is not None and i not in seen:
+                seen.add(i)
+                out.append(i)
+        if len(out) >= limit:
+            break
+    return np.array(out[:limit], dtype=np.int64)
 
 
 def _pctile_of(values: np.ndarray, idx: np.ndarray) -> np.ndarray:
@@ -182,7 +233,12 @@ def run_slate(slate: str, cfg: dict) -> list[dict]:
 
     cand = ep.compute_lineup_scores(lineups, _SR).astype(np.float32)      # (M, S)
     own = players_df["ownership"].astype(float).to_numpy()
-    fpool = ep.build_topn_field_pool(players_df, own, FIELD_N, seed)
+    fp_cache = OUT_DIR / f"field_{slate}_{FIELD_N}_{seed}.npy"
+    if fp_cache.exists():
+        fpool = np.load(fp_cache)
+    else:
+        fpool = ep.build_topn_field_pool(players_df, own, FIELD_N, seed)
+        np.save(fp_cache, fpool)
     col_map = {int(p): i for i, p in enumerate(pid)}
     fcols = np.array([[col_map[int(p)] for p in r] for r in fpool], dtype=np.int32)
     fs = ep._score_field_cols_batched(mat.astype(np.float32), fcols)      # (S, F) transient
@@ -196,38 +252,50 @@ def run_slate(slate: str, cfg: dict) -> list[dict]:
     del part
     X_win = expit(ep._LOGISTIC_NORMAL_SCALE * (cand - thr[None, :]) / tau[None, :]).astype(np.float32)
 
-    # CURRENCY-NEUTRAL shared reference set: the pool's own ceiling score,
-    # which is neither arm's currency. Both arms measure redundancy against
-    # the SAME set, so only the delta is interpreted.
+    A_bulk, A_win = _normalize(cand), _normalize(X_win)
+
+    # --- the four reference sets (see REFERENCE-SET ARMS in the docstring) --
     ceil_scores = ep.compute_pool_ceiling_scores(
         type("P", (), {"lineups": lineups, "p99": getattr(pool, "p99", None)})(), players_df,
     ) if hasattr(pool, "p99") else None
     if ceil_scores is None or not np.isfinite(ceil_scores).any():
         ceil_scores = ep.compute_pool_proj_scores(lineups, players_df)
-    ref_idx = np.argsort(-np.nan_to_num(ceil_scores, nan=-np.inf))[:REF_SIZE]
+    proj = ep.compute_pool_proj_scores(lineups, players_df)
+    ownv = ep.compute_pool_ownership(lineups, players_df)
+    prj_own = ep.compute_prj_own_ev(proj, ownv, float(FIELD_N))
+    rng_ref = np.random.default_rng(hash(slate) % (2 ** 32))
+    refs = {
+        "ceiling": np.argsort(-np.nan_to_num(ceil_scores, nan=-np.inf))[:REF_SIZE],
+        "prj_own": np.argsort(-np.nan_to_num(prj_own, nan=-np.inf))[:REF_SIZE],
+        "shipped": _shipped_reference(adir, lineups, REF_SIZE),
+        "random": rng_ref.choice(len(lineups), size=REF_SIZE, replace=False),
+    }
 
-    red_bulk = _redundancy(cand, ref_idx)
-    red_win = _redundancy(X_win, ref_idx)
-
-    rest = np.setdiff1d(np.arange(len(lineups)), ref_idx)
-    r_sorted = rest[np.argsort(-realized[rest])]
-    elite = r_sorted[:TOPK]
-
-    pb = _pctile_of(red_bulk[rest], np.searchsorted(np.sort(rest), elite))
-    pw = _pctile_of(red_win[rest], np.searchsorted(np.sort(rest), elite))
-    # searchsorted maps global -> position within `rest` (rest is sorted)
-    rows = [{
-        "slate": slate, "n_pool": len(pool.lineups), "n_graded": len(lineups),
-        "n_dropped_ungradeable": n_dropped, "field_n": F, "bar_rank": N,
-        "topk": TOPK, "ref_size": REF_SIZE,
-        "best_realized": round(float(realized[elite[0]]), 2),
-        "best_pctile_bulk": round(float(pb[0]), 1),
-        "best_pctile_winspace": round(float(pw[0]), 1),
-        "mean_pctile_bulk": round(float(pb.mean()), 1),
-        "mean_pctile_winspace": round(float(pw.mean()), 1),
-        "delta_mean_pctile": round(float(pw.mean() - pb.mean()), 1),
-        "n_elite_worse_under_winspace": int((pw > pb).sum()),
-    }]
+    rows = []
+    for ref_name, ref_idx in refs.items():
+        if len(ref_idx) < 5:
+            print(f"    [{ref_name}] only {len(ref_idx)} reference lineups matched -- skipped")
+            continue
+        red_bulk = _redundancy(A_bulk, ref_idx)
+        red_win = _redundancy(A_win, ref_idx)
+        rest = np.setdiff1d(np.arange(len(lineups)), ref_idx)
+        elite = rest[np.argsort(-realized[rest])][:TOPK]
+        pos = np.searchsorted(rest, elite)          # rest is sorted by setdiff1d
+        pb = _pctile_of(red_bulk[rest], pos)
+        pw = _pctile_of(red_win[rest], pos)
+        rows.append({
+            "slate": slate, "reference": ref_name, "ref_matched": int(len(ref_idx)),
+            "n_pool": len(pool.lineups), "n_graded": len(lineups),
+            "n_dropped_ungradeable": n_dropped, "field_n": F, "bar_rank": N,
+            "topk": TOPK, "ref_size": REF_SIZE,
+            "best_realized": round(float(realized[elite[0]]), 2),
+            "best_pctile_bulk": round(float(pb[0]), 1),
+            "best_pctile_winspace": round(float(pw[0]), 1),
+            "mean_pctile_bulk": round(float(pb.mean()), 1),
+            "mean_pctile_winspace": round(float(pw.mean()), 1),
+            "delta_mean_pctile": round(float(pw.mean() - pb.mean()), 1),
+            "n_elite_worse_under_winspace": int((pw > pb).sum()),
+        })
     return rows
 
 
@@ -246,27 +314,28 @@ def main() -> None:
         t0 = time.time()
         rows = run_slate(sl, cfg)
         _append_and_reload(RESULTS_CSV, sl, rows)
-        r = rows[0]
-        print(f"{sl}  pool {r['n_pool']} graded {r['n_graded']} "
-              f"(dropped {r['n_dropped_ungradeable']})  bar N={r['bar_rank']}/{r['field_n']}  "
+        r0 = rows[0]
+        print(f"{sl}  pool {r0['n_pool']} graded {r0['n_graded']} "
+              f"(dropped {r0['n_dropped_ungradeable']})  bar N={r0['bar_rank']}/{r0['field_n']}  "
               f"({time.time()-t0:.0f}s)")
-        print(f"    best realized {r['best_realized']}  redundancy pctile: "
-              f"bulk {r['best_pctile_bulk']}  winspace {r['best_pctile_winspace']}")
-        print(f"    top-{TOPK} mean pctile: bulk {r['mean_pctile_bulk']}  "
-              f"winspace {r['mean_pctile_winspace']}  "
-              f"delta {r['delta_mean_pctile']:+.1f}  "
-              f"({r['n_elite_worse_under_winspace']}/{TOPK} worse under winspace)")
+        for r in rows:
+            print(f"    {r['reference']:<8}(n={r['ref_matched']:<3}) "
+                  f"bulk {r['mean_pctile_bulk']:5.1f}  win {r['mean_pctile_winspace']:5.1f}  "
+                  f"delta {r['delta_mean_pctile']:+6.1f}  "
+                  f"({r['n_elite_worse_under_winspace']}/{TOPK} worse)")
 
     df = pd.read_csv(RESULTS_CSV)
     print("\n=== VALIDITY SCREEN: is win-space more hostile to the winners than bulk? ===")
-    print(df[["slate", "n_graded", "best_pctile_bulk", "best_pctile_winspace",
-              "mean_pctile_bulk", "mean_pctile_winspace", "delta_mean_pctile",
-              "n_elite_worse_under_winspace"]].to_string(index=False))
+    print(df.pivot_table(index="slate", columns="reference",
+                         values="delta_mean_pctile").round(1).to_string())
+    print("\n  by reference set:")
+    for ref, sub in df.groupby("reference"):
+        d = sub["delta_mean_pctile"].to_numpy()
+        p = wilcoxon(d).pvalue if len(d) >= 5 and np.ptp(d) > 0 else float("nan")
+        bb = sub["best_pctile_winspace"] - sub["best_pctile_bulk"]
+        print(f"    {ref:<8} mean delta {d.mean():+6.1f}   favourable {int((d < 0).sum())}/{len(d)}"
+              f"   Wilcoxon p={p:.4f}   best-lineup delta {bb.mean():+6.1f}")
     d = df["delta_mean_pctile"].to_numpy()
-    print(f"\n  mean delta (winspace - bulk) = {d.mean():+.1f} pctile points   "
-          f"slates worse under winspace: {int((d > 0).sum())}/{len(d)}")
-    if len(d) >= 5 and np.ptp(d) > 0:
-        print(f"  Wilcoxon p = {wilcoxon(d).pvalue:.3f}")
     print("\n  POSITIVE delta = win-space suppresses eventual winners MORE than bulk (bad).")
     print("  This screen can only KILL the idea; benefit needs prospective testing.")
 
