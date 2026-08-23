@@ -21,37 +21,28 @@ from pathlib import Path
 # Make sure project root is on the path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-import pandas as pd
-
 from src.api.config_io import read_config
 from src.api.slate_exclusions import compute_file_fingerprint
 from src.api.twitter_lineups import (
+    build_team_candidates,
     match_player_name,
+    match_position_for,
     parse_notification_body,
     upsert_twitter_lineup,
 )
+from src.ingestion.dk_slate import DraftKingsSlateIngestor
 
 
-def _load_team_hitters(team: str) -> list[dict]:
+def _load_team_players(team: str) -> list[dict]:
+    """Candidate pool for *team*: every player on the DK slate, pitchers included.
+
+    Goes through the ingestor rather than reading the CSV directly so the pool
+    matches what POST /api/twitter-lineups/parse builds — same normalized
+    `position` and the `eligible_positions` the match tiebreaker needs.
+    """
     cfg = read_config()
-    slate_df = pd.read_csv(cfg.paths.dk_slate)
-    slate_df.columns = [c.lower().replace(" ", "_") for c in slate_df.columns]
-    for c in list(slate_df.columns):
-        if "teamabbrev" in c:
-            slate_df = slate_df.rename(columns={c: "team"})
-        elif c == "id":
-            slate_df = slate_df.rename(columns={c: "player_id"})
-    rows = slate_df[(slate_df["team"] == team) & (slate_df["position"] != "P")]
-    return [
-        {
-            "player_id": int(r["player_id"]),
-            "name": str(r["name"]),
-            "team": str(r["team"]),
-            "position": str(r["position"]),
-            "salary": int(r["salary"]),
-        }
-        for _, r in rows.iterrows()
-    ]
+    slate_df = DraftKingsSlateIngestor(str(cfg.paths.dk_slate)).get_slate_dataframe()
+    return build_team_candidates(slate_df, team)
 
 
 def _pick(prompt: str, options: list[dict]) -> dict | None:
@@ -105,8 +96,8 @@ def main() -> None:
         print("ERROR: No batter slots extracted. Check that player lines follow 'Name POS' format.")
         sys.exit(1)
 
-    team_hitters = _load_team_hitters(team)
-    if not team_hitters:
+    team_players = _load_team_players(team)
+    if not team_players:
         print(f"WARNING: {team} not found on the current DK slate — lineup will be saved but won't affect this run.")
 
     # Resolve each slot
@@ -114,7 +105,9 @@ def main() -> None:
     ambiguous = False
     print()
     for raw in raw_slots:
-        candidates = match_player_name(raw["name"], team_hitters)
+        candidates = match_player_name(
+            raw["name"], team_players, position=match_position_for(raw["position"])
+        )
         if len(candidates) == 1:
             c = candidates[0]
             print(f"  Slot {raw['slot']:1d}  {raw['name']:<20s}  →  {c['name']}  [{c['match_confidence']}]")

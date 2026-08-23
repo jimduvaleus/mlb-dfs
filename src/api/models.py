@@ -561,6 +561,15 @@ class GppConfig(BaseModel):
     external_pool_mean_calib_batter: float = 1.0
     external_pool_mean_calib_pitcher: float = 1.0
 
+    # Rescale each SaberSim quantile grid to that player's "My Proj" when the
+    # two disagree by more than 20% (rather than dropping the grid for a
+    # Gaussian, the old and only response). SaberSim's dk_*_percentile columns
+    # are its own sim output and do not follow a hand-edited projection, so
+    # without this a manual projection change reaches players_df["mean"] but
+    # never the simulated worlds — and the marginal-reward ranking is computed
+    # entirely over those. See build_quantile_grids in external_pool.py.
+    external_pool_grid_mean_rescale: bool = False
+
 
 class MarginalRewardConfig(BaseModel):
     """Knobs for the Marginal-Reward Portfolio allocator (Haugh & Singal 2019).

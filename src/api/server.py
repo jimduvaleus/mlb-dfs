@@ -32,7 +32,6 @@ from .config_io import read_config, write_config
 from .models import AppConfig, DoubleheaderStatusResponse, ExclusionsUpdate, GameStatus, ParsedSlot, PlayerExclusionStatus, PlayerExclusionsUpdate, PlayerMatch, PlayerProjectionOverridesResponse, PlayerProjectionOverridesUpdate, PortfolioResult, ProjectionsStatus, SlateGamesResponse, SlateListResponse, SlateOption, SlatePlayersResponse, TeamOwnershipReductionsResponse, TeamOwnershipReductionsUpdate, TwitterLineupParseRequest, TwitterLineupParseResponse, TwitterLineupRecord, TwitterLineupSaveRequest, TwitterLineupSlot
 from .mlb_schedule import get_doubleheader_teams_cached
 from .twitter_lineups import (
-    _PITCHER_POSITIONS,
     delete_twitter_lineup,
     get_confirmed_team_lineups,
     get_twitter_overrides,
@@ -40,7 +39,9 @@ from .twitter_lineups import (
     extract_lineup_team,
     extract_lineup_header_date,
     looks_like_lineup,
+    build_team_candidates,
     match_player_name,
+    match_position_for,
     parse_notification_body,
     set_twitter_lineup_locked,
     upsert_twitter_lineup,
@@ -573,19 +574,8 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
     team_players: list[dict] = []
     team_in_slate = False
     if slate_df is not None:
-        rows = slate_df[slate_df["team"] == team]
-        team_in_slate = not rows.empty
-        team_players = [
-            {
-                "player_id": int(r["player_id"]),
-                "name": str(r["name"]),
-                "team": str(r["team"]),
-                "position": str(r["position"]),
-                "eligible_positions": list(r["eligible_positions"]) if "eligible_positions" in r and isinstance(r["eligible_positions"], list) else [str(r["position"])],
-                "salary": int(r["salary"]),
-            }
-            for _, r in rows.iterrows()
-        ]
+        team_players = build_team_candidates(slate_df, team)
+        team_in_slate = bool(team_players)
 
     warning: str | None = None
     if not team_in_slate:
@@ -593,11 +583,9 @@ def parse_twitter_lineup(req: TwitterLineupParseRequest) -> TwitterLineupParseRe
 
     parsed_slots: list[ParsedSlot] = []
     for raw in raw_slots:
-        # DK lists every pitcher as eligible position "P" regardless of SP/RP —
-        # normalize the notification's SP/RP label so the eligible_positions
-        # tiebreaker in match_player_name can actually match.
-        match_position = "P" if raw["position"] in _PITCHER_POSITIONS else raw["position"]
-        candidate_dicts = match_player_name(raw["name"], team_players, position=match_position)
+        candidate_dicts = match_player_name(
+            raw["name"], team_players, position=match_position_for(raw["position"])
+        )
         matches = [
             PlayerMatch(
                 player_id=c["player_id"],

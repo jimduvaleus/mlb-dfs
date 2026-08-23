@@ -239,6 +239,42 @@ def match_player_name(
     return results
 
 
+def match_position_for(position: str) -> str:
+    """Fold a notification-reported position into the slate's position vocabulary.
+
+    DK lists every pitcher as eligible position "P" regardless of SP/RP, so an
+    "SP"/"RP" line has to be normalized before it can be used as the
+    `eligible_positions` tiebreaker in `match_player_name`.
+    """
+    return "P" if position in _PITCHER_POSITIONS else position
+
+
+def build_team_candidates(slate_df, team: str) -> list[dict]:
+    """Return `match_player_name` candidate dicts for every slate player on *team*.
+
+    *slate_df* must be an ingestor slate DataFrame (`get_slate_dataframe()`),
+    whose `position` column is already normalized — SP/RP collapse to "P" —
+    unlike the raw DK CSV, where `Position` holds SP/RP and only
+    `Roster Position` holds "P".
+
+    Batters and pitchers alike are included, so a parsed pitcher line (slot 10)
+    resolves to a player_id the same way batters do, and excluded players are
+    kept too — exclusion is not slot confirmation.
+    """
+    rows = slate_df[slate_df["team"] == team]
+    return [
+        {
+            "player_id": int(r["player_id"]),
+            "name": str(r["name"]),
+            "team": str(r["team"]),
+            "position": str(r["position"]),
+            "eligible_positions": list(r["eligible_positions"]) if "eligible_positions" in r and isinstance(r["eligible_positions"], list) else [str(r["position"])],
+            "salary": int(r["salary"]),
+        }
+        for _, r in rows.iterrows()
+    ]
+
+
 def load_twitter_lineups(slate_fingerprint: str = "") -> list[dict]:
     """Load confirmed lineups.
 

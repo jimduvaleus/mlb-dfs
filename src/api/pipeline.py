@@ -2424,6 +2424,7 @@ class PipelineRunner:
             scratch_prob=float(gpp_cfg.get("external_pool_scratch_prob", 0.02)),
             mean_calib_batter=float(gpp_cfg.get("external_pool_mean_calib_batter", 1.0)),
             mean_calib_pitcher=float(gpp_cfg.get("external_pool_mean_calib_pitcher", 1.0)),
+            rescale_to_file_mean=bool(gpp_cfg.get("external_pool_grid_mean_rescale", False)),
         )
         n_sims = int(sim_cfg.get("n_sims", 10_000))
         # topn_coverage only: auto-size n_sims to the total sim-world demand

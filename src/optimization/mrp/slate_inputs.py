@@ -22,6 +22,11 @@ path and the UI path simulate identically:
                                       0.935 at p=0.30, so left at 1.0 rather
                                       than fitting noise.
     external_pool_scratch_prob        P(a rostered player is scratched).
+    external_pool_grid_mean_rescale   LOCATION, per player. Rescales each grid
+                                      to that player's "My Proj" when the two
+                                      disagree by >20%, so a hand-edited
+                                      projection actually reaches the sim (the
+                                      dk_*_percentile columns do not follow it).
 
 An earlier version of this file defaulted calibration ON on the belief that
 production shipped it. It does not -- the live config and the `flat2000_uc`
@@ -51,6 +56,7 @@ class SimCalibration:
     scratch_prob: float = 0.02
     mean_calib_batter: float = 1.0
     mean_calib_pitcher: float = 1.0
+    grid_mean_rescale: bool = False
 
     @classmethod
     def from_config(cls, cfg: dict) -> "SimCalibration":
@@ -60,19 +66,23 @@ class SimCalibration:
             scratch_prob=float(g.get("external_pool_scratch_prob", 0.02)),
             mean_calib_batter=float(g.get("external_pool_mean_calib_batter", 1.0)),
             mean_calib_pitcher=float(g.get("external_pool_mean_calib_pitcher", 1.0)),
+            grid_mean_rescale=bool(g.get("external_pool_grid_mean_rescale", False)),
         )
 
     def cache_key(self) -> str:
         """Part of the sim-cache filename: two runs under different calibration
         are different sims and must never share a cached matrix."""
         return (f"z{int(self.zero_inflate)}s{self.scratch_prob:g}"
-                f"b{self.mean_calib_batter:g}p{self.mean_calib_pitcher:g}")
+                f"b{self.mean_calib_batter:g}p{self.mean_calib_pitcher:g}"
+                f"r{int(self.grid_mean_rescale)}")
 
     def describe(self) -> str:
-        on = self.zero_inflate or self.mean_calib_batter != 1.0 or self.mean_calib_pitcher != 1.0
+        on = (self.zero_inflate or self.mean_calib_batter != 1.0
+              or self.mean_calib_pitcher != 1.0 or self.grid_mean_rescale)
         return (f"{'on' if on else 'off'} (zero_inflate={self.zero_inflate}, "
                 f"scratch={self.scratch_prob:g}, batter={self.mean_calib_batter:g}, "
-                f"pitcher={self.mean_calib_pitcher:g})")
+                f"pitcher={self.mean_calib_pitcher:g}, "
+                f"grid_mean_rescale={self.grid_mean_rescale})")
 
 
 @dataclass
@@ -152,6 +162,7 @@ def build_slate_inputs(
         zero_inflate=calib.zero_inflate, scratch_prob=calib.scratch_prob,
         mean_calib_batter=calib.mean_calib_batter,
         mean_calib_pitcher=calib.mean_calib_pitcher,
+        rescale_to_file_mean=calib.grid_mean_rescale,
     )
     engine = SimulationEngine(copula, players_df, batter_pca_model=None,
                               score_grid=None, quantile_grids=grids)

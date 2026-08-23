@@ -188,6 +188,106 @@ class TestQuantileGrids:
         assert changed_pit == 0
 
 
+class TestGridMeanRescale:
+    """`rescale_to_file_mean`: a hand-edited "My Proj" must actually reach the
+    simulated distribution. SaberSim's dk_*_percentile columns are its own sim
+    output and do not follow the edit, so without this the projection never
+    reaches the marginal-reward ranking (which is computed only over sims)."""
+
+    @staticmethod
+    def _frame(means: dict[int, float]) -> pd.DataFrame:
+        """One synthetic row per (player_id -> file mean). Every row carries the
+        SAME percentile knots (grid mean ~= 9.2), so the file mean is the only
+        thing that varies and the rescale factor is exactly grid_mean/file_mean."""
+        rows = []
+        for pid, mean in means.items():
+            rows.append({
+                "player_id": pid,
+                "name": f"P{pid}",
+                "position": "P" if pid % 2 == 0 else "OF",
+                "mean": mean,
+                "p25": 2.0, "p50": 6.0, "p75": 12.0,
+                "p85": 16.0, "p95": 24.0, "p99": 33.0,
+                "pa": np.nan, "h": np.nan, "bb": np.nan,
+            })
+        return pd.DataFrame(rows)
+
+    def _grid_mean(self, pid: int) -> float:
+        """The raw grid mean for the shared knot set above."""
+        # a file mean equal to the grid's own mean always passes the tolerance,
+        # so this reads the untouched grid back out.
+        probe = self._frame({pid: 9.0})
+        return float(build_quantile_grids(probe)[pid].mean())
+
+    def test_off_by_default_still_drops_the_mismatched_player(self):
+        gm = self._grid_mean(1)
+        df = self._frame({1: gm * 0.6})
+        assert 1 not in build_quantile_grids(df)
+        assert 1 not in build_quantile_grids(df, rescale_to_file_mean=False)
+
+    def test_rescale_keeps_the_player_and_lands_on_the_file_mean(self):
+        gm = self._grid_mean(1)
+        target = gm * 0.6
+        grids = build_quantile_grids(self._frame({1: target}), rescale_to_file_mean=True)
+        assert 1 in grids
+        assert grids[1].mean() == pytest.approx(target, rel=1e-9)
+        assert np.all(np.diff(grids[1]) >= 0)
+
+    def test_rescale_is_a_dial_not_a_cliff(self):
+        """Successively lower projections must lower the sim monotonically —
+        the old behaviour was a single discontinuous jump to a Gaussian."""
+        gm = self._grid_mean(1)
+        prev_mean = prev_p99 = float("inf")
+        for frac in (1.0, 0.95, 0.9, 0.8, 0.7, 0.6):
+            g = build_quantile_grids(
+                self._frame({1: gm * frac}), rescale_to_file_mean=True,
+            )[1]
+            assert g.mean() < prev_mean and g[99] < prev_p99
+            prev_mean, prev_p99 = g.mean(), g[99]
+
+    def test_no_dead_band_small_edits_move_the_sim(self):
+        """The rescale is unconditional: a 10% edit — inside the legacy +-20%
+        band, where the old code did nothing at all — must still move the sim."""
+        gm = self._grid_mean(1)
+        df = self._frame({1: gm * 0.9})
+        off = build_quantile_grids(df)
+        on = build_quantile_grids(df, rescale_to_file_mean=True)
+        assert set(off) == set(on) == {1}
+        assert not np.array_equal(off[1], on[1])
+        assert on[1].mean() == pytest.approx(gm * 0.9, rel=1e-9)
+
+    def test_unedited_grid_is_left_alone(self):
+        """A grid whose mean already equals the file mean is untouched, so
+        turning the knob on is not itself a perturbation."""
+        gm = self._grid_mean(1)
+        df = self._frame({1: gm})
+        assert np.array_equal(
+            build_quantile_grids(df)[1],
+            build_quantile_grids(df, rescale_to_file_mean=True)[1],
+        )
+
+    def test_grid_beyond_the_reject_ratio_still_falls_back_to_gaussian(self):
+        gm = self._grid_mean(1)
+        df = self._frame({1: gm / (ep._GRID_MEAN_REJECT_RATIO + 1.0)})
+        assert 1 not in build_quantile_grids(df, rescale_to_file_mean=True)
+
+    def test_rescale_composes_with_the_calibration_constant(self):
+        """The rescale is computed on the RAW grid, so the two location fixes
+        multiply cleanly and calib cannot move fallback membership."""
+        gm = self._grid_mean(1)
+        target = gm * 0.6
+        grids = build_quantile_grids(
+            self._frame({1: target}), rescale_to_file_mean=True, mean_calib_batter=0.88,
+        )
+        assert grids[1].mean() == pytest.approx(0.88 * target, rel=1e-9)
+
+    def test_rescale_applies_to_pitchers_too(self):
+        gm = self._grid_mean(2)  # even id -> position "P"
+        target = gm * 0.6
+        grids = build_quantile_grids(self._frame({2: target}), rescale_to_file_mean=True)
+        assert grids[2].mean() == pytest.approx(target, rel=1e-9)
+
+
 class TestPwinExponents:
     @staticmethod
     def _groups():

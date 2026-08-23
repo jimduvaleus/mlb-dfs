@@ -711,6 +711,19 @@ haircut would be fitting noise. Re-check as the archive grows. (Note an earlier
 0.953 estimate was contaminated: it averaged over ALL export pitchers including
 bullpen arms who never appear and score 0. Rostered pitchers are starters.)"""
 
+_GRID_MEAN_TOLERANCE = 0.20
+"""LEGACY path only (`rescale_to_file_mean=False`): |grid mean - file mean| /
+file mean above which the grid is discarded for a Gaussian. Kept so every
+backtest/replay caller stays byte-identical; the rescale path replaces the
+whole band rather than narrowing it (see build_quantile_grids)."""
+
+_GRID_MEAN_REJECT_RATIO = 2.0
+"""Hard-reject band for `rescale_to_file_mean`: a grid whose mean is more than
+this factor away from the file mean in either direction is not a projection
+edit, it is a broken or mismatched row (wrong player, wrong slate, a percentile
+block from a different scoring system), and rescaling it would manufacture a
+distribution out of nothing. Those still fall back to the Gaussian."""
+
 
 def batter_blank_probability(
     pa: float, h: float, bb: float, scratch_prob: float = _DEFAULT_SCRATCH_PROB,
@@ -787,11 +800,12 @@ def build_quantile_grids(
     scratch_prob: float = _DEFAULT_SCRATCH_PROB,
     mean_calib_batter: float = 1.0,
     mean_calib_pitcher: float = 1.0,
+    rescale_to_file_mean: bool = False,
 ) -> dict[int, np.ndarray]:
     """Per-player evenly spaced quantile grids for EmpiricalQuantileMarginal,
     resampled from the file's irregular percentiles. Skips a player (engine
-    falls back to Gaussian) on missing/non-monotone knots or a >20% mismatch
-    between the grid-implied mean and the file mean.
+    falls back to Gaussian) on missing/non-monotone knots, or on a grid-vs-file
+    mean mismatch the `rescale_to_file_mean` branch below cannot absorb.
 
     `zero_inflate` adds a point mass at 0 for **batters** (see
     batter_blank_probability / _zero_inflate_grid), correcting a measured ~9x
@@ -812,14 +826,43 @@ def build_quantile_grids(
     without a grid (Gaussian fallback) are therefore uncalibrated — a small
     minority whose means are salary-heuristic anyway.
 
-    Order is load-bearing: the +-20% grid-vs-file-mean sanity check runs against
-    the RAW grid, before either correction, so a calibration constant can never
-    push a player into or out of the Gaussian fallback.
+    `rescale_to_file_mean` makes the file's `My Proj` an actual dial on the
+    simulated distribution. The percentile columns are SaberSim's own simulation
+    output and do NOT follow a hand-edited projection, so without this the mean
+    column is decorative: it reaches `players_df["mean"]` (a display/floor
+    input) but never the sim, and therefore never the marginal-reward ranking,
+    which is computed entirely over simulated worlds. The only thing a manual
+    edit could previously do was push a player across the +-20% band into the
+    Gaussian fallback — a discontinuous shape swap, not a dial. With this on,
+    EVERY grid is scaled by `file mean / grid mean`, so the sim tracks the
+    projection continuously in both location and ceiling.
+
+    Deliberately unconditional rather than "rescale only outside the +-20%
+    band": a surviving dead band would leave small edits doing nothing (the
+    original complaint) and would treat players inconsistently, since the raw
+    grids already run 9-30% above their own file mean before anyone edits
+    anything — the interpolation over six sparse knots over-integrates the
+    right tail. Under a band, that untouched spread decides who gets corrected.
+    Grids beyond `_GRID_MEAN_REJECT_RATIO` are still dropped: that far out it is
+    a broken row, not an edit.
+
+    NOTE this makes the whole slate sim at its projected means, which is a
+    location change of the same kind as `mean_calib_batter` (that constant is a
+    fitted population haircut; this is a per-player identity). They compose
+    multiplicatively — check you are not double-counting before turning both on.
+
+    Off by default so every backtest/replay caller stays byte-identical; the
+    live pipeline turns it on from config (`gpp.external_pool_grid_mean_rescale`).
+
+    Order is load-bearing: the grid-vs-file-mean comparison runs against the RAW
+    grid, before the zero-inflation and calibration corrections, so neither a
+    calibration constant nor the shape fix can push a player into or out of the
+    Gaussian fallback, or change the rescale factor.
     """
     q_levels = np.array([0.25, 0.50, 0.75, 0.85, 0.95, 0.99])
     grid_q = np.linspace(0.0, 1.0, n_points)
     grids: dict[int, np.ndarray] = {}
-    n_inflated = n_calibrated = 0
+    n_inflated = n_calibrated = n_rescaled = n_rejected = 0
     for r in proj_ext.itertuples(index=False):
         knots = np.array([r.p25, r.p50, r.p75, r.p85, r.p95, r.p99], dtype=np.float64)
         if np.any(~np.isfinite(knots)) or not np.isfinite(r.mean) or r.mean <= 0:
@@ -835,10 +878,26 @@ def build_quantile_grids(
         grid = np.interp(grid_q, levels, values)
         grid = np.maximum.accumulate(grid)
         grid_mean = float(grid.mean())
-        if abs(grid_mean - float(r.mean)) > 0.2 * float(r.mean):
+        file_mean = float(r.mean)  # > 0, guarded at the top of the loop
+        # Computed on the RAW grid so neither correction below can move it.
+        rescale = 1.0
+        if rescale_to_file_mean:
+            ratio = grid_mean / file_mean if grid_mean > 0.0 else 0.0
+            if not (1.0 / _GRID_MEAN_REJECT_RATIO <= ratio <= _GRID_MEAN_REJECT_RATIO):
+                logger.debug(
+                    "External pool: grid mean %.2f vs file mean %.2f for %s — beyond "
+                    "+-%.0fx, Gaussian fallback.",
+                    grid_mean, file_mean, r.name, _GRID_MEAN_REJECT_RATIO,
+                )
+                n_rejected += 1
+                continue
+            if ratio != 1.0:
+                rescale = 1.0 / ratio
+                n_rescaled += 1
+        elif abs(grid_mean - file_mean) > _GRID_MEAN_TOLERANCE * file_mean:
             logger.debug(
                 "External pool: grid mean %.2f vs file mean %.2f for %s — Gaussian fallback.",
-                grid_mean, r.mean, r.name,
+                grid_mean, file_mean, r.name,
             )
             continue
         is_pitcher = str(r.position) == "P"
@@ -853,8 +912,13 @@ def build_quantile_grids(
             grid = inflated
         calib = mean_calib_pitcher if is_pitcher else mean_calib_batter
         if calib != 1.0:
-            grid = grid * float(calib)
             n_calibrated += 1
+        # One multiply for both location fixes: the projection rescale (grid ->
+        # file mean) and the empirical calibration constant. Applied after
+        # zero-inflation, like calib always has been, so the shape fix's
+        # deliberate mean-preserving remap is not undone by either.
+        if calib != 1.0 or rescale != 1.0:
+            grid = grid * (float(calib) * rescale)
         grids[int(r.player_id)] = grid
     if zero_inflate or n_calibrated:
         logger.info(
@@ -867,6 +931,12 @@ def build_quantile_grids(
     else:
         logger.info(
             "External pool: quantile grids built for %d/%d players.", len(grids), len(proj_ext),
+        )
+    if rescale_to_file_mean:
+        logger.info(
+            "External pool: %d grid(s) rescaled to the file's projected mean, "
+            "%d rejected as beyond +-%.0fx (Gaussian fallback).",
+            n_rescaled, n_rejected, _GRID_MEAN_REJECT_RATIO,
         )
     return grids
 
