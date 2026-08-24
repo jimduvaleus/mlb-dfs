@@ -629,6 +629,13 @@ def frontier_lineups(
                  or max(lambdas_used) >= max(search) * 0.999)),
     }
 
+    # Publish the real operating-point count the moment line 4 has decided it.
+    # Everything above -- sampling, scoring, the lambda* search -- is a single
+    # opaque phase to a progress bar, and without this the UI has no total to
+    # divide by until the FIRST lambda* has already finished generating.
+    if progress_cb is not None:
+        progress_cb(0, len(lambdas_used), 0)
+
     md = None
     anchors: dict = {}
     if n_anchors > 0 and lambdas_used:

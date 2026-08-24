@@ -194,7 +194,12 @@ def test_frontier_emits_the_events_the_ui_bar_needs():
     assert "mrp_frontier" in stages, "per-lambda progress drives the live bar"
 
     start = next(e for e in seen if e["stage"] == "mrp_frontier_start")
-    assert {"n_lambdas", "n_per_lambda", "n_pairs"} <= set(start)
+    # `n_lambda_search` is the grid line 4 CHOOSES FROM. It is deliberately not
+    # called n_lambdas: generation happens at the distinct lambda* only, and
+    # labelling the search size as the sweep size told the user "16 λ" while
+    # the bar counted to 5.
+    assert {"n_lambda_search", "per_team", "n_sample", "n_pairs"} <= set(start)
+    assert "n_lambdas" not in start, "the ambiguous name must not come back"
 
     prog = [e for e in seen if e["stage"] == "mrp_frontier"]
     assert all({"done", "total", "n_lineups"} <= set(e) for e in prog)
@@ -202,6 +207,15 @@ def test_frontier_emits_the_events_the_ui_bar_needs():
     assert [e["done"] for e in prog] == sorted(e["done"] for e in prog)
     assert [e["n_lineups"] for e in prog] == sorted(e["n_lineups"] for e in prog)
     assert prog[-1]["done"] <= prog[-1]["total"]
+
+    # ONE denominator for the whole phase. The bar divides by `total`; when it
+    # fell back to the search-grid size before the first progress event, the
+    # readout jumped from "0 / 16" to "1 / 5" mid-run.
+    assert len({e["total"] for e in prog}) == 1, "the bar's denominator must not change"
+    # And the count is published before any generation is reported, so the bar
+    # has a denominator for its whole life rather than only after the first
+    # operating point has finished.
+    assert prog[0]["done"] == 0
 
 
 def test_from_generated_is_parallel_to_the_portfolio():

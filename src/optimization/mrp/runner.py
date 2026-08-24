@@ -379,8 +379,12 @@ def _frontier_augment(
 
     if progress_cb is not None:
         progress_cb({"stage": "mrp_frontier_start",
-                     "n_lambdas": cfg.frontier_n_lambdas,
-                     "n_per_lambda": cfg.frontier_per_team,
+                     # The SEARCH grid line 4 chooses from -- NOT the number of
+                     # operating points generated at, which is the count of
+                     # distinct lambda* and is not known until line 4 has run.
+                     "n_lambda_search": cfg.frontier_n_lambdas,
+                     "per_team": cfg.frontier_per_team,
+                     "n_sample": cfg.frontier_sample_n,
                      "n_pairs": len(cov_by_pair)})
 
     # min_uniques/min_stack mirror the sigma_frontier precedent so frontier

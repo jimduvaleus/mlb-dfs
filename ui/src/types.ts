@@ -987,8 +987,12 @@ export interface MrpStartEvent extends SSEEvent {
 /** Line-2 frontier generation, ahead of the allocation proper. */
 export interface MrpFrontierStartEvent extends SSEEvent {
   stage: 'mrp_frontier_start'
-  n_lambdas: number
-  n_per_lambda: number
+  /** Size of the lambda SEARCH grid line 4 chooses from -- not the number of
+   *  operating points generated at, which is the count of distinct lambda*
+   *  and is unknown until line 4 has run. */
+  n_lambda_search: number
+  per_team: number
+  n_sample: number
   n_pairs: number
 }
 

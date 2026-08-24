@@ -343,12 +343,22 @@ export function ProgressPanel({ events, running }: Props) {
       mrpLabel = `Building contest states: ${latestMrpBuild.done} / ${latestMrpBuild.total}`
       mrpEtaMs = rate(mrpBuildEvents, latestMrpBuild.total - latestMrpBuild.done)
     } else if (mrpFrontierStartEvent && !mrpFrontierDoneEvent) {
-      const done = latestMrpFrontier?.done ?? 0
-      const total = latestMrpFrontier?.total ?? mrpFrontierStartEvent.n_lambdas
-      mrpPct = total > 0 ? Math.round((done / total) * 100) : 0
-      mrpLabel = `Frontier: λ ${done} / ${total}`
-        + (latestMrpFrontier ? ` · ${latestMrpFrontier.n_lineups.toLocaleString()} lineups generated` : ' · solving first anchor…')
-      mrpEtaMs = rate(mrpFrontierProgressEvents, total - done)
+      // Two phases with no shared denominator. Until line 4 reports back there
+      // is no operating-point count to divide by -- and the SEARCH grid size is
+      // emphatically not it (16 searched, ~5 generated at), so falling back to
+      // it made the bar jump from "0 / 16" to "1 / 5" mid-run.
+      if (!latestMrpFrontier) {
+        mrpPct = 0
+        mrpLabel = `Frontier: sampling ${mrpFrontierStartEvent.n_sample.toLocaleString()} candidates, `
+          + `searching ${mrpFrontierStartEvent.n_lambda_search} λ for each contest's λ*…`
+      } else {
+        const { done, total } = latestMrpFrontier
+        mrpPct = total > 0 ? Math.round((done / total) * 100) : 0
+        mrpLabel = `Frontier: λ* ${done} / ${total}`
+          + (done > 0 ? ` · ${latestMrpFrontier.n_lineups.toLocaleString()} lineups generated`
+                      : ' · generating at the first operating point…')
+        mrpEtaMs = rate(mrpFrontierProgressEvents, total - done)
+      }
     } else {
       mrpLabel = 'Preparing allocation…'
     }
@@ -1196,8 +1206,9 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'mrp_frontier_start': {
       const ev = e as unknown as MrpFrontierStartEvent
-      return `Sweeping ${ev.n_lambdas} λ values, up to ${ev.n_per_lambda.toLocaleString()} lineups each `
-        + `· ${ev.n_pairs.toLocaleString()} covariance pairs`
+      return `Sampling ${ev.n_sample.toLocaleString()} candidates · searching `
+        + `${ev.n_lambda_search} λ for each contest's λ* · keeping `
+        + `${ev.per_team} per team · ${ev.n_pairs.toLocaleString()} covariance pairs`
     }
     case 'mrp_frontier_done': {
       const ev = e as unknown as MrpFrontierDoneEvent
