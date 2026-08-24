@@ -141,6 +141,30 @@ export interface MarginalRewardConfig {
   smooth_tau_scale: number
   field_pool_size: number
   max_sims_per_contest: number
+  /** Haugh & Singal line 2: generate along the mean-variance frontier and add
+   *  the result to the candidate pool. dR cannot select what is not in it. */
+  frontier_enabled: boolean
+  /** Lambda grid size. Lambda is not tuned -- dR picks from the whole
+   *  frontier -- so this is a diversity knob, not a hyperparameter. */
+  frontier_n_lambdas: number
+  /** The diversity knob: top N per (lambda, primary stack team). Without it
+   *  the generator produces single-team lineups. */
+  frontier_per_team: number
+  /** Candidates sampled from the team-round-robin generator, then ranked by
+   *  the exact objective. */
+  frontier_sample_n: number
+  /** Exact CP-SAT solves keeping the true frontier tip in the pool. 0 makes
+   *  generation completely solver-free. */
+  frontier_n_anchors: number
+  frontier_n_generations: number
+  frontier_mutants_per_parent: number
+  /** Min salary for generated lineups. Match the floor SaberSim was given so
+   *  generated lineups sit in the same salary regime as the pool. 0 disables. */
+  frontier_salary_floor: number
+  /** Lambda is raised until the solution moves this many players off the
+   *  lambda=0 lineup, fixing the grid's upper end per slate. */
+  /** Per-solve CP-SAT cap, seconds. */
+  frontier_solver_timeout_s: number
 }
 
 export interface AppConfig {
@@ -191,6 +215,9 @@ export interface LineupResult {
   entry_fee?: string | null
   contest_name?: string | null
   entry_sort_order?: number | null
+  /** True when this lineup came from a GENERATED source (marginal reward's
+   *  line-2 frontier) rather than the imported SaberSim pool. */
+  from_generated?: boolean | null
 }
 
 export interface SlateOption {
@@ -275,6 +302,9 @@ export type SSEStage =
   | 'topn_pick_progress'
   | 'topn_contest_done'
   | 'mrp_start'
+  | 'mrp_frontier_start'
+  | 'mrp_frontier_progress'
+  | 'mrp_frontier_done'
   | 'mrp_build_progress'
   | 'mrp_pick_progress'
   | 'mrp_done'
@@ -950,6 +980,57 @@ export interface MrpStartEvent extends SSEEvent {
   gamma_in: number
   gamma_out: number
   smooth_tau_scale: number
+  /** Whether the line-2 frontier generator ran for this allocation. */
+  frontier_enabled?: boolean
+}
+
+/** Line-2 frontier generation, ahead of the allocation proper. */
+export interface MrpFrontierStartEvent extends SSEEvent {
+  stage: 'mrp_frontier_start'
+  n_lambdas: number
+  n_per_lambda: number
+  n_pairs: number
+}
+
+/** One per lambda. `n_lineups` is cumulative yield, reported alongside the
+ *  counter because the two move at very different rates: solve cost climbs
+ *  steeply with lambda while mutation yield does not, so the bare fraction
+ *  alone misleads about how much work is left. */
+export interface MrpFrontierProgressEvent extends SSEEvent {
+  stage: 'mrp_frontier_progress'
+  done: number
+  total: number
+  n_lineups: number
+}
+
+export interface MrpFrontierDoneEvent extends SSEEvent {
+  stage: 'mrp_frontier_done'
+  n_generated: number | null
+  n_kept: number | null
+  n_dropped_duplicate: number | null
+  lambda_min: number | null
+  lambda_max: number | null
+  n_lambdas_represented: number | null
+  n_cov_pairs: number | null
+  n_players_kept: number | null
+  n_players_before: number | null
+  n_pitchers_kept: number | null
+  n_teams: number | null
+  /** How many contests sigma_dG was blended over, and the worst agreement
+   *  between any single contest's sigma_dG and the blend. Near 1.0 means the
+   *  contests want the same lineups; low means this slate's contests disagree
+   *  and one blended vector serves none of them well. */
+  sigma_dG_contests?: number | null
+  sigma_dG_min_corr?: number | null
+  /** How many distinct operating points Algorithm 4's line 4 chose across the
+   *  slate's contests, and whether any landed on the search grid's edge (which
+   *  means the true optimum may lie outside the range searched). */
+  n_lambda_star?: number | null
+  lambda_star_at_edge?: boolean | null
+  lambda_search_lo?: number | null
+  lambda_search_hi?: number | null
+  /** Set when generation could not run; the allocation continues without it. */
+  skipped?: string | null
 }
 
 export interface MrpBuildProgressEvent extends SSEEvent {
@@ -966,6 +1047,10 @@ export interface MrpPickProgressEvent extends SSEEvent {
 
 export interface MrpDoneEvent extends SSEEvent {
   stage: 'mrp_done'
+  /** Entries filled from generated frontier lineups, and the total filled --
+   *  the portfolio's generated share. Absent when nothing was generated. */
+  n_generated_picked?: number
+  n_entries?: number
   /** Money-relevant allocation problems: purchased entries left unfilled, or
    *  overlap caps relaxed to fill them. Rendered as a Portfolio-tab banner. */
   warnings?: string[]

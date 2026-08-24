@@ -206,3 +206,28 @@ def test_empty_section_falls_back_to_defaults(tmp_path, monkeypatch):
     got = config_io.read_config()
     assert got.gpp.n_candidates == AppConfig().gpp.n_candidates
     assert got.marginal_reward.smooth_tau_scale == 0.0
+
+
+def test_mrp_sse_stage_names_agree_across_python_and_typescript():
+    """Every mrp_* stage the pipeline emits must exist in types.ts's SSEStage.
+
+    Same class of silent failure the config sync above guards: an SSE consumer
+    that stops matching a renamed stage does not error, it just quietly shows
+    nothing -- here, a progress bar that never advances and an elapsed clock
+    that stalls. Cheap to pin, invisible otherwise.
+    """
+    emitted = set(re.findall(r'self\._cb\("(mrp_[a-z_]+)"',
+                             (ROOT / "src" / "api" / "pipeline.py").read_text()))
+    assert emitted, "no mrp_* events found — did the emit call shape change?"
+
+    ts = (ROOT / "ui" / "src" / "types.ts").read_text()
+    declared = set(re.findall(r"\|\s*'(mrp_[a-z_]+)'", ts))
+    missing = emitted - declared
+    assert not missing, f"emitted but absent from types.ts SSEStage: {sorted(missing)}"
+
+    panel = (ROOT / "ui" / "src" / "components" / "ProgressPanel.tsx").read_text()
+    unhandled = {s for s in emitted if f"'{s}'" not in panel}
+    assert not unhandled, (
+        f"emitted but never referenced in ProgressPanel: {sorted(unhandled)} — "
+        "these would reach the UI and render nothing"
+    )

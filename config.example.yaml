@@ -175,9 +175,10 @@ gpp:
 # Marginal-Reward Portfolio (MRP) -- parallel track, Haugh & Singal 2019.
 # Deliberately NOT under gpp.*: this is a separate allocator that shares the
 # sim/field/payout substrate but none of the funnel, and gpp.* is already at
-# the edge of manageability. Nothing in the live pipeline reads this block yet
-# -- it is wired only into scripts/eval_*. Per the build plan, UI/models.py
-# sync is deferred until the live A/B decides whether this path ships.
+# the edge of manageability. Read by the live pipeline since 2026-08-19
+# (src/api/pipeline.py, the external_pool_ev_type == "marginal_reward" branch)
+# as well as by scripts/eval_*; UI/models.py sync is done, so the three-way
+# sync rule below applies.
 # ---------------------------------------------------------------------------
 marginal_reward:
   # Selected by gpp.external_pool_ev_type: marginal_reward. These are only the
@@ -223,6 +224,125 @@ marginal_reward:
   # contest count. This caps the world axis (evenly strided) instead.
   max_sims_per_contest: 12500
 
+  # --- Haugh & Singal line 2: mean-variance frontier generation ------------
+  # Sweep `argmax_w w'mu + lambda(w'Sigma w - 2 w'sigma_dG)` and add the
+  # results to the candidate pool. By equation (14) that lambda-term is
+  # Var(w'delta - G) - Var(G), i.e. the variance of our MARGIN over the payout
+  # cutoff -- so the sweep runs from the plain projection lineup out to the
+  # highest-margin-variance one. dR cannot select what is not in the pool, and
+  # the pool measured as NOT spanning this region on 9/9 slates (the coverage
+  # arm of the 2026-08-19 gate; frontier minimum at pool percentile 0.000).
+  # Solved with CP-SAT + McCormick product variables over within-copula-unit
+  # pairs only (~1,000, vs ~80,000 dense) -- see src/optimization/mrp/
+  # frontier_qp.py. Off by default: it costs solve time and changes the pool.
+  frontier_enabled: false
+  #
+  # ONE EXACT ANCHOR PER LAMBDA, THEN FREE MUTATION. The obvious build --
+  # iterate no-good cuts until N lineups come out, as generate_optimal_lineups
+  # does -- measured at ~10s PER LINEUP: each cut makes the next solve harder
+  # and every one re-proves optimality from scratch. But we do not need optimal
+  # lineups. The paper needs argmax because it PLAYS w_lambda; dR re-ranks by
+  # marginal dollars anyway, so that proof is bought and discarded. So one
+  # anchor is solved per lambda and its neighbourhood is walked with
+  # generate_shape_mutants (no solver), everything ranked by the exact
+  # objective. Measured on 08/18: 520 lineups in 16.5s vs 90 in 15 minutes, at
+  # BETTER quality (median 93-96% of each lambda's optimum).
+  #
+  # Wall clock is therefore driven by n_lambdas alone (~2.6s per anchor);
+  # the other three knobs raise yield for ~1s total.
+  frontier_n_lambdas: 12        # size of the lambda SEARCH grid that line 4
+                                # chooses from -- not an operating point.
+                                #
+                                # LAMBDA IS NOW CHOSEN PER CONTEST, by the
+                                # paper's Algorithm 4 line 4:
+                                #   lambda* = argmax_lambda sum_d
+                                #     (R_d - R_{d+1}) P{w'delta > G^(r_d)}
+                                # evaluated against each contest's own
+                                # simulated field and payout table. That step
+                                # used to be SKIPPED, on the argument that dR
+                                # re-ranks by marginal dollars anyway -- which
+                                # governs selection from what we generate, and
+                                # cannot fix a grid generating the wrong
+                                # thing. In its place was an invented rule
+                                # ("raise lambda until the top lineup moves N
+                                # players") with no connection to the payout
+                                # structure or the field size. Measured on
+                                # 08/24, it put half the grid where the
+                                # objective had gone projection-blind: rho
+                                # with projection 0.377 at the grid's top and
+                                # NEGATIVE just beyond, team spread collapsed
+                                # to 3.4%, so a 97-projection stack scored
+                                # 98.6% of a 105-projection one.
+                                #
+                                # Line 4 gives lambda* rising with field size
+                                # -- ~0.037 at 496 entrants, ~0.056 at 8,000 --
+                                # i.e. small contests get higher-projection,
+                                # less contrarian builds. That matches the
+                                # conventional read of small-field play, and
+                                # falls out of the payout maths rather than
+                                # being tuned to it.
+  frontier_per_team: 8          # THE DIVERSITY KNOB: top N per (lambda,
+                                # primary stack team). Without it the
+                                # generator produced 100% ONE-TEAM lineups on
+                                # 08/18 -- every lambda's argmax picks the same
+                                # team (lambda trades mean against variance, it
+                                # has no reason to switch teams) and
+                                # generate_shape_mutants preserves the stack
+                                # profile exactly, propagating that one team to
+                                # every descendant. The selector then had to
+                                # get all its diversity from the external pool.
+                                # per_team x n_teams is the cap per lambda.
+  frontier_sample_n: 30000      # candidates drawn from CandidateGenerator's
+                                # team-round-robin sampler, then ranked by the
+                                # exact objective. Measured on 08/18: 30k in
+                                # 9.6s, scored in 0.03s, all 18 teams covered,
+                                # each team's best recovering 93.7-99.1% of
+                                # that team's EXACT stack-forced optimum.
+                                # Stack-forcing the solver instead gets 100%
+                                # but costs 6.9s per anchor -- 374s for
+                                # 3 lambdas x 18 teams.
+  frontier_n_anchors: 2         # exact CP-SAT solves at spread lambdas. Keeps
+                                # the true frontier tip in the pool (sampling
+                                # lands ~4% short) and stands as a drift check
+                                # on the sampler. 0 = completely solver-free.
+  frontier_n_generations: 2     # shape-mutation depth around the per-team
+                                # winners. The per-team cap is RE-APPLIED after
+                                # mutation: without that, 2 generations x 4
+                                # mutants turned 1,728 picks into 32,893
+                                # lineups and the per-contest (M x S) rank
+                                # arrays blow the memory budget.
+  frontier_mutants_per_parent: 4
+  frontier_salary_floor: 47500   # min salary for GENERATED lineups. Set to the
+                                # floor SaberSim was given: generated lineups
+                                # are merged into the external pool and compete
+                                # with it, so they should occupy the same
+                                # salary regime. Deliberately NOT
+                                # optimizer.salary_floor -- that is a holdover
+                                # from the internal optimizer and is higher
+                                # than what the external pool was built under.
+                                # 0 disables, but with no floor the sampler
+                                # leaves thousands unspent, a shape no other
+                                # stage of the funnel produces (and unused
+                                # salary is a dupe-model feature).
+  frontier_solver_timeout_s: 8.0   # per-anchor cap; FEASIBLE is accepted. Only
+                                # the highest lambda usually needs it: measured
+                                # 5 of 6 anchors proved OPTIMAL in under 3.4s,
+                                # and only the frontier's extreme end saturates.
+  # Frontier lineups are EXEMPT from gpp.external_pool_proj_score_pct: the
+  # floor basis is SaberSim's own "99th" column, which a generated lineup does
+  # not have, and the fallback (compute_pool_ceiling_proxy) assumes the 10
+  # rostered players are independent -- so it understates exactly the
+  # correlated-stack variance this objective maximises. dR still has to want
+  # them; the exemption only declines to pre-judge them on a biased basis.
+  #
+  # They are ALSO exempt from the 9/10 near-duplicate cull. Shape mutants
+  # differ from their parent by one player, which is exactly what that cull
+  # targets -- it removed 73% of them (520 -> 140) when tried -- and it is
+  # redundant against dR, whose demotion term already prices a near-duplicate
+  # mechanically. Exact duplicates are still dropped. NOTE the knock-on:
+  # gamma_out: 8 is a no-op only against a fully 9/10-culled pool, so it can
+  # start binding on frontier-vs-frontier pairs.
+
 # NOTE: stochastic (Dirichlet) ownership and sigma_dG-targeted generation were
 # BUILT AND THEN DESCOPED BY MEASUREMENT, so they have no config here:
 #   * Perfect knowledge of the entire opponent field measured worth ~nothing
@@ -234,3 +354,13 @@ marginal_reward:
 #     pool lacks -- already disconfirmed here.
 # Both modules and their tests remain as measurement tools. See EVIDENCE_LOG.md
 # 2026-08-19 entries before re-adding either knob.
+#
+# SCOPE OF THAT SECOND BULLET, since marginal_reward.frontier_enabled above now
+# generates along the paper's line 2: the rho +0.907 verdict was measured on
+# the LINEAR form -- sigma_dG alone, the cross-term. The quadratic w'Sigma w
+# was dropped from that build because CBC cannot express a quadratic objective,
+# not because it was judged worthless, and it was never measured. Equation (14)
+# makes the two halves of one object (margin variance), so the ownership
+# verdict covers the cross-term and does not extend to the whole term. The
+# linear path in sigma_frontier.py remains what eval_field_covariance.py
+# measures; frontier_qp.py is what generates.

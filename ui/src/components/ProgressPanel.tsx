@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppRescoreFieldProgressEvent, GppRescoreScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent, SelfPlayPoolStartEvent, SelfPlayPoolDoneEvent, SelfPlayContestProgressEvent, SelfPlayPayoutFallbackEvent, TopnPoolStartEvent, TopnPoolProgressEvent, TopnPoolDoneEvent, TopnContestStartEvent, TopnPickProgressEvent, TopnContestDoneEvent } from '../types'
+import type { SSEEvent, SimulateEvent, OptimizeLineupEvent, GppGenerateProgressEvent, GppFieldProgressEvent, GppScoreProgressEvent, GppRescoreFieldProgressEvent, GppRescoreScoreProgressEvent, GppSelectProgressEvent, GppOptimalProgressEvent, GppDetSelectProgressEvent, GppDetRiskStartEvent, GppRefineProgressEvent, SelfPlayPoolStartEvent, SelfPlayPoolDoneEvent, SelfPlayContestProgressEvent, SelfPlayPayoutFallbackEvent, TopnPoolStartEvent, TopnPoolProgressEvent, TopnPoolDoneEvent, TopnContestStartEvent, TopnPickProgressEvent, TopnContestDoneEvent, MrpStartEvent, MrpFrontierStartEvent, MrpFrontierProgressEvent, MrpFrontierDoneEvent, MrpBuildProgressEvent, MrpPickProgressEvent, MrpDoneEvent } from '../types'
 
 interface Props {
   events: SSEEvent[]
@@ -65,6 +65,8 @@ const STAGE_LABELS: Record<string, string> = {
   // skipped from the log (see the flooding note in the row builder), so a
   // label for them would be dead code.
   mrp_start: 'Marginal reward: allocating',
+  mrp_frontier_start: 'Marginal reward: generating frontier',
+  mrp_frontier_done: 'Marginal reward: frontier generated',
   mrp_done: 'Marginal reward: allocation complete',
   mrp_payout_fallback: 'Marginal reward: MISSING PAYOUT STRUCTURE',
   complete: 'Complete',
@@ -137,6 +139,9 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'topn_pick_progress' ||
       last?.stage === 'topn_contest_done' ||
       last?.stage === 'mrp_start' ||
+      last?.stage === 'mrp_frontier_start' ||
+      last?.stage === 'mrp_frontier_progress' ||
+      last?.stage === 'mrp_frontier_done' ||
       last?.stage === 'mrp_build_progress' ||
       last?.stage === 'mrp_pick_progress' ||
       last?.stage === 'mrp_done' ||
@@ -292,6 +297,62 @@ export function ProgressPanel({ events, running }: Props) {
   const latestTopnPick = topnPickEvents[topnPickEvents.length - 1]
   const latestTopnContestDone = topnContestDoneEvents[topnContestDoneEvents.length - 1]
   const isTopnCoverage = topnPoolStartEvent !== undefined || topnContestStartEvents.length > 0
+
+  // --- Marginal reward (MRP): three sequential phases, one bar ------------
+  // Frontier generation -> per-contest state build -> entry picks. The bar
+  // tracks the CURRENT phase rather than a weighted whole, because the phase
+  // costs are wildly unequal and slate-dependent (frontier ~2.5 min, picks
+  // ~2 min, build seconds) so a blended percentage would be a worse lie than
+  // an honest per-phase one. Same convention as the topn bar above.
+  const mrpStartEvent = events.find(e => e.stage === 'mrp_start') as unknown as MrpStartEvent | undefined
+  const mrpFrontierStartEvent = events.find(e => e.stage === 'mrp_frontier_start') as unknown as MrpFrontierStartEvent | undefined
+  const mrpFrontierProgressEvents = events.filter(e => e.stage === 'mrp_frontier_progress') as unknown as MrpFrontierProgressEvent[]
+  const latestMrpFrontier = mrpFrontierProgressEvents[mrpFrontierProgressEvents.length - 1]
+  const mrpFrontierDoneEvent = events.find(e => e.stage === 'mrp_frontier_done') as unknown as MrpFrontierDoneEvent | undefined
+  const mrpBuildEvents = events.filter(e => e.stage === 'mrp_build_progress') as unknown as MrpBuildProgressEvent[]
+  const latestMrpBuild = mrpBuildEvents[mrpBuildEvents.length - 1]
+  const mrpPickEvents = events.filter(e => e.stage === 'mrp_pick_progress') as unknown as MrpPickProgressEvent[]
+  const latestMrpPick = mrpPickEvents[mrpPickEvents.length - 1]
+  const mrpDoneEvent = events.find(e => e.stage === 'mrp_done') as unknown as MrpDoneEvent | undefined
+  const isMrp = mrpStartEvent !== undefined
+
+  let mrpPct = 0
+  let mrpLabel = ''
+  let mrpEtaMs: number | null = null
+  if (isMrp) {
+    // Rate over the last few events of the CURRENT phase. Deliberately recent
+    // rather than cumulative: frontier solve cost climbs steeply with lambda,
+    // so an average over the whole phase reads far too optimistic near the end.
+    const rate = (evs: Array<{ timestamp: number; done: number }>, remaining: number) => {
+      if (evs.length < 2 || remaining <= 0) return null
+      const recent = evs.slice(-4)
+      const dt = recent[recent.length - 1].timestamp - recent[0].timestamp
+      const dDone = recent[recent.length - 1].done - recent[0].done
+      return dDone > 0 && dt > 0 ? (dt / dDone) * remaining : null
+    }
+
+    if (latestMrpPick && latestMrpPick.done < latestMrpPick.total) {
+      mrpPct = latestMrpPick.total > 0 ? Math.round((latestMrpPick.done / latestMrpPick.total) * 100) : 0
+      mrpLabel = `Filling entries: ${latestMrpPick.done.toLocaleString()} / ${latestMrpPick.total.toLocaleString()}`
+      mrpEtaMs = rate(mrpPickEvents, latestMrpPick.total - latestMrpPick.done)
+    } else if (latestMrpPick) {
+      mrpPct = 100
+      mrpLabel = `Filling entries: ${latestMrpPick.done.toLocaleString()} / ${latestMrpPick.total.toLocaleString()}`
+    } else if (latestMrpBuild) {
+      mrpPct = latestMrpBuild.total > 0 ? Math.round((latestMrpBuild.done / latestMrpBuild.total) * 100) : 0
+      mrpLabel = `Building contest states: ${latestMrpBuild.done} / ${latestMrpBuild.total}`
+      mrpEtaMs = rate(mrpBuildEvents, latestMrpBuild.total - latestMrpBuild.done)
+    } else if (mrpFrontierStartEvent && !mrpFrontierDoneEvent) {
+      const done = latestMrpFrontier?.done ?? 0
+      const total = latestMrpFrontier?.total ?? mrpFrontierStartEvent.n_lambdas
+      mrpPct = total > 0 ? Math.round((done / total) * 100) : 0
+      mrpLabel = `Frontier: λ ${done} / ${total}`
+        + (latestMrpFrontier ? ` · ${latestMrpFrontier.n_lineups.toLocaleString()} lineups generated` : ' · solving first anchor…')
+      mrpEtaMs = rate(mrpFrontierProgressEvents, total - done)
+    } else {
+      mrpLabel = 'Preparing allocation…'
+    }
+  }
 
   let topnPct = 0
   let topnLabel = ''
@@ -601,6 +662,8 @@ export function ProgressPanel({ events, running }: Props) {
     }
   } else if (running && isTopnCoverage) {
     etaMs = topnEtaMs
+  } else if (running && isMrp) {
+    etaMs = mrpEtaMs
   } else {
     if (running && current > 0 && total > current) {
       const recent = lineupEvents.slice(-4) // up to 4 events → 3 intervals
@@ -617,7 +680,7 @@ export function ProgressPanel({ events, running }: Props) {
   // start of the run rather than only once isGpp flips true partway
   // through (which for external mode doesn't happen until the risk sweep).
   const isExternalRun = events.some(e => typeof e.stage === 'string' && e.stage.startsWith('external_'))
-  const liveElapsedMs = running && first && (current > 0 || isGpp || isExternalRun || isSelfPlay || isTopnCoverage) ? now - first.timestamp : null
+  const liveElapsedMs = running && first && (current > 0 || isGpp || isExternalRun || isSelfPlay || isTopnCoverage || isMrp) ? now - first.timestamp : null
 
   return (
     <div className="progress-panel">
@@ -698,6 +761,32 @@ export function ProgressPanel({ events, running }: Props) {
         <div className="progress-bar-wrap">
           <div className="progress-bar" style={{ width: `${topnPct}%` }} />
           <span className="progress-label">{topnLabel}</span>
+        </div>
+      )}
+
+      {/* Marginal reward progress bar */}
+      {isMrp && running && mrpLabel && (
+        <div className="progress-bar-wrap">
+          <div className="progress-bar" style={{ width: `${mrpPct}%` }} />
+          <span className="progress-label">{mrpLabel}</span>
+        </div>
+      )}
+
+      {/* How much of the portfolio the generated frontier actually won.
+          Gated on the frontier having RUN, not on it having won anything:
+          "0 of 103" is a real result worth seeing when generation was on,
+          but pure noise when it was off. */}
+      {mrpFrontierDoneEvent != null && mrpDoneEvent != null
+        && mrpDoneEvent.n_entries != null && mrpDoneEvent.n_entries > 0
+        && mrpDoneEvent.n_generated_picked != null && (
+        <div className="progress-det-label">
+          {mrpDoneEvent.n_generated_picked.toLocaleString()} of{' '}
+          {mrpDoneEvent.n_entries.toLocaleString()} entries
+          {' '}({Math.round((mrpDoneEvent.n_generated_picked / mrpDoneEvent.n_entries) * 100)}%)
+          {' '}came from the generated frontier
+          {mrpFrontierDoneEvent?.n_kept != null && (
+            <span className="muted"> · {mrpFrontierDoneEvent.n_kept.toLocaleString()} generated lineups offered</span>
+          )}
         </div>
       )}
 
@@ -881,6 +970,10 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
     // contest state built — same flooding problem as topn_pick_progress
     // above. They still drive the live elapsed timer; only the log rows go.
     if (e.stage === 'mrp_pick_progress' || e.stage === 'mrp_build_progress') continue
+    // Per-lambda frontier progress drives the live bar above; a row each
+    // would push the surrounding stages off screen for no added information.
+    if (e.stage === 'mrp_frontier_progress') continue
+    if (e.stage === 'mrp_frontier_start' && hasEvent('mrp_frontier_done')) continue
     if (e.stage === 'mrp_start' && hasEvent('mrp_done')) continue
     // Skip start event once done event is present (collapse into one row)
     if (e.stage === 'gpp_optimal_start' && hasEvent('gpp_optimal_done')) continue
@@ -1100,6 +1193,33 @@ function renderDetail(e: SSEEvent): string {
       }
       return `${ev.n_entries} entries across ${ev.n_contests} contests `
         + `from ${ev.n_pool.toLocaleString()} lineups (γ_in ${ev.gamma_in}, γ_out ${ev.gamma_out})`
+    }
+    case 'mrp_frontier_start': {
+      const ev = e as unknown as MrpFrontierStartEvent
+      return `Sweeping ${ev.n_lambdas} λ values, up to ${ev.n_per_lambda.toLocaleString()} lineups each `
+        + `· ${ev.n_pairs.toLocaleString()} covariance pairs`
+    }
+    case 'mrp_frontier_done': {
+      const ev = e as unknown as MrpFrontierDoneEvent
+      if (ev.skipped) return `Skipped — ${ev.skipped}`
+      const dropped = ev.n_dropped_duplicate
+        ? `, ${ev.n_dropped_duplicate.toLocaleString()} exact duplicate${ev.n_dropped_duplicate === 1 ? '' : 's'} dropped`
+        : ''
+      const universe = ev.n_players_kept != null && ev.n_players_before != null
+        ? ` · solved over ${ev.n_players_kept} of ${ev.n_players_before} players`
+          + (ev.n_pitchers_kept != null && ev.n_teams != null
+            ? ` (${ev.n_pitchers_kept} starters / ${ev.n_teams} teams)` : '')
+        : ''
+      const lam = ev.lambda_min != null && ev.lambda_max != null
+        ? ` · λ* ${ev.lambda_min.toPrecision(3)}–${ev.lambda_max.toPrecision(3)}`
+          + (ev.n_lambda_star != null ? ` over ${ev.n_lambda_star} operating point${ev.n_lambda_star === 1 ? '' : 's'}` : '')
+          + (ev.lambda_star_at_edge ? ' ⚠ at search edge' : '')
+        : ''
+      const blend = ev.sigma_dG_contests != null
+        ? ` · σ_dG blended over ${ev.sigma_dG_contests} contest${ev.sigma_dG_contests === 1 ? '' : 's'}`
+          + (ev.sigma_dG_min_corr != null ? ` (min corr ${ev.sigma_dG_min_corr.toFixed(3)})` : '')
+        : ''
+      return `${(ev.n_kept ?? 0).toLocaleString()} lineups added to the pool${dropped}${lam}${blend}${universe}`
     }
     case 'mrp_payout_fallback': {
       const ev = e as unknown as { n_missing: number; n_contests: number }

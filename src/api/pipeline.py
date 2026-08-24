@@ -3068,6 +3068,18 @@ class PipelineRunner:
                 smooth_tau_scale=float(_mr_cfg.get("smooth_tau_scale", 0.0)),
                 field_pool_size=int(_mr_cfg.get("field_pool_size", 25_000)),
                 max_sims_per_contest=int(_mr_cfg.get("max_sims_per_contest", 12_500)),
+                frontier_enabled=bool(_mr_cfg.get("frontier_enabled", False)),
+                frontier_n_lambdas=int(_mr_cfg.get("frontier_n_lambdas", 12)),
+                frontier_per_team=int(_mr_cfg.get("frontier_per_team", 8)),
+                frontier_sample_n=int(_mr_cfg.get("frontier_sample_n", 30_000)),
+                frontier_n_anchors=int(_mr_cfg.get("frontier_n_anchors", 2)),
+                frontier_n_generations=int(_mr_cfg.get("frontier_n_generations", 2)),
+                frontier_mutants_per_parent=int(
+                    _mr_cfg.get("frontier_mutants_per_parent", 4)),
+                frontier_salary_floor=float(
+                    _mr_cfg.get("frontier_salary_floor", 47_500.0)),
+                frontier_solver_timeout_s=float(
+                    _mr_cfg.get("frontier_solver_timeout_s", 10.0)),
                 seed=_mrp_seed,
             )
             self._cb("mrp_start", {
@@ -3075,6 +3087,7 @@ class PipelineRunner:
                 "n_entries": sum(len(g.entries) for g in groups),
                 "gamma_in": _mrp_conf.gamma_in, "gamma_out": _mrp_conf.gamma_out,
                 "smooth_tau_scale": _mrp_conf.smooth_tau_scale,
+                "frontier_enabled": _mrp_conf.frontier_enabled,
             })
 
             def _mrp_progress(info: dict) -> None:
@@ -3085,6 +3098,29 @@ class PipelineRunner:
                 elif stage == "mrp_pick":
                     self._cb("mrp_pick_progress",
                              {"done": info["done"], "total": info["total"]})
+                elif stage == "mrp_frontier_start":
+                    self._cb("mrp_frontier_start", {
+                        "n_lambdas": info.get("n_lambdas"),
+                        "n_per_lambda": info.get("n_per_lambda"),
+                        "n_pairs": info.get("n_pairs"),
+                    })
+                elif stage == "mrp_frontier":
+                    self._cb("mrp_frontier_progress", {
+                        "done": info["done"], "total": info["total"],
+                        "n_lineups": info.get("n_lineups", 0),
+                    })
+                elif stage == "mrp_frontier_done":
+                    self._cb("mrp_frontier_done", {
+                        k: info.get(k) for k in (
+                            "n_generated", "n_kept", "n_dropped_duplicate",
+                            "lambda_min", "lambda_max", "n_lambdas_represented",
+                            "n_cov_pairs", "n_players_kept", "n_players_before",
+                            "n_pitchers_kept", "n_teams", "skipped",
+                            "sigma_dG_contests", "sigma_dG_min_corr",
+                            "n_lambda_star", "lambda_star_at_edge",
+                            "lambda_search_lo", "lambda_search_hi",
+                        )
+                    })
                 elif stage == "mrp_floor":
                     # Re-report the ceiling floor with the count MRP actually
                     # applied. The pool-wide `external_proj_score_floor` event
@@ -3120,7 +3156,12 @@ class PipelineRunner:
                 "per_contest": _mrp_diag.per_contest,
                 "relaxations": _mrp_diag.relaxations,
                 "warnings": _mrp_warnings,
+                "n_generated_picked": int(sum(1 for f in _mrp_alloc.from_generated if f)),
+                "n_entries": len(_mrp_alloc.portfolio),
             })
+            # Parallel to the portfolio, so _build_external_entry_map can tag
+            # each lineup with where it came from.
+            self._external_from_generated = list(_mrp_alloc.from_generated)
             allocations = {1.0: _mrp_alloc}
         else:
             # --- 5-risk sweep: independent per-contest allocations ---------
@@ -3285,12 +3326,17 @@ class PipelineRunner:
         entry_sort_order = fill index, so PortfolioTable's existing ascending
         sort renders the per-contest, descending-entry-fee fill order."""
         entry_map: dict[int, dict] = {}
+        # Absent for every allocator that generates nothing, and short if an
+        # allocation was cut off, so index defensively rather than assuming
+        # it lines up (see ExternalAllocation.from_generated).
+        gen = getattr(self, "_external_from_generated", None) or []
         for i, (file_path, rec) in enumerate(self._external_entry_plan):
             entry_map[i + 1] = {
                 "upload_tag": _extract_upload_tag(file_path.name),
                 "entry_fee": rec.entry_fee_raw,
                 "contest_name": _shorten_contest_name(rec.contest_name),
                 "entry_sort_order": i,
+                "from_generated": bool(gen[i]) if i < len(gen) else False,
             }
         return entry_map
 

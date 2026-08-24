@@ -1319,6 +1319,37 @@ button { cursor: pointer; }
   border-bottom: 1px solid #2d3748;
 }
 
+/* Provenance marker: this lineup was built by the marginal-reward line-2
+   frontier generator rather than imported from the SaberSim pool. Sits on the
+   contest-name line, which has spare width on every entry. Amber rather than
+   the entry line's green so it reads as a distinct axis of information, not a
+   louder version of the contest name. */
+.lineup-gen-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid #b7791f;
+  border-radius: 3px;
+  background: rgba(183, 121, 31, 0.16);
+  color: #ecc94b;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  vertical-align: 1px;
+}
+
+.portfolio-gen-summary {
+  margin-left: 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #a0aec0;
+}
+
+.portfolio-gen-summary .lineup-gen-badge {
+  margin-left: 0;
+  margin-right: 6px;
+}
+
 .lineup-card-header-right {
   margin-left: auto;
   display: flex;

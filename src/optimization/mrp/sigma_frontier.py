@@ -1,4 +1,15 @@
-"""Targeted candidate generation along the sigma_dG frontier.
+"""LEGACY linear frontier: sigma_dG only, no quadratic term.
+
+SUPERSEDED FOR GENERATION by `frontier_qp.py`, which solves the paper's line 2
+whole. Kept because `scripts/eval_field_covariance.py` measures on this linear
+form and remains a working diagnostic, and because `pool_sigma_coverage` below
+is the pool-spanning gate regardless of which solver produced the frontier.
+
+WHY IT WAS SUPERSEDED. Equation (14) makes line 2's lambda-term
+`Var(w'delta - G) - Var(G)` -- margin variance. This module keeps only the
+cross-term, which is half that object, and the half that measured as ~84%
+ownership (commit 5128a7f). The other half, `w'Sigma w`, was dropped for a
+solver limitation rather than a modelling reason and was never measured.
 
 WHY THIS IS GATED, NOT ASSUMED. This repo has a measured negative on generated
 supplements: `diagnose_ilp_supplement_pwin.py` found ILP supplements scoring
@@ -23,8 +34,10 @@ with all 10 players matching). dR cannot select what is not in the pool.
 So: run `pool_sigma_coverage` FIRST. If the external pool already spans the
 low-sigma region densely, generation buys nothing and should be skipped.
 
-LINEAR, hence a plain CBC solve rather than a MIQP -- which is the whole reason
-the mean-variance quadratic term was dropped from this build. `df["mean"]` is
+LINEAR, hence a plain CBC solve rather than a MIQP. That was the whole reason
+the quadratic term was dropped here -- an implementation constraint, not a
+judgement that the term was worthless. `frontier_qp.py` lifts it by moving to
+CP-SAT with McCormick product variables. `df["mean"]` is
 `generate_optimal_lineups`' objective coefficient vector, so swapping it is the
 same one-line substitution `generate_sim_optimal_lineups` already makes.
 """
@@ -40,11 +53,12 @@ def sigma_objective(
     sigma_dG: np.ndarray,
     lam: float,
 ) -> np.ndarray:
-    """The paper's linear objective, on an interpretable lambda scale.
+    """The paper's objective MINUS its quadratic term, on a rescaled lambda.
 
     Haugh & Singal maximise `w'mu + lambda(w'Sigma w - 2 w'sigma_dG)`; dropping
-    the quadratic term (we evaluate the true reward directly, so we do not need
-    their mean-variance surrogate) leaves `w'mu - 2 lambda w'sigma_dG`.
+    the quadratic term (CBC cannot express it) leaves `w'mu - 2 lambda
+    w'sigma_dG`. Use `frontier_qp.frontier_lineups` for the full objective --
+    this is the diagnostic form only.
 
     sigma_dG is a covariance in FPTS^2 while mu is in FPTS, so a raw lambda
     grid would be neither interpretable nor comparable across slates. sigma is

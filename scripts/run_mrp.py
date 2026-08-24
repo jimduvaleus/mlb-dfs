@@ -143,6 +143,23 @@ def main() -> int:
     ap.add_argument("--smooth-tau", type=float, default=0.0)
     ap.add_argument("--max-sims-per-contest", type=int, default=12_500)
     ap.add_argument("--field-pool", type=int, default=25_000)
+    ap.add_argument("--frontier", action="store_true",
+                    help="generate along the Haugh & Singal line-2 mean-variance "
+                         "frontier and add the result to the candidate pool")
+    ap.add_argument("--frontier-lambdas", type=int, default=12)
+    ap.add_argument("--frontier-per-team", type=int, default=8,
+                    help="lineups kept per (lambda, primary stack team) -- the "
+                         "diversity control")
+    ap.add_argument("--frontier-sample", type=int, default=30_000,
+                    help="candidates sampled before exact ranking")
+    ap.add_argument("--frontier-anchors", type=int, default=2,
+                    help="exact CP-SAT solves; 0 = solver-free generation")
+    ap.add_argument("--frontier-generations", type=int, default=2)
+    ap.add_argument("--frontier-mutants", type=int, default=4)
+    ap.add_argument("--frontier-salary-floor", type=float, default=47_500.0,
+                    help="min salary for generated lineups; match what SaberSim "
+                         "was given. 0 disables")
+    ap.add_argument("--frontier-timeout", type=float, default=8.0)
     ap.add_argument("--proj-score-pct", type=float, default=None,
                     help="pool-wide ceiling floor: cull the bottom N%% of lineups "
                          "by SaberSim 99th (default: gpp.external_pool_proj_score_pct "
@@ -200,6 +217,15 @@ def main() -> int:
         smooth_tau_scale=args.smooth_tau, seed=args.seed,
         field_pool_size=args.field_pool,
         max_sims_per_contest=args.max_sims_per_contest,
+        frontier_enabled=args.frontier,
+        frontier_n_lambdas=args.frontier_lambdas,
+        frontier_per_team=args.frontier_per_team,
+        frontier_sample_n=args.frontier_sample,
+        frontier_n_anchors=args.frontier_anchors,
+        frontier_n_generations=args.frontier_generations,
+        frontier_mutants_per_parent=args.frontier_mutants,
+        frontier_salary_floor=args.frontier_salary_floor,
+        frontier_solver_timeout_s=args.frontier_timeout,
     )
     _floor_pct = args.proj_score_pct
     if _floor_pct is None:
@@ -210,12 +236,26 @@ def main() -> int:
     _floor_scores = (
         ep.compute_pool_ceiling_scores(si.pool, si.players_df) if _floor_pct > 0 else None
     )
+    def _progress(d: dict) -> None:
+        """Not every stage is a counter.
+
+        `mrp_floor`, `mrp_preflight` and the `mrp_frontier_*` pair report a
+        verdict rather than progress and carry no done/total, so keying on
+        them unconditionally raises KeyError partway through a real run.
+        """
+        stage = d.get("stage", "")
+        done, total = d.get("done"), d.get("total")
+        if done is None or total is None:
+            print(f"  {stage}: " + ", ".join(
+                f"{k}={v}" for k, v in d.items() if k != "stage"))
+            return
+        if done % 25 == 0 or done == total:
+            print(f"  {stage} {done}/{total}", end="\r")
+
     alloc, diag = allocate_marginal_reward(
         si.pool, si.players_df, si.sim_results, groups, cfg, preassigned=preassigned,
         floor_scores=_floor_scores, proj_score_floor_percentile=_floor_pct,
-        progress_cb=lambda d: (
-            print(f"  {d['stage']} {d['done']}/{d['total']}", end="\r")
-            if d["done"] % 25 == 0 or d["done"] == d["total"] else None),
+        progress_cb=_progress,
     )
     print()
     print(diag.summary())

@@ -602,6 +602,41 @@ class MarginalRewardConfig(BaseModel):
     # capped (evenly strided) rather than multiplying by the contest count.
     max_sims_per_contest: int = 12500
 
+    # --- Haugh & Singal line 2: mean-variance frontier generation ----------
+    # Sweep `argmax_w w'mu + lambda(w'Sigma w - 2 w'sigma_dG)` and add the
+    # result to the candidate pool. dR cannot select what is not in the pool,
+    # and the pool measured as NOT spanning this region on 9/9 slates. Off by
+    # default: it costs CP-SAT solve time and changes the pool.
+    frontier_enabled: bool = False
+    # Lambda grid size. Lambda is NOT tuned -- dR picks from the whole
+    # frontier -- so this is a generation-diversity knob, not a hyperparameter.
+    # Wall clock is dominated by the ANCHOR solves -- one per lambda, ~2.6s
+    # each. Mutation and exact scoring are ~1s total for hundreds of lineups,
+    # so n_lambdas drives cost and the rest drive yield near-free.
+    frontier_n_lambdas: int = 12
+    # THE DIVERSITY KNOB: top N per (lambda, primary stack team). Without it
+    # the generator produced 100% single-team lineups, because every lambda's
+    # argmax picks the same team and shape-preserving mutation freezes it.
+    frontier_per_team: int = 8
+    # Candidates drawn from the team-round-robin sampler and ranked by the
+    # exact objective. 30k costs ~10s and covers every team on the slate.
+    frontier_sample_n: int = 30000
+    # Exact CP-SAT solves at spread lambdas, keeping the true frontier tip in
+    # the pool. 0 makes the run completely solver-free.
+    frontier_n_anchors: int = 2
+    frontier_n_generations: int = 2
+    frontier_mutants_per_parent: int = 4
+    # Minimum salary for GENERATED lineups. Deliberately not
+    # optimizer.salary_floor, which is a holdover from the internal optimizer
+    # and not the floor the external pool was built under -- set this to match
+    # whatever SaberSim was given, so generated lineups occupy the same salary
+    # regime as the pool lineups they are merged into and compete with.
+    # 0 disables the floor entirely.
+    frontier_salary_floor: float = 47500.0
+    # Per-solve cap. CP-SAT re-solves from scratch after each no-good cut, so
+    # FEASIBLE is accepted rather than paying for a proof of optimality.
+    frontier_solver_timeout_s: float = 8.0
+
 
 class AppConfig(BaseModel):
     platform: Platform = Platform.DRAFTKINGS

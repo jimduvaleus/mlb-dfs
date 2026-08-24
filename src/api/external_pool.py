@@ -20,7 +20,7 @@ import logging
 import re
 import shutil
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, field as _dc_field
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -105,6 +105,11 @@ class ExternalAllocation:
     portfolio: list               # [(Lineup, roi)] flat, per-contest fill order
     entry_plan: list              # [(Path, EntryRecord)] parallel to portfolio
     unfilled: list                # [(Path, EntryRecord)] pool exhausted
+    # Parallel to `portfolio`: True where the lineup came from a GENERATED
+    # source rather than the imported external pool (currently MRP's line-2
+    # frontier). Empty from allocators that generate nothing, so callers must
+    # treat a short/absent list as "all False" rather than indexing blindly.
+    from_generated: list = _dc_field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -482,6 +487,75 @@ def parse_lineup_pool(paths, valid_ids: set[int], require_roi_blocks: bool = Tru
     )
 
 
+_STD_RESCALE_DEADBAND = 0.001
+"""Relative gap below which `My Proj` vs `dk_points` is display rounding, not
+an edit. Measured on the 08/24 export: rounding tops out at 0.091% and the
+smallest real edit is 0.14%, so 0.1% sits cleanly in the gap."""
+
+
+def _std_scaled_to_edited_mean(
+    df: pd.DataFrame, std_col: str, mean_col: str, edited: pd.Series,
+) -> pd.Series:
+    """`std_col`, rescaled by however far the user edited the projection.
+
+    SaberSim's `dk_std` is the spread its own simulation produced around
+    `dk_points`. A hand-edited `My Proj` does not regenerate it -- so importing
+    the edited mean against the untouched std leaves an inconsistent pair, and
+    the coefficient of variation moves by exactly the size of the edit in the
+    wrong direction. Measured on the 08/24 slate: one team edited down 6.3%
+    came in with a CV 6.7% too high, which moved it from 7th to 3rd on the
+    slate for variance-per-unit-projection.
+
+    Scaling by `edited / original` preserves the CV SaberSim actually computed,
+    and is the SAME assumption `build_quantile_grids(rescale_to_file_mean=True)`
+    makes on the grid path -- a projection edit rescales the whole distribution,
+    location and spread together. Without it the two marginal paths disagree,
+    and a player just below the grid-validity threshold would respond to an
+    edit differently from one just above it.
+
+    NO CONFIG FLAG: an unedited row's ratio is 1.0, so this only moves players
+    somebody actually edited and needs no gate.
+
+    EDITS PROPAGATE TO THE OPPOSING TEAM. SaberSim re-subsamples whole game
+    simulations when a team projection is moved, so nudging one team shifts its
+    OPPONENT's numbers too -- by a little, in both directions. On the 08/24
+    export a deliberate 4.2-7.8% cut to nine PIT batters also moved all ten of
+    their opponent's by -1.1% to +1.35%. Those secondary shifts are real and
+    must be honoured, which is why this keys on the columns disagreeing rather
+    than on any notion of "the team the user edited".
+
+    The `_STD_RESCALE_DEADBAND` exists because the two columns also disagree at
+    the 4th decimal on almost every row -- `My Proj` is stored to fewer places
+    than `dk_points`. Measured on that same export: 108 of 126 batters sit
+    within 0.091% (display rounding), the smallest genuine shift is 0.14%, and
+    the deliberate ones run 4.2-7.8%. The band sits in that gap, so rounding is
+    a true no-op and replays of unedited slates stay byte-identical. Note it is
+    DATA-LIMITED, not a preference: it cannot go below ~0.1% without catching
+    rounding, so a re-subsample shift smaller than that is missed. At 0.1% of a
+    6-point projection that is 0.006 FPTS.
+
+    WHAT THIS CANNOT RECOVER: a re-subsample changes the distribution's SHAPE,
+    not just its location, and the percentile columns still describe the
+    pre-edit sim. Scaling by a constant ratio is a location-and-scale
+    correction -- the best available approximation without SaberSim re-exporting
+    its percentiles, and the same approximation the grid path makes.
+
+    This is NOT the +-20% dead band `build_quantile_grids` argues against. That
+    one was wide enough to swallow real edits, which was the original
+    complaint; 0.1% of a 6-point projection is 0.006 FPTS and cannot be an
+    intentional adjustment.
+    """
+    std = pd.to_numeric(df[std_col], errors="coerce")
+    original = pd.to_numeric(df.get(mean_col), errors="coerce")
+    ratio = edited / original.where(original > 0)
+    # Outside this band it is a broken row rather than an edit (a blanked or
+    # mistyped cell), and scaling a std by it would do more harm than leaving
+    # the inconsistency; same spirit as _GRID_MEAN_REJECT_RATIO on the grid path.
+    ratio = ratio.where(ratio.between(0.2, 5.0), 1.0).fillna(1.0)
+    ratio = ratio.where((ratio - 1.0).abs() > _STD_RESCALE_DEADBAND, 1.0)
+    return std * ratio
+
+
 def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.DataFrame:
     """SaberSim per-player export -> canonical projections.csv frame, for use
     as a first-class ``projections_source`` (as opposed to full external-pool
@@ -549,7 +623,7 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
         "player_id": pd.to_numeric(df["DFS ID"], errors="coerce"),
         "name": df["Name"],
         "mean": mean_raw,
-        "std_dev": pd.to_numeric(df[std_col], errors="coerce"),
+        "std_dev": _std_scaled_to_edited_mean(df, std_col, mean_col, mean_raw),
         "lineup_slot": lineup_slot,
         "slot_confirmed": slot_confirmed,
         "status_confirmed": confirmed,
@@ -573,7 +647,12 @@ def parse_player_projections(path: Path) -> pd.DataFrame:
         "team": df["Team"].astype(str),
         "salary": pd.to_numeric(df.get("Salary"), errors="coerce"),
         "mean": pd.to_numeric(df["My Proj"], errors="coerce"),
-        "std_dev": pd.to_numeric(df["dk_std"], errors="coerce"),
+        # Same rescale as parse_sabersim_projections: dk_std is SaberSim's
+        # spread around dk_points and does not follow a hand-edited My Proj.
+        "std_dev": _std_scaled_to_edited_mean(
+            df, "dk_std", "dk_points",
+            pd.to_numeric(df["My Proj"], errors="coerce"),
+        ),
         "ownership": pd.to_numeric(df.get("My Own"), errors="coerce"),
         "p25": pd.to_numeric(df.get("dk_25_percentile"), errors="coerce"),
         "p50": pd.to_numeric(df.get("dk_50_percentile"), errors="coerce"),
