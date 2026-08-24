@@ -5,6 +5,7 @@ import { useSSE } from './hooks/useSSE'
 import { ConfigForm } from './components/ConfigForm'
 import { ProjectionsPanel } from './components/ProjectionsPanel'
 import { ProgressPanel } from './components/ProgressPanel'
+import { ErrorBoundary } from './components/ErrorBoundary'
 import { PortfolioTable } from './components/PortfolioTable'
 import { ProjectionsTable } from './components/ProjectionsTable'
 import { MetricsPanel } from './components/MetricsPanel'
@@ -644,7 +645,9 @@ export default function App() {
         )}
 
         {state.activeTab === 'run' && (
-          <ProgressPanel events={events} running={running} />
+          <ErrorBoundary label="Progress panel">
+            <ProgressPanel events={events} running={running} />
+          </ErrorBoundary>
         )}
 
         {state.activeTab === 'portfolio' && (

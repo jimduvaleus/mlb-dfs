@@ -3102,3 +3102,48 @@ button { cursor: pointer; }
 .allocation-warning-list li + li {
   margin-top: 4px;
 }
+
+/* Contained render crash (see components/ErrorBoundary.tsx). Red rather than
+   the amber used for pipeline warnings: an allocation warning is the run
+   telling you something true about your portfolio, this is the UI admitting
+   it is broken, and conflating the two trains you to ignore the wrong one. */
+.error-boundary {
+  border: 1px solid #9b2c2c;
+  border-radius: 4px;
+  background: rgba(155, 44, 44, 0.12);
+  padding: 12px 14px;
+  margin: 12px 0;
+}
+
+.error-boundary-header {
+  color: #fc8181;
+  font-weight: 700;
+  margin-bottom: 6px;
+}
+
+.error-boundary-message {
+  color: #feb2b2;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-word;
+  margin-bottom: 6px;
+}
+
+.error-boundary-hint {
+  color: #a0aec0;
+  font-size: 13px;
+  margin: 0 0 10px;
+}
+
+.error-boundary-retry {
+  background: #2d3748;
+  color: #e2e8f0;
+  border: 1px solid #4a5568;
+  border-radius: 3px;
+  padding: 4px 12px;
+  font-size: 13px;
+}
+
+.error-boundary-retry:hover {
+  background: #3a4759;
+}

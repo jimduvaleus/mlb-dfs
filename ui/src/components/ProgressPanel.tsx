@@ -21,6 +21,20 @@ function formatMsWhole(ms: number): string {
   return `${m}m ${s}s`
 }
 
+/** Format a count that the backend may not have sent.
+ *
+ *  Progress payloads cross three layers -- the emitter in src/optimization,
+ *  the relay in src/api/pipeline.py, and this panel -- and a rename that
+ *  updates only two of them (as `mrp_frontier_start` did) delivers the field
+ *  as undefined. Calling .toLocaleString() on that throws during render, and
+ *  with no boundary above it React unmounts the whole app: a blank page,
+ *  mid-run, from a progress READOUT. Degrade to "?" instead. The relay key
+ *  sync is tested in tests/test_mrp_progress_relay.py; this is the seatbelt
+ *  for the layer that test cannot reach. */
+function fmtCount(n: number | null | undefined): string {
+  return n == null ? '?' : n.toLocaleString()
+}
+
 const STAGE_LABELS: Record<string, string> = {
   load_slate: 'Load slate',
   simulate: 'Simulate',
@@ -349,13 +363,13 @@ export function ProgressPanel({ events, running }: Props) {
       // it made the bar jump from "0 / 16" to "1 / 5" mid-run.
       if (!latestMrpFrontier) {
         mrpPct = 0
-        mrpLabel = `Frontier: sampling ${mrpFrontierStartEvent.n_sample.toLocaleString()} candidates, `
-          + `searching ${mrpFrontierStartEvent.n_lambda_search} λ for each contest's λ*…`
+        mrpLabel = `Frontier: sampling ${fmtCount(mrpFrontierStartEvent.n_sample)} candidates, `
+          + `searching ${fmtCount(mrpFrontierStartEvent.n_lambda_search)} λ for each contest's λ*…`
       } else {
         const { done, total } = latestMrpFrontier
         mrpPct = total > 0 ? Math.round((done / total) * 100) : 0
         mrpLabel = `Frontier: λ* ${done} / ${total}`
-          + (done > 0 ? ` · ${latestMrpFrontier.n_lineups.toLocaleString()} lineups generated`
+          + (done > 0 ? ` · ${fmtCount(latestMrpFrontier.n_lineups)} lineups generated`
                       : ' · generating at the first operating point…')
         mrpEtaMs = rate(mrpFrontierProgressEvents, total - done)
       }
@@ -1206,9 +1220,9 @@ function renderDetail(e: SSEEvent): string {
     }
     case 'mrp_frontier_start': {
       const ev = e as unknown as MrpFrontierStartEvent
-      return `Sampling ${ev.n_sample.toLocaleString()} candidates · searching `
-        + `${ev.n_lambda_search} λ for each contest's λ* · keeping `
-        + `${ev.per_team} per team · ${ev.n_pairs.toLocaleString()} covariance pairs`
+      return `Sampling ${fmtCount(ev.n_sample)} candidates · searching `
+        + `${fmtCount(ev.n_lambda_search)} λ for each contest's λ* · keeping `
+        + `${fmtCount(ev.per_team)} per team · ${fmtCount(ev.n_pairs)} covariance pairs`
     }
     case 'mrp_frontier_done': {
       const ev = e as unknown as MrpFrontierDoneEvent

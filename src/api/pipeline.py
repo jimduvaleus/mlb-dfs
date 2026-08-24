@@ -3100,8 +3100,9 @@ class PipelineRunner:
                              {"done": info["done"], "total": info["total"]})
                 elif stage == "mrp_frontier_start":
                     self._cb("mrp_frontier_start", {
-                        "n_lambdas": info.get("n_lambdas"),
-                        "n_per_lambda": info.get("n_per_lambda"),
+                        "n_lambda_search": info.get("n_lambda_search"),
+                        "per_team": info.get("per_team"),
+                        "n_sample": info.get("n_sample"),
                         "n_pairs": info.get("n_pairs"),
                     })
                 elif stage == "mrp_frontier":
