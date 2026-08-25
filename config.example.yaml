@@ -281,17 +281,27 @@ marginal_reward:
                                 # conventional read of small-field play, and
                                 # falls out of the payout maths rather than
                                 # being tuned to it.
-  frontier_per_team: 8          # THE DIVERSITY KNOB: top N per (lambda,
-                                # primary stack team). Without it the
-                                # generator produced 100% ONE-TEAM lineups on
-                                # 08/18 -- every lambda's argmax picks the same
-                                # team (lambda trades mean against variance, it
-                                # has no reason to switch teams) and
-                                # generate_shape_mutants preserves the stack
-                                # profile exactly, propagating that one team to
-                                # every descendant. The selector then had to
-                                # get all its diversity from the external pool.
-                                # per_team x n_teams is the cap per lambda.
+  frontier_target_lineups: 4000 # TOTAL generated lineups to aim for. NOT a
+                                # per-team rate: output is
+                                # n_lambda_star x n_teams x per_team, and
+                                # n_lambda_star is EMERGENT -- whatever line 4
+                                # returns once it has seen the contests. A
+                                # fixed per-team rate therefore swung the pool
+                                # from 4,320 lineups (6 operating points) to
+                                # 1,920 (2 operating points) on the SAME
+                                # setting, purely on how much the slate's
+                                # contests happened to agree. Dividing a total
+                                # by the actual lambda* count instead keeps
+                                # output near target and the memory projection
+                                # stable enough to plan against.
+  frontier_min_per_team: 4      # floor on the DERIVED per-team cap. That cap
+                                # is the anti-monopoly guarantee -- without it
+                                # the generator produced 100% ONE-TEAM lineups
+                                # on 08/18, since every lambda's argmax picks
+                                # the same team and generate_shape_mutants
+                                # preserves the stack profile exactly -- so it
+                                # has to survive the division on a slate with
+                                # many operating points.
   frontier_sample_n: 30000      # candidates drawn from CandidateGenerator's
                                 # team-round-robin sampler, then ranked by the
                                 # exact objective. Measured on 08/18: 30k in

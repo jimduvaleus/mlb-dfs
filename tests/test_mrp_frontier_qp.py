@@ -243,7 +243,9 @@ def test_sweep_dedups_and_returns_legal_lineups():
 
     specs, sim, cmap = _contest_env(df)
     lus, lams, diag = frontier_lineups(df, var, cov, _zero_sigma(df), specs, sim, cmap,
-                                       n_lambdas=4, per_team=3, sample_n=2_000,
+                                       n_lambdas=4, sample_n=2_000,
+                                       # per_team is derived; the floor pins it
+                                       target_lineups=1, min_per_team=3,
                                        n_anchors=1, n_generations=1,
                                        mutants_per_parent=2, **SOLVE_KW)
     assert diag["n_lambda_star"] >= 1
@@ -264,7 +266,8 @@ def test_missing_eligible_positions_is_rejected():
     specs, sim, cmap = _contest_env(_players_df())
     with pytest.raises((ValueError, KeyError, AttributeError)):
         frontier_lineups(df, var, cov, _zero_sigma(df), specs, sim, cmap,
-                         n_lambdas=2, per_team=1, sample_n=200,
+                         n_lambdas=2, sample_n=200,
+                         target_lineups=1, min_per_team=1,
                          n_anchors=1, n_generations=0)
 
 
@@ -288,7 +291,8 @@ def test_generated_lineups_span_many_stack_teams():
 
     specs, sim, cmap = _contest_env(df)
     lus, _lams, _d = frontier_lineups(df, var, cov, _zero_sigma(df), specs, sim, cmap,
-                                      n_lambdas=4, per_team=3, sample_n=4_000,
+                                      n_lambdas=4, sample_n=4_000,
+                                      target_lineups=1, min_per_team=3,
                                       n_anchors=0, n_generations=0, **SOLVE_KW)
     assert lus, "sweep produced nothing"
 
@@ -425,3 +429,52 @@ def test_line4_picks_a_higher_lambda_for_the_harder_bar():
         f"the harder bar should want at least as much variance: "
         f"small={lam_star['small']:.4g} large={lam_star['large']:.4g}"
     )
+
+
+def test_per_team_slots_are_spent_on_distinct_shapes():
+    """The per-team cap is a DIVERSITY BUDGET, not just an anti-monopoly cap.
+
+    `generate_shape_mutants` differs from its parent by ~1 player, so without
+    this the budget fills with 1-swap siblings: measured on the 08/24 slate,
+    1,091 of 1,920 generated lineups shared a 9-player core with another, so a
+    40-slot team was really offering ~25 distinct shapes. Skipping a sibling
+    during selection does not shrink the pool -- the slot refills with the next
+    best DISTINCT lineup -- which is what separates this from culling
+    afterwards, which removes options without adding any.
+    """
+    df = _players_df()
+    var, cov = _sigma_inputs(df)
+    specs, sim, cmap = _contest_env(df)
+
+    lus, _lams, _d = frontier_lineups(df, var, cov, _zero_sigma(df), specs, sim, cmap,
+                                      n_lambdas=4, sample_n=6_000,
+                                      target_lineups=1, min_per_team=8,
+                                      n_anchors=0, n_generations=1,
+                                      mutants_per_parent=3, **SOLVE_KW)
+    assert lus, "sweep produced nothing"
+
+    # No two lineups kept for the same lambda may share a 9-player core.
+    from src.optimization.mrp.frontier_qp import _core_keys
+    counts: dict = {}
+    for l in lus:
+        for c in _core_keys(l.player_ids):
+            counts[c] = counts.get(c, 0) + 1
+    sibling_cores = sum(1 for v in counts.values() if v > 1)
+    # Mutation siblings can still cross lambda boundaries (the core set is
+    # per-lambda so a later lambda is not starved by an earlier one's picks),
+    # so this is a strong bound rather than zero.
+    assert sibling_cores <= 0.15 * len(lus), (
+        f"{sibling_cores} shared 9-player cores across {len(lus)} lineups -- "
+        "the per-team budget is filling with 1-swap siblings again"
+    )
+
+
+def test_core_keys_detects_exactly_the_nine_of_ten_relation():
+    from src.optimization.mrp.frontier_qp import _core_keys
+    a = list(range(10))
+    one_swap = list(range(9)) + [99]        # 9/10 overlap
+    two_swap = list(range(8)) + [98, 99]    # 8/10 overlap
+    ka = set(_core_keys(a))
+    assert ka & set(_core_keys(one_swap))
+    assert not (ka & set(_core_keys(two_swap)))
+    assert len(_core_keys(a)) == 10

@@ -614,10 +614,13 @@ class MarginalRewardConfig(BaseModel):
     # each. Mutation and exact scoring are ~1s total for hundreds of lineups,
     # so n_lambdas drives cost and the rest drive yield near-free.
     frontier_n_lambdas: int = 12
-    # THE DIVERSITY KNOB: top N per (lambda, primary stack team). Without it
-    # the generator produced 100% single-team lineups, because every lambda's
-    # argmax picks the same team and shape-preserving mutation freezes it.
-    frontier_per_team: int = 8
+    # TOTAL generated lineups to aim for -- not a per-team rate. Output is
+    # n_lambda_star x n_teams x per_team, and n_lambda_star is emergent (line 4
+    # decides it), so a fixed rate swung the pool 1,920-4,320 on one setting.
+    frontier_target_lineups: int = 4000
+    # Floor on the derived per-team cap: the anti-monopoly guarantee has to
+    # survive the division.
+    frontier_min_per_team: int = 4
     # Candidates drawn from the team-round-robin sampler and ranked by the
     # exact objective. 30k costs ~10s and covers every team on the slate.
     frontier_sample_n: int = 30000

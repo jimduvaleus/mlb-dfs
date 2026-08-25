@@ -71,11 +71,16 @@ class MRPConfig:
     # n_anchors costs (~2.6-8s each). Scoring, lambda calibration and mutation
     # are together under a second.
     frontier_n_lambdas: int = 12
-    # THE DIVERSITY KNOB. Top N per (lambda, primary stack team), so no single
-    # team can crowd out the rest however much the objective favours it. The
-    # previous solve-then-mutate build produced 100% one-team lineups without
-    # it. per_team x n_teams is the effective cap per lambda.
-    frontier_per_team: int = 8
+    # TOTAL generated lineups to aim for -- NOT a per-team rate. Output is
+    # n_lambda_star x n_teams x per_team, and n_lambda_star is EMERGENT (line 4
+    # decides it), so a fixed rate made the pool swing 1,920-4,320 on the same
+    # setting depending only on how much the slate's contests agreed. per_team
+    # is derived from this, once lambda* is known.
+    frontier_target_lineups: int = 4_000
+    # Floor on the derived per-team cap: the anti-monopoly guarantee (no one
+    # team crowds out the rest -- the solve-then-mutate build produced 100%
+    # one-team lineups without it) has to survive the division.
+    frontier_min_per_team: int = 4
     # Candidates drawn from CandidateGenerator's team-round-robin sampler and
     # ranked by the exact objective. 30k costs ~10s and covers every team.
     frontier_sample_n: int = 30_000
@@ -383,7 +388,7 @@ def _frontier_augment(
                      # operating points generated at, which is the count of
                      # distinct lambda* and is not known until line 4 has run.
                      "n_lambda_search": cfg.frontier_n_lambdas,
-                     "per_team": cfg.frontier_per_team,
+                     "target_lineups": cfg.frontier_target_lineups,
                      "n_sample": cfg.frontier_sample_n,
                      "n_pairs": len(cov_by_pair)})
 
@@ -393,7 +398,8 @@ def _frontier_augment(
         gen_df, var_by_pid, cov_by_pair, sigma_dG,
         specs, sim_matrix, {int(p): i for i, p in enumerate(sim_results.player_ids)},
         n_lambdas=cfg.frontier_n_lambdas,
-        per_team=cfg.frontier_per_team,
+        target_lineups=cfg.frontier_target_lineups,
+        min_per_team=cfg.frontier_min_per_team,
         sample_n=cfg.frontier_sample_n,
         n_anchors=cfg.frontier_n_anchors,
         n_generations=cfg.frontier_n_generations,
