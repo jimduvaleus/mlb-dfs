@@ -639,6 +639,10 @@ class MarginalRewardConfig(BaseModel):
     # Per-solve cap. CP-SAT re-solves from scratch after each no-good cut, so
     # FEASIBLE is accepted rather than paying for a proof of optimality.
     frontier_solver_timeout_s: float = 8.0
+    # Processes the shape-mutation step is spread over. 0 = auto (physical
+    # cores - 1, affinity aware), 1 = serial. Pure speed: the generated
+    # lineups are identical either way.
+    frontier_mutant_workers: int = 0
 
 
 class AppConfig(BaseModel):

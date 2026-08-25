@@ -161,6 +161,11 @@ def main() -> int:
                     help="min salary for generated lineups; match what SaberSim "
                          "was given. 0 disables")
     ap.add_argument("--frontier-timeout", type=float, default=8.0)
+    ap.add_argument("--frontier-mutant-workers", type=int, default=0,
+                    help="processes the shape-mutation step is spread over "
+                         "(0 = auto: physical cores - 1, 1 = serial). Speed "
+                         "only -- the generated lineups are identical at any "
+                         "worker count")
     ap.add_argument("--proj-score-pct", type=float, default=None,
                     help="pool-wide ceiling floor: cull the bottom N%% of lineups "
                          "by SaberSim 99th (default: gpp.external_pool_proj_score_pct "
@@ -228,6 +233,7 @@ def main() -> int:
         frontier_mutants_per_parent=args.frontier_mutants,
         frontier_salary_floor=args.frontier_salary_floor,
         frontier_solver_timeout_s=args.frontier_timeout,
+        frontier_mutant_workers=args.frontier_mutant_workers,
     )
     _floor_pct = args.proj_score_pct
     if _floor_pct is None:

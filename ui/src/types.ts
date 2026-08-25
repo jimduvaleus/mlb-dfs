@@ -168,6 +168,10 @@ export interface MarginalRewardConfig {
    *  lambda=0 lineup, fixing the grid's upper end per slate. */
   /** Per-solve CP-SAT cap, seconds. */
   frontier_solver_timeout_s: number
+  /** Processes the shape-mutation step is spread over. 0 = auto (physical
+   *  cores - 1, affinity aware), 1 = serial. Speed only -- the generated
+   *  lineups are identical either way. */
+  frontier_mutant_workers: number
 }
 
 export interface AppConfig {

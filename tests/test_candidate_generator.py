@@ -724,3 +724,64 @@ def test_shape_mutants_respect_preexisting_seen(generator):
     )
     assert not ({frozenset(m.player_ids) for m in second}
                 & {frozenset(m.player_ids) for m in first})
+
+
+def test_shape_mutants_parallel_matches_serial(generator, monkeypatch):
+    """n_workers is a speed dial and nothing else.
+
+    The chunking is what buys this: each block of parents draws from its own
+    SeedSequence child and starts from the same `seen` snapshot, so the number
+    of processes the chunks are spread over cannot change the output. Chunk
+    size is patched down so a small fixture still produces several of them.
+    """
+    from src.optimization import candidate_generator as cg
+    monkeypatch.setattr(cg, "_SHAPE_MUTANT_CHUNK", 8)
+
+    parents = generator.generate(n_candidates=40)
+    base_seen = {frozenset(lu.player_ids) for lu in parents}
+    serial = generator.generate_shape_mutants(
+        parents, n_per_parent=2, seen=set(base_seen), rng_seed=37,
+    )
+    assert serial
+    parallel = generator.generate_shape_mutants(
+        parents, n_per_parent=2, seen=set(base_seen), rng_seed=37, n_workers=3,
+    )
+    assert [m.player_ids for m in parallel] == [m.player_ids for m in serial]
+
+
+def test_shape_mutants_chunking_is_worker_count_independent(generator, monkeypatch):
+    """Two chunk sizes may differ, but the same chunk size must not depend on
+    how the chunks were scheduled — including the auto (n_workers=0) path."""
+    from src.optimization import candidate_generator as cg
+    monkeypatch.setattr(cg, "_SHAPE_MUTANT_CHUNK", 8)
+
+    parents = generator.generate(n_candidates=40)
+    base_seen = {frozenset(lu.player_ids) for lu in parents}
+    runs = [
+        generator.generate_shape_mutants(
+            parents, n_per_parent=2, seen=set(base_seen), rng_seed=41, n_workers=w,
+        )
+        for w in (1, 2, 0)
+    ]
+    assert runs[0]
+    for other in runs[1:]:
+        assert [m.player_ids for m in other] == [m.player_ids for m in runs[0]]
+
+
+def test_shape_mutants_parallel_updates_seen_in_place(generator, monkeypatch):
+    """Callers carry dedupe state across generations through `seen`; the
+    parallel path merges in the parent, so that contract has to survive."""
+    from src.optimization import candidate_generator as cg
+    monkeypatch.setattr(cg, "_SHAPE_MUTANT_CHUNK", 8)
+
+    parents = generator.generate(n_candidates=40)
+    seen = {frozenset(lu.player_ids) for lu in parents}
+    n_before = len(seen)
+    mutants = generator.generate_shape_mutants(
+        parents, n_per_parent=2, seen=seen, rng_seed=43, n_workers=3,
+    )
+    assert mutants
+    keys = [frozenset(m.player_ids) for m in mutants]
+    assert len(set(keys)) == len(keys), "Duplicate mutants across chunks"
+    assert len(seen) == n_before + len(mutants)
+    assert all(k in seen for k in keys)

@@ -22,6 +22,7 @@ Diversity parameters:
 """
 import logging
 import math
+import os
 from typing import Callable, Optional
 
 import numpy as np
@@ -48,6 +49,105 @@ _MAX_HITTERS_PER_TEAM = 5
 # in the weighted fallback used when the hint is infeasible.
 _SAME_GAME_SECONDARY_PROB = 0.10
 _SAME_GAME_SECONDARY_BOOST = 1.25
+
+# Parents per shape-mutant work unit. FIXED, and deliberately not derived from
+# the worker count: each chunk draws from its own SeedSequence child, so a run
+# is reproducible from (rng_seed, parents) alone and `n_workers` moves only the
+# wall clock. Same reasoning as the pinned num_search_workers in
+# mrp/frontier_qp.py -- a portfolio that changes with the machine that built it
+# is not debuggable. 250 keeps per-chunk IPC negligible against the ~1s of
+# mutation work a chunk carries.
+_SHAPE_MUTANT_CHUNK = 250
+
+_SHAPE_MUTANT_STATE: dict = {}
+"""Per-worker payload for the parallel shape-mutant path (see below)."""
+
+
+def _threads_per_core() -> int:
+    """Hardware threads sharing one physical core (2 = SMT/hyper-threading).
+
+    Read from cpu0's sibling list and assumed uniform, which is right on every
+    machine this runs on and merely imprecise on a hybrid big/little part.
+    """
+    try:
+        with open("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list") as fh:
+            raw = fh.read().strip()
+    except OSError:
+        return 1
+    n = 0
+    for part in raw.split(","):
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            try:
+                n += int(hi) - int(lo) + 1
+            except ValueError:
+                n += 1
+        elif part:
+            n += 1
+    return max(1, n)
+
+
+def _auto_mutant_workers() -> int:
+    """PHYSICAL cores minus one, honouring this process's CPU affinity.
+
+    Not logical CPUs: the mutation loop is compute-bound integer/dict work, so
+    the second thread of an SMT core adds nothing. Measured on an 8-core/16-
+    thread box, gen-2-sized call (56 chunks, 38.5s serial): 4 workers 4.18x,
+    6 5.31x, 8 5.87x, 12 5.91x -- the curve flattens at the PHYSICAL count, and
+    on the smaller gen-1 call (16 chunks) anything past 6 was actively slower
+    as pool startup stopped being amortised. So logical-core provisioning buys
+    nothing here and costs a laptop its remaining responsiveness.
+
+    The minus one leaves a core for the parent, which does the merge and holds
+    the sim matrix, and keeps the machine usable while a run is in flight.
+    """
+    avail = getattr(os, "process_cpu_count", lambda: None)() or 0
+    if not avail:
+        try:
+            avail = len(os.sched_getaffinity(0))
+        except AttributeError:
+            avail = os.cpu_count() or 1
+    return max(1, avail // _threads_per_core() - 1)
+
+
+def _mutant_mp_context():
+    """Start method for the shape-mutant pool.
+
+    forkserver in preference to fork: the pipeline runs inside the threaded
+    FastAPI server, and forking a multi-threaded process is deprecated from
+    3.12 and can deadlock a child on a lock some other thread held at fork
+    time. The forkserver's own process is single-threaded, so its children
+    inherit no such lock. Falls back to whatever the platform offers.
+    """
+    import multiprocessing as mp
+
+    available = mp.get_all_start_methods()
+    for name in ("forkserver", "spawn"):
+        if name in available:
+            return mp.get_context(name)
+    return mp.get_context()
+
+
+def _shape_mutant_pool_init(generator, seen: set, kwargs: dict) -> None:
+    """ProcessPoolExecutor initializer: unpickle the read-only payload once per
+    worker, so a chunk task carries only its parents and its seed rather than
+    a fresh copy of the generator and the `seen` set."""
+    _SHAPE_MUTANT_STATE["generator"] = generator
+    _SHAPE_MUTANT_STATE["seen"] = seen
+    _SHAPE_MUTANT_STATE["kwargs"] = kwargs
+
+
+def _shape_mutant_chunk_task(task) -> list[list[int]]:
+    """One chunk, in a worker process."""
+    parents, seed_state = task
+    state = _SHAPE_MUTANT_STATE
+    # A fresh copy of the snapshot per chunk, never the worker's accumulated
+    # view: a chunk's output must not depend on which other chunks happened to
+    # be scheduled onto the same process before it.
+    return state["generator"]._shape_mutants_chunk(
+        parents, set(state["seen"]), np.random.default_rng(seed_state),
+        **state["kwargs"],
+    )
 
 
 def _gumbel_choice(rng: np.random.Generator, n: int, size: int, weights: np.ndarray) -> np.ndarray:
@@ -867,6 +967,7 @@ class CandidateGenerator:
         progress_cb: Optional[Callable[[int], None]] = None,
         progress_every: int = 500,
         stop_check: Optional[Callable[[], bool]] = None,
+        n_workers: Optional[int] = None,
     ) -> list[Lineup]:
         """Shape-preserving neighborhood mutants of seed parent lineups.
 
@@ -889,6 +990,17 @@ class CandidateGenerator:
         diversity without diluting the shape. Replacement sampling is
         salary-local (weight ∝ exp(-|Δsalary| / salary_locality)).
 
+        WORK IS CHUNKED, ALWAYS. Parents are cut into fixed-size blocks of
+        `_SHAPE_MUTANT_CHUNK`, each drawing from its own SeedSequence child
+        and each starting from the SAME snapshot of `seen`. That is what makes
+        `n_workers` a pure speed dial: the mutants a run produces depend on
+        (rng_seed, parents, chunk size) and not on how many cores the machine
+        happened to have, so a portfolio stays reproducible off the box that
+        built it. The cost of the snapshot rule is that two chunks can
+        independently land on the same lineup; the merge below keeps the
+        first and drops the rest rather than re-drawing, which loses a
+        fraction of a percent of the output and buys determinism for it.
+
         Parameters
         ----------
         parents : seed lineups to mutate (shaped sim-optimal / sim-winner
@@ -901,13 +1013,120 @@ class CandidateGenerator:
             A mutant below the floor is rejected unless it still spends at
             least its parent's salary.
         progress_cb : called with the number of parents processed, every
-            progress_every parents
+            progress_every parents (serial) or at each chunk boundary
+            (parallel)
+        n_workers : processes to spread the chunks over. None/1 = serial,
+            0 = auto (`_auto_mutant_workers`: physical cores - 1, affinity
+            aware), in either case capped at the chunk count so a small call
+            never spawns a pool it cannot fill. The loop is pure Python, so
+            threads cannot help — this is the one stage of the frontier
+            generator where the GIL, not the algorithm, is the wall (measured
+            21.8s of `mrp.frontier_lineups`' 39.7s on the 08/25 slate).
         """
-        rng = np.random.default_rng(
-            rng_seed if rng_seed is not None else self._rng_seed
-        )
-        meta = self._ensure_mutant_meta()
+        if not parents:
+            return []
+
         floor = salary_floor if salary_floor is not None else self._salary_floor
+        kwargs = dict(
+            n_per_parent=int(n_per_parent),
+            max_attempts_per_mutant=int(max_attempts_per_mutant),
+            salary_locality=float(salary_locality),
+            pitcher_swap_weight=float(pitcher_swap_weight),
+            salary_floor=floor,
+        )
+        chunks = [
+            parents[i:i + _SHAPE_MUTANT_CHUNK]
+            for i in range(0, len(parents), _SHAPE_MUTANT_CHUNK)
+        ]
+        seeds = np.random.SeedSequence(
+            rng_seed if rng_seed is not None else self._rng_seed
+        ).spawn(len(chunks))
+        # One snapshot for every chunk — see the docstring. `seen` itself is
+        # still mutated in place at merge time, which callers rely on to carry
+        # dedupe state across generations.
+        snapshot = set(seen)
+
+        workers = 1 if n_workers is None else int(n_workers)
+        if workers == 0:
+            workers = _auto_mutant_workers()
+        workers = max(1, min(workers, len(chunks)))
+
+        results: list[list[list[int]]] = [[] for _ in chunks]
+        if workers == 1:
+            done = 0
+            for ci, chunk in enumerate(chunks):
+                if stop_check is not None and stop_check():
+                    break
+                offset = done
+                results[ci] = self._shape_mutants_chunk(
+                    chunk, set(snapshot), np.random.default_rng(seeds[ci]),
+                    progress_cb=(
+                        (lambda n, _o=offset: progress_cb(_o + n))
+                        if progress_cb is not None else None),
+                    progress_every=progress_every,
+                    stop_check=stop_check, **kwargs,
+                )
+                done += len(chunk)
+        else:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+
+            # The payload (this generator plus the `seen` snapshot) rides the
+            # initializer, so each worker unpickles it once and every chunk
+            # task afterwards carries only its parents and its seed.
+            with ProcessPoolExecutor(
+                max_workers=workers, mp_context=_mutant_mp_context(),
+                initializer=_shape_mutant_pool_init,
+                initargs=(self, snapshot, kwargs),
+            ) as ex:
+                futures = {
+                    ex.submit(_shape_mutant_chunk_task, (chunks[ci], seeds[ci])): ci
+                    for ci in range(len(chunks))
+                }
+                done = 0
+                for fut in as_completed(futures):
+                    results[futures[fut]] = fut.result()
+                    done += len(chunks[futures[fut]])
+                    if progress_cb is not None:
+                        progress_cb(done)
+                    if stop_check is not None and stop_check():
+                        for f in futures:
+                            f.cancel()
+                        break
+
+        # Merge in chunk order, so the result is parent-ordered exactly as the
+        # serial path returned it before this was chunked.
+        out: list[Lineup] = []
+        for kids in results:
+            for ids in kids:
+                key = frozenset(ids)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(Lineup(player_ids=list(ids)))
+        return out
+
+    def _shape_mutants_chunk(
+        self,
+        parents: list[Lineup],
+        seen: set,
+        rng: np.random.Generator,
+        n_per_parent: int,
+        max_attempts_per_mutant: int,
+        salary_locality: float,
+        pitcher_swap_weight: float,
+        salary_floor: Optional[float],
+        progress_cb: Optional[Callable[[int], None]] = None,
+        progress_every: int = 500,
+        stop_check: Optional[Callable[[], bool]] = None,
+    ) -> list[list[int]]:
+        """One block of parents. Returns raw id lists, not Lineups, because
+        this is what crosses a process boundary in the parallel path.
+
+        `seen` is the caller's SNAPSHOT and is mutated locally only — the real
+        set is updated when `generate_shape_mutants` merges the chunks.
+        """
+        meta = self._ensure_mutant_meta()
+        floor = salary_floor
         pid_salary = self._pid_salary
         pid_team = self._pid_team
         pmeta = self._pmeta
@@ -920,7 +1139,7 @@ class CandidateGenerator:
             ep = m.get("eligible_positions")
             return bool(ep) and pos in ep
 
-        out: list[Lineup] = []
+        out: list[list[int]] = []
         for n_done, parent in enumerate(parents):
             if stop_check is not None and stop_check():
                 break
@@ -935,14 +1154,23 @@ class CandidateGenerator:
                 pid_team[pid] for pid in p_ids if pmeta[pid]["position"] != "P"
             }
 
-            slot_w = np.array(
+            # Cumulative (unnormalised) slot weights. Drawing a slot is then a
+            # searchsorted on one uniform, where rng.choice(replace=False, p=)
+            # cost 52us a call against 4.8us for this: it sorts, calls
+            # np.unique, and rebuilds the cumulative weights every single time.
+            # At ~200k attempts a run that alone was ~20% of the stage.
+            slot_cw = np.cumsum(np.array(
                 [
                     pitcher_swap_weight if pmeta[pid]["position"] == "P" else 1.0
                     for pid in p_ids
                 ],
                 dtype=np.float64,
-            )
-            slot_w /= slot_w.sum()
+            ))
+            slot_total = float(slot_cw[-1])
+
+            def _draw_slot() -> int:
+                return min(int(np.searchsorted(slot_cw, rng.random() * slot_total)),
+                           roster_size - 1)
 
             produced = 0
             attempts = 0
@@ -950,8 +1178,18 @@ class CandidateGenerator:
             while produced < n_per_parent and attempts < max_attempts:
                 attempts += 1
                 ids = list(p_ids)
-                n_swaps = 1 if rng.random() < 0.6 else 2
-                swap_slots = rng.choice(roster_size, size=n_swaps, replace=False, p=slot_w)
+                first = _draw_slot()
+                swap_slots = [first]
+                if rng.random() >= 0.6:
+                    # Second slot, without replacement: redraw a bounded number
+                    # of times rather than renormalising the weights, which at
+                    # 10 slots hits a distinct slot almost immediately. A run
+                    # of collisions falls back to a single swap.
+                    for _ in range(8):
+                        second = _draw_slot()
+                        if second != first:
+                            swap_slots.append(second)
+                            break
 
                 feasible_swap = True
                 for j in swap_slots:
@@ -974,18 +1212,16 @@ class CandidateGenerator:
                         feasible_swap = False
                         break
                     old_sal = pid_salary[old_pid]
-                    w = np.array(
-                        [
-                            math.exp(-abs(pid_salary[pid] - old_sal) / salary_locality)
-                            for pid in cand_pids
-                        ],
-                        dtype=np.float64,
-                    )
-                    w_sum = w.sum()
-                    if w_sum <= 0:
+                    cw = np.cumsum(np.fromiter(
+                        (math.exp(-abs(pid_salary[pid] - old_sal) / salary_locality)
+                         for pid in cand_pids),
+                        dtype=np.float64, count=len(cand_pids),
+                    ))
+                    total = float(cw[-1])
+                    if total <= 0:
                         feasible_swap = False
                         break
-                    pick = int(np.searchsorted(np.cumsum(w / w_sum), rng.random()))
+                    pick = int(np.searchsorted(cw, rng.random() * total))
                     ids[j] = cand_pids[min(pick, len(cand_pids) - 1)]
                 if not feasible_swap:
                     continue
@@ -1005,7 +1241,7 @@ class CandidateGenerator:
                     continue
 
                 seen.add(key)
-                out.append(mutant)
+                out.append(ids)
                 produced += 1
 
         return out

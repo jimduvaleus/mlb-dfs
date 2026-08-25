@@ -95,6 +95,14 @@ class MRPConfig:
     # as the external pool they are merged into. 0 disables.
     frontier_salary_floor: float = 47_500.0
     frontier_solver_timeout_s: float = 8.0
+    # Processes the shape-mutation step is spread over. 0 = auto (PHYSICAL
+    # cores - 1, affinity aware -- SMT siblings add nothing to a compute-bound
+    # Python loop), 1 = serial. Mutation is a pure-Python per-parent loop and
+    # the largest single block of the frontier's wall clock, so this is the
+    # only dial on the stage that is not also a pool-quality decision. Output
+    # is unaffected: parents are chunked at a fixed size and each chunk seeds
+    # from its own SeedSequence child.
+    frontier_mutant_workers: int = 0
 
     def rules(self) -> AllocationRules:
         return AllocationRules(
@@ -417,6 +425,7 @@ def _frontier_augment(
                       else None),
         timeout_s=cfg.frontier_solver_timeout_s,
         seed=cfg.seed,
+        mutant_workers=cfg.frontier_mutant_workers,
         progress_cb=(lambda d, t, n: progress_cb(
             {"stage": "mrp_frontier", "done": d, "total": t,
              "n_lineups": n})) if progress_cb else None,

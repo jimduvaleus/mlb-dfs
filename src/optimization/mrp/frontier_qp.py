@@ -579,6 +579,7 @@ def frontier_lineups(
     min_secondary=None,
     timeout_s: float = 8.0,
     seed: int = 42,
+    mutant_workers: int = 0,
     progress_cb: Optional[Callable[[int, int, int], None]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
 ) -> tuple[list[Lineup], list[float], dict]:
@@ -617,6 +618,14 @@ def frontier_lineups(
 
     `min_per_team` floors the result: the per-team cap is what stops one team
     crowding out the rest, and that guarantee has to survive the division.
+
+    `mutant_workers` spreads step 3's mutation over processes (0 = auto,
+    1 = serial). Mutation is the largest single block of this function's wall
+    clock -- 21.8s of 39.7s on the 08/25 slate -- and it is a pure-Python
+    per-parent loop, so processes are the only thing that helps: the same
+    slate ran the stage in 22.1s on auto. Output does not depend on the
+    count, because `generate_shape_mutants` chunks parents at a fixed size
+    and seeds each chunk from its own SeedSequence child.
 
     Returns `(lineups, lambda_per_lineup, diag)`.
     """
@@ -753,6 +762,7 @@ def frontier_lineups(
                 kids = generator.generate_shape_mutants(
                     parents, n_per_parent=int(mutants_per_parent), seen=seen,
                     rng_seed=seed + g, salary_floor=salary_floor,
+                    n_workers=mutant_workers,
                 )
                 if not kids:
                     break

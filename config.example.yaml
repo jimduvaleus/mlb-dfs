@@ -338,6 +338,28 @@ marginal_reward:
                                 # the highest lambda usually needs it: measured
                                 # 5 of 6 anchors proved OPTIMAL in under 3.4s,
                                 # and only the frontier's extreme end saturates.
+  frontier_mutant_workers: 0    # processes the shape-mutation step is spread
+                                # over. 0 = auto, 1 = serial. AUTO IS PHYSICAL
+                                # CORES - 1, affinity aware: the loop is
+                                # compute-bound Python, so an SMT sibling adds
+                                # nothing. Measured on 8 cores / 16 threads,
+                                # the big gen-2 call went 4.18x at 4 workers,
+                                # 5.31x at 6, 5.87x at 8, 5.91x at 12 -- flat
+                                # from the physical count on -- while the
+                                # smaller gen-1 call got SLOWER past 6.
+                                # PURE SPEED, not a pool decision: parents are
+                                # chunked at a fixed size and each chunk draws
+                                # from its own SeedSequence child, so the
+                                # lineups are identical at any worker count.
+                                # Worth having because mutation is the biggest
+                                # block of the stage (21.8s of 39.7s measured
+                                # on 08/25, which auto ran in 22.1s) and is
+                                # a pure-Python per-parent loop -- threads
+                                # cannot touch it, only processes can. The
+                                # quality dial for the same time is
+                                # frontier_n_generations x mutants_per_parent,
+                                # which builds ~20x target_lineups so _cap can
+                                # keep 1x.
   # Frontier lineups are EXEMPT from gpp.external_pool_proj_score_pct: the
   # floor basis is SaberSim's own "99th" column, which a generated lineup does
   # not have, and the fallback (compute_pool_ceiling_proxy) assumes the 10

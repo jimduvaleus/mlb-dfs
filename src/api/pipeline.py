@@ -3085,6 +3085,8 @@ class PipelineRunner:
                     _mr_cfg.get("frontier_salary_floor", 47_500.0)),
                 frontier_solver_timeout_s=float(
                     _mr_cfg.get("frontier_solver_timeout_s", 10.0)),
+                frontier_mutant_workers=int(
+                    _mr_cfg.get("frontier_mutant_workers", 0)),
                 seed=_mrp_seed,
             )
             self._cb("mrp_start", {
