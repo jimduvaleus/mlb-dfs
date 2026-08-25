@@ -363,17 +363,27 @@ def _load_portfolio_from_csv(platform_val: str) -> list[dict] | None:
                     "team": str(row["team"]),
                     "salary": int(row["salary"]),
                     "mean": float(row["mean"]) if "mean" in row and pd.notna(row["mean"]) else None,
+                    "ownership": float(row["ownership"]) if "ownership" in row and pd.notna(row["ownership"]) else None,
                     "slot": int(row["slot"]) if "slot" in row and pd.notna(row["slot"]) else None,
                     "slot_confirmed": bool(row["slot_confirmed"]) if "slot_confirmed" in row and pd.notna(row["slot_confirmed"]) else False,
                     "assigned_position": str(row["assigned_position"]) if "assigned_position" in row and pd.notna(row["assigned_position"]) else None,
                 }
                 for _, row in group.iterrows()
             ]
+            # Rebuild the per-lineup projected-score / ownership totals the
+            # same all-or-nothing way _serialize_portfolio does, so a player
+            # missing a projection can't read as a zero contribution. Without
+            # this the PRJ/OWN chips on the lineup cards vanish on any reload,
+            # since the UI prefers this CSV portfolio over the sweep JSON.
+            _means = [p["mean"] for p in players if p["mean"] is not None]
+            _owns = [p["ownership"] for p in players if p["ownership"] is not None]
             portfolio.append({
                 "lineup_index": int(lineup_idx),
                 "p_hit_target": float(first["p_hit_target"]),
                 "lineup_salary": int(first["lineup_salary"]),
                 "mean_ev": float(first["mean_ev"]) if "mean_ev" in first and pd.notna(first["mean_ev"]) else None,
+                "lineup_mean": round(sum(_means), 2) if len(_means) == len(players) else None,
+                "lineup_ownership": round(sum(_owns), 1) if len(_owns) == len(players) else None,
                 "players": _upload_order_players(players),
             })
         if not portfolio:

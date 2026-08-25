@@ -2237,7 +2237,10 @@ class PipelineRunner:
 
         # --- Save CSV ---------------------------------------------------
         os.makedirs(output_dir, exist_ok=True)
-        portfolio_df = self._format_portfolio_df(portfolio, players_df, mean_ev_from_score=_portfolio_has_dollar_ev)
+        portfolio_df = self._format_portfolio_df(
+            portfolio, players_df, mean_ev_from_score=_portfolio_has_dollar_ev,
+            ownership_by_id=getattr(self, "_ownership_pct", None),
+        )
         output_path = os.path.join(output_dir, f"portfolio_{platform.value}.csv")
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Portfolio saved to %s", output_path)
@@ -3259,7 +3262,10 @@ class PipelineRunner:
                 lr.update(info)
 
         os.makedirs(output_dir, exist_ok=True)
-        portfolio_df = self._format_portfolio_df(portfolio, players_df, mean_ev_from_score=True)
+        portfolio_df = self._format_portfolio_df(
+            portfolio, players_df, mean_ev_from_score=True,
+            ownership_by_id=getattr(self, "_ownership_pct", None),
+        )
         portfolio_df.to_csv(
             os.path.join(output_dir, f"portfolio_{platform.value}.csv"), index=False,
         )
@@ -3362,7 +3368,10 @@ class PipelineRunner:
         platform_val = self._platform.value if hasattr(self, "_platform") else "draftkings"
         os.makedirs(self._output_dir, exist_ok=True)
 
-        portfolio_df = self._format_portfolio_df(portfolio, self._players_df, mean_ev_from_score=True)
+        portfolio_df = self._format_portfolio_df(
+            portfolio, self._players_df, mean_ev_from_score=True,
+            ownership_by_id=getattr(self, "_ownership_pct", None),
+        )
         output_path = os.path.join(self._output_dir, f"portfolio_{platform_val}.csv")
         portfolio_df.to_csv(output_path, index=False)
         logger.info("Activated risk=%.0f portfolio; saved to %s", risk, output_path)
@@ -3514,7 +3523,10 @@ class PipelineRunner:
         )
 
         os.makedirs(self._output_dir, exist_ok=True)
-        portfolio_df = self._format_portfolio_df(self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev)
+        portfolio_df = self._format_portfolio_df(
+            self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev,
+            ownership_by_id=getattr(self, "_ownership_pct", None),
+        )
         platform_val = self._platform.value if hasattr(self, "_platform") else "draftkings"
         output_path = os.path.join(self._output_dir, f"portfolio_{platform_val}.csv")
         portfolio_df.to_csv(output_path, index=False)
@@ -4248,7 +4260,14 @@ class PipelineRunner:
         portfolio: list,
         players_df: pd.DataFrame,
         mean_ev_from_score: bool = False,
+        ownership_by_id: Optional[dict] = None,
     ) -> pd.DataFrame:
+        """Flatten a portfolio to one row per (lineup, player) for the CSV.
+
+        ``ownership_by_id`` is in percentage points (same contract as
+        ``_serialize_portfolio``) and is persisted so the portfolio restored
+        from this CSV after a restart can rebuild the per-lineup ownership
+        total, not just the projected-score total."""
         from src.optimization.optimizer import _build_player_meta
         id_to_name = dict(zip(players_df["player_id"], players_df.get("name", players_df["player_id"])))
         id_to_salary = dict(zip(players_df["player_id"], players_df["salary"]))
@@ -4279,6 +4298,11 @@ class PipelineRunner:
                     "team": id_to_team.get(pid, ""),
                     "salary": id_to_salary.get(pid, 0),
                     "mean": float(id_to_mean[pid]) if pid in id_to_mean else None,
+                    "ownership": (
+                        float(ownership_by_id[pid])
+                        if ownership_by_id is not None and pid in ownership_by_id
+                        else None
+                    ),
                     "lineup_salary": total_salary,
                     "mean_ev": mean_ev,
                     "slot": int(id_to_slot[pid]) if pid in id_to_slot else None,
