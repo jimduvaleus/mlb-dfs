@@ -1221,8 +1221,8 @@ function renderDetail(e: SSEEvent): string {
     case 'mrp_frontier_start': {
       const ev = e as unknown as MrpFrontierStartEvent
       return `Sampling ${fmtCount(ev.n_sample)} candidates · searching `
-        + `${fmtCount(ev.n_lambda_search)} λ for each contest's λ* · keeping `
-        + `${fmtCount(ev.per_team)} per team · ${fmtCount(ev.n_pairs)} covariance pairs`
+        + `${fmtCount(ev.n_lambda_search)} λ for each contest's λ* · targeting `
+        + `${fmtCount(ev.target_lineups)} lineups · ${fmtCount(ev.n_pairs)} covariance pairs`
     }
     case 'mrp_frontier_done': {
       const ev = e as unknown as MrpFrontierDoneEvent

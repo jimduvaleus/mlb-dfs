@@ -534,6 +534,18 @@ def calibrate_lambda_grid(
     return [0.0] + list(np.geomspace(lo, hi, n_lambdas - 1))
 
 
+def _core_keys(pids):
+    """The 10 nine-player subsets of a lineup.
+
+    Two lineups overlap in exactly 9 players iff they share one of these, so
+    the near-duplicate test is 10 set lookups rather than a comparison against
+    every lineup kept so far. That is what lets it run INSIDE the per-team
+    selection loop instead of as a separate O(n^2) pass afterwards.
+    """
+    s = sorted(int(x) for x in pids)
+    return [frozenset(s[:k] + s[k + 1:]) for k in range(len(s))]
+
+
 def _primary_stack(pids, team_of: dict, pos_of: dict):
     """The team supplying the most BATTERS -- a lineup's stack identity."""
     counts: dict = {}
@@ -555,7 +567,8 @@ def frontier_lineups(
     sim_matrix: np.ndarray,
     col_map: dict,
     n_lambdas: int = 12,
-    per_team: int = 20,
+    target_lineups: int = 4_000,
+    min_per_team: int = 4,
     sample_n: int = 30_000,
     n_anchors: int = 2,
     n_generations: int = 2,
@@ -591,6 +604,19 @@ def frontier_lineups(
 
     Scoring a fixed sample pool is what makes all of this affordable: a lambda
     is a re-rank (0.03s per 20k lineups), not a solve.
+
+    BUDGET IS A TOTAL, NOT A PER-TEAM RATE. Output is
+    `n_lambda_star x n_teams x per_team`, and `n_lambda_star` is EMERGENT --
+    whatever line 4 returns once it has seen the contests. Setting the per-team
+    rate directly therefore made pool size swing with how much the slate's
+    contests happened to agree: the same rate of 40 gave 4,320 lineups on a
+    6-operating-point slate and 1,920 on a 2-point one. `target_lineups` is
+    divided by the actual `n_lambda_star x n_teams` instead, so output lands
+    near the target however line 4 resolves, and the memory projection becomes
+    stable enough to plan against.
+
+    `min_per_team` floors the result: the per-team cap is what stops one team
+    crowding out the rest, and that guarantee has to survive the division.
 
     Returns `(lineups, lambda_per_lineup, diag)`.
     """
@@ -652,18 +678,31 @@ def frontier_lineups(
             if got:
                 anchors.setdefault(float(lambdas_used[gi]), []).extend(got)
 
+    # Derived only once lambda* is known -- see the budget note above.
+    n_teams = len({t for pid, t in team_of.items() if pos_of.get(pid) != "P"})
+    per_team = max(int(min_per_team),
+                   int(target_lineups) // max(len(lambdas_used) * max(n_teams, 1), 1))
+    diag.update(n_teams=n_teams, per_team_derived=per_team,
+                target_lineups=int(target_lineups))
+
     seen: set = set()
     lineups: list[Lineup] = []
     lambdas: list[float] = []
 
     def _cap(cands: list[Lineup], sc: np.ndarray) -> list[Lineup]:
+        """Top `per_team` per team, skipping 9/10 siblings of what is kept."""
         taken: dict = {}
+        kept_cores: set = set()
         out: list[Lineup] = []
         for j in np.argsort(sc)[::-1]:
             lu = cands[int(j)]
             t = _primary_stack(lu.player_ids, team_of, pos_of)
             if taken.get(t, 0) >= per_team:
                 continue
+            ck = _core_keys(lu.player_ids)
+            if any(c in kept_cores for c in ck):
+                continue
+            kept_cores.update(ck)
             taken[t] = taken.get(t, 0) + 1
             out.append(lu)
         return out
@@ -674,6 +713,7 @@ def frontier_lineups(
         scores = scorer.score(rows, float(lam), sigma_dG)
         taken: dict = {}
         picked: list[Lineup] = []
+        cores: set = set()
         for j in np.argsort(scores)[::-1]:
             t = _primary_stack(rows[j], team_of, pos_of)
             if taken.get(t, 0) >= per_team:
@@ -681,7 +721,17 @@ def frontier_lineups(
             key = frozenset(int(x) for x in rows[j])
             if key in seen:
                 continue
+            # A team's per_team slots are a DIVERSITY BUDGET, so spend them on
+            # distinct shapes. Measured: 37% of generated lineups shared a
+            # 9-player core with another, so a 40-slot team really offered ~25
+            # shapes. Skipping a 1-swap sibling here does NOT shrink the pool --
+            # the slot refills with the next-best distinct lineup -- which is
+            # the whole difference between this and culling afterwards.
+            ck = _core_keys(rows[j])
+            if any(c in cores for c in ck):
+                continue
             seen.add(key)
+            cores.update(ck)
             taken[t] = taken.get(t, 0) + 1
             picked.append(sampled[int(j)])
 

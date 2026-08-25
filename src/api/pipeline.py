@@ -3073,7 +3073,9 @@ class PipelineRunner:
                 max_sims_per_contest=int(_mr_cfg.get("max_sims_per_contest", 12_500)),
                 frontier_enabled=bool(_mr_cfg.get("frontier_enabled", False)),
                 frontier_n_lambdas=int(_mr_cfg.get("frontier_n_lambdas", 12)),
-                frontier_per_team=int(_mr_cfg.get("frontier_per_team", 8)),
+                frontier_target_lineups=int(
+                    _mr_cfg.get("frontier_target_lineups", 4000)),
+                frontier_min_per_team=int(_mr_cfg.get("frontier_min_per_team", 4)),
                 frontier_sample_n=int(_mr_cfg.get("frontier_sample_n", 30_000)),
                 frontier_n_anchors=int(_mr_cfg.get("frontier_n_anchors", 2)),
                 frontier_n_generations=int(_mr_cfg.get("frontier_n_generations", 2)),
@@ -3104,7 +3106,7 @@ class PipelineRunner:
                 elif stage == "mrp_frontier_start":
                     self._cb("mrp_frontier_start", {
                         "n_lambda_search": info.get("n_lambda_search"),
-                        "per_team": info.get("per_team"),
+                        "target_lineups": info.get("target_lineups"),
                         "n_sample": info.get("n_sample"),
                         "n_pairs": info.get("n_pairs"),
                     })

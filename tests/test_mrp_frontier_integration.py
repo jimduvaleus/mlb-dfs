@@ -21,7 +21,8 @@ from tests.test_mrp_runner import _fixture, _group
 
 FRONTIER_CFG = MRPConfig(
     field_pool_size=400, max_sims_per_contest=300, seed=1,
-    frontier_enabled=True, frontier_n_lambdas=3, frontier_per_team=2,
+    frontier_enabled=True, frontier_n_lambdas=3,
+    frontier_target_lineups=40, frontier_min_per_team=2,
     frontier_sample_n=800, frontier_n_anchors=1, frontier_n_generations=1,
     frontier_mutants_per_parent=2, frontier_solver_timeout_s=5.0,
     # The toy roster's salaries top out around $40k for ten players, so the
@@ -198,8 +199,11 @@ def test_frontier_emits_the_events_the_ui_bar_needs():
     # called n_lambdas: generation happens at the distinct lambda* only, and
     # labelling the search size as the sweep size told the user "16 λ" while
     # the bar counted to 5.
-    assert {"n_lambda_search", "per_team", "n_sample", "n_pairs"} <= set(start)
+    assert {"n_lambda_search", "target_lineups", "n_sample", "n_pairs"} <= set(start)
     assert "n_lambdas" not in start, "the ambiguous name must not come back"
+    # per_team is DERIVED from the total budget now, so it is not knowable at
+    # start time -- the emitter must not claim to send it.
+    assert "per_team" not in start
 
     prog = [e for e in seen if e["stage"] == "mrp_frontier"]
     assert all({"done", "total", "n_lineups"} <= set(e) for e in prog)

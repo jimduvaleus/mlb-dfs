@@ -312,10 +312,16 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                         onChange={e => set('marginal_reward', 'frontier_n_lambdas', Number(e.target.value))}
                         disabled={disabled} />
                     </FieldRow>
-                    <FieldRow label="Lineups per team, per λ">
-                      <input type="number" step={1} min={1} max={200}
-                        value={draft.marginal_reward?.frontier_per_team ?? 8}
-                        onChange={e => set('marginal_reward', 'frontier_per_team', Number(e.target.value))}
+                    <FieldRow label="Target generated lineups (total)">
+                      <input type="number" step={500} min={500} max={20000}
+                        value={draft.marginal_reward?.frontier_target_lineups ?? 4000}
+                        onChange={e => set('marginal_reward', 'frontier_target_lineups', Number(e.target.value))}
+                        disabled={disabled} />
+                    </FieldRow>
+                    <FieldRow label="Min lineups per team">
+                      <input type="number" step={1} min={1} max={50}
+                        value={draft.marginal_reward?.frontier_min_per_team ?? 4}
+                        onChange={e => set('marginal_reward', 'frontier_min_per_team', Number(e.target.value))}
                         disabled={disabled} />
                     </FieldRow>
                     <FieldRow label="Candidates sampled">

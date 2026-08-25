@@ -147,9 +147,12 @@ export interface MarginalRewardConfig {
   /** Lambda grid size. Lambda is not tuned -- dR picks from the whole
    *  frontier -- so this is a diversity knob, not a hyperparameter. */
   frontier_n_lambdas: number
-  /** The diversity knob: top N per (lambda, primary stack team). Without it
-   *  the generator produces single-team lineups. */
-  frontier_per_team: number
+  /** TOTAL generated lineups to aim for. The per-team cap is derived from
+   *  this and the emergent lambda* count, so output stays near target however
+   *  many operating points line 4 returns. */
+  frontier_target_lineups: number
+  /** Floor on the derived per-team cap -- the anti-monopoly guarantee. */
+  frontier_min_per_team: number
   /** Candidates sampled from the team-round-robin generator, then ranked by
    *  the exact objective. */
   frontier_sample_n: number
@@ -991,7 +994,9 @@ export interface MrpFrontierStartEvent extends SSEEvent {
    *  operating points generated at, which is the count of distinct lambda*
    *  and is unknown until line 4 has run. */
   n_lambda_search: number
-  per_team: number
+  /** TOTAL lineups aimed for. The per-team cap is derived from this and the
+   *  emergent lambda* count, so it is not knowable at start time. */
+  target_lineups: number
   n_sample: number
   n_pairs: number
 }

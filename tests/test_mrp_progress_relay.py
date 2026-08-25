@@ -183,11 +183,20 @@ def test_relay_output_matches_the_typescript_interface(stage):
 
 
 def test_the_frontier_start_regression_stays_closed():
-    """The exact rename that blanked the UI: emitter moved to
-    n_lambda_search/per_team/n_sample, relay was left on the old names."""
+    """The exact rename that blanked the UI: the emitter moved to
+    n_lambda_search/.../n_sample and the relay was left on the old names.
+
+    The payload has since been renamed a second time -- `per_team` became
+    `target_lineups` when the per-team cap stopped being configured directly
+    and started being DERIVED from a total budget and the emergent lambda*
+    count. Both retired names are asserted absent, because either one
+    reappearing means a relay is reading a key the emitter no longer sends.
+    """
     reads = RELAY["mrp_frontier_start"]["reads"]
-    assert {"n_lambda_search", "per_team", "n_sample", "n_pairs"} <= reads
-    assert not ({"n_lambdas", "n_per_lambda"} & reads), "old field names are back"
+    assert {"n_lambda_search", "target_lineups", "n_sample", "n_pairs"} <= reads
+    assert not ({"n_lambdas", "n_per_lambda", "per_team"} & reads), (
+        "a retired field name is back in the relay"
+    )
 
 
 def test_spread_emitters_are_accounted_for():

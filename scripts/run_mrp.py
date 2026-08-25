@@ -147,9 +147,10 @@ def main() -> int:
                     help="generate along the Haugh & Singal line-2 mean-variance "
                          "frontier and add the result to the candidate pool")
     ap.add_argument("--frontier-lambdas", type=int, default=12)
-    ap.add_argument("--frontier-per-team", type=int, default=8,
-                    help="lineups kept per (lambda, primary stack team) -- the "
-                         "diversity control")
+    ap.add_argument("--frontier-target", type=int, default=4000,
+                    help="TOTAL generated lineups to aim for; the per-team cap "
+                         "is derived from this and the emergent lambda* count")
+    ap.add_argument("--frontier-min-per-team", type=int, default=4)
     ap.add_argument("--frontier-sample", type=int, default=30_000,
                     help="candidates sampled before exact ranking")
     ap.add_argument("--frontier-anchors", type=int, default=2,
@@ -219,7 +220,8 @@ def main() -> int:
         max_sims_per_contest=args.max_sims_per_contest,
         frontier_enabled=args.frontier,
         frontier_n_lambdas=args.frontier_lambdas,
-        frontier_per_team=args.frontier_per_team,
+        frontier_target_lineups=args.frontier_target,
+        frontier_min_per_team=args.frontier_min_per_team,
         frontier_sample_n=args.frontier_sample,
         frontier_n_anchors=args.frontier_anchors,
         frontier_n_generations=args.frontier_generations,
