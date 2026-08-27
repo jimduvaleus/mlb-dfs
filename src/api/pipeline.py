@@ -255,6 +255,12 @@ class PipelineRunner:
         # imported pool. Cached candidates/field are meaningless here.
         self._use_external_pool = use_external_pool
         self._external_mode = False
+        # Frontier attribution, set only when the line-2 generator actually
+        # added lineups. Cleared at the top of every _run_external so a second
+        # run with the generator OFF cannot inherit the first run's verdict and
+        # label imported lineups as generated.
+        self._external_generated_keys: Optional[set] = None
+        self._external_from_generated: list = []
         if use_external_pool:
             self._use_cached_candidates = False
             self._use_cached_field = False
@@ -2988,6 +2994,13 @@ class PipelineRunner:
         from src.api import external_pool as ep
         from .slate_exclusions import compute_file_fingerprint, compute_slate_id, read_exclusions
 
+        # Frontier attribution is per RUN. A PipelineRunner is reused across
+        # runs by the server, so leaving last run's keys in place would label
+        # imported lineups as generated the moment the generator is switched
+        # off — a silently wrong provenance claim rather than a missing one.
+        self._external_generated_keys = None
+        self._external_from_generated = []
+
         gpp_cfg = cfg.get("gpp", {})
         _ev_type = str(gpp_cfg.get("external_pool_ev_type", "roi")).strip().lower()
         if _ev_type not in ("roi", "prj_own", "p_win", "proj_top", "self_play",
@@ -3758,6 +3771,15 @@ class PipelineRunner:
                     pool, players_df, sim_results, _pc_slots, _mr_cfg_pc,
                     _pc_raw[0], _pc_cs, _pc_col_map, seed=_rng_seed,
                 )
+                # Frontier lineups are appended at the END of pool.lineups, so
+                # they are the last n_frontier. Recorded as KEYS, not indices:
+                # every arm below draws its own portfolio from this one pool,
+                # and an index is only meaningful against a single ordering.
+                if _pc_n_frontier:
+                    self._external_generated_keys = {
+                        frozenset(lu.player_ids)
+                        for lu in pool.lineups[-_pc_n_frontier:]
+                    }
 
             _pc_cap = max(int(gpp_cfg.get("per_contest_shortlist", 8_000)), _pc_need)
             _pc_lineups = list(pool.lineups)
@@ -4130,9 +4152,11 @@ class PipelineRunner:
         self._sim_results = None  # replace_lineup is unsupported in this mode
 
         entry_map = self._build_external_entry_map()
+        _gen_keys = getattr(self, "_external_generated_keys", None)
         result = self._serialize_portfolio(
             portfolio, players_df, mean_ev_from_score=True,
             ownership_by_id=getattr(self, "_ownership_pct", None),
+            generated_keys=_gen_keys,
         )
         for lr in result:
             info = entry_map.get(lr["lineup_index"])
@@ -4153,6 +4177,7 @@ class PipelineRunner:
             lineups = self._serialize_portfolio(
                 p, players_df, mean_ev_from_score=True,
                 ownership_by_id=getattr(self, "_ownership_pct", None),
+                generated_keys=_gen_keys,
             )
             for lr in lineups:
                 info = entry_map.get(lr["lineup_index"])
@@ -4215,14 +4240,23 @@ class PipelineRunner:
         # allocation was cut off, so index defensively rather than assuming
         # it lines up (see ExternalAllocation.from_generated).
         gen = getattr(self, "_external_from_generated", None) or []
+        # Callers merge this map onto ALREADY-serialized rows, so anything named
+        # here overwrites what _serialize_portfolio decided. When per-lineup
+        # attribution is available it is the better answer (it is per arm, not
+        # per slot), so the positional fallback stands down rather than
+        # clobbering it with a slot-indexed verdict from a different portfolio.
+        by_lineup = getattr(self, "_external_generated_keys", None) is not None
         for i, (file_path, rec) in enumerate(self._external_entry_plan):
             entry_map[i + 1] = {
                 "upload_tag": _extract_upload_tag(file_path.name),
                 "entry_fee": rec.entry_fee_raw,
                 "contest_name": _shorten_contest_name(rec.contest_name),
                 "entry_sort_order": i,
-                "from_generated": bool(gen[i]) if i < len(gen) else False,
             }
+            if not by_lineup:
+                entry_map[i + 1]["from_generated"] = (
+                    bool(gen[i]) if i < len(gen) else False
+                )
         return entry_map
 
     def activate_sweep_risk(self, risk: float) -> list[dict]:
@@ -4257,6 +4291,10 @@ class PipelineRunner:
         result = self._serialize_portfolio(
             portfolio, self._players_df, mean_ev_from_score=True,
             ownership_by_id=getattr(self, "_ownership_pct", None),
+            # Re-attributed, not carried over: activating a different risk tier
+            # swaps in a DIFFERENT portfolio off the same pool, so which of its
+            # lineups the frontier produced is a fresh question.
+            generated_keys=getattr(self, "_external_generated_keys", None),
         )
 
         if self._all_file_entries:
@@ -4418,6 +4456,7 @@ class PipelineRunner:
         result = self._serialize_portfolio(
             self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev,
             ownership_by_id=getattr(self, "_ownership_pct", None),
+            generated_keys=getattr(self, "_external_generated_keys", None),
         )
 
         os.makedirs(self._output_dir, exist_ok=True)
@@ -5068,13 +5107,24 @@ class PipelineRunner:
         players_df: pd.DataFrame,
         mean_ev_from_score: bool = False,
         ownership_by_id: Optional[dict] = None,
+        generated_keys: Optional[set] = None,
     ) -> list[dict]:
         """`ownership_by_id` maps player_id -> projected ownership in
         *percentage points*. The two pipelines carry ownership on different
         scales — the internal one as a fraction summing to 10 across the
         slate (compute_heuristic_ownership, and the SaberSim "Adj Own"/100
         path), external mode as raw "My Own" percentage points — so callers
-        normalize rather than having this guess from magnitudes."""
+        normalize rather than having this guess from magnitudes.
+
+        `generated_keys` is a set of frozenset(player_ids) for lineups the
+        line-2 frontier produced, and marks `from_generated` per LINEUP rather
+        than per entry slot. Attribution has to be a property of the lineup
+        here: per-contest selection builds one portfolio per ARM off a shared
+        pool, so slot 7 holds a different lineup in every arm and the positional
+        list MRP uses (`ExternalAllocation.from_generated` — one portfolio, one
+        well-defined order) cannot describe them all. Keys are exact rather than
+        a heuristic: `_frontier_augment` drops any generated lineup whose
+        frozenset already exists in the imported pool, so no lineup is both."""
         from src.optimization.optimizer import _build_player_meta
         id_to_name = dict(zip(players_df["player_id"], players_df.get("name", players_df["player_id"])))
         id_to_salary = dict(zip(players_df["player_id"], players_df["salary"]))
@@ -5118,7 +5168,7 @@ class PipelineRunner:
             mean_ev: Optional[float] = round(float(score), 4) if mean_ev_from_score else None
             _means = [p["mean"] for p in players if p["mean"] is not None]
             _owns = [p["ownership"] for p in players if p["ownership"] is not None]
-            result.append({
+            row = {
                 "lineup_index": i,
                 "p_hit_target": round(score, 4),
                 "lineup_salary": total_salary,
@@ -5129,7 +5179,10 @@ class PipelineRunner:
                 "lineup_mean": round(sum(_means), 2) if len(_means) == len(players) else None,
                 "lineup_ownership": round(sum(_owns), 1) if len(_owns) == len(players) else None,
                 "players": players,
-            })
+            }
+            if generated_keys is not None:
+                row["from_generated"] = frozenset(lineup.player_ids) in generated_keys
+            result.append(row)
         return result
 
     # ------------------------------------------------------------------
@@ -5687,6 +5740,11 @@ class PipelineRunner:
         # general-purpose trim. Unlike the parallel dR state build, this DOES
         # change which lineups are picked -- it is a speed/quality trade.
         _pc_per_entry = int(gpp_cfg.get("per_contest_cand_per_entry", 400))
+        # narrow_fn runs once per ARM, so a bare log line here prints six times
+        # per contest (five Kelly risk tiers plus dR) and buries the stage
+        # boundaries either side of it. The cap is a property of the contest,
+        # not the arm, so report it once.
+        _pc_narrow_logged: set = set()
 
         def _narrow(ctx, avail, k, slot):
             if _pc_per_entry <= 0:
@@ -5700,11 +5758,13 @@ class PipelineRunner:
             # returns positions into `avail`, and _to_idx maps them back by
             # identity, but a stable order keeps diagnostics readable.
             narrowed = np.sort(avail[keep])
-            logger.info(
-                "  %s: %d entries — narrowing %d candidates to top %d by this "
-                "contest's EV (%d/entry)",
-                slot.contest_name[:32], k, len(avail), cap, _pc_per_entry,
-            )
+            if slot.contest_id not in _pc_narrow_logged:
+                _pc_narrow_logged.add(slot.contest_id)
+                logger.info(
+                    "  %s: %d entries — narrowing %d candidates to top %d by "
+                    "this contest's EV (%d/entry)",
+                    slot.contest_name[:32], k, len(avail), cap, _pc_per_entry,
+                )
             return narrowed
 
         picks_by_arm, diag = select_per_contest_multi_arm(

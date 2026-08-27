@@ -10,6 +10,7 @@ These tests cover the two seams that reintroduce that failure silently: the
 ladder handed to the generator, and a generator that no-ops without saying so.
 """
 import logging
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -201,3 +202,92 @@ def test_mrp_config_defaults_cover_every_frontier_knob():
         assert seen[k] == getattr(ref, k), f"{k} drifted from MRPConfig's default"
     assert seen["frontier_enabled"] is True
     assert seen["seed"] == 7
+
+
+# --------------------------------------------------------------------------
+# Frontier attribution (`from_generated`)
+# --------------------------------------------------------------------------
+
+def _mini_players_df():
+    import pandas as pd
+    return pd.DataFrame({
+        "player_id": list(range(1, 21)),
+        "name": [f"P{i}" for i in range(1, 21)],
+        "salary": [4000] * 20, "team": ["A"] * 20, "position": ["OF"] * 20,
+        "slot": [1] * 20, "mean": [10.0] * 20,
+    })
+
+
+class _LU:
+    def __init__(self, pids):
+        self.player_ids = list(pids)
+
+
+def test_attribution_is_per_lineup_so_every_arm_gets_its_own_answer():
+    """The reason this is keyed by lineup and not by entry slot.
+
+    Per-contest selection builds one portfolio per ARM off a shared pool, so
+    slot 3 holds a different lineup in each of them. MRP's positional
+    `from_generated` list describes one portfolio in one order and cannot
+    describe six; keying on the lineup can.
+    """
+    gen = _LU(range(1, 11))
+    imported = _LU(range(11, 21))
+    keys = {frozenset(gen.player_ids)}
+    df = _mini_players_df()
+
+    arm_a = [(gen, 1.0), (imported, 1.0)]
+    arm_b = [(imported, 1.0), (gen, 1.0)]      # same slots, swapped lineups
+    rows_a = PipelineRunner._serialize_portfolio(arm_a, df, generated_keys=keys)
+    rows_b = PipelineRunner._serialize_portfolio(arm_b, df, generated_keys=keys)
+
+    assert [r["from_generated"] for r in rows_a] == [True, False]
+    assert [r["from_generated"] for r in rows_b] == [False, True]
+
+
+def test_unattributed_portfolios_omit_the_flag_rather_than_claiming_false():
+    """Absent means "not tracked here"; False would mean "imported"."""
+    df = _mini_players_df()
+    rows = PipelineRunner._serialize_portfolio([(_LU(range(1, 11)), 1.0)], df)
+    assert "from_generated" not in rows[0]
+
+
+def test_the_key_set_is_dropped_between_runs():
+    """A second run with the generator OFF must not inherit the first verdict.
+
+    The server reuses one PipelineRunner across runs, so stale keys would not
+    merely be untidy — they would label imported lineups as generated, which is
+    a wrong provenance claim rather than a missing one.
+    """
+    r = _runner()
+    r._external_generated_keys = {frozenset(range(1, 11))}
+    r._external_from_generated = [True]
+    # The clear at the top of _run_external, reproduced as the contract it is.
+    import inspect
+    src = inspect.getsource(PipelineRunner._run_external)
+    head = src.split("gpp_cfg = cfg.get")[0]
+    assert "self._external_generated_keys = None" in head, (
+        "_run_external must clear frontier attribution before any branch runs"
+    )
+    assert "self._external_from_generated = []" in head
+
+
+def test_the_entry_map_stops_overwriting_a_per_lineup_verdict():
+    """Entry meta is merged ONTO serialized rows, so it must not clobber them."""
+    from src.api.dk_entries import EntryRecord
+    r = _runner()
+    r._external_entry_plan = [
+        (Path("DKEntries.csv"),
+         EntryRecord(entry_id="1", contest_name="MLB $2K Pickoff [Single Entry]",
+                     contest_id="c", entry_fee_cents=300, entry_fee_raw="$3"))
+    ]
+    r._external_from_generated = [True]
+
+    r._external_generated_keys = None
+    assert "from_generated" in r._build_external_entry_map()[1]
+
+    r._external_generated_keys = {frozenset(range(1, 11))}
+    assert "from_generated" not in r._build_external_entry_map()[1], (
+        "with per-lineup attribution available the slot-indexed fallback must "
+        "stand down, not overwrite it"
+    )
