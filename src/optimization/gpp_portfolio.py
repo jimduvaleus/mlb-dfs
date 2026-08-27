@@ -1654,6 +1654,141 @@ class KellyPortfolioSelector:
         return result
 
 
+
+class EMaxPortfolioSelector:
+    """Best-entry selector: greedy on E_w[max_i payout_i,w].
+
+    Where the Det selector proxies self-competition with a correlation penalty
+    and Kelly prices it through the concavity of log, this objective asks the
+    blunt question a top-heavy GPP actually poses: *did any one of my entries
+    hit?* Only the portfolio's best entry in each world counts, so a second
+    lineup that spikes in the same worlds as one already held contributes
+    nothing, while one that spikes in worlds the portfolio currently misses
+    contributes its full value. Diversity is not a term here either — it is the
+    shape of the objective.
+
+    Marginal gain of j given the running per-world best `m`:
+
+        dE(j) = E_w[ max(payout_j,w, m_w) ] - E_w[ m_w ]
+              = E_w[ (payout_j,w - m_w)+ ]
+
+    `m` only ever rises, so gains are monotonically non-increasing and lazy
+    greedy (stale gains as upper bounds, re-evaluate the heap top) is exact —
+    the same argument KellyPortfolioSelector relies on, and re-evaluating one
+    candidate is a single O(S) pass rather than an (M, S) rebuild.
+
+    PASS GROSS PAYOUT, NOT NET. `baseline` is the per-world value of holding
+    nothing, which is 0 for a gross ladder; with net payouts the all-lose world
+    is -fee and "max" would silently mean "least-bad loss" instead of "best
+    win". The class does not convert, because whether a caller's matrix is
+    gross or net is not inspectable.
+
+    This objective is deliberately risk-SEEKING relative to dR: it values a
+    portfolio by its best outcome and is indifferent to how the other 149
+    entries finish. It is included to be measured against dR and Kelly, not
+    because it dominates them.
+    """
+
+    def __init__(
+        self,
+        robust_payout: np.ndarray,
+        candidates: list[Lineup],
+        portfolio_size: int,
+        ev_floor: float = 0.20,
+        baseline: float = 0.0,
+        cand_chunk: int = 1_000,
+    ) -> None:
+        self._robust_payout = np.asarray(robust_payout, dtype=np.float32)
+        self._candidates = candidates
+        self._portfolio_size = portfolio_size
+        self._ev_floor = float(ev_floor)
+        self._baseline = float(baseline)
+        self._cand_chunk = int(cand_chunk)
+
+    def _gains_all(self, payout: np.ndarray, m: np.ndarray,
+                   remaining: np.ndarray) -> np.ndarray:
+        """(M_pool,) full gain vector, chunked over candidates.
+
+        The naive form materialises an (M_pool, S) temporary — 200 MB at
+        4,000 x 12,500 float32, and this runs once per full rebuild. Chunking
+        keeps the transient at (cand_chunk, S) per CLAUDE.md's matrix rule.
+        """
+        M = payout.shape[0]
+        out = np.full(M, -np.inf, dtype=np.float64)
+        for lo in range(0, M, self._cand_chunk):
+            hi = min(lo + self._cand_chunk, M)
+            blk = remaining[lo:hi]
+            if not blk.any():
+                continue
+            diff = payout[lo:hi] - m[None, :]
+            np.maximum(diff, 0.0, out=diff)
+            g = diff.mean(axis=1)
+            out[lo:hi] = np.where(blk, g, -np.inf)
+            del diff
+        return out
+
+    def select(
+        self,
+        stop_check: Optional[Callable[[], bool]] = None,
+        progress_cb: Optional[Callable[[dict], None]] = None,
+    ) -> list[tuple[Lineup, float]]:
+        t0 = time.perf_counter()
+        pool_ev = self._robust_payout.mean(axis=1).astype(np.float64)
+        pool_idx = np.where(pool_ev >= self._ev_floor)[0]
+        if len(pool_idx) == 0:
+            logger.warning("EMaxSelector: no candidates with EV >= $%.2f.", self._ev_floor)
+            return []
+        payout = np.ascontiguousarray(self._robust_payout[pool_idx])   # (M_pool, S) f32
+        ev_vals = pool_ev[pool_idx]
+        M_pool, n_sims = payout.shape
+        size = min(self._portfolio_size, M_pool)
+
+        m = np.full(n_sims, self._baseline, dtype=np.float32)
+        selected: list[int] = []
+        remaining = np.ones(M_pool, dtype=bool)
+
+        gains = self._gains_all(payout, m, remaining)
+        stale = np.zeros(M_pool, dtype=bool)
+        while len(selected) < size:
+            if stop_check is not None and stop_check():
+                logger.info("EMaxSelector: stop requested at step %d.", len(selected) + 1)
+                break
+            while True:
+                best = int(np.argmax(gains))
+                if gains[best] == -np.inf:
+                    break
+                if stale[best]:
+                    d = payout[best] - m
+                    np.maximum(d, 0.0, out=d)
+                    gains[best] = float(d.mean())
+                    stale[best] = False
+                    continue
+                break
+            if gains[best] == -np.inf:
+                break
+            selected.append(best)
+            remaining[best] = False
+            gained = float(gains[best])
+            np.maximum(m, payout[best], out=m)
+            gains[best] = -np.inf
+            stale[remaining] = True
+            if progress_cb is not None:
+                progress_cb({
+                    "step": len(selected),
+                    "portfolio_size": size,
+                    "lineup_ev": float(ev_vals[best]),
+                    "emax_gain": gained,
+                    "n_remaining": int(remaining.sum()),
+                })
+
+        result = [(self._candidates[pool_idx[i]], float(ev_vals[i])) for i in selected]
+        logger.info(
+            "EMaxSelector done: %d lineups, E[max] $%.2f in %.1fs",
+            len(result), float(m.mean()), time.perf_counter() - t0,
+        )
+        return result
+
+
 _POPCOUNT_LUT = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
 
 
