@@ -45,7 +45,7 @@ from typing import Callable, Optional
 import numpy as np
 import pandas as pd
 
-from src.optimization.lineup import Lineup
+from src.optimization.lineup import Lineup, normalize_eligible_positions
 from src.optimization.candidate_generator import CandidateGenerator
 from src.optimization.mrp.lineup_variance import FrontierScorer, lineup_variance
 from src.optimization.optimal_lineups import POS_REQUIREMENTS
@@ -143,7 +143,7 @@ def _build_metadata(df: pd.DataFrame) -> dict:
         ep = r.eligible_positions
         meta[pid] = {
             "position": r.position,
-            "eligible_positions": list(ep) if ep is not None else [r.position],
+            "eligible_positions": normalize_eligible_positions(ep, r.position),
             "salary": float(r.salary),
             "team": r.team,
             "opponent": r.opponent,

@@ -33,7 +33,7 @@ from src.optimization.contest import (
     _is_valid_field_lineup,
     _player_meta_from_df,
 )
-from src.optimization.lineup import Lineup, ROSTER_REQUIREMENTS, SALARY_CAP
+from src.optimization.lineup import Lineup, ROSTER_REQUIREMENTS, SALARY_CAP, normalize_eligible_positions
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +87,23 @@ def _threads_per_core() -> int:
     return max(1, n)
 
 
+def physical_cores() -> int:
+    """Physical cores available to THIS process, honouring CPU affinity.
+
+    The repo's one piece of topology-aware sizing, public so every stage that
+    provisions workers agrees on what a core is instead of each reaching for
+    `os.cpu_count()` (which reports logical CPUs and over-provisions 2x on any
+    SMT part).
+    """
+    avail = getattr(os, "process_cpu_count", lambda: None)() or 0
+    if not avail:
+        try:
+            avail = len(os.sched_getaffinity(0))
+        except AttributeError:
+            avail = os.cpu_count() or 1
+    return max(1, avail // _threads_per_core())
+
+
 def _auto_mutant_workers() -> int:
     """PHYSICAL cores minus one, honouring this process's CPU affinity.
 
@@ -101,13 +118,7 @@ def _auto_mutant_workers() -> int:
     The minus one leaves a core for the parent, which does the merge and holds
     the sim matrix, and keeps the machine usable while a run is in flight.
     """
-    avail = getattr(os, "process_cpu_count", lambda: None)() or 0
-    if not avail:
-        try:
-            avail = len(os.sched_getaffinity(0))
-        except AttributeError:
-            avail = os.cpu_count() or 1
-    return max(1, avail // _threads_per_core() - 1)
+    return max(1, physical_cores() - 1)
 
 
 def _mutant_mp_context():
@@ -492,6 +503,8 @@ class CandidateGenerator:
         progress_cb: Optional[Callable[[int], None]] = None,
         stop_check: Optional[Callable[[], bool]] = None,
         floor_relief: int = 2500,
+        dedupe: bool = True,
+        seen: Optional[set] = None,
     ) -> list[Lineup]:
         """Generate up to n_candidates valid stacked lineups.
 
@@ -502,6 +515,32 @@ class CandidateGenerator:
           minimum of salary_floor - floor_relief).  Each team's floor resets to the
           configured value at the start of its slot.
         Phase 2: backfill remaining slots via weighted sampling, skipping teams at quota.
+
+        DEDUPE (default ON). Sampling with replacement inevitably re-draws the
+        same roster: measured 08/26, `generate(30_000)` returned 29,463 distinct
+        lineups -- 537 duplicates, 1.8% of the pool. A duplicate is never useful
+        in a candidate pool and is actively dangerous to any rank-and-cut
+        selection, because identical lineups carry identical scores and
+        therefore sort adjacent: a top-150 cut by projected ownership pulled in
+        13 duplicate entries, one lineup four times over. Entering the same
+        lineup four times is the purest form of self-competition there is.
+        (Production's Det selector was incidentally protected -- two identical
+        rows correlate at 1.0, so its diversity term rejects the second -- which
+        is why this went unnoticed.)
+
+        A duplicate is rejected exactly like a failed stack check: it consumes
+        an attempt, does not count as a team success (so it cannot suppress the
+        dynamic floor relief), and does not credit quota. The loop then keeps
+        sampling, so the caller still receives n_candidates lineups -- they are
+        simply all distinct. Cost is ~537 extra attempts against a budget of
+        n_candidates * max_attempts_multiplier.
+
+        NOT BYTE-IDENTICAL TO PRE-08/26 POOLS. Any replay or backtest baseline
+        recorded before this defaults on was computed against a pool containing
+        duplicates; pass `dedupe=False` to reproduce one exactly.
+
+        `seen`, when given, additionally excludes lineups the caller already
+        holds (same frozenset-of-player-ids key as generate_shape_mutants).
         """
         games = {
             self._pmeta[pid]["game"]
@@ -537,6 +576,7 @@ class CandidateGenerator:
 
         rng = np.random.default_rng(self._rng_seed)
         results: list[Lineup] = []
+        _seen: set = set(seen) if seen else set()
         # team_counts tracks 4-group and 5-group lineups only; 3-group lineups
         # are added to results but do not count toward any team's quota.
         team_counts: dict[str, int] = {}
@@ -627,6 +667,11 @@ class CandidateGenerator:
 
                 if ids is None or not self._check_stack(ids):
                     continue
+                if dedupe:
+                    key = frozenset(int(p) for p in ids)
+                    if key in _seen:
+                        continue
+                    _seen.add(key)
 
                 team_success_count += 1
                 _credit(primary_team, primary_size, secondary_size, st)
@@ -665,6 +710,11 @@ class CandidateGenerator:
             )
             if ids is None or not self._check_stack(ids):
                 continue
+            if dedupe:
+                key = frozenset(int(p) for p in ids)
+                if key in _seen:
+                    continue
+                _seen.add(key)
 
             _credit(primary_team, primary_size, secondary_size, st)
             results.append(Lineup(player_ids=ids))
@@ -1257,9 +1307,10 @@ class CandidateGenerator:
             self._mutant_meta = {pid: dict(m) for pid, m in self._pmeta.items()}
             if "eligible_positions" in self._players_df.columns:
                 for r in self._players_df.itertuples(index=False):
-                    ep = r.eligible_positions
-                    if ep is not None:
-                        self._mutant_meta[int(r.player_id)]["eligible_positions"] = list(ep)
+                    ep = normalize_eligible_positions(
+                        r.eligible_positions, getattr(r, "position", ""))
+                    if ep:
+                        self._mutant_meta[int(r.player_id)]["eligible_positions"] = ep
         return self._mutant_meta
 
     def _check_stack(self, ids: list[int]) -> bool:

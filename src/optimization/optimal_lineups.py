@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from src.optimization.lineup import Lineup
+from src.optimization.candidate_generator import physical_cores
 
 POS_REQUIREMENTS: dict[str, int] = {
     "P": 2, "C": 1, "1B": 1, "2B": 1, "3B": 1, "SS": 1, "OF": 3,
@@ -48,6 +49,7 @@ def generate_sim_optimal_lineups(
     progress_cb: Optional[Callable[[int], None]] = None,
     stop_check: Optional[Callable[[], bool]] = None,
     min_secondary: Optional[int] = None,
+    n_workers: Optional[int] = None,
 ) -> list[Lineup]:
     """Per-sim optimal lineups: for each sim index, solve the roster ILP with
     that sim's *realized* player scores as the objective — the lineup that
@@ -67,6 +69,15 @@ def generate_sim_optimal_lineups(
 
     Runs solves in a thread pool — CBC releases the GIL. Returns unique
     lineups in sim_indices order.
+
+    `n_workers` (None/0 = auto = physical cores) caps that pool. A bare
+    ThreadPoolExecutor() defaults to `min(32, os.cpu_count() + 4)`, which is 20
+    on an 8-physical-core box — 2.5x oversubscription, and each solve holds the
+    GIL for its whole `df.copy()` + model-build before CBC releases it inside
+    Solve(). Measured 08/26, 200 solves: 1 worker 743 ms/solve, 4 218 ms
+    (3.41x), 8 142 ms (5.24x), 16 139 ms (5.36x), 20 139 ms (5.35x). The curve
+    is flat past the PHYSICAL count, so the extra 12 threads bought 2% while
+    tripling contention — harmless on a workstation, costly on a laptop.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -88,7 +99,8 @@ def generate_sim_optimal_lineups(
         return lineups[0] if lineups else None
 
     results: list[Optional[Lineup]] = [None] * len(sim_indices)
-    with ThreadPoolExecutor() as executor:
+    workers = int(n_workers) if n_workers else physical_cores()
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {executor.submit(_solve, s): i for i, s in enumerate(sim_indices)}
         n_done = 0
         for fut in as_completed(futures):

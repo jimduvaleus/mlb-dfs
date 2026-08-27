@@ -130,6 +130,39 @@ def test_generate_returns_lineup_objects(generator):
     assert all(len(lu.player_ids) == 10 for lu in results)
 
 
+def test_generate_dedupes_by_default(generator):
+    """Sampling with replacement re-draws rosters; the pool must not keep them.
+
+    Measured 08/26 before the fix: generate(30_000) returned 29,463 distinct
+    lineups. Identical lineups carry identical scores, so any rank-and-cut
+    selection sorts them adjacent and sweeps several into one portfolio --
+    entering the same lineup twice is the purest form of self-competition.
+    """
+    lineups = generator.generate(n_candidates=400)
+    keys = [frozenset(int(p) for p in lu.player_ids) for lu in lineups]
+    assert len(set(keys)) == len(keys), (
+        f"{len(keys) - len(set(keys))} duplicate lineups in a deduped pool"
+    )
+
+
+def test_generate_dedupe_off_is_opt_out(generator):
+    """dedupe=False stays available so a pre-08/26 baseline can be reproduced."""
+    lineups = generator.generate(n_candidates=400, dedupe=False)
+    assert len(lineups) > 0  # no assertion on uniqueness: duplicates are allowed
+
+
+def test_generate_honours_seen(players_df, ownership_vec):
+    """`seen` excludes lineups the caller already holds."""
+    from src.optimization.candidate_generator import CandidateGenerator
+    first = CandidateGenerator(players_df, ownership_vec, rng_seed=7).generate(
+        n_candidates=150)
+    held = {frozenset(int(p) for p in lu.player_ids) for lu in first}
+    second = CandidateGenerator(players_df, ownership_vec, rng_seed=7).generate(
+        n_candidates=150, seen=held)
+    got = {frozenset(int(p) for p in lu.player_ids) for lu in second}
+    assert not (held & got)
+
+
 def test_generate_deterministic_with_seed(players_df, ownership_vec):
     gen1 = CandidateGenerator(players_df, ownership_vec, rng_seed=99)
     gen2 = CandidateGenerator(players_df, ownership_vec, rng_seed=99)

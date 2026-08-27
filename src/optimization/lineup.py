@@ -166,3 +166,36 @@ class Lineup:
             return False
 
         return True
+
+
+_POSITION_ALIASES = {"SP": "P", "RP": "P"}
+
+
+def normalize_eligible_positions(ep, fallback: str = "") -> list:
+    """Coerce an `eligible_positions` cell into the list form every consumer
+    assumes, accepting the DK-style '3B/OF' string as well.
+
+    `list("3B/OF")` yields ['3','B','/','O','F'] -- a silent corruption, not an
+    error: every multi-character position then fails a `pos in ep` test, and a
+    caller who passed the string gets ZERO valid swaps out of
+    generate_shape_mutants rather than a warning (measured 08/26: 0 mutants
+    with the string, 239 with the list, 104 with the column absent entirely --
+    i.e. the corrupted column is strictly worse than no column at all).
+    The DK ingestor already emits lists, so the live path never hit this; the
+    hazard is any caller that assembles players_df by hand.
+    """
+    if ep is None:
+        return [fallback] if fallback else []
+    if isinstance(ep, str):
+        toks = [t.strip().upper() for t in ep.split("/") if t.strip()]
+    else:
+        try:
+            toks = [str(t).strip().upper() for t in ep if str(t).strip()]
+        except TypeError:
+            return [fallback] if fallback else []
+    out: list = []
+    for t in toks:
+        t = _POSITION_ALIASES.get(t, t)
+        if t not in out:
+            out.append(t)
+    return out or ([fallback] if fallback else [])
