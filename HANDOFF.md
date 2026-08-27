@@ -1,13 +1,25 @@
 # Handoff — contest-aware portfolio selection (2026-08-26)
 
-Delete this file once the work is merged. It exists because 27 files are
-uncommitted and because several *negative* results are worth more than the code.
+Delete this file once the work is merged. It exists because several *negative*
+results here are worth more than the code, and none of them are recoverable from
+reading it.
 
-## State: nothing is committed
+## State: committed, not pushed
 
-13 modified core files + 13 new scripts + 1 new module, on branch
-`parallel-shape-mutants`. **1,202 tests pass**, `tsc` clean. Commit before doing
-anything else, or the first `git checkout` loses a day's work.
+Six commits on `parallel-shape-mutants`, working tree clean, nothing pushed.
+**1,202 tests pass**, `tsc` clean.
+
+    e1f3825  Fix three silent defects in candidate generation
+    f3eace3  Add E[max] selector, fast portfolio builder, per-contest selection
+    c29863f  Make GPP selection contest-aware; add Kelly/dR/E[max] arms
+    92b27a0  Surface selection arms and contest identity in the UI
+    475cb44  Add the measurement harnesses, and this note
+    ae896bf  Correct the sweep-dimension note
+
+`e1f3825` stands alone and is worth keeping regardless of whether the rest
+lands. Note `config.yaml` is gitignored — new keys live in
+`config.example.yaml`, and any machine with an older `config.yaml` picks up
+defaults from `models.py`, not from the file.
 
 ## What was built
 
