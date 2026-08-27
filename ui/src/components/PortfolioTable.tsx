@@ -298,12 +298,17 @@ function playerKey(players: PlayerRow[]): string {
   return [...players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
 }
 
-// The sweep is keyed by a numeric "risk", but under selector_mode=all that key
-// doubles as an ARM identifier: det sweeps 1-5 (risk is a real EV/diversity
-// blend there), while kelly=11-15, coverage=23, emax=31 and dr=41 are distinct
-// objectives for which "risk" is meaningless. Keep the numbers out of the UI —
-// "Risk 41" tells a user nothing — and show EVw only where it is a real dial.
-// Mapping mirrors pipeline.py's sweep labels; keep the two in sync.
+// The sweep is keyed by a numeric "risk", and that key ALWAYS doubles as an arm
+// identifier: det sweeps 1-5 (risk is a real EV/diversity blend there), while
+// kelly=11-15, coverage=23, emax=31 and dr=41 are distinct objectives for which
+// "risk" is meaningless. Keep the numbers out of the UI — "Risk 41" tells a
+// user nothing — and show EVw only where it is a real dial.
+//
+// "Always" is load-bearing. The bands used to be applied only when more than
+// one arm ran, so a Kelly-only sweep arrived as 1.0-5.0 and fell through to the
+// det branch below: five buttons reading "Risk 1".."Risk 5" with an EVw stat,
+// for the one arm the user had just switched off. Mirrors pipeline.py's
+// _ARM_LABEL_* constants; keep the two in sync.
 function armLabel(risk: number): { name: string; sub: string | null; isDet: boolean } {
   if (risk >= 41) return { name: 'dR', sub: 'exact demotion', isDet: false }
   if (risk >= 31) return { name: 'E[max]', sub: 'best entry', isDet: false }

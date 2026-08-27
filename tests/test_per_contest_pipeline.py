@@ -143,7 +143,7 @@ def _sweep(runner, slots, shortlist, scorer, modes, k=1, **kw):
     return runner._per_contest_sweep(
         slots=slots, shortlist=shortlist, cand_scores=scores, e_dupes=None,
         field_pool=pool, gpp_cfg=kw.pop("gpp_cfg", {}), modes=modes,
-        multi_arm=len(modes) > 1, cash_anchor_fraction=0.25,
+        cash_anchor_fraction=0.25,
         det_sweep_risks=kw.pop("det_sweep_risks", []), **kw,
     )
 
@@ -195,9 +195,34 @@ def test_arms_are_labelled_distinctly_in_multi_arm_mode(slots, shortlist, scorer
     assert set(labels) == {11.0, 12.0, 13.0, 14.0, 15.0, 31.0}
 
 
-def test_single_arm_keeps_its_base_labels(slots, shortlist, scorer):
-    sweep, _, _ = _sweep(_runner(), slots, shortlist, scorer, {"emax"})
-    assert [lbl for lbl, _ in sweep] == [3.0]
+def test_an_arm_keeps_its_own_label_when_it_runs_alone(slots, shortlist, scorer):
+    """A single-arm sweep must NOT collapse onto the Determinant band.
+
+    The sweep key doubles as an arm identifier -- `armLabel` in
+    PortfolioTable.tsx reads the number to decide which objective a portfolio
+    came from. Labels used to be offset only when more than one arm ran, so a
+    Kelly-only run emitted 1.0-5.0 and the UI rendered five buttons reading
+    "Risk 1".."Risk 5" with a Determinant EVw stat: the exact arm the user had
+    just switched off. An arm that renames itself depending on its neighbours
+    is, from the UI's side, a different arm.
+    """
+    assert [lbl for lbl, _ in _sweep(
+        _runner(), slots, shortlist, scorer, {"emax"})[0]] == [31.0]
+    assert [lbl for lbl, _ in _sweep(
+        _runner(), slots, shortlist, scorer, {"dr"})[0]] == [41.0]
+    assert [lbl for lbl, _ in _sweep(
+        _runner(), slots, shortlist, scorer, {"coverage"})[0]] == [23.0]
+    assert [lbl for lbl, _ in _sweep(
+        _runner(), slots, shortlist, scorer, {"kelly"})[0]] == [11., 12., 13., 14., 15.]
+
+
+def test_arm_labels_do_not_move_when_another_arm_is_added(slots, shortlist, scorer):
+    """Adding or removing an arm must not relabel the others."""
+    alone = [lbl for lbl, _ in _sweep(
+        _runner(), slots, shortlist, scorer, {"kelly"})[0]]
+    with_dr = [lbl for lbl, _ in _sweep(
+        _runner(), slots, shortlist, scorer, {"kelly", "dr"})[0]]
+    assert alone == [l for l in with_dr if l < 41.0]
 
 
 def test_every_arm_flattens_into_the_same_entry_order(slots, shortlist, scorer):
@@ -230,7 +255,7 @@ def test_reported_ev_is_the_contest_the_lineup_will_be_entered_in(slots, shortli
 
 def test_dr_arm_runs_and_returns_distinct_lineups(slots, shortlist, scorer):
     sweep, picks, _ = _sweep(_runner(), slots, shortlist, scorer, {"dr"})
-    assert [lbl for lbl, _ in sweep] == [3.0]
+    assert [lbl for lbl, _ in sweep] == [41.0]
     for per_contest in picks.values():
         flat = [i for v in per_contest.values() for i in v]
         assert len(flat) == len(set(flat))

@@ -215,6 +215,17 @@ _PC_RANK_MIN_CUT = 0.25
 # shortlist the whole slate ran on before the frontier was wired in.
 _PC_CAND_CAP_FLOOR = 2_000
 
+# Sweep "risk" doubles as an ARM identifier. Determinant keeps the 1-5 band
+# because risk is a real EV/diversity dial there; for every other arm the number
+# is only a name, and these bands are what `armLabel` in PortfolioTable.tsx
+# decodes. They are FIXED, never conditional on how many arms are selected:
+# an arm that renames itself depending on its neighbours is indistinguishable,
+# from the UI's side, from a different arm.
+_ARM_LABEL_KELLY = 10.0        # + risk tier 1-5 -> 11-15
+_ARM_LABEL_COVERAGE = 23.0
+_ARM_LABEL_EMAX = 31.0
+_ARM_LABEL_DR = 41.0
+
 
 class PipelineRunner:
     """
@@ -1772,10 +1783,10 @@ class PipelineRunner:
                 )
             if not _modes:
                 _modes = {"det"}
-            # Sweep keys double as arm identifiers whenever more than one arm
-            # runs, so they must not collide; a single-arm run keeps its base
-            # labels so existing saved sweeps still resolve.
-            _multi_arm = len(_modes) > 1
+            # Sweep keys double as arm identifiers, so they must not collide.
+            # The bands are fixed (_ARM_LABEL_*) rather than conditional on how
+            # many arms run: a Kelly-only sweep that renamed itself into the
+            # Determinant band rendered as "Risk 1".."Risk 5" in the UI.
             _fresh_p_beat999: Optional[np.ndarray] = None
             _fresh_e_dupes: Optional[np.ndarray] = None
             _fresh_beat_bits: Optional[np.ndarray] = None
@@ -2265,7 +2276,6 @@ class PipelineRunner:
                         field_pool=_pc_pool,
                         gpp_cfg=gpp_cfg,
                         modes=_modes,
-                        multi_arm=_multi_arm,
                         cash_anchor_fraction=_cash_anchor_fraction,
                         det_sweep_risks=(_DET_SWEEP_RISKS if "det" in _modes else []),
                         ev_override=_pc_ev_override,
@@ -2304,7 +2314,7 @@ class PipelineRunner:
                     # hits log(<=0)). kelly_bankroll_mult is a global scale.
                     _kelly_mults = {1.0: 1.25, 2.0: 1.5, 3.0: 2.0, 4.0: 4.0, 5.0: 8.0}
                     _kelly_scale = max(float(gpp_cfg.get("kelly_bankroll_mult", 1.0)), 1e-6)
-                    _kelly_lbl_off = 10.0 if _multi_arm else 0.0
+                    _kelly_lbl_off = _ARM_LABEL_KELLY
                     for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
                         if self._stop_check is not None and self._stop_check():
                             break
@@ -2355,9 +2365,8 @@ class PipelineRunner:
                                     np.asarray(_fresh_e_dupes, dtype=np.float64), 0.0,
                                 ))
                         # Risk is a no-op for coverage: single tier, labeled
-                        # 23 in "all" mode to stay distinct from det 1-5 and
-                        # kelly 11-15.
-                        _cov_risk = 23.0 if _multi_arm else 3.0
+                        # 23 to stay distinct from det 1-5 and kelly 11-15.
+                        _cov_risk = _ARM_LABEL_COVERAGE
                         self._cb("gpp_det_risk_start", {
                             "risk": _cov_risk, "risk_index": 1, "total_risks": 1,
                         })
@@ -2384,9 +2393,9 @@ class PipelineRunner:
                     from src.optimization.gpp_portfolio import EMaxPortfolioSelector
                     # Risk is a no-op for E[max] (only the portfolio's BEST
                     # entry per world enters the objective, so there is no
-                    # EV/diversity blend to sweep). Labeled 31 in "all" mode to
-                    # stay distinct from det 1-5, kelly 11-15, coverage 23.
-                    _emax_risk = 31.0 if _multi_arm else 3.0
+                    # EV/diversity blend to sweep). Labeled 31 to stay
+                    # distinct from det 1-5, kelly 11-15, coverage 23.
+                    _emax_risk = _ARM_LABEL_EMAX
                     self._cb("gpp_det_risk_start", {
                         "risk": _emax_risk, "risk_index": 1, "total_risks": 1,
                     })
@@ -2415,7 +2424,7 @@ class PipelineRunner:
 
                 if "dr" in _arm_modes and _dr_field_sorted is not None:
                     from src.optimization.mrp.delta_reward import ContestDeltaState
-                    _dr_risk = 41.0 if _multi_arm else 3.0
+                    _dr_risk = _ARM_LABEL_DR
                     # MEMORY, and why dR gets a shortlist when no other arm does.
                     # Every other selector consumes robust_payout, which already
                     # exists. dR additionally needs (M, S) candidate scores plus
@@ -3902,7 +3911,7 @@ class PipelineRunner:
             _pc_sweep, _pc_picks, _pc_diag = self._per_contest_sweep(
                 slots=_pc_slots, shortlist=_pc_shortlist, cand_scores=_pc_scores,
                 e_dupes=None, field_pool=_pc_pool_fields, gpp_cfg=gpp_cfg,
-                modes=_pc_modes, multi_arm=len(_pc_modes) > 1,
+                modes=_pc_modes,
                 cash_anchor_fraction=float(gpp_cfg.get("cash_anchor_fraction", 0.25)),
                 det_sweep_risks=([1.0, 2.0, 3.0, 4.0, 5.0] if "det" in _pc_modes else []),
             )
@@ -5464,7 +5473,6 @@ class PipelineRunner:
         field_pool,
         gpp_cfg: dict,
         modes: set,
-        multi_arm: bool,
         cash_anchor_fraction: float,
         det_sweep_risks: list,
         ev_override: Optional[np.ndarray] = None,
@@ -5683,17 +5691,24 @@ class PipelineRunner:
             gc.collect()
             return picks
 
+        # ARM LABELS ARE UNCONDITIONAL. They used to collapse onto the det
+        # band (1-5) whenever only one arm was selected, on the theory that a
+        # single arm needs no disambiguation. It does: `armLabel` in
+        # PortfolioTable.tsx reads the number to decide what the arm IS, so a
+        # Kelly-only run rendered five buttons reading "Risk 1".."Risk 5" with
+        # a Determinant EVw stat beside them -- the arm the user had just
+        # unchecked. The label identifies the objective, so it cannot depend on
+        # how many other objectives happen to be running alongside it.
         arm_fns: dict = {}
         if "kelly" in modes:
-            off = 10.0 if multi_arm else 0.0
             for r in (1.0, 2.0, 3.0, 4.0, 5.0):
-                arm_fns[r + off] = _kelly_arm(r)
+                arm_fns[r + _ARM_LABEL_KELLY] = _kelly_arm(r)
         if "coverage" in modes:
-            arm_fns[23.0 if multi_arm else 3.0] = _coverage_arm
+            arm_fns[_ARM_LABEL_COVERAGE] = _coverage_arm
         if "emax" in modes:
-            arm_fns[31.0 if multi_arm else 3.0] = _emax_arm
+            arm_fns[_ARM_LABEL_EMAX] = _emax_arm
         if "dr" in modes:
-            arm_fns[41.0 if multi_arm else 3.0] = _dr_arm
+            arm_fns[_ARM_LABEL_DR] = _dr_arm
         for r in det_sweep_risks:
             arm_fns[r] = _det_arm(r)
 
