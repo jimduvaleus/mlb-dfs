@@ -90,13 +90,37 @@ ceiling — 5:1 coverage. Improving *what reaches* the objectives does not bind.
 
 1. **Wire `select_per_contest` into `pipeline._run`.** Shortlist once, compute
    `cand_scores` once (contest-independent), call it per arm, route through
-   `assign_per_contest` instead of `assign_lineups_to_entries`. Two contract
-   questions to settle first:
-   - The sweep is keyed by one number per portfolio, but selection is now
-     per-arm AND per-contest (2 arms x 6 contests = 12 portfolios). Either add a
-     dimension or let an arm's portfolio be the concatenation across contests
-     (which `assign_per_contest` produces naturally).
-   - `portfolio_size` becomes per-contest, not global.
+   `assign_per_contest` instead of `assign_lineups_to_entries`.
+
+   **The sweep stays ONE-dimensional — one portfolio per arm.** A "portfolio" is
+   and always was "the set of lineups across all contests we will submit"; the
+   old flow spread a single portfolio across contests too, via
+   `assign_lineups_to_entries`. Per-contest selection does not create a new
+   object, it just makes each contest's slice actually chosen for that contest
+   instead of an arbitrary cut of a single-ladder portfolio. So `activate_risk`
+   works unchanged (worth renaming to `activate_arm`, cosmetic only), and
+   `assign_per_contest` already returns the file -> (entry, lineup) shape
+   `write_upload_files` consumes. An earlier draft of this doc claimed the sweep
+   needed a second dimension for arms x contests; it does not.
+
+   `LineupResult` already carries `contest_name` / `entry_fee` / `upload_tag` /
+   `entry_sort_order`, and `PortfolioTable` already renders them per row, so no
+   new plumbing is needed to show which lineup goes where.
+
+   Two DISPLAY issues do need care, neither architectural:
+   - **Aggregate stats blend deliberately different targets.** A portfolio
+     spanning a 792-entry Pickoff (mean own 115.8) and a 17,835-entry mini-MAX
+     (89.0) averages to ~94, which hides the 45-point spread that is the whole
+     point and reads as mediocre middle-ground rather than correct per-contest
+     targeting. Group the summary by contest, or label the aggregate as blended.
+   - **`overlap_profile` / `cluster_decomposition` mean different things within
+     versus across contests.** Within a contest, overlap is self-competition.
+     Across contests, entries never compete, so overlap there is
+     bankroll-variance -- which is exactly why `gamma_out` is documented as "NOT
+     an EV rule". One blended number conflates the two; report per-contest
+     within, plus a separate cross-contest figure.
+
+   Still open: `portfolio_size` becomes per-contest, not global.
 2. **First real UI run.** `replay_slate.py` cannot exercise any of this — no
    archive has `market_odds_projections.csv`. Only a smoke test has run
    (`_field_sorted_list` / `_sim_matrix` / `_build_col_lineups` verified against
