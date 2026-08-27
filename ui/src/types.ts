@@ -43,6 +43,10 @@ export interface PortfolioConfig {
 export type ExternalEvType = 'roi' | 'prj_own' | 'p_win' | 'proj_top' | 'self_play' | 'topn_coverage' | 'marginal_reward'
 
 export interface GppConfig {
+  selector_mode?: string
+  contest_structure?: string
+  contest_field_size?: number
+  dr_shortlist?: number
   n_candidates: number
   n_field_lineups: number
   n_field_samples: number
@@ -1103,7 +1107,10 @@ export interface PayoutFallbackContest {
  *  borrowed payout curve misallocates entries between contests, not just
  *  within one. */
 export interface MrpPayoutFallbackEvent extends SSEEvent {
-  stage: 'mrp_payout_fallback'
+  // Emitted by BOTH the marginal-reward path and the GPP path: identical
+  // payload, identical hard-gate semantics (a borrowed payout curve misprices
+  // any dollar-denominated objective), so one dialog serves both.
+  stage: 'mrp_payout_fallback' | 'gpp_payout_fallback'
   n_missing: number
   n_contests: number
   description: string

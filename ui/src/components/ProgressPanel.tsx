@@ -83,6 +83,7 @@ const STAGE_LABELS: Record<string, string> = {
   mrp_frontier_done: 'Marginal reward: frontier generated',
   mrp_done: 'Marginal reward: allocation complete',
   mrp_payout_fallback: 'Marginal reward: MISSING PAYOUT STRUCTURE',
+  gpp_payout_fallback: 'GPP: MISSING PAYOUT STRUCTURE',
   complete: 'Complete',
   stopped: 'Stopped',
   error: 'Error',

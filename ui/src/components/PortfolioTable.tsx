@@ -240,6 +240,20 @@ function playerKey(players: PlayerRow[]): string {
   return [...players.map(p => p.player_id)].sort((a, b) => a - b).join(',')
 }
 
+// The sweep is keyed by a numeric "risk", but under selector_mode=all that key
+// doubles as an ARM identifier: det sweeps 1-5 (risk is a real EV/diversity
+// blend there), while kelly=11-15, coverage=23, emax=31 and dr=41 are distinct
+// objectives for which "risk" is meaningless. Keep the numbers out of the UI —
+// "Risk 41" tells a user nothing — and show EVw only where it is a real dial.
+// Mapping mirrors pipeline.py's sweep labels; keep the two in sync.
+function armLabel(risk: number): { name: string; sub: string | null; isDet: boolean } {
+  if (risk >= 41) return { name: 'dR', sub: 'exact demotion', isDet: false }
+  if (risk >= 31) return { name: 'E[max]', sub: 'best entry', isDet: false }
+  if (risk >= 23 && risk < 31) return { name: 'Coverage', sub: 'world coverage', isDet: false }
+  if (risk >= 11) return { name: 'Kelly', sub: `bankroll ${risk - 10}`, isDet: false }
+  return { name: `Risk ${risk}`, sub: null, isDet: true }
+}
+
 // Mirrors DeterminantPortfolioSelector.evw_for_risk in gpp_portfolio.py:
 // EVw = evwBase at risk=1, evwMax at risk=5; linear in between.
 function evwForRisk(risk: number, evwBase: number, evwMax: number): number {
@@ -537,8 +551,12 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                     setViewingRisk(entry.risk === displayedRisk ? null : entry.risk)
                   }}
                 >
-                  {isActive && <span className="portfolio-risk-star">★ </span>}Risk {entry.risk}
-                  <span className="portfolio-risk-btn-stats">EVw {evwForRisk(entry.risk, evwBase, evwMax).toFixed(3)}</span>
+                  {isActive && <span className="portfolio-risk-star">★ </span>}{armLabel(entry.risk).name}
+                  {armLabel(entry.risk).isDet ? (
+                    <span className="portfolio-risk-btn-stats">EVw {evwForRisk(entry.risk, evwBase, evwMax).toFixed(3)}</span>
+                  ) : (
+                    <span className="portfolio-risk-btn-stats">{armLabel(entry.risk).sub}</span>
+                  )}
                   {(() => {
                     // Average projected score / ownership across the tier, so
                     // risk tiers are comparable on composition rather than on

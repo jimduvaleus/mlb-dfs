@@ -215,6 +215,83 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                   disabled={disabled} />
               </FieldRow>
             )}
+            {(() => {
+              // selector_mode is a comma list of arms. Rendering it as
+              // checkboxes rather than a fixed set of combo options keeps every
+              // combination reachable without enumerating 2^n of them. The four
+              // playable arms are always shown; "det" appears only when it is
+              // already selected, so a config that has it can still turn it off
+              // instead of having it silently dropped by the first toggle.
+              const ARMS: { id: string; name: string; hint: string }[] = [
+                { id: 'kelly', name: 'Kelly', hint: 'log bankroll growth · no upstream cost' },
+                { id: 'dr', name: 'dR', hint: 'exact demotion · holds the sorted field (~0.6–1.2 GB)' },
+                { id: 'emax', name: 'E[max]', hint: 'best entry hits · no upstream cost' },
+                { id: 'coverage', name: 'Coverage', hint: 'world coverage · ~69 MB packed bits · contest-blind' },
+              ]
+              const raw = draft.gpp.selector_mode ?? 'kelly,dr'
+              const sel = new Set(
+                raw.toLowerCase() === 'all'
+                  ? ['det', 'kelly', 'coverage', 'emax', 'dr']
+                  : raw.split(',').map(x => x.trim()).filter(Boolean)
+              )
+              const shown = sel.has('det')
+                ? [...ARMS, { id: 'det', name: 'Determinant (legacy)', hint: 'correlation proxy · 9–13 pts behind the others' }]
+                : ARMS
+              const toggle = (id: string, on: boolean) => {
+                const next = new Set(sel)
+                if (on) next.add(id); else next.delete(id)
+                // Never write an empty list: the pipeline would fall back to
+                // Determinant, which is the one arm this UI exists to retire.
+                setGpp('selector_mode', next.size ? [...next].join(',') : 'kelly')
+              }
+              return (
+                <>
+                  <div className="field-row"><label>Selection arms</label></div>
+                  {shown.map(a => (
+                    <FieldRow key={a.id} label={a.name}>
+                      <span style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <input type="checkbox" checked={sel.has(a.id)}
+                          onChange={e => toggle(a.id, e.target.checked)}
+                          disabled={disabled} />
+                        <span style={{ fontSize: '0.85em', color: 'var(--color-text-muted)' }}>
+                          {a.hint}
+                        </span>
+                      </span>
+                    </FieldRow>
+                  ))}
+                  <p className="field-hint">
+                    Each arm prices self-competition between your own entries a different
+                    way, and each builds a full portfolio you can compare in the Portfolio
+                    tab before making one active. Selection itself is seconds next to
+                    generation and scoring — the cost that varies is upstream, noted per
+                    arm above. Kelly and dR measured strongest across four contests and
+                    are the default; coverage ties them on large fields but does not react
+                    to contest size at all, so treat it with care on small ones.
+                  </p>
+                </>
+              )
+            })()}
+            <FieldRow label="Contest (payout table)">
+              <input type="text" placeholder="e.g. Bat Flip — blank = generic $4 GPP curve"
+                value={draft.gpp.contest_structure ?? ''}
+                onChange={e => setGpp('contest_structure', e.target.value)}
+                disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Contest field size">
+              <input type="number" step={1} min={0}
+                value={draft.gpp.contest_field_size ?? 0}
+                onChange={e => setGpp('contest_field_size', Number(e.target.value))}
+                disabled={disabled} />
+            </FieldRow>
+            <p className="field-hint">
+              The ladder and field size are the only contest-specific inputs the
+              selectors see, and they respond strongly: a small contest is won by
+              beating a few hundred people, so uniqueness stops being worth paying
+              for and the build comes back chalkier on its own. Leave blank to keep
+              the legacy fixed 5,001-entry curve. Field size 0 takes it from the
+              matched table. An unrecognised contest falls back to the nearest-size
+              table and asks before continuing.
+            </p>
             <FieldRow label="External pool EV type">
               <select value={draft.gpp.external_pool_ev_type ?? 'roi'}
                 onChange={e => setGpp('external_pool_ev_type', e.target.value)} disabled={disabled}>

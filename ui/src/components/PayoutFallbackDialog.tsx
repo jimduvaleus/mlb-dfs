@@ -11,10 +11,11 @@ interface Props {
  * Mid-run gate. Marginal reward could not find a registered payout table for
  * one or more contests and would silently borrow another contest's structure.
  *
- * This blocks the run rather than warning, because dR is denominated in
- * dollars and the greedy compares marginal dollars ACROSS contests — a wrong
- * payout curve does not just misrank candidates inside one contest, it
- * misallocates entries between them, slate-wide.
+ * This blocks the run rather than warning, because every objective that
+ * consumes it — dR, Kelly, E[max] — is denominated in DOLLARS. In the
+ * marginal-reward path a wrong curve also misallocates entries between
+ * contests, slate-wide; in the GPP path it misprices the ladder the whole
+ * selection is optimising against.
  */
 export function PayoutFallbackDialog({ contests, nContests, onProceed, onCancel }: Props) {
   return (
@@ -23,7 +24,7 @@ export function PayoutFallbackDialog({ contests, nContests, onProceed, onCancel 
         <p className="dialog-title">Missing payout structure</p>
         <p className="dialog-message">
           {contests.length} of {nContests} contest{nContests !== 1 ? 's' : ''} have no
-          registered payout table. Marginal reward will fall back to another contest's
+          registered payout table. Selection will fall back to another contest's
           structure:
         </p>
 

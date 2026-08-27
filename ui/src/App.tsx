@@ -352,7 +352,7 @@ export default function App() {
         dispatch({ type: 'set_run_status', status: 'error' })
       } else if (event.stage === 'mrp_done') {
         setAllocWarnings(((event as unknown as MrpDoneEvent).warnings) ?? [])
-      } else if (event.stage === 'mrp_payout_fallback') {
+      } else if (event.stage === 'mrp_payout_fallback' || event.stage === 'gpp_payout_fallback') {
         // The run is BLOCKED in the executor thread until POST /api/run/confirm
         // answers this, so the dialog is not optional chrome.
         setPayoutFallback(event as unknown as MrpPayoutFallbackEvent)
