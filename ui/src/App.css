@@ -1269,6 +1269,70 @@ button { cursor: pointer; }
   gap: 12px;
 }
 
+/* Per-contest summary. Shown only when the portfolio spans more than one
+   contest, i.e. when each slice was chosen against its own ladder and a
+   portfolio-wide average would describe none of them. */
+.portfolio-contest-summary {
+  background: #161b27;
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+}
+.portfolio-contest-summary-head {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+  font-size: 0.82em;
+  color: #a0aec0;
+}
+.portfolio-contest-spread {
+  margin-left: auto;
+  color: #68d391;
+  font-weight: 600;
+  cursor: help;
+}
+.portfolio-contest-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82em;
+  color: #cbd5e0;
+}
+.portfolio-contest-table th {
+  text-align: left;
+  font-weight: 500;
+  color: #718096;
+  padding: 2px 8px 4px 0;
+  border-bottom: 1px solid #2d3748;
+}
+.portfolio-contest-table td {
+  padding: 3px 8px 3px 0;
+  white-space: nowrap;
+}
+.portfolio-contest-table td:nth-child(2) {
+  white-space: normal;
+  width: 100%;
+}
+
+/* Spans the full card grid so each contest's lineups read as one block. */
+.portfolio-contest-divider {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 6px 0 -4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #2d3748;
+  font-size: 0.85em;
+  font-weight: 600;
+  color: #90cdf4;
+}
+.portfolio-contest-divider-sub {
+  font-weight: 400;
+  color: #718096;
+}
+
 .lineup-card {
   background: #161b27;
   border: 1px solid #2d3748;
@@ -3146,4 +3210,34 @@ button { cursor: pointer; }
 
 .error-boundary-retry:hover {
   background: #3a4759;
+}
+
+
+/* Collapsed config subtree — used for the external-pool block, which is inert
+   unless the run dialog's external-pool box is ticked. */
+.config-collapse {
+  border: 1px solid #2d3748;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-top: 10px;
+}
+.config-collapse > summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #cbd5e0;
+  font-size: 0.9em;
+  list-style: revert;
+}
+.config-collapse[open] > summary {
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #2d3748;
+}
+.config-collapse-sub {
+  font-weight: 400;
+  color: #718096;
+  font-size: 0.9em;
+}
+.config-collapse-sub code {
+  color: #90cdf4;
 }

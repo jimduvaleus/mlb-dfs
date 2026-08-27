@@ -1,13 +1,14 @@
-# Handoff — contest-aware portfolio selection (2026-08-26)
+# Handoff — contest-aware portfolio selection (updated 2026-08-27)
 
 Delete this file once the work is merged. It exists because several *negative*
 results here are worth more than the code, and none of them are recoverable from
 reading it.
 
-## State: committed, not pushed
+## State: seven commits + uncommitted wiring
 
-Six commits on `parallel-shape-mutants`, working tree clean, nothing pushed.
-**1,202 tests pass**, `tsc` clean.
+Seven commits on `parallel-shape-mutants`; the per-contest **wiring** described
+under "Wiring, as built" is in the working tree, not yet committed.
+**1,249 tests pass**, `tsc` clean.
 
     e1f3825  Fix three silent defects in candidate generation
     f3eace3  Add E[max] selector, fast portfolio builder, per-contest selection
@@ -15,11 +16,13 @@ Six commits on `parallel-shape-mutants`, working tree clean, nothing pushed.
     92b27a0  Surface selection arms and contest identity in the UI
     475cb44  Add the measurement harnesses, and this note
     ae896bf  Correct the sweep-dimension note
+    67ac4bc  Correct HANDOFF's own state section
 
 `e1f3825` stands alone and is worth keeping regardless of whether the rest
 lands. Note `config.yaml` is gitignored — new keys live in
 `config.example.yaml`, and any machine with an older `config.yaml` picks up
-defaults from `models.py`, not from the file.
+defaults from `models.py`, not from the file. That now includes the four
+`gpp.per_contest_*` keys.
 
 ## What was built
 
@@ -35,10 +38,10 @@ keep it in sync with `pipeline.py`.
 gates the run through the existing `PayoutFallbackDialog` (payload shape matches
 `mrp_payout_fallback`, one dialog serves both).
 
-**Per-contest selection** — `src/optimization/multi_contest.py`. Groups an
-entries file by contest, resolves each ladder, orders them, and selects each
-contest's own disjoint slice. **Built and verified standalone; NOT yet wired
-into `pipeline._run`** — that is the next task.
+**Per-contest selection** — `src/optimization/multi_contest.py`, now WIRED into
+`pipeline._run` (see "Wiring, as built" below). Groups an entries file by
+contest, resolves each ladder, orders them, and selects each contest's own
+disjoint slice.
 
 **Fixes found along the way** (each was silent, each found by checking an
 invariant rather than by anything failing):
@@ -98,58 +101,130 @@ Pattern worth internalising: **two strong proxy improvements both converted to
 nothing.** A 150-lineup portfolio draws from ~750 candidates above its own mean
 ceiling — 5:1 coverage. Improving *what reaches* the objectives does not bind.
 
+## Wiring, as built (2026-08-27)
+
+Item 1 is done. Per-contest selection **replaces** the single-ladder path
+whenever the slate has entry files; with none, the old path runs unchanged,
+which is what keeps `replay_slate.py` reproducible (archives carry no
+`*Entries.csv`). No feature flag — that was a deliberate call.
+
+Four things turned out differently from the plan above, and each is the
+interesting part:
+
+1. **Contests had to become the OUTER loop.** `select_per_contest` iterates
+   contests for one arm. Everything expensive is a function of the contest
+   alone — the (n_sims x F) sorted field and the payout kernel over the
+   shortlist — so running arms outside rebuilt all of it per arm: 36 field
+   builds instead of 6 at six contests x six arm keys, tens of minutes of pure
+   recomputation. `select_per_contest_multi_arm` now owns the fill loop and
+   `select_per_contest` is a single-arm wrapper over it, so the fill-order and
+   disjointness rules still have exactly one implementation. Each arm keeps its
+   own `used` set: slices are disjoint *within* an arm, arms never constrain
+   each other.
+2. **One field pool, subsampled per contest**, not one field per contest
+   (`SharedFieldPool`). Field entries are i.i.d. draws from the same ownership
+   model, so a random F-subset IS a valid F-field; regenerating buys only
+   independent noise at a full `generate_field` per contest. Subsets are
+   NESTED, which matters more than the speed: with independent draws, part of
+   the measured ownership spread between a small and a large contest would be
+   field-draw noise and the two would be inseparable. Raw arrays are ~1.4 MB
+   and held for the whole phase; only the scored, sorted field (~1.8 GB at 25k
+   sims x 17,835) is rebuilt, one at a time, via a generator.
+3. **The dupe model had to be rescaled per contest.** `DUPE_REF_FIELD_SIZE`'s
+   own docstring says any caller applying the model across contests of
+   different sizes must scale by `field_size / N_REF`, and `ContestScorer`
+   never does because its whole run is one contest. Unscaled, a 234-entry
+   contest's duplication was overstated ~60x. `scale_dupes_for_field`.
+4. **The EV floor is off during per-contest selection.** `gpp.ev_floor` is a
+   dollar threshold calibrated on the reference ladder; across contests from $1
+   to $25 fees it is either trivially cleared or culls the entire pool. The
+   funnel already gated on it twice, which is where a fee-denominated floor
+   belongs. Same reasoning `fast_portfolio.py`'s arm wrappers already used.
+
+Also settled along the way:
+
+- **`portfolio_size` is no longer the per-contest count** — each contest takes
+  exactly the entries the file gives it. `portfolio_size` now only bounds the
+  funnel; `gpp.per_contest_shortlist` (default 4,000) bounds selection.
+- **Assignment is positional.** `_assign_positional` replaces
+  `assign_lineups_to_entries`, and the diversity reorder is skipped: it exists
+  to line lineup strength up with entry FEE across a fee-heterogeneous slate,
+  and within a contest every entry has the same fee while across contests each
+  slice was already chosen for its own ladder.
+- **Contest identity rides on the entry map**, which is merged into every
+  lineup row live, across the whole sweep, and again on restore from disk — so
+  the UI groups per contest with no new plumbing and it survives a restart.
+- **`replace_lineup` swaps in place** on this path instead of appending and
+  reordering. Caveat now stated in the code: the replacement is ranked on the
+  reference ladder, because the contest's field is freed by then. It is a
+  like-for-like swap, not a re-selection.
+- Two guards fall back rather than crash after the whole funnel has run: a
+  contest whose resolved table has no entry count disables the path entirely,
+  and a pool too small to fill every entry disjointly turns disjointness off
+  for that run with a loud warning.
+
+**The sweep stayed ONE-dimensional**, as the corrected note predicted. A
+"portfolio" is and always was "the set of lineups across all contests we will
+submit"; the old flow spread a single portfolio across contests too, via
+`assign_lineups_to_entries`. Per-contest selection does not create a new object,
+it just makes each contest's slice actually chosen for that contest. So
+`activate_sweep_risk` works unchanged (still worth renaming to `activate_arm`,
+cosmetic only).
+
+**Display.** The arm buttons show the ownership RANGE across contests, not the
+mean (with the per-contest breakdown in the tooltip); a summary table above the
+cards gives one row per contest plus the headline spread; the card list is
+divided by contest. The `complete`/`stopped` SSE payloads carry a `contests`
+list.
+
+**Tests: 1,249 pass** (was 1,202), `tsc` clean. 47 new across
+`tests/test_multi_contest.py` (fill order, disjointness, arm independence,
+field-pool nesting, dupe scaling, payout-matrix invariants) and
+`tests/test_per_contest_pipeline.py` (every arm end-to-end through a real
+`ContestScorer` and real ladders, entry order, positional assignment, the
+summary).
+
 ## Open work, in order
 
-1. **Wire `select_per_contest` into `pipeline._run`.** Shortlist once, compute
-   `cand_scores` once (contest-independent), call it per arm, route through
-   `assign_per_contest` instead of `assign_lineups_to_entries`.
-
-   **The sweep stays ONE-dimensional — one portfolio per arm.** A "portfolio" is
-   and always was "the set of lineups across all contests we will submit"; the
-   old flow spread a single portfolio across contests too, via
-   `assign_lineups_to_entries`. Per-contest selection does not create a new
-   object, it just makes each contest's slice actually chosen for that contest
-   instead of an arbitrary cut of a single-ladder portfolio. So `activate_risk`
-   works unchanged (worth renaming to `activate_arm`, cosmetic only), and
-   `assign_per_contest` already returns the file -> (entry, lineup) shape
-   `write_upload_files` consumes. An earlier draft of this doc claimed the sweep
-   needed a second dimension for arms x contests; it does not.
-
-   `LineupResult` already carries `contest_name` / `entry_fee` / `upload_tag` /
-   `entry_sort_order`, and `PortfolioTable` already renders them per row, so no
-   new plumbing is needed to show which lineup goes where.
-
-   Two DISPLAY issues do need care, neither architectural:
-   - **Aggregate stats blend deliberately different targets.** A portfolio
-     spanning a 792-entry Pickoff (mean own 115.8) and a 17,835-entry mini-MAX
-     (89.0) averages to ~94, which hides the 45-point spread that is the whole
-     point and reads as mediocre middle-ground rather than correct per-contest
-     targeting. Group the summary by contest, or label the aggregate as blended.
-   - **`overlap_profile` / `cluster_decomposition` mean different things within
-     versus across contests.** Within a contest, overlap is self-competition.
-     Across contests, entries never compete, so overlap there is
-     bankroll-variance -- which is exactly why `gamma_out` is documented as "NOT
-     an EV rule". One blended number conflates the two; report per-contest
-     within, plus a separate cross-contest figure.
-
-   Still open: `portfolio_size` becomes per-contest, not global.
-2. **First real UI run.** `replay_slate.py` cannot exercise any of this — no
-   archive has `market_odds_projections.csv`. Only a smoke test has run
-   (`_field_sorted_list` / `_sim_matrix` / `_build_col_lineups` verified against
-   a real `ContestScorer`; world axes agree).
-3. **Multi-slate validation.** Everything rests on two slates. `replay_slate.py
-   --all --variants` is what would turn any of this into a design principle.
-4. **Cross-contest risk** — measured, not built. Rebuilding contest B under an
-   exact-duplicate constraint raised P(at least one contest profits) **+4.1 pts**
-   and P(at least one doubles) **+2.9**, costing 5.7% of mean EV. `gamma_out`
-   below 9 buys nothing beyond the duplicate rule. `select_per_contest`'s
-   `exclude_used=True` already delivers this within a run.
+1. **First real UI run.** Still not done, and still the gap that matters:
+   `replay_slate.py` cannot exercise any of this, because no archive has both
+   `market_odds_projections.csv` and a `*Entries.csv`. Everything above is
+   covered by tests against real ladders and a real `ContestScorer`, which is
+   not the same as having run it once at production scale. Watch RSS on the
+   first run — the per-contest peak is one sorted field (~1.8 GB at 25k sims
+   and a 17,835-entry contest) plus the shortlist payout matrix.
+2. **Multi-slate validation.** Everything still rests on two slates.
+   `replay_slate.py --all --variants` is what would turn any of this into a
+   design principle — and note it exercises the SINGLE-LADDER path, so it
+   validates the funnel, not the per-contest selection.
+3. **Cross-contest risk** — measured, not built. Rebuilding contest B under an
+   exact-duplicate constraint raised P(at least one contest profits) **+4.1
+   pts** and P(at least one doubles) **+2.9**, costing 5.7% of mean EV.
+   `gamma_out` below 9 buys nothing beyond the duplicate rule.
+   `per_contest_disjoint` (default on) already delivers this within a run.
+4. **Cross-contest overlap reporting.** `overlap_profile` /
+   `cluster_decomposition` mean different things within versus across contests:
+   within, overlap is self-competition; across, entries never compete, so it is
+   bankroll variance — which is why `gamma_out` is documented as "NOT an EV
+   rule". Those helpers live only in `scripts/analyze_rival_portfolio.py`, not
+   in the pipeline or UI, so nothing currently conflates the two — but nothing
+   reports the cross-contest figure either.
 
 ## Gotchas
 
-- Coverage silently yields nothing if `gpp.compute_tail_metrics` is off.
+- Coverage silently yields nothing if `gpp.compute_tail_metrics` is off. On the
+  per-contest path it recomputes its own beat-p99.9 bits from each contest's
+  field (`contest_beat_bits`) rather than reusing the fresh pass's, so it does
+  not depend on `retain_beat999_worlds` there — but it still needs a field, so
+  it forces the sorted field to be materialized rather than streamed.
 - dR is the only arm with real memory cost — it retains the sorted field
-  (~0.6-1.2 GB) the pipeline otherwise frees; `gpp.dr_shortlist` caps it.
+  (~0.6-1.2 GB) the pipeline otherwise frees; `gpp.dr_shortlist` caps it. On the
+  per-contest path `gpp.dr_shortlist` is NOT the cap — `per_contest_shortlist`
+  is, and it applies to every arm.
+- Per-contest peak memory is one sorted field (~1.8 GB at 25k sims and a
+  17,835-entry contest) plus the shortlist payout matrix, one contest at a time.
+  `per_contest_field_samples > 1` does not multiply that (samples are streamed),
+  but it does multiply the field build and the per-contest score+sort.
 - Any new `gpp.*` config key must land in **three** places (`config.yaml`,
   `models.py`, `types.ts`) or Pydantic drops it silently on save.
 - Grading noise: gaps under ~1.3 pts (ME) / ~3.2 pts (BF) are unresolved at 40k

@@ -92,6 +92,23 @@ gpp:
   contest_field_size: 0      # 0 = take it from the resolved structure
   dr_shortlist: 4000         # memory cap on the dR arm; see pipeline.py
   kelly_bankroll_mult: 1.0
+  # Per-contest selection. Active whenever the slate has *Entries.csv files:
+  # each contest picks its own slice against its own ladder, in descending
+  # top-prize order. contest_structure above still sets the reference ladder
+  # the funnel is denominated in, and is the whole story with no entry files.
+  per_contest_shortlist: 8000       # candidates handed to the per-contest arms;
+                                    # size against imported pool + frontier_target_lineups,
+                                    # not the import alone. ~4.3GB peak, ~7min at n_sims=25k
+  per_contest_field_samples: 1      # field draws per contest; costs a score+sort each
+  per_contest_disjoint: true        # no lineup entered in two contests
+  per_contest_rank_sims: 2500       # worlds used to rank the pool per contest for the shortlist
+                                    # union; 0 = fall back to the ownership-stratified cut
+  per_contest_cand_per_entry: 400   # per-contest candidate cap, PER PURCHASED ENTRY
+                                    # (floor 2,000). Stops a 2-entry contest paying for
+                                    # an 8k-candidate dR state; no-op above ~20 entries.
+                                    # 0 disables. Changes picks, not just speed.
+  per_contest_shortlist_strata: 10  # fallback only: ownership bands; 1 = plain top-N by EV
+  per_contest_cand_chunk: 2000      # payout-kernel chunk (memory only)
   final_rescore_top: 20000
   evw_base: 0.10
   evw_max: 0.30
@@ -104,7 +121,12 @@ gpp:
   dupe_salary_coef: 0.095
   dupe_stack_coef: -0.102
   dupe_min_gross_payout: 15.0
-  external_pool_ev_type: roi        # roi | prj_own | p_win | proj_top | self_play | topn_coverage | marginal_reward
+  external_pool_ev_type: roi        # roi | prj_own | p_win | proj_top | self_play | topn_coverage | marginal_reward | per_contest
+                                   # per_contest = run the imported pool through the same per-contest
+                                   # selection the generated path uses, with gpp.selector_mode's arms
+                                   # (kelly/dr/emax/coverage). Differs from marginal_reward in SHAPE:
+                                   # MRP is one global greedy over (lineup, contest) pairs, this fills
+                                   # each contest's slice in descending-top-prize order.
   external_pool_own_scale: 30000.0  # prj_own: field size where 1 ownership pt == 1 proj pt
   external_pool_pwin_sharpness: 0.05 # p_win: exponent multiplier on an entry count (1.0 = literal P(win); calibrated lower, see models.py). With flat_reference below, the count is that fixed reference rather than each contest's implied entries
   external_pool_pwin_admit_n: 2000  # p_win stage-A cull window (flat -- see multiplier below). 100 (max(100,1.5x) scaled) was the prior default, validated on an 8-slate replay-harness sweep; SUPERSEDED 2026-07-31: a real-money 7-slate/21-draw backtest (tests/backtest.py) with exact payout tables + real fields found this wider flat-2000 window beats it at p=0.007-0.03 on 5/6 alternate arms -- do not revert without new empirical evidence (see memory project-flat2000-live-override-20260731)

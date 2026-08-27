@@ -57,13 +57,26 @@ def _emitted_payloads() -> tuple[dict[str, set[str]], set[str]]:
     return literal, spread
 
 
+# The relay is split across two functions: `_mrp_progress` handles the stages
+# only MRP emits (build/pick/floor) and delegates the frontier stages to
+# `_frontier_progress`, which the per-contest external path calls directly so
+# the same generator cannot end up reported under two different event names.
+# Both are relays in the sense this test cares about -- they rebuild the
+# payload key by key -- so both are parsed.
+_RELAY_FNS = ("_mrp_progress", "_frontier_progress")
+
+
 def _relay_branches() -> dict[str, dict[str, set[str] | str | None]]:
     """Incoming stage -> {reads: keys pulled off `info`, writes: keys sent to
     the UI, out_stage: the stage name the UI receives}."""
     tree = ast.parse(PIPELINE.read_text())
-    fn = next((n for n in ast.walk(tree)
-               if isinstance(n, ast.FunctionDef) and n.name == "_mrp_progress"), None)
-    assert fn is not None, "_mrp_progress relay not found in src/api/pipeline.py"
+    fns = [n for n in ast.walk(tree)
+           if isinstance(n, ast.FunctionDef) and n.name in _RELAY_FNS]
+    found = {n.name for n in fns}
+    assert found == set(_RELAY_FNS), (
+        f"relay functions {set(_RELAY_FNS) - found} not found in "
+        "src/api/pipeline.py"
+    )
 
     branches: dict[str, dict] = {}
 
@@ -78,7 +91,8 @@ def _relay_branches() -> dict[str, dict[str, set[str] | str | None]]:
                 branches[test.comparators[0].value] = _branch_keys(stmt.body)
             visit_chain(stmt.orelse)
 
-    visit_chain(fn.body)
+    for fn in fns:
+        visit_chain(fn.body)
     return branches
 
 

@@ -139,6 +139,93 @@ class GppConfig(BaseModel):
     # of robust_payout; capping M keeps the peak bounded on a laptop.
     dr_shortlist: int = 4000
     kelly_bankroll_mult: float = 1.0
+    # PER-CONTEST SELECTION. Active whenever the slate has entry files: each
+    # contest in them selects its own slice against its OWN ladder and field
+    # size, in descending-top-prize fill order, instead of one portfolio being
+    # spread across all of them. contest_structure above still supplies the
+    # single reference ladder the funnel (EV floor, fresh re-score, tail
+    # metrics) is denominated in, and is the whole story when there are no
+    # entry files — which is why replay stays reproducible.
+    #
+    # Shortlist size handed to the per-contest selectors. Everything downstream
+    # is (shortlist x n_sims); the floor is however many entries the file needs.
+    # Also consumed by external_pool_ev_type="per_contest", which runs the
+    # imported SaberSim pool through the same per-contest selection.
+    #
+    # SIZED AGAINST THE AUGMENTED POOL, not the imported one. A SaberSim export
+    # runs ~4,200 lineups and frontier_target_lineups defaults to 4,000, so an
+    # augmented pool lands near 8,200 and a 4,000 cap threw away more than half
+    # the menu the frontier had just been run to widen. At 8,000 the pool goes
+    # through essentially whole -- and because 8,200 <= 8,000 / (1 -
+    # _PC_RANK_MIN_CUT), the "not worth a ranking pass" shortcut fires and the
+    # union-rank stage is skipped outright.
+    #
+    # This is a COMPUTATIONAL guard, never a quality device: a smaller value can
+    # only remove options the arms would otherwise have had. So it should be as
+    # large as the budget allows. Measured 2026-08-27 at n_sims=25,000 on the
+    # 08/25 six-contest entries file (scripts/bench_per_contest_shortlist.py),
+    # cost is linear in M and memory is set by the single largest contest. The
+    # peaks are MEASURED on that contest (mini-MAX, F=17,835); the wall figures
+    # are EXTRAPOLATED to all six from the two largest, which were measured in
+    # full -- the four small contests are dominated by the F-insensitive dR
+    # state build, so the extrapolation is the reliable part:
+    #
+    #   M       largest-contest peak   6-contest selection wall (est.)
+    #   4,000   3.1 GB                 ~3.5 min
+    #   8,000   4.3 GB                 ~7 min
+    #   12,000  5.6 GB                 ~10 min
+    #   16,000  6.9 GB                 ~13 min
+    #
+    # 8,000 keeps peak at roughly half the 8 GB target. Raise it in step with
+    # frontier_target_lineups; ~55% of the marginal cost is the dR state build
+    # (`precompute_field_ranks`), which is a single-threaded NumPy loop over
+    # worlds, so that is the thing to parallelise before paying for 16,000.
+    per_contest_shortlist: int = 8000
+    # Sim worlds used to RANK the pool against each contest's ladder when
+    # forming the shortlist union. Choosing which ~4,000 of ~15,000 candidates
+    # go on the menu is coarse work and does not need the full world count that
+    # pricing the final selection does: measured at production scale, ranking
+    # the whole pool against six ladders costs ~10s at 2,500 worlds against
+    # ~98s at 25,000. 0 falls back to the ownership-stratified cut.
+    per_contest_rank_sims: int = 2500
+    # Field samples per contest. One shared pool is generated at the largest
+    # contest's size and subsampled down per contest, so this multiplies BOTH
+    # the field generation and the per-contest score+sort. n_sims already
+    # averages each candidate over every sim world; raise this only to damp
+    # field-composition noise when validating.
+    per_contest_field_samples: int = 1
+    # Make each arm's contest slices disjoint. A lineup entered in two contests
+    # concentrates risk with no diversification benefit; measured 08/26, the
+    # constraint raised P(at least one contest profits) +4.1 pts and P(at least
+    # one doubles) +2.9, costing 5.7% of mean EV.
+    per_contest_disjoint: bool = True
+    # Ownership bands the shortlist is drawn from, best-by-EV within each.
+    # A plain top-N-by-EV cut ranks everything on the funnel reference's ladder,
+    # which biases WHICH lineups survive and not just how many -- it thins
+    # whichever ownership quadrant the reference contest does not want, starving
+    # the contests that differ most from it. Selection is per contest, so the
+    # shortlist's job is only to avoid discarding what some contest wants.
+    # 1 (or 0) restores the plain top-N cut.
+    # Per-contest candidate cap, as a rate PER PURCHASED ENTRY, floored at
+    # _PC_CAND_CAP_FLOOR. The global shortlist sizes the whole slate; this sizes
+    # each contest's own slice of it, because the cost of a contest is (cap x
+    # n_sims) regardless of how many lineups it needs. Measured 08/27: three
+    # 2-entry contests spent 96s building dR state over 8,202 candidates to
+    # choose six lineups, 22% of the selection stage.
+    #
+    # Safe where it bites because dR's first pick IS argmax mean EV and each
+    # later pick is that minus a demotion term the earlier picks create -- at
+    # k=2 there is one demotion pair in the whole problem. At large k that term
+    # is doing real work on exactly the contrarian tail an EV ranking cuts
+    # first, so the rate is per entry and 400 makes this a no-op above ~20
+    # entries on a typical augmented pool. 0 disables it.
+    #
+    # Unlike the parallel dR state build, this CHANGES WHICH LINEUPS ARE PICKED.
+    # It is a speed/quality trade, not a free one.
+    per_contest_cand_per_entry: int = 400
+    per_contest_shortlist_strata: int = 10
+    # Candidate-axis chunk for the per-contest payout kernel (memory only).
+    per_contest_cand_chunk: int = 2000
     # Safety cap on the fresh-rescore slice. The slice itself is defined by
     # ev_floor (rescore everything at/above it, then drop what falls below on
     # fresh EVs); this cap only bounds memory/time on pathological slates.

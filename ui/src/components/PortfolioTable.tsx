@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { Fragment, useState, useRef, useEffect } from 'react'
 import type { ContestNameCollision, LineupResult, PlatformType, PlayerRow, PortfolioSweepEntry } from '../types'
 import { fetchContestAnalysis } from '../api'
 import { getStackNotation, alphabetizeDuplicateGroups } from '../utils'
@@ -219,6 +219,64 @@ function calcAvgMeanOwn(lineups: LineupResult[]): { mean: number | null; own: nu
 }
 
 
+// Per-contest grouping. Present only when per-contest selection ran, in which
+// case each contest's slice was chosen against ITS OWN ladder and field size --
+// so any figure averaged across contests describes none of them. A portfolio
+// spanning a small chalky contest and a large contrarian one averages to a
+// middle-ground ownership that reads as mediocre rather than as correct
+// per-contest targeting, which is exactly what these groups exist to prevent.
+export interface ContestGroup {
+  key: string
+  name: string
+  fillRank: number
+  fieldSize: number | null
+  topPrize: number | null
+  approximate: boolean
+  entryFee: string | null
+  lineups: LineupResult[]
+  mean: number | null
+  own: number | null
+}
+
+function groupByContest(lineups: LineupResult[]): ContestGroup[] {
+  if (!lineups.some(l => l.contest_field_size != null)) return []
+  const groups = new Map<string, ContestGroup>()
+  for (const l of lineups) {
+    const key = `${l.entry_sort_order ?? -1}|${l.contest_name ?? ''}`
+    let g = groups.get(key)
+    if (!g) {
+      g = {
+        key,
+        name: l.contest_name ?? 'Unknown contest',
+        fillRank: l.entry_sort_order ?? 0,
+        fieldSize: l.contest_field_size ?? null,
+        topPrize: l.contest_top_prize ?? null,
+        approximate: !!l.contest_approximate,
+        entryFee: l.entry_fee ?? null,
+        lineups: [],
+        mean: null,
+        own: null,
+      }
+      groups.set(key, g)
+    }
+    g.lineups.push(l)
+  }
+  const out = [...groups.values()].sort((a, b) => a.fillRank - b.fillRank)
+  for (const g of out) {
+    const { mean, own } = calcAvgMeanOwn(g.lineups)
+    g.mean = mean
+    g.own = own
+  }
+  return out
+}
+
+// Spread of mean ownership across contests -- the headline number for whether
+// contest-awareness actually did anything on this slate.
+function ownSpread(groups: ContestGroup[]): number | null {
+  const v = groups.map(g => g.own).filter((x): x is number => x != null)
+  return v.length > 1 ? Math.max(...v) - Math.min(...v) : null
+}
+
 function entrySortKey(lineup: LineupResult): [number, number, number] {
   const ratio = lineup.entry_sort_order ?? Infinity
   const fee = parseFeeCents(lineup.entry_fee)
@@ -396,6 +454,10 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
     .slice(0, 10)
 
   const hasEntries = activeLineups.some(l => l.upload_tag)
+  // Non-empty only when per-contest selection ran (the pipeline puts contest
+  // identity on every lineup's entry meta in that case).
+  const contestGroups = groupByContest(activeLineups)
+  const contestOwnSpread = ownSpread(contestGroups)
   // Share of the shipped portfolio that came from a generated source rather
   // than the imported pool. Only rendered when something was generated -- on
   // every other allocator the flag is absent and the counter would read a
@@ -562,11 +624,27 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                     // risk tiers are comparable on composition rather than on
                     // the selector's own EV currency.
                     const { mean, own } = calcAvgMeanOwn(entry.lineups)
-                    return (mean != null || own != null) && (
-                      <span className="portfolio-risk-btn-stats">
-                        {[mean != null ? `${mean.toFixed(1)} mean` : null,
-                          own != null ? `${own.toFixed(1)} own` : null]
-                          .filter(Boolean).join(' · ')}
+                    // Once the slice for each contest was chosen against its own
+                    // ladder, one averaged ownership describes no contest in the
+                    // portfolio. Show the RANGE across contests instead: it is
+                    // the same information the average destroys, and a wide one
+                    // is the arm working rather than the arm being inconsistent.
+                    const groups = groupByContest(entry.lineups)
+                    const owns = groups.map(g => g.own).filter((x): x is number => x != null)
+                    const ownText = owns.length > 1
+                      ? `${Math.min(...owns).toFixed(0)}\u2013${Math.max(...owns).toFixed(0)} own`
+                      : own != null ? `${own.toFixed(1)} own` : null
+                    return (mean != null || ownText != null) && (
+                      <span
+                        className="portfolio-risk-btn-stats"
+                        title={owns.length > 1
+                          ? `Mean summed ownership per contest: ${groups
+                              .map(g => `${g.name} ${g.own?.toFixed(1) ?? 'n/a'}`)
+                              .join(' · ')}`
+                          : undefined}
+                      >
+                        {[mean != null ? `${mean.toFixed(1)} mean` : null, ownText]
+                          .filter(Boolean).join(' \u00b7 ')}
                       </span>
                     )
                   })()}
@@ -701,14 +779,75 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
           })}
         </div>
       )}
+      {contestGroups.length > 1 && (
+        <div className="portfolio-contest-summary">
+          <div className="portfolio-contest-summary-head">
+            <span>Selected per contest, in fill order</span>
+            {contestOwnSpread != null && (
+              <span
+                className="portfolio-contest-spread"
+                title="Difference between the chalkiest and the most contrarian contest's mean summed ownership. This is the contest-awareness the per-contest path exists to produce; a portfolio-wide average would hide it."
+              >
+                {contestOwnSpread.toFixed(0)} pts of ownership spread
+              </span>
+            )}
+          </div>
+          <table className="portfolio-contest-table">
+            <thead>
+              <tr>
+                <th>#</th><th>Contest</th><th>Fee</th><th>Lineups</th>
+                <th>Field</th><th>To 1st</th><th>PRJ</th><th>OWN</th>
+              </tr>
+            </thead>
+            <tbody>
+              {contestGroups.map(g => (
+                <tr key={g.key}>
+                  <td>{g.fillRank + 1}</td>
+                  <td title={g.approximate ? 'No registered payout table — the nearest captured one was used' : undefined}>
+                    {g.name}{g.approximate ? ' *' : ''}
+                  </td>
+                  <td>{g.entryFee ?? '—'}</td>
+                  <td>{g.lineups.length}</td>
+                  <td>{g.fieldSize != null ? g.fieldSize.toLocaleString() : '—'}</td>
+                  <td>{g.topPrize != null ? `$${Math.round(g.topPrize).toLocaleString()}` : '—'}</td>
+                  <td>{g.mean != null ? g.mean.toFixed(1) : '—'}</td>
+                  <td>{g.own != null ? g.own.toFixed(1) : '—'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
       <div className="portfolio-cards">
-        {visibleLineups.map(lineup => {
+        {visibleLineups.map((lineup, visibleIdx) => {
           const sorted = sortAndAssignPositions(lineup.players, platform)
           const stack = getStackNotation(lineup.players)
           const isReplacing = replacingLineupIndex === lineup.lineup_index
           const optIdx = optimalIndexMap.get(playerKey(lineup.players))
+          // Contest divider. visibleLineups is sorted by entry_sort_order,
+          // which per-contest selection sets to the contest's fill rank, so
+          // each contest's lineups are contiguous and one boundary check is
+          // enough. Rendered as a sibling of the card via a fragment so the
+          // grid layout of .portfolio-cards is not disturbed by a wrapper.
+          const prev = visibleIdx > 0 ? visibleLineups[visibleIdx - 1] : null
+          const showContestHeader =
+            contestGroups.length > 1 &&
+            lineup.contest_field_size != null &&
+            (prev == null || prev.entry_sort_order !== lineup.entry_sort_order)
           return (
-            <div key={lineup.lineup_index} className="lineup-card">
+            <Fragment key={lineup.lineup_index}>
+            {showContestHeader && (
+              <div className="portfolio-contest-divider">
+                {lineup.contest_name}
+                {lineup.contest_field_size != null && (
+                  <span className="portfolio-contest-divider-sub">
+                    {lineup.contest_field_size.toLocaleString()} entries
+                    {lineup.entry_fee ? ` · ${lineup.entry_fee}` : ''}
+                  </span>
+                )}
+              </div>
+            )}
+            <div className="lineup-card">
               <div className="lineup-card-header">
                 <span className="lineup-card-num">#{lineup.lineup_index}</span>
                 <span className="lineup-card-salary">${lineup.lineup_salary.toLocaleString()}</span>
@@ -786,6 +925,7 @@ export function PortfolioTable({ lineups, optimalLineups = [], portfolioSweep = 
                 ))}
               </div>
             </div>
+            </Fragment>
           )
         })}
       </div>

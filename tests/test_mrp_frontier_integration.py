@@ -115,7 +115,9 @@ def test_only_exact_duplicates_are_dropped_from_the_frontier():
 
 def test_a_frontier_lineup_duplicating_a_pool_lineup_is_dropped():
     """Two identical entries in one contest is an error, not a diversity call."""
-    from src.optimization.mrp.runner import _frontier_augment
+    from src.optimization.mrp.runner import (
+        _frontier_augment, frontier_contests_from_groups,
+    )
 
     df, sim, pool = _fixture()
     # Stand in for the generator: hand the merge a lineup the pool already has.
@@ -132,7 +134,8 @@ def test_a_frontier_lineup_duplicating_a_pool_lineup_is_dropped():
         fp = cs.score_field(cs.generate_field(df, own, n_lineups=200, rng_seed=1),
                             sim_matrix, {int(p): i for i, p in enumerate(sim.player_ids)})
         newpool, n_frontier, fdiag, _fs = _frontier_augment(
-            pool, df, sim, sim_matrix, fp, _groups(), FRONTIER_CFG, None, rng,
+            pool, df, sim, sim_matrix, fp,
+            frontier_contests_from_groups(_groups()), FRONTIER_CFG, None, rng,
         )
     finally:
         fq.frontier_lineups = real_fn

@@ -63,6 +63,9 @@ const STAGE_LABELS: Record<string, string> = {
   gpp_rescore_start: 'Fresh re-score',
   gpp_rescore_done: 'Fresh re-score',
   gpp_field_inject: 'Field lineups',
+  gpp_per_contest_start: 'Per-contest selection',
+  gpp_per_contest_done: 'Per-contest selection',
+  gpp_contest_select: 'Contest',
   gpp_holdout: 'Holdout evaluation',
   self_play_pool_start: 'Self-play: building pool',
   self_play_pool_done: 'Self-play: pool built',
@@ -79,8 +82,11 @@ const STAGE_LABELS: Record<string, string> = {
   // skipped from the log (see the flooding note in the row builder), so a
   // label for them would be dead code.
   mrp_start: 'Marginal reward: allocating',
-  mrp_frontier_start: 'Marginal reward: generating frontier',
-  mrp_frontier_done: 'Marginal reward: frontier generated',
+  // Not prefixed 'Marginal reward:' — MARGINAL REWARD and PER-CONTEST both
+  // run this generator, and the label is the only thing on the row that
+  // names the stage.
+  mrp_frontier_start: 'Frontier: generating lineups',
+  mrp_frontier_done: 'Frontier: lineups generated',
   mrp_done: 'Marginal reward: allocation complete',
   mrp_payout_fallback: 'Marginal reward: MISSING PAYOUT STRUCTURE',
   gpp_payout_fallback: 'GPP: MISSING PAYOUT STRUCTURE',
@@ -135,6 +141,10 @@ export function ProgressPanel({ events, running }: Props) {
       last?.stage === 'gpp_rescore_field_progress' ||
       last?.stage === 'gpp_rescore_score_progress' ||
       last?.stage === 'gpp_rescore_done' ||
+      last?.stage === 'gpp_per_contest_start' ||
+      last?.stage === 'gpp_contest_field_progress' ||
+      last?.stage === 'gpp_contest_select' ||
+      last?.stage === 'gpp_contest_done' ||
       last?.stage === 'gpp_field_inject' ||
       last?.stage === 'gpp_select_progress' ||
       last?.stage === 'gpp_mv_select_progress' ||
@@ -252,6 +262,18 @@ export function ProgressPanel({ events, running }: Props) {
   const latestRescoreScoreProgress = rescoreScoreProgressEvents[rescoreScoreProgressEvents.length - 1]
   const rescoreDone = events.some(e => e.stage === 'gpp_rescore_done')
 
+  // --- Per-contest selection (Phase 3) — again on distinct event names, so a
+  // per-contest field build does not render under the first-stage label.
+  const perContestStart = events.find(e => e.stage === 'gpp_per_contest_start') as unknown as { n_contests: number; n_entries: number; shortlist: number; n_arms: number; work_total: number; timestamp: number } | undefined
+  const perContestDone = events.find(e => e.stage === 'gpp_per_contest_done') as unknown as { n_contests: number; n_entries: number; n_arms: number; shortlist: number; elapsed_s: number } | undefined
+  const contestFieldProgressEvents = events.filter(e => e.stage === 'gpp_contest_field_progress') as unknown as { n_done: number; n_total: number; n_field: number; n_k: number; timestamp: number }[]
+  const latestContestFieldProgress = contestFieldProgressEvents[contestFieldProgressEvents.length - 1]
+  const contestSelectEvents = events.filter(e => e.stage === 'gpp_contest_select') as unknown as { contest_index: number; contests_total: number; contest_name: string; n_entries: number; field_size: number; entry_fee: number; top_prize: number; table_name: string; is_approximate: boolean; shortlist: number; n_arms: number; work_done: number; work_total: number; timestamp: number }[]
+  const latestContestSelect = contestSelectEvents[contestSelectEvents.length - 1]
+  const contestDoneEvents = events.filter(e => e.stage === 'gpp_contest_done') as unknown as { contest_index: number; contests_total: number; contest_name: string; work_done: number; work_total: number; timestamp: number }[]
+  const latestContestDone = contestDoneEvents[contestDoneEvents.length - 1]
+  const isPerContest = perContestStart !== undefined || contestSelectEvents.length > 0
+
   // Det-EV hoisted variables (used in both gppLabel, detSegments, and ETA)
   const isDetEv = detRiskStartEvents.length > 0 || detProgressEvents.length > 0
   const latestDetStep = detProgressEvents[detProgressEvents.length - 1]
@@ -331,6 +353,43 @@ export function ProgressPanel({ events, running }: Props) {
   const mrpDoneEvent = events.find(e => e.stage === 'mrp_done') as unknown as MrpDoneEvent | undefined
   const isMrp = mrpStartEvent !== undefined
 
+  // FRONTIER IS ITS OWN PHASE, not an MRP one. Both MARGINAL REWARD and
+  // PER-CONTEST run the line-2 generator, and PER-CONTEST emits no `mrp_start`,
+  // so computing this inside `if (isMrp)` meant the external per-contest path
+  // ran the slowest stage in the pipeline behind a bar that never appeared.
+  // Rate is taken over recent events rather than cumulatively: solve cost
+  // climbs steeply with lambda, so a whole-phase average reads far too
+  // optimistic near the end.
+  const frontierRate = (evs: Array<{ timestamp: number; done: number }>, remaining: number) => {
+    if (evs.length < 2 || remaining <= 0) return null
+    const recent = evs.slice(-4)
+    const dt = recent[recent.length - 1].timestamp - recent[0].timestamp
+    const dDone = recent[recent.length - 1].done - recent[0].done
+    return dDone > 0 && dt > 0 ? (dt / dDone) * remaining : null
+  }
+  const isFrontierRunning = mrpFrontierStartEvent !== undefined && mrpFrontierDoneEvent === undefined
+  let frontierPct = 0
+  let frontierLabel = ''
+  let frontierEtaMs: number | null = null
+  if (mrpFrontierStartEvent && !mrpFrontierDoneEvent) {
+    // Two phases with no shared denominator. Until line 4 reports back there
+    // is no operating-point count to divide by -- and the SEARCH grid size is
+    // emphatically not it (16 searched, ~5 generated at), so falling back to
+    // it made the bar jump from "0 / 16" to "1 / 5" mid-run.
+    if (!latestMrpFrontier) {
+      frontierPct = 0
+      frontierLabel = `Frontier: sampling ${fmtCount(mrpFrontierStartEvent.n_sample)} candidates, `
+        + `searching ${fmtCount(mrpFrontierStartEvent.n_lambda_search)} λ for each contest's λ*…`
+    } else {
+      const { done, total } = latestMrpFrontier
+      frontierPct = total > 0 ? Math.round((done / total) * 100) : 0
+      frontierLabel = `Frontier: λ* ${done} / ${total}`
+        + (done > 0 ? ` · ${fmtCount(latestMrpFrontier.n_lineups)} of ~${fmtCount(mrpFrontierStartEvent.target_lineups)} lineups generated`
+                    : ' · generating at the first operating point…')
+      frontierEtaMs = frontierRate(mrpFrontierProgressEvents, total - done)
+    }
+  }
+
   let mrpPct = 0
   let mrpLabel = ''
   let mrpEtaMs: number | null = null
@@ -357,23 +416,11 @@ export function ProgressPanel({ events, running }: Props) {
       mrpPct = latestMrpBuild.total > 0 ? Math.round((latestMrpBuild.done / latestMrpBuild.total) * 100) : 0
       mrpLabel = `Building contest states: ${latestMrpBuild.done} / ${latestMrpBuild.total}`
       mrpEtaMs = rate(mrpBuildEvents, latestMrpBuild.total - latestMrpBuild.done)
-    } else if (mrpFrontierStartEvent && !mrpFrontierDoneEvent) {
-      // Two phases with no shared denominator. Until line 4 reports back there
-      // is no operating-point count to divide by -- and the SEARCH grid size is
-      // emphatically not it (16 searched, ~5 generated at), so falling back to
-      // it made the bar jump from "0 / 16" to "1 / 5" mid-run.
-      if (!latestMrpFrontier) {
-        mrpPct = 0
-        mrpLabel = `Frontier: sampling ${fmtCount(mrpFrontierStartEvent.n_sample)} candidates, `
-          + `searching ${fmtCount(mrpFrontierStartEvent.n_lambda_search)} λ for each contest's λ*…`
-      } else {
-        const { done, total } = latestMrpFrontier
-        mrpPct = total > 0 ? Math.round((done / total) * 100) : 0
-        mrpLabel = `Frontier: λ* ${done} / ${total}`
-          + (done > 0 ? ` · ${fmtCount(latestMrpFrontier.n_lineups)} lineups generated`
-                      : ' · generating at the first operating point…')
-        mrpEtaMs = rate(mrpFrontierProgressEvents, total - done)
-      }
+    } else if (isFrontierRunning) {
+      // Rendered by the shared frontier bar below, which PER-CONTEST also
+      // uses. Kept as an explicit branch so the fall-through does not label
+      // the frontier phase "Preparing allocation…".
+      mrpLabel = ''
     } else {
       mrpLabel = 'Preparing allocation…'
     }
@@ -463,7 +510,23 @@ export function ProgressPanel({ events, running }: Props) {
   let gppPct = 0
   let gppLabel = ''
   if (isGpp) {
-    if (isDetEv) {
+    if (perContestDone) {
+      gppPct = 100
+      gppLabel = `Per-contest selection complete — ${perContestDone.n_contests} contests, ${perContestDone.n_entries} entries`
+    } else if (latestContestSelect) {
+      // Bar is weighted by work, not by contests done: contests fill in
+      // top-prize order, so a 17,835-entry contest and a 792-entry one sit
+      // next to each other and a flat count would lurch.
+      const done = latestContestDone?.work_done ?? latestContestSelect.work_done
+      gppPct = Math.round((done / latestContestSelect.work_total) * 100)
+      gppLabel = `Contest ${latestContestSelect.contest_index}/${latestContestSelect.contests_total}: ${latestContestSelect.contest_name} — ${latestContestSelect.n_entries} ${latestContestSelect.n_entries === 1 ? 'entry' : 'entries'}, field ${latestContestSelect.field_size.toLocaleString()}, ${latestContestSelect.n_arms} arm${latestContestSelect.n_arms === 1 ? '' : 's'}`
+    } else if (latestContestFieldProgress) {
+      gppPct = Math.round((latestContestFieldProgress.n_done / latestContestFieldProgress.n_total) * 100)
+      gppLabel = `Per-contest field pool: ${latestContestFieldProgress.n_done.toLocaleString()} / ${latestContestFieldProgress.n_total.toLocaleString()} lineups`
+    } else if (perContestStart) {
+      gppPct = 0
+      gppLabel = `Per-contest selection: ${perContestStart.n_contests} contests, ${perContestStart.n_entries} entries, ${perContestStart.shortlist.toLocaleString()} shortlisted…`
+    } else if (isDetEv) {
       const currentRisk = latestDetStep?.risk ?? latestDetRiskStart?.risk ?? null
       const riskOfN = latestDetRiskStart
         ? `Risk ${latestDetRiskStart.risk_index}/${latestDetRiskStart.total_risks}`
@@ -589,6 +652,27 @@ export function ProgressPanel({ events, running }: Props) {
         ? currentRemainingMs + avgMsPerSubstep * remainingSubsteps
         : currentRemainingMs
     }
+  } else if (running && isPerContest && !perContestDone) {
+    if (latestContestSelect) {
+      // Calibrate the cost-per-work-unit from what has actually finished, then
+      // project the remaining contests' work. The work proxy (field size +
+      // shortlist) only has to be roughly proportional — the measured constant
+      // does the rest — but until one contest has completed there is nothing to
+      // calibrate from, so no ETA is shown rather than a fabricated one.
+      const done = latestContestDone?.work_done ?? 0
+      const total = latestContestSelect.work_total
+      const t0 = (perContestStart ?? contestSelectEvents[0]).timestamp
+      const elapsed = (latestContestDone?.timestamp ?? 0) - t0
+      if (done > 0 && elapsed > 0 && total > done) {
+        etaMs = (elapsed / done) * (total - done)
+      }
+    } else if (latestContestFieldProgress && contestFieldProgressEvents.length >= 2) {
+      const remaining = latestContestFieldProgress.n_total - latestContestFieldProgress.n_done
+      const recent = contestFieldProgressEvents.slice(-4)
+      const recentElapsed = recent[recent.length - 1].timestamp - recent[0].timestamp
+      const recentLineups = recent[recent.length - 1].n_done - recent[0].n_done
+      if (remaining > 0 && recentLineups > 0) etaMs = (recentElapsed / recentLineups) * remaining
+    }
   } else if (isGpp) {
     if (running && latestOptimalProgress && !optimalDone) {
       const elapsed = latestOptimalProgress.timestamp - optimalProgressEvents[0].timestamp
@@ -685,6 +769,10 @@ export function ProgressPanel({ events, running }: Props) {
       const recentDone = recent[recent.length - 1].contests_done - recent[0].contests_done
       if (recentDone > 0) etaMs = (recentElapsed / recentDone) * remaining
     }
+  } else if (running && isFrontierRunning) {
+    // Ahead of the per-contest and MRP branches: while the generator is
+    // running it is the only thing running, in either shape.
+    etaMs = frontierEtaMs
   } else if (running && isTopnCoverage) {
     etaMs = topnEtaMs
   } else if (running && isMrp) {
@@ -705,7 +793,8 @@ export function ProgressPanel({ events, running }: Props) {
   // start of the run rather than only once isGpp flips true partway
   // through (which for external mode doesn't happen until the risk sweep).
   const isExternalRun = events.some(e => typeof e.stage === 'string' && e.stage.startsWith('external_'))
-  const liveElapsedMs = running && first && (current > 0 || isGpp || isExternalRun || isSelfPlay || isTopnCoverage || isMrp) ? now - first.timestamp : null
+  const liveElapsedMs = running && first && (current > 0 || isGpp || isExternalRun || isSelfPlay || isTopnCoverage || isMrp
+      || isFrontierRunning) ? now - first.timestamp : null
 
   return (
     <div className="progress-panel">
@@ -786,6 +875,14 @@ export function ProgressPanel({ events, running }: Props) {
         <div className="progress-bar-wrap">
           <div className="progress-bar" style={{ width: `${topnPct}%` }} />
           <span className="progress-label">{topnLabel}</span>
+        </div>
+      )}
+
+      {/* Frontier generation — shared by MARGINAL REWARD and PER-CONTEST. */}
+      {isFrontierRunning && running && frontierLabel && (
+        <div className="progress-bar-wrap">
+          <div className="progress-bar" style={{ width: `${frontierPct}%` }} />
+          <span className="progress-label">{frontierLabel}</span>
         </div>
       )}
 
@@ -973,7 +1070,12 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
 
   for (const e of events) {
     if (e.stage === 'optimize_lineup' || e.stage === 'upload_files') continue
-    if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress' || e.stage === 'gpp_rescore_field_progress') continue
+    if (GPP_PROGRESS_STAGES.has(e.stage) || e.stage === 'gpp_field_progress' || e.stage === 'gpp_rescore_field_progress' || e.stage === 'gpp_contest_field_progress') continue
+    // gpp_contest_done exists to advance the bar and calibrate the ETA; the
+    // matching gpp_contest_select already put a row in the log, so a second
+    // one per contest would double the phase's footprint for no information.
+    if (e.stage === 'gpp_contest_done') continue
+    if (e.stage === 'gpp_per_contest_start' && hasEvent('gpp_per_contest_done')) continue
     // self_play_contest_progress/self_play_payout_fallback each get their
     // own dedicated list (per-contest row list / warning banner) below.
     if (e.stage === 'self_play_contest_progress' || e.stage === 'self_play_payout_fallback') continue
@@ -1024,6 +1126,25 @@ function buildDisplayEvents(events: SSEEvent[]): Array<{ stage: string; label: s
 
 function renderDetail(e: SSEEvent): string {
   switch (e.stage) {
+    case 'gpp_per_contest_start': {
+      const ev = e as unknown as { n_contests: number; n_entries: number; shortlist: number; n_arms: number }
+      return `${ev.n_contests} contests, ${ev.n_entries} entries — each selects its own slice against its own ladder, largest top prize first (${ev.shortlist.toLocaleString()} shortlisted, ${ev.n_arms} arm${ev.n_arms === 1 ? '' : 's'})`
+    }
+    case 'gpp_per_contest_done': {
+      const ev = e as unknown as { n_contests: number; n_entries: number; elapsed_s: number }
+      return `${ev.n_entries} entries filled across ${ev.n_contests} contests in ${ev.elapsed_s}s`
+    }
+    case 'gpp_contest_select': {
+      const ev = e as unknown as {
+        contest_index: number; contests_total: number; contest_name: string
+        n_entries: number; field_size: number; entry_fee: number; top_prize: number
+        table_name: string; is_approximate: boolean
+      }
+      return `${ev.contest_index}/${ev.contests_total} · ${ev.contest_name} — `
+        + `${ev.n_entries} ${ev.n_entries === 1 ? 'entry' : 'entries'} @ $${ev.entry_fee.toFixed(2)}, `
+        + `field ${ev.field_size.toLocaleString()}, $${Math.round(ev.top_prize).toLocaleString()} to 1st`
+        + ` [${ev.table_name}${ev.is_approximate ? ' — APPROXIMATE' : ''}]`
+    }
     case 'load_slate': {
       const ev = e as unknown as {
         n_teams: number; n_batters: number; n_pitchers: number;
@@ -1231,6 +1352,15 @@ function renderDetail(e: SSEEvent): string {
       const dropped = ev.n_dropped_duplicate
         ? `, ${ev.n_dropped_duplicate.toLocaleString()} exact duplicate${ev.n_dropped_duplicate === 1 ? '' : 's'} dropped`
         : ''
+      // Pool growth, not just the addition: in external-pool mode the whole
+      // point is how much wider the menu got than the import, and "3,977 added"
+      // alone does not say whether that doubled the pool or barely moved it.
+      const grew = ev.n_real != null
+        ? ` (pool ${ev.n_real.toLocaleString()} → ${(ev.n_real + (ev.n_kept ?? 0)).toLocaleString()})`
+        : ''
+      const gen = ev.n_generated != null
+        ? `${ev.n_generated.toLocaleString()} generated · `
+        : ''
       const universe = ev.n_players_kept != null && ev.n_players_before != null
         ? ` · solved over ${ev.n_players_kept} of ${ev.n_players_before} players`
           + (ev.n_pitchers_kept != null && ev.n_teams != null
@@ -1245,7 +1375,7 @@ function renderDetail(e: SSEEvent): string {
         ? ` · σ_dG blended over ${ev.sigma_dG_contests} contest${ev.sigma_dG_contests === 1 ? '' : 's'}`
           + (ev.sigma_dG_min_corr != null ? ` (min corr ${ev.sigma_dG_min_corr.toFixed(3)})` : '')
         : ''
-      return `${(ev.n_kept ?? 0).toLocaleString()} lineups added to the pool${dropped}${lam}${blend}${universe}`
+      return `${gen}${(ev.n_kept ?? 0).toLocaleString()} added to the pool${grew}${dropped}${lam}${blend}${universe}`
     }
     case 'mrp_payout_fallback': {
       const ev = e as unknown as { n_missing: number; n_contests: number }

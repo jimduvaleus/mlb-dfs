@@ -16,6 +16,7 @@ from src.optimization.mrp.marginal_reward import (
     joint_gross_world,
     joint_gross_worlds,
     portfolio_reward,
+    _precompute_field_ranks_numpy,
     precompute_field_ranks,
 )
 from tests.bt_core import grade_pick, grade_pool, grade_portfolio
@@ -183,6 +184,47 @@ def test_precompute_rank_cap_is_lossless_below_the_cap():
     paying = full < 40
     np.testing.assert_array_equal(full[paying], capped[paying])
     assert (capped[~paying] == 40).all()
+
+
+@pytest.mark.parametrize("seed", range(4))
+def test_parallel_field_ranks_are_bitwise_identical_to_the_numpy_reference(seed):
+    """The parallel kernel is a SPEED change, not a modelling one.
+
+    `precompute_field_ranks` was a pure-NumPy loop over worlds running on one
+    core, measured at 225s of a 544s per-contest run. It is now a
+    `parallel=True` Numba kernel. The whole case for that rewrite is that no
+    lineup's rank moves, so the pre-rewrite implementation is kept as
+    `_precompute_field_ranks_numpy` purely so the claim stays testable.
+
+    Scores are drawn as small integers on purpose: continuous floats almost
+    never tie, and the tie band is exactly where the two searches ("right"
+    minus "left") could disagree.
+    """
+    rng = np.random.default_rng(9100 + seed)
+    S, F, M = 29, 71, 53
+    field_sorted = np.sort(
+        rng.integers(100, 112, size=(S, F)).astype(np.float32), axis=1)
+    cand = rng.integers(98, 114, size=(M, S)).astype(np.float32)
+
+    for cap in (None, 1, 17, F, F + 50):
+        fast_a, fast_t = precompute_field_ranks(cand, field_sorted, rank_cap=cap)
+        ref_a, ref_t = _precompute_field_ranks_numpy(
+            cand, field_sorted, chunk=7, rank_cap=cap)
+        np.testing.assert_array_equal(fast_a, ref_a, err_msg=f"n_above, cap={cap}")
+        np.testing.assert_array_equal(fast_t, ref_t, err_msg=f"f_ties, cap={cap}")
+        assert fast_a.dtype == np.uint16 and fast_t.dtype == np.uint8
+
+
+def test_field_ranks_saturate_rather_than_wrap_on_a_huge_tie_band():
+    """f_ties is uint8; a field where every entry ties must clamp, not wrap."""
+    S, F, M = 3, 400, 5
+    field_sorted = np.full((S, F), 120.0, dtype=np.float32)
+    cand = np.full((M, S), 120.0, dtype=np.float32)
+
+    _, f_ties = precompute_field_ranks(cand, field_sorted)
+    ref = _precompute_field_ranks_numpy(cand, field_sorted)[1]
+    assert (f_ties == 255).all(), "must saturate at the uint8 cap"
+    np.testing.assert_array_equal(f_ties, ref)
 
 
 def test_tier_form_equals_rank_lookup_on_every_real_payout_table():

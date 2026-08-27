@@ -40,13 +40,20 @@ export interface PortfolioConfig {
 
 // External-pool EV currency: Saber's per-contest ROI, our own projected
 // score minus ownership scaled by implied field size, or simulated P(win).
-export type ExternalEvType = 'roi' | 'prj_own' | 'p_win' | 'proj_top' | 'self_play' | 'topn_coverage' | 'marginal_reward'
+export type ExternalEvType = 'roi' | 'prj_own' | 'p_win' | 'proj_top' | 'self_play' | 'topn_coverage' | 'marginal_reward' | 'per_contest'
 
 export interface GppConfig {
   selector_mode?: string
   contest_structure?: string
   contest_field_size?: number
   dr_shortlist?: number
+  per_contest_shortlist?: number
+  per_contest_field_samples?: number
+  per_contest_disjoint?: boolean
+  per_contest_rank_sims?: number
+  per_contest_cand_per_entry?: number
+  per_contest_shortlist_strata?: number
+  per_contest_cand_chunk?: number
   n_candidates: number
   n_field_lineups: number
   n_field_samples: number
@@ -226,6 +233,14 @@ export interface LineupResult {
   entry_fee?: string | null
   contest_name?: string | null
   entry_sort_order?: number | null
+  // Present only when per-contest selection ran: this lineup was chosen
+  // against THIS contest's ladder and field, not a slate-wide reference one.
+  // entry_sort_order is then the contest's fill rank, so sorting by it groups
+  // the portfolio by contest.
+  contest_field_size?: number | null
+  contest_top_prize?: number | null
+  contest_table?: string | null
+  contest_approximate?: boolean | null
   /** True when this lineup came from a GENERATED source (marginal reward's
    *  line-2 frontier) rather than the imported SaberSim pool. */
   from_generated?: boolean | null
@@ -299,6 +314,12 @@ export type SSEStage =
   | 'gpp_hybrid_select_progress'
   | 'gpp_det_risk_start'
   | 'gpp_det_select_progress'
+  | 'gpp_per_contest_start'
+  | 'gpp_contest_field_progress'
+  | 'gpp_contest_select'
+  | 'gpp_contest_done'
+  | 'gpp_per_contest_done'
+  | 'gpp_payout_fallback'
   | 'gpp_holdout'
   | 'self_play_pool_start'
   | 'self_play_pool_done'
@@ -1025,6 +1046,9 @@ export interface MrpFrontierDoneEvent extends SSEEvent {
   n_generated: number | null
   n_kept: number | null
   n_dropped_duplicate: number | null
+  /** Pool size BEFORE augmentation, so the log can show what the pool grew
+   *  from. Named for the real (imported or sampled) lineups it counts. */
+  n_real?: number | null
   lambda_min: number | null
   lambda_max: number | null
   n_lambdas_represented: number | null

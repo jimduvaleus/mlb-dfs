@@ -26,6 +26,7 @@ want net dollars subtract `fee * k` at the end.
 from __future__ import annotations
 
 import numpy as np
+from numba import njit, prange
 
 # Ties with the field are ~measure-zero on continuous simulated scores but do
 # occur through float32 collisions. They are counted exactly, saturating at
@@ -145,6 +146,63 @@ def portfolio_reward(
     return float(np.nansum(per_entry, axis=0).mean())
 
 
+@njit(parallel=True, cache=True)
+def _field_ranks_kernel(cand_scores, field_sorted, cap, ftie_cap, n_above, f_ties):
+    """Per-world binary search over the sorted field, parallel over WORLDS.
+
+    Replaces a pure-NumPy double loop that ran on one core and measured 225s of
+    a 544s per-contest run -- 41% of the whole pipeline, and the largest single
+    line item in it. The payout kernel next door has been `parallel=True` all
+    along; this one simply never got the same treatment.
+
+    OUTPUT IS BITWISE-IDENTICAL to `_precompute_field_ranks_numpy` for finite
+    scores, and a test asserts it: the two searches below reproduce
+    `np.searchsorted`'s "right" (count of field entries <= v) and "left" (count
+    strictly < v) exactly, and the world axis is a pure independent reduction,
+    so nothing about the parallelism can reorder a result. This is a speed
+    change and NOT a modelling one -- no lineup's rank moves.
+
+    NaN is the one exception, and it cannot arise here: a lineup score is a sum
+    of ten finite simulated player scores. Were one to appear, NumPy sorts NaN
+    last and would call it the BEST rank (n_above = 0); the comparisons below
+    make every branch false and call it the worst (n_above = F). Both are
+    garbage; neither is worth a branch in the inner loop to preserve.
+
+    WORLDS, NOT CANDIDATES, is the parallel axis. `field_sorted[s]` is the array
+    being searched -- 71 KB at F=17,835, so it stays resident in L2 across all M
+    candidates of that world, and the ~28 probes per candidate hit cache.
+    Splitting over candidates instead would stream a fresh 71 KB row per
+    iteration and lose exactly that.
+    """
+    M, S = cand_scores.shape
+    F = field_sorted.shape[1]
+    for s in prange(S):
+        for i in range(M):
+            v = cand_scores[i, s]
+            # right: how many field entries are <= v  (searchsorted "right")
+            lo, hi = 0, F
+            while lo < hi:
+                mid = (lo + hi) >> 1
+                if field_sorted[s, mid] <= v:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            right = lo
+            # left: how many are strictly < v  (searchsorted "left"). Bounded
+            # above by `right`, since the two differ only over the tie band.
+            lo2, hi2 = 0, right
+            while lo2 < hi2:
+                mid = (lo2 + hi2) >> 1
+                if field_sorted[s, mid] < v:
+                    lo2 = mid + 1
+                else:
+                    hi2 = mid
+            above = F - right
+            n_above[i, s] = above if above < cap else cap
+            ties = right - lo2
+            f_ties[i, s] = ties if ties < ftie_cap else ftie_cap
+
+
 def precompute_field_ranks(
     cand_scores: np.ndarray,
     field_sorted: np.ndarray,
@@ -183,6 +241,35 @@ def precompute_field_ranks(
     cap = int(rank_cap) if rank_cap is not None else F
     cap = max(0, min(cap, np.iinfo(np.uint16).max))
 
+    n_above = np.empty((M, S), dtype=np.uint16)
+    f_ties = np.empty((M, S), dtype=np.uint8)
+    _field_ranks_kernel(
+        np.ascontiguousarray(cand_scores, dtype=np.float32),
+        np.ascontiguousarray(field_sorted, dtype=np.float32),
+        cap, _FTIE_CAP, n_above, f_ties,
+    )
+    return n_above, f_ties
+
+
+def _precompute_field_ranks_numpy(
+    cand_scores: np.ndarray,
+    field_sorted: np.ndarray,
+    chunk: int = 512,
+    rank_cap: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Reference implementation of `precompute_field_ranks`, kept for testing.
+
+    This was the production path until the loop was measured at 225s of a 544s
+    per-contest run -- 41% of the whole pipeline, on one core of sixteen. It is
+    retained because "the parallel kernel returns exactly this" is the only
+    claim worth making about the rewrite, and the only way to keep asserting it
+    is to have both. See tests/test_mrp_marginal_reward.py.
+    """
+    cand_scores = np.asarray(cand_scores)
+    M, S = cand_scores.shape
+    F = field_sorted.shape[1]
+    cap = int(rank_cap) if rank_cap is not None else F
+    cap = max(0, min(cap, np.iinfo(np.uint16).max))
     n_above = np.empty((M, S), dtype=np.uint16)
     f_ties = np.empty((M, S), dtype=np.uint8)
     for s0 in range(0, S, chunk):

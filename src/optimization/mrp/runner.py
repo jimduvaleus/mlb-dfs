@@ -251,13 +251,76 @@ def _floor_keep_indices(
     }
 
 
+@dataclass
+class FrontierContest:
+    """One contest as the line-2 generator needs to see it.
+
+    The frontier only ever asks a contest three things: how big is the field
+    (which order statistics to read), what does the ladder pay (the tier
+    weights), and how much of our money is on it (the sigma_dG blend weight).
+    Normalising to that lets the same generator be driven from an MRP
+    `ContestGroup` or from a `multi_contest.ContestSlot` without either path
+    learning about the other.
+
+    `payout_arr` is the pre-resolved ladder when the caller already has one.
+    `multi_contest.resolve_contest_slots` does, and its resolution is the one
+    to trust: it matches the size variant on the ADVERTISED prize pool in the
+    contest name, where `nearest_payout_structure`'s entry-count match is wrong
+    by the rake (it picked the wrong variant for 5 of 6 contests on a real
+    entries file). Leaving it None falls back to the name lookup, which is all
+    an MRP `ContestGroup` can offer.
+    """
+
+    contest_id: str
+    n_entries: int
+    field_size: int
+    payout_arr: Optional[np.ndarray] = None
+    contest_name: str = ""
+
+    def ladder(self, f_size: int) -> np.ndarray:
+        """Payout array for a field clipped to what the pool can supply."""
+        if self.payout_arr is not None:
+            return np.asarray(self.payout_arr, dtype=np.float64)
+        structure, _approx = nearest_payout_structure(
+            self.contest_name, n_entries=f_size,
+        )
+        return payout_table_to_array(structure)
+
+
+def frontier_contests_from_groups(groups: list) -> list[FrontierContest]:
+    """MRP `ContestGroup`s -> `FrontierContest`s (ladder resolved by name)."""
+    return [
+        FrontierContest(
+            contest_id=g.contest_id,
+            n_entries=len(g.entries),
+            field_size=int(implied_field_size(g)),
+            contest_name=g.contest_name,
+        )
+        for g in groups
+    ]
+
+
+def frontier_contests_from_slots(slots: list) -> list[FrontierContest]:
+    """`multi_contest.ContestSlot`s -> `FrontierContest`s (ladder pre-resolved)."""
+    return [
+        FrontierContest(
+            contest_id=sl.contest_id,
+            n_entries=int(sl.n_entries),
+            field_size=int(sl.field_size),
+            payout_arr=np.asarray(sl.payout_arr, dtype=np.float64),
+            contest_name=sl.contest_name,
+        )
+        for sl in slots
+    ]
+
+
 def _frontier_augment(
     pool,
     players_df,
     sim_results,
     sim_matrix,
     field_pool_scores,
-    groups: list,
+    contests: list,
     cfg: "MRPConfig",
     floor_scores: Optional[np.ndarray],
     rng,
@@ -300,7 +363,7 @@ def _frontier_augment(
     n_real = len(pool.lineups)
     if "eligible_positions" not in getattr(players_df, "columns", []):
         return pool, 0, {"skipped": "players_df has no eligible_positions"}, floor_scores
-    if not groups:
+    if not contests:
         return pool, 0, {"skipped": "no contests"}, floor_scores
 
     F_pool = field_pool_scores.shape[1]
@@ -323,10 +386,9 @@ def _frontier_augment(
     # per-contest agreement with the blend so a slate where it does NOT hold
     # is visible rather than silent.
     thr_parts, meta, specs = [], [], []
-    for g in groups:
-        f_size = int(np.clip(int(implied_field_size(g)) or F_pool, 1, F_pool))
-        structure, _approx = nearest_payout_structure(g.contest_name, n_entries=f_size)
-        payout_arr = payout_table_to_array(structure)
+    for c in contests:
+        f_size = int(np.clip(int(c.field_size) or F_pool, 1, F_pool))
+        payout_arr = c.ladder(f_size)
         ranks = tier_boundary_ranks(payout_arr)
         if ranks.size == 0:
             continue
@@ -340,8 +402,8 @@ def _frontier_augment(
         # sigma_dG and the lambda* search instead of being rebuilt.
         amounts = payout_arr[np.clip(ranks - 1, 0, len(payout_arr) - 1)]
         steps_c = amounts - np.concatenate((amounts[1:], [0.0]))
-        specs.append((g.contest_id, thr_c, steps_c, len(g.entries)))
-        meta.append((payout_arr, ranks, f_size, len(g.entries)))
+        specs.append((c.contest_id, thr_c, steps_c, c.n_entries))
+        meta.append((payout_arr, ranks, f_size, c.n_entries))
         del field_sorted
     if not thr_parts:
         return pool, 0, {"skipped": "no contest has a paying payout table"}, floor_scores
@@ -573,7 +635,8 @@ def allocate_marginal_reward(
     if cfg.frontier_enabled:
         pool, n_frontier, frontier_diag, floor_scores = _frontier_augment(
             pool, players_df, sim_results, sim_matrix, field_pool_scores,
-            groups, cfg, floor_scores, rng, progress_cb, stop_check,
+            frontier_contests_from_groups(groups), cfg, floor_scores, rng,
+            progress_cb, stop_check,
         )
     del sim_matrix
 

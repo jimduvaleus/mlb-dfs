@@ -125,6 +125,113 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
     }
   }
 
+  // The line-2 frontier generator is shared by the two per-contest shapes:
+  // MARGINAL REWARD merges its lineups into one global greedy, PER-CONTEST
+  // merges them into the pool each contest picks its own slice from. Both
+  // read the same `marginal_reward:` keys, so the controls are defined once
+  // and rendered under either mode rather than duplicated and left to drift.
+  const frontierControls = (
+    <>
+            <FieldRow label="Generate along the mean-variance frontier">
+              <input type="checkbox"
+                checked={draft.marginal_reward?.frontier_enabled ?? false}
+                onChange={e => set('marginal_reward', 'frontier_enabled', e.target.checked)}
+                disabled={disabled} />
+            </FieldRow>
+            <p className="field-hint">
+              Haugh &amp; Singal's line 2 — sweep <code>w'μ + λ(w'Σw − 2w'σ_dG)</code> and
+              add the results to the candidate pool. The λ-term is the variance of your
+              margin over the payout cutoff, so the sweep runs from the plain projection
+              lineup out to the highest-variance one. Marginal reward cannot select a
+              lineup that is not in the pool, and the SaberSim pool measured as not
+              spanning this region on 9 of 9 slates. Costs CP-SAT solve time and changes
+              the pool, so it is off by default.
+            </p>
+            {draft.marginal_reward?.frontier_enabled && (
+              <>
+                <FieldRow label="λ search grid size">
+                  <input type="number" step={1} min={2} max={40}
+                    value={draft.marginal_reward?.frontier_n_lambdas ?? 6}
+                    onChange={e => set('marginal_reward', 'frontier_n_lambdas', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Target generated lineups (total)">
+                  <input type="number" step={500} min={500} max={20000}
+                    value={draft.marginal_reward?.frontier_target_lineups ?? 4000}
+                    onChange={e => set('marginal_reward', 'frontier_target_lineups', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Min lineups per team">
+                  <input type="number" step={1} min={1} max={50}
+                    value={draft.marginal_reward?.frontier_min_per_team ?? 4}
+                    onChange={e => set('marginal_reward', 'frontier_min_per_team', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Candidates sampled">
+                  <input type="number" step={5000} min={5000} max={200000}
+                    value={draft.marginal_reward?.frontier_sample_n ?? 30000}
+                    onChange={e => set('marginal_reward', 'frontier_sample_n', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Exact solver anchors (0 = none)">
+                  <input type="number" step={1} min={0} max={12}
+                    value={draft.marginal_reward?.frontier_n_anchors ?? 2}
+                    onChange={e => set('marginal_reward', 'frontier_n_anchors', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Mutation generations">
+                  <input type="number" step={1} min={0} max={12}
+                    value={draft.marginal_reward?.frontier_n_generations ?? 5}
+                    onChange={e => set('marginal_reward', 'frontier_n_generations', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Mutants per parent">
+                  <input type="number" step={1} min={1} max={40}
+                    value={draft.marginal_reward?.frontier_mutants_per_parent ?? 6}
+                    onChange={e => set('marginal_reward', 'frontier_mutants_per_parent', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <FieldRow label="Generated lineup salary floor">
+                  <input type="number" step={100} min={0} max={50000}
+                    value={draft.marginal_reward?.frontier_salary_floor ?? 47500}
+                    onChange={e => set('marginal_reward', 'frontier_salary_floor', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <p className="field-hint">
+                  Set this to the salary floor SaberSim was given, so generated lineups
+                  sit in the same salary regime as the external pool they're merged into
+                  and compete with. It is deliberately separate from the optimizer's own
+                  salary floor, which is a holdover and higher. 0 disables it — but with
+                  no floor the sampler builds lineups leaving thousands unspent, a shape
+                  no other stage of the funnel produces.
+                </p>
+                <FieldRow label="Solver timeout per lineup (s)">
+                  <input type="number" step="any" min={0.5}
+                    value={draft.marginal_reward?.frontier_solver_timeout_s ?? 8}
+                    onChange={e => set('marginal_reward', 'frontier_solver_timeout_s', Number(e.target.value))}
+                    disabled={disabled} />
+                </FieldRow>
+                <p className="field-hint">
+                  Candidates are sampled from the team-round-robin generator and ranked
+                  by the exact objective. λ is then chosen <strong>per contest</strong> by
+                  the paper's line 4 — the λ maximising expected top-heavy payout against
+                  that contest's own simulated field and payout table. Small fields come
+                  out with higher-projection, less contrarian builds and large fields with
+                  more extreme ones, because that is what the payout maths says rather
+                  than anything hand-tuned. The grid size below is only the search range
+                  line 4 picks from. <strong>Lineups per team</strong> bounds any one
+                  team's share: near its optimum the objective barely separates stacks, so
+                  without a cap the pool collapses onto one.
+                  Frontier lineups skip the ceiling floor and the 9/10 near-duplicate
+                  cull (mutants differ from their parent by one player, which is what
+                  that cull targets), so they still have to earn a slot on marginal
+                  dollars alone.
+                </p>
+              </>
+            )}
+    </>
+  )
+
   return (
     <form className="config-form" onSubmit={handleSubmit}>
       <div className="config-form-footer">
@@ -271,27 +378,62 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 </>
               )
             })()}
-            <FieldRow label="Contest (payout table)">
-              <input type="text" placeholder="e.g. Bat Flip — blank = generic $4 GPP curve"
-                value={draft.gpp.contest_structure ?? ''}
-                onChange={e => setGpp('contest_structure', e.target.value)}
+            <FieldRow label="Per-contest shortlist">
+              <input type="number" step={100} min={0}
+                value={draft.gpp.per_contest_shortlist ?? 8000}
+                onChange={e => setGpp('per_contest_shortlist', Number(e.target.value))}
                 disabled={disabled} />
             </FieldRow>
-            <FieldRow label="Contest field size">
-              <input type="number" step={1} min={0}
-                value={draft.gpp.contest_field_size ?? 0}
-                onChange={e => setGpp('contest_field_size', Number(e.target.value))}
+            <FieldRow label="Per-contest candidates per entry (0 = no cap)">
+              <input type="number" step={50} min={0}
+                value={draft.gpp.per_contest_cand_per_entry ?? 400}
+                onChange={e => setGpp('per_contest_cand_per_entry', Number(e.target.value))}
                 disabled={disabled} />
             </FieldRow>
             <p className="field-hint">
-              The ladder and field size are the only contest-specific inputs the
-              selectors see, and they respond strongly: a small contest is won by
-              beating a few hundred people, so uniqueness stops being worth paying
-              for and the build comes back chalkier on its own. Leave blank to keep
-              the legacy fixed 5,001-entry curve. Field size 0 takes it from the
-              matched table. An unrecognised contest falls back to the nearest-size
-              table and asks before continuing.
+              Caps how many candidates each contest chooses from, as a rate per
+              purchased entry (floored at 2,000). A 2-entry contest otherwise pays
+              the same per-candidate cost as a 60-entry one — measured at 22% of the
+              selection stage to pick six lineups. Safe there because dR's first pick
+              is exactly the highest-EV lineup and each later one subtracts a demotion
+              term the earlier picks create, so at two entries there is almost nothing
+              to price. At 400 this is a no-op above roughly 20 entries, which is
+              deliberate: with many slots to fill that demotion term is doing real work
+              on the contrarian tail an EV ranking cuts first. Unlike the other speed
+              knobs, this changes which lineups get picked.
             </p>
+            <FieldRow label="Per-contest field samples">
+              <input type="number" step={1} min={1}
+                value={draft.gpp.per_contest_field_samples ?? 1}
+                onChange={e => setGpp('per_contest_field_samples', Number(e.target.value))}
+                disabled={disabled} />
+            </FieldRow>
+            <FieldRow label="Disjoint contest slices">
+              <input type="checkbox"
+                checked={draft.gpp.per_contest_disjoint ?? true}
+                onChange={e => setGpp('per_contest_disjoint', e.target.checked)}
+                disabled={disabled} />
+            </FieldRow>
+            <p className="field-hint">
+              When the slate has entry files, each contest in them selects its own
+              slice against its own ladder and field size, largest top prize first,
+              instead of one portfolio being spread across all of them. The contest
+              above still sets the reference ladder the funnel (EV floor, fresh
+              re-score) is denominated in. Shortlist is how many survivors the
+              per-contest selectors see — everything downstream is shortlist × sims.
+              Field samples multiply both the field build and a per-contest sort, so
+              raise it only to damp field noise when validating. Disjoint slices stop
+              the same lineup being entered in two contests, which concentrates risk
+              without diversifying it.
+            </p>
+            <details className="config-collapse">
+              <summary>
+                External candidate pool (SaberSim)
+                <span className="config-collapse-sub">
+                  {' '}— only applies when the run dialog's external-pool box is ticked;
+                  currently <code>{draft.gpp.external_pool_ev_type ?? 'roi'}</code>
+                </span>
+              </summary>
             <FieldRow label="External pool EV type">
               <select value={draft.gpp.external_pool_ev_type ?? 'roi'}
                 onChange={e => setGpp('external_pool_ev_type', e.target.value)} disabled={disabled}>
@@ -302,6 +444,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 <option value="self_play">SELF-PLAY</option>
                 <option value="topn_coverage">TOP-N COVERAGE</option>
                 <option value="marginal_reward">MARGINAL REWARD</option>
+                <option value="per_contest">PER-CONTEST (kelly/dR/E[max])</option>
               </select>
             </FieldRow>
             {draft.gpp.external_pool_ev_type === 'marginal_reward' && (
@@ -366,103 +509,32 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                   them), so this caps the world axis rather than letting n_sims multiply by
                   the contest count.
                 </p>
-                <FieldRow label="Generate along the mean-variance frontier">
-                  <input type="checkbox"
-                    checked={draft.marginal_reward?.frontier_enabled ?? false}
-                    onChange={e => set('marginal_reward', 'frontier_enabled', e.target.checked)}
-                    disabled={disabled} />
-                </FieldRow>
-                <p className="field-hint">
-                  Haugh &amp; Singal's line 2 — sweep <code>w'μ + λ(w'Σw − 2w'σ_dG)</code> and
-                  add the results to the candidate pool. The λ-term is the variance of your
-                  margin over the payout cutoff, so the sweep runs from the plain projection
-                  lineup out to the highest-variance one. Marginal reward cannot select a
-                  lineup that is not in the pool, and the SaberSim pool measured as not
-                  spanning this region on 9 of 9 slates. Costs CP-SAT solve time and changes
-                  the pool, so it is off by default.
-                </p>
-                {draft.marginal_reward?.frontier_enabled && (
-                  <>
-                    <FieldRow label="λ search grid size">
-                      <input type="number" step={1} min={2} max={40}
-                        value={draft.marginal_reward?.frontier_n_lambdas ?? 6}
-                        onChange={e => set('marginal_reward', 'frontier_n_lambdas', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <FieldRow label="Target generated lineups (total)">
-                      <input type="number" step={500} min={500} max={20000}
-                        value={draft.marginal_reward?.frontier_target_lineups ?? 4000}
-                        onChange={e => set('marginal_reward', 'frontier_target_lineups', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <FieldRow label="Min lineups per team">
-                      <input type="number" step={1} min={1} max={50}
-                        value={draft.marginal_reward?.frontier_min_per_team ?? 4}
-                        onChange={e => set('marginal_reward', 'frontier_min_per_team', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <FieldRow label="Candidates sampled">
-                      <input type="number" step={5000} min={5000} max={200000}
-                        value={draft.marginal_reward?.frontier_sample_n ?? 30000}
-                        onChange={e => set('marginal_reward', 'frontier_sample_n', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <FieldRow label="Exact solver anchors (0 = none)">
-                      <input type="number" step={1} min={0} max={12}
-                        value={draft.marginal_reward?.frontier_n_anchors ?? 2}
-                        onChange={e => set('marginal_reward', 'frontier_n_anchors', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <FieldRow label="Mutation generations">
-                      <input type="number" step={1} min={0} max={12}
-                        value={draft.marginal_reward?.frontier_n_generations ?? 5}
-                        onChange={e => set('marginal_reward', 'frontier_n_generations', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <FieldRow label="Mutants per parent">
-                      <input type="number" step={1} min={1} max={40}
-                        value={draft.marginal_reward?.frontier_mutants_per_parent ?? 6}
-                        onChange={e => set('marginal_reward', 'frontier_mutants_per_parent', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <FieldRow label="Generated lineup salary floor">
-                      <input type="number" step={100} min={0} max={50000}
-                        value={draft.marginal_reward?.frontier_salary_floor ?? 47500}
-                        onChange={e => set('marginal_reward', 'frontier_salary_floor', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <p className="field-hint">
-                      Set this to the salary floor SaberSim was given, so generated lineups
-                      sit in the same salary regime as the external pool they're merged into
-                      and compete with. It is deliberately separate from the optimizer's own
-                      salary floor, which is a holdover and higher. 0 disables it — but with
-                      no floor the sampler builds lineups leaving thousands unspent, a shape
-                      no other stage of the funnel produces.
-                    </p>
-                    <FieldRow label="Solver timeout per lineup (s)">
-                      <input type="number" step="any" min={0.5}
-                        value={draft.marginal_reward?.frontier_solver_timeout_s ?? 8}
-                        onChange={e => set('marginal_reward', 'frontier_solver_timeout_s', Number(e.target.value))}
-                        disabled={disabled} />
-                    </FieldRow>
-                    <p className="field-hint">
-                      Candidates are sampled from the team-round-robin generator and ranked
-                      by the exact objective. λ is then chosen <strong>per contest</strong> by
-                      the paper's line 4 — the λ maximising expected top-heavy payout against
-                      that contest's own simulated field and payout table. Small fields come
-                      out with higher-projection, less contrarian builds and large fields with
-                      more extreme ones, because that is what the payout maths says rather
-                      than anything hand-tuned. The grid size below is only the search range
-                      line 4 picks from. <strong>Lineups per team</strong> bounds any one
-                      team's share: near its optimum the objective barely separates stacks, so
-                      without a cap the pool collapses onto one.
-                      Frontier lineups skip the ceiling floor and the 9/10 near-duplicate
-                      cull (mutants differ from their parent by one player, which is what
-                      that cull targets), so they still have to earn a slot on marginal
-                      dollars alone.
-                    </p>
-                  </>
-                )}
+                {frontierControls}
+              </>
+            )}
+            {draft.gpp.external_pool_ev_type === 'per_contest' && (
+              <>
+              <p className="field-hint">
+                Runs the imported pool through the same per-contest selection the
+                generated pool uses: each contest on the entries files picks its own
+                slice against its own payout ladder and field size, largest top prize
+                first, with no lineup entered twice. The objectives come from
+                <strong> Selection arms</strong> above (Kelly / dR / E[max] / coverage),
+                and each arm builds a full portfolio you can compare before making one
+                active. It differs from MARGINAL REWARD in shape rather than objective —
+                that one runs a single global greedy over (lineup, contest) pairs, this
+                fills one contest at a time. Shortlist size and field draws per contest
+                are the <code>per_contest_*</code> keys in config.yaml.
+              </p>
+              <p className="field-hint">
+                An imported pool is a menu somebody else wrote, and the arms can only
+                pick what is on it — a real run filled 110 slots out of 4,219 SaberSim
+                lineups, a 2.6% cut where the generated path cuts 0.4%. Turning the
+                frontier on below adds generated candidates to that pool rather than
+                replacing any of it: your own lineups are all still there and still
+                eligible, they just stop being the only thing on offer.
+              </p>
+              {frontierControls}
               </>
             )}
             {draft.gpp.external_pool_ev_type === 'proj_top' && (
@@ -663,6 +735,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 </FieldRow>
               </>
             )}
+            </details>
           </section>
         </div>
       </div>

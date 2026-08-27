@@ -197,6 +197,25 @@ def _measure_sim_ceiling(
         )
 
 
+# Below this much reduction, the per-contest shortlist ranking pass is not
+# worth running. Its cost is dominated by generating a field at the largest
+# contest's size (measured 08/27: 39s for a 17,835-lineup field), which is
+# FIXED regardless of how much the union then cuts -- so on a pool that is
+# already near the cap it buys an arbitrary trim of a few percent for the full
+# price. Seen on a real run: a 4,219-lineup SaberSim pool (already 9/10-overlap
+# deduped, so there is no funnel upstream of it) paid 39s + 5s of ranking to
+# drop 219 lineups. Taking the whole pool instead costs ~5% more memory in the
+# per-contest payout matrix and nothing else.
+_PC_RANK_MIN_CUT = 0.25
+
+# Floor under the per-contest candidate cap (see `_per_contest_sweep._narrow`).
+# A single-entry contest still gets a real menu: the cap exists to stop a
+# 2-entry contest paying for an 8,000-candidate dR state, not to reduce it to a
+# top-N-by-EV lookup. 2,000 is ~25% of a typical augmented pool and roughly the
+# shortlist the whole slate ran on before the frontier was wired in.
+_PC_CAND_CAP_FLOOR = 2_000
+
+
 class PipelineRunner:
     """
     Runs the full DFS portfolio pipeline with progress callbacks.
@@ -653,6 +672,11 @@ class PipelineRunner:
             })
 
         _portfolio_sweep_raw: list = []  # populated only by det_ev; safe default for other objectives
+        # Per-contest selection state; empty on every path that does not
+        # reach GPP selection (other objectives, an early stop). `_pc_slots` is
+        # re-bound from the entries file inside the GPP branch.
+        _pc_slots: list = []
+        _pc_diag: dict = {}
 
         # ----------------------------------------------------------------
         # GPP portfolio: rapid candidate pool + contest simulation +
@@ -1182,10 +1206,80 @@ class PipelineRunner:
             # worth paying for. Pinning a single 5,001-entry reference curve
             # throws all of that away and silently prices every contest as if
             # it were a mid-size $4 GPP.
+            # THE ENTRIES FILE ALREADY KNOWS ALL OF THIS. Contest name, entry
+            # fee, advertised prize pool and implied field size are on every
+            # row of a DK entries file, and `resolve_contest_slots` turns them
+            # into exact ladders -- verified against a real six-contest file,
+            # all six exact, no fallback. Asking the user to retype one of them
+            # into `gpp.contest_structure` is asking them to re-enter data we
+            # hold, in a free-text box that fails in quiet ways ("Four Seamer"
+            # without the hyphen matches nothing and lands on a 235-entry
+            # table). So the config keys are now an OVERRIDE, used when set and
+            # when there is no entries file to read (replay, ad-hoc runs).
+            #
+            # Resolved HERE rather than at Phase 3 so the approximate-ladder
+            # confirmation gate fires before generation and scoring, not after
+            # forty minutes of work.
+            _pc_slots = []
+            if all_file_entries:
+                from src.optimization.multi_contest import (
+                    describe_slots as _describe_slots,
+                    resolve_contest_slots as _resolve_slots,
+                )
+                try:
+                    _pc_slots = _resolve_slots(all_file_entries)
+                except Exception as _pc_e:
+                    logger.warning(
+                        "Per-contest resolution failed (%s); falling back to "
+                        "the single-ladder path.", _pc_e,
+                    )
+                    _pc_slots = []
+            if _pc_slots and any(int(sl.field_size) <= 0 for sl in _pc_slots):
+                # Field size comes from the resolved table's total_entries and
+                # is what the whole per-contest path is denominated in; a zero
+                # would size the shared field pool to nothing.
+                logger.warning(
+                    "Per-contest selection disabled: %s resolved to a payout "
+                    "table with no entry count.",
+                    ", ".join(repr(sl.contest_name) for sl in _pc_slots
+                              if int(sl.field_size) <= 0),
+                )
+                _pc_slots = []
+            if _pc_slots:
+                logger.info("Contests read from the entries file(s):\n%s",
+                            _describe_slots(_pc_slots))
+
             _contest_name = str(gpp_cfg.get("contest_structure", "") or "").strip()
             _contest_entries = int(gpp_cfg.get("contest_field_size", 0) or 0)
             _gpp_approx = False
-            if _contest_name:
+            _pc_reference = None
+            if _pc_slots and not _contest_name:
+                # WHICH CONTEST ANCHORS THE FUNNEL. The funnel needs one field
+                # size and one ladder to score the whole pool against; only
+                # selection is per contest. Pick the contest carrying the most
+                # MONEY (entries x fee), because that is where being wrong
+                # costs the most, and because it lands near the $4/5,001
+                # reference every threshold downstream (ev_floor, tail_ev_min_
+                # gross) was calibrated against -- an alternative rule like
+                # "largest field" would anchor on a $1 contest where the $0.20
+                # ev_floor is a 20% ROI hurdle and would gut the pool.
+                #
+                # This choice biases WHAT SURVIVES, not just how much: a large
+                # -field anchor thins the chalky material the small contests
+                # want, a small-field one thins the contrarian tail the large
+                # ones want. That is handled where the shortlist is actually
+                # formed (see the stratified cut at Phase 3), not here.
+                _pc_reference = PipelineRunner._funnel_reference(_pc_slots)
+                _gpp_structure = _pc_reference.structure
+                _gpp_approx = bool(_pc_reference.is_approximate)
+                logger.info(
+                    "Funnel reference derived from entries file: %s "
+                    "(%d entries x $%.2f = $%.2f at risk, field %d)",
+                    _pc_reference.contest_name, _pc_reference.n_entries,
+                    _pc_reference.entry_fee, _pc_reference.dollars_at_risk,
+                    _pc_reference.field_size,
+                )
+            elif _contest_name:
                 _gpp_structure, _gpp_approx = nearest_payout_structure(
                     _contest_name, n_entries=(_contest_entries or None),
                 )
@@ -1206,44 +1300,72 @@ class PipelineRunner:
                 f"{float(_gpp_payout_arr.sum()):,.0f}",
                 "  [APPROXIMATE]" if _gpp_approx else "",
             )
-            if _gpp_approx:
-                # Same hard gate the marginal-reward path uses, and for the same
-                # reason: dR, Kelly and E[max] are all denominated in DOLLARS,
-                # so a borrowed curve does not merely reorder candidates, it
-                # misprices the objective outright.
-                _fb_row = {
-                    "contest_id": _contest_name,
-                    "contest_name": _contest_name,
-                    "k": portfolio_size,
-                    "implied_field_size": n_field,
-                    "table_name": str(_gpp_structure.get("name", "?")),
-                    "table_entries": int(_gpp_structure.get("total_entries", 0)),
-                    "table_entry_fee": float(_gpp_structure.get("entry_fee", 0.0)),
-                    "table_prize_pool": float(_gpp_payout_arr.sum()),
-                    "entry_fee": float(_gpp_structure.get("entry_fee", 0.0)),
-                    "exact": False,
-                }
-                _fb_payload = {
-                    "n_missing": 1, "n_contests": 1, "contests": [_fb_row],
-                    "description": (
+            # Approximate-ladder gate. Every objective downstream is
+            # denominated in DOLLARS, so a borrowed curve does not merely
+            # reorder candidates, it misprices the objective outright. Covers
+            # EVERY contest on the entries file, not just the funnel reference,
+            # and fires here -- before generation and scoring -- rather than
+            # after the pool is built.
+            _approx_slots = [sl for sl in _pc_slots if sl.is_approximate]
+            if _approx_slots or (_gpp_approx and not _pc_slots):
+                if _approx_slots:
+                    _fb_rows = [{
+                        "contest_id": sl.contest_id,
+                        "contest_name": sl.contest_name,
+                        "k": sl.n_entries,
+                        "implied_field_size": sl.field_size,
+                        "table_name": str(sl.structure.get("name", "?")),
+                        "table_entries": int(sl.structure.get("total_entries", 0)),
+                        "table_entry_fee": float(sl.structure.get("entry_fee", 0.0)),
+                        "table_prize_pool": float(sl.prize_pool),
+                        "entry_fee": float(sl.entry_fee),
+                        "exact": False,
+                    } for sl in _approx_slots]
+                    _n_contests = len(_pc_slots)
+                    _desc = (
+                        f"{len(_fb_rows)} of {_n_contests} contests on this "
+                        "entries file have no registered payout table; the "
+                        "nearest captured table will be used for them: "
+                        + ", ".join(
+                            f"{r['contest_name']} (~{r['implied_field_size']:,}) "
+                            f"-> {r['table_name']}" for r in _fb_rows
+                        )
+                    )
+                else:
+                    _fb_rows = [{
+                        "contest_id": _contest_name,
+                        "contest_name": _contest_name,
+                        "k": portfolio_size,
+                        "implied_field_size": n_field,
+                        "table_name": str(_gpp_structure.get("name", "?")),
+                        "table_entries": int(_gpp_structure.get("total_entries", 0)),
+                        "table_entry_fee": float(_gpp_structure.get("entry_fee", 0.0)),
+                        "table_prize_pool": float(_gpp_payout_arr.sum()),
+                        "entry_fee": float(_gpp_structure.get("entry_fee", 0.0)),
+                        "exact": False,
+                    }]
+                    _n_contests = 1
+                    _desc = (
                         f"{_contest_name} (~{n_field:,} entries) has no "
                         f"registered payout table; falling back to "
                         f"{_gpp_structure.get('name', '?')} "
                         f"({int(_gpp_structure.get('total_entries', 0)):,} entries, "
                         f"${float(_gpp_structure.get('entry_fee', 0)):.2f} entry, "
                         f"${float(_gpp_payout_arr.sum()):,.0f} prize pool)."
-                    ),
+                    )
+                _fb_payload = {
+                    "n_missing": len(_fb_rows), "n_contests": _n_contests,
+                    "contests": _fb_rows, "description": _desc,
                 }
-                logger.warning("GPP payout fallback: %s", _fb_payload["description"])
+                logger.warning("GPP payout fallback: %s", _desc)
                 self._cb("gpp_payout_fallback", _fb_payload)
                 if self._await_confirmation is None:
                     raise RuntimeError(
                         "GPP: no registered payout table for "
-                        f"{_contest_name!r}, and this run has no way to ask. "
-                        "Register it in data/payout_structures/ (see "
-                        "PROSPECTIVE_PROTOCOL.md), set gpp.contest_structure to "
-                        "a registered name, or run from the UI to confirm.\n\n"
-                        f"{_fb_payload['description']}"
+                        + ", ".join(repr(r["contest_name"]) for r in _fb_rows)
+                        + ". Register it in data/payout_structures/ (see "
+                        "PROSPECTIVE_PROTOCOL.md) or run from the UI to "
+                        f"confirm.\n\n{_desc}"
                     )
                 if not self._await_confirmation("gpp_payout_fallback", _fb_payload):
                     self._cb("stopped", {"reason": "payout fallback declined"})
@@ -1862,9 +1984,17 @@ class PipelineRunner:
                 # before the det sweep allocates the M×M correlation matrix.
                 # The two are mutually exclusive in practice — dR never builds
                 # the correlation matrix — so this is a swap, not an addition.
+                # PER-CONTEST SELECTION. Contests, ladders and field sizes
+                # were all read from the entries file before generation began
+                # (see the resolution block above, which also ran the
+                # approximate-ladder gate); `_pc_slots` is empty when there is
+                # no entries file, which is what keeps the single-ladder path
+                # alive for `scripts/replay_slate.py`.
+                _pc_picks: dict = {}
+
                 _dr_field_sorted = None
                 _dr_sim_matrix = None
-                if "dr" in _modes:
+                if "dr" in _modes and not _pc_slots:
                     _fsl = getattr(scorer, "_field_sorted_list", None)
                     if _fsl:
                         _dr_field_sorted = np.ascontiguousarray(_fsl[0])
@@ -1930,6 +2060,228 @@ class PipelineRunner:
                     (f" (anchor={_cash_anchor_fraction:.2f})" if _ev_override_vec is not None else ""),
                 )
 
+                _arm_modes = _modes
+                if _pc_slots:
+                    from src.optimization.multi_contest import SharedFieldPool
+                    _t_pc = time.perf_counter()
+                    _pc_need = sum(s.n_entries for s in _pc_slots)
+                    # SHORTLIST. Everything downstream is (shortlist x n_sims):
+                    # the candidate scores, each contest's payout matrix, and
+                    # dR's rank state. The cut is by fresh EV, so it discards
+                    # only what the objectives would rank last anyway, and the
+                    # floor is the entries the file actually needs.
+                    _pc_cap = max(
+                        int(gpp_cfg.get("per_contest_shortlist", 8_000)), _pc_need,
+                    )
+                    # Disjointness is a preference, not a precondition. Failing
+                    # the whole run here would throw away the entire funnel over
+                    # a constraint that exists to reduce correlated risk -- a
+                    # lineup entered twice is worse than one entered once, and
+                    # far better than no portfolio at all.
+                    _pc_disjoint = bool(gpp_cfg.get("per_contest_disjoint", True))
+                    if _pc_disjoint and len(candidates) < _pc_need:
+                        logger.warning(
+                            "Per-contest selection: %d candidates survived the "
+                            "funnel but the entries file needs %d disjoint "
+                            "lineups. Allowing contests to reuse lineups for "
+                            "this run -- raise the pool size or loosen ev_floor.",
+                            len(candidates), _pc_need,
+                        )
+                        _pc_disjoint = False
+                    _pc_ev_all = robust_payout.mean(axis=1)
+                    # SHORTLIST COMPOSITION, not just size. A plain
+                    # top-N-by-mean-EV cut ranks every candidate on the funnel
+                    # reference's ladder alone, and that is a COMPOSITION bias,
+                    # not a threshold: measured on this codebase, the same pool
+                    # yields portfolios ~19 ownership points apart between a
+                    # small and a large field. Cutting the pool on one ladder
+                    # therefore thins whichever quadrant that contest does not
+                    # want -- chalky material if the reference is a big field,
+                    # the contrarian tail if it is a small one -- and the
+                    # contests that differ most from the reference are the ones
+                    # starved. Selection is per contest now, so the shortlist's
+                    # only remaining job is NOT DISCARDING what some contest
+                    # wants.
+                    #
+                    # So stratify by projected ownership and take the best of
+                    # each band. Every band keeps a full quota, which guarantees
+                    # the chalky end survives for a 792-entry Pickoff and the
+                    # contrarian end survives for a 17,835-entry mini-MAX,
+                    # while EV still decides who represents each band. This is
+                    # cheap: candidates here have already cleared the funnel's
+                    # floor twice, and a portfolio draws from roughly 5x more
+                    # material than it needs, so widening the menu costs
+                    # nothing the objectives cannot ignore.
+                    _pc_strata = int(gpp_cfg.get("per_contest_shortlist_strata", 10))
+                    _pc_rank_sims = int(gpp_cfg.get("per_contest_rank_sims", 2_500))
+                    _pc_field_max = max(int(sl.field_size) for sl in _pc_slots)
+                    _pc_k = max(int(gpp_cfg.get("per_contest_field_samples", 1)), 1)
+                    _pc_seed = int(opt_cfg.get("rng_seed") or 42)
+                    if len(candidates) <= _pc_cap / (1.0 - _PC_RANK_MIN_CUT):
+                        # Near the cap already — ranking cannot do meaningful
+                        # compositional work and its cost is fixed. Take the lot.
+                        if len(candidates) > _pc_cap:
+                            logger.info(
+                                "Shortlist: taking all %d candidates (cap %d) — "
+                                "a %.0f%% cut is not worth a ranking pass.",
+                                len(candidates), _pc_cap,
+                                100.0 * (1 - _pc_cap / len(candidates)),
+                            )
+                        _pc_sel = np.arange(len(candidates))
+                    elif _pc_rank_sims > 0:
+                        # Rank the WHOLE pool against every contest's own ladder
+                        # and union the results, so the shortlist carries no
+                        # single ladder's bias at all. Done at reduced world
+                        # resolution — picking a menu is coarse work.
+                        _t_rank = time.perf_counter()
+                        from src.optimization.gpp_portfolio import (
+                            _RANK_FIELD_SEED_OFFSET as _RANK_OFF,
+                        )
+                        _rank_raw = scorer.build_raw_field_pool(
+                            n_lineups=_pc_field_max, n_samples=1,
+                            stop_check=self._stop_check,
+                            seed_offset=_RANK_OFF,
+                            progress_cb=lambda done, total: self._cb(
+                                "gpp_contest_field_progress",
+                                {"n_done": done, "n_total": total,
+                                 "n_field": _pc_field_max, "n_k": 1},
+                            ),
+                        )
+                        _S_full = scorer._sim_matrix.shape[0]
+                        _n_rank = int(min(_pc_rank_sims, _S_full))
+                        _w_idx = np.sort(np.random.default_rng(_pc_seed).choice(
+                            _S_full, size=_n_rank, replace=False,
+                        ))
+                        _sim_rank = np.ascontiguousarray(scorer._sim_matrix[_w_idx])
+                        _cols_all = scorer._build_col_lineups(candidates)
+                        _scores_rank = np.empty(
+                            (len(candidates), _n_rank), dtype=np.float32,
+                        )
+                        for _c0 in range(0, len(candidates), 500):
+                            _c1 = min(_c0 + 500, len(candidates))
+                            _scores_rank[_c0:_c1] = _sim_rank[
+                                :, _cols_all[_c0:_c1]].sum(axis=2).T
+                        del _cols_all
+                        _cs_rank = scorer._cs
+
+                        def _rank_sort_fn(raw, _m=_sim_rank, _cm=scorer._col_map):
+                            return np.ascontiguousarray(np.sort(
+                                _cs_rank.score_field(raw, _m, _cm), axis=1,
+                            ))
+
+                        _pc_sel, _ = self._union_shortlist_by_contest(
+                            _pc_slots, _scores_rank, _rank_raw, _rank_sort_fn,
+                            _pc_cap, seed=_pc_seed,
+                            e_dupes=(np.asarray(_fresh_e_dupes, dtype=np.float64)
+                                     if (_fresh_e_dupes is not None
+                                         and gpp_cfg.get("dupe_penalty", False))
+                                     else None),
+                            dupe_min_gross=float(gpp_cfg.get("dupe_min_gross_payout", 15.0)),
+                            cand_chunk=max(int(gpp_cfg.get("per_contest_cand_chunk", 2_000)), 1),
+                        )
+                        del _scores_rank, _sim_rank, _rank_raw
+                        gc.collect()
+                        logger.info(
+                            "[TIMING] Per-contest shortlist ranking: %.1fs",
+                            time.perf_counter() - _t_rank,
+                        )
+                    else:
+                        _own_map = dict(zip(
+                            sim_players_df["player_id"].astype(int),
+                            field_ownership_vector,
+                        ))
+                        _own_sum = np.array([
+                            sum(float(_own_map.get(int(pid), 0.0)) for pid in lu.player_ids)
+                            for lu in candidates
+                        ], dtype=np.float64)
+                        _pc_sel = PipelineRunner._stratified_shortlist(
+                            _pc_ev_all, _own_sum, _pc_cap, _pc_strata,
+                        )
+                        logger.info(
+                            "Shortlist: %d of %d over %d ownership band(s) "
+                            "(own sum %.1f-%.1f, EV $%.2f-$%.2f)",
+                            len(_pc_sel), len(candidates), max(_pc_strata, 1),
+                            float(_own_sum[_pc_sel].min()), float(_own_sum[_pc_sel].max()),
+                            float(_pc_ev_all[_pc_sel].min()), float(_pc_ev_all[_pc_sel].max()),
+                        )
+                    _pc_shortlist = [candidates[i] for i in _pc_sel]
+                    _pc_dupes = (
+                        np.asarray(_fresh_e_dupes, dtype=np.float64)[_pc_sel]
+                        if _fresh_e_dupes is not None else None
+                    )
+                    _pc_ev_override = (
+                        _ev_override_vec[_pc_sel] if _ev_override_vec is not None else None
+                    )
+                    # (N, S) scores on the shared sim worlds — CONTEST-INDEPENDENT,
+                    # so this is built once and every contest reuses it; only the
+                    # field and the ladder change per contest.
+                    _pc_col = scorer._build_col_lineups(_pc_shortlist)
+                    _pc_S = scorer._sim_matrix.shape[0]
+                    _pc_scores = np.empty((len(_pc_shortlist), _pc_S), dtype=np.float32)
+                    for _c0 in range(0, len(_pc_shortlist), 250):
+                        _c1 = min(_c0 + 250, len(_pc_shortlist))
+                        _pc_scores[_c0:_c1] = scorer._sim_matrix[
+                            :, _pc_col[_c0:_c1]].sum(axis=2).T
+                    del _pc_col
+                    # ONE field pool, sized to the largest contest and
+                    # subsampled down per contest (see SharedFieldPool). Drawn
+                    # separately from the shortlist ranking pass above, on a
+                    # disjoint seed — see _RANK_FIELD_SEED_OFFSET.
+                    logger.info(
+                        "Per-contest selection: %d contests, %d entries, "
+                        "shortlist %d of %d, field pool %d x %d (%.1f GB per "
+                        "sorted field at %d sims)",
+                        len(_pc_slots), _pc_need, len(_pc_shortlist),
+                        len(candidates), _pc_k, _pc_field_max,
+                        _pc_field_max * _pc_S * 4 / 1e9, _pc_S,
+                    )
+                    _pc_raw = scorer.build_raw_field_pool(
+                        n_lineups=_pc_field_max, n_samples=_pc_k,
+                        stop_check=self._stop_check,
+                        # Distinct stage from the first-stage/rescore field
+                        # events so the UI shows a per-contest readout instead
+                        # of holding a stale first-stage label over.
+                        progress_cb=lambda done, total: self._cb(
+                            "gpp_contest_field_progress",
+                            {"n_done": done, "n_total": total,
+                             "n_field": _pc_field_max, "n_k": _pc_k},
+                        ),
+                    )
+                    _pc_pool = SharedFieldPool(
+                        _pc_raw, scorer.sorted_field_from_raw,
+                        seed=int(opt_cfg.get("rng_seed") or 42),
+                    )
+                    _portfolio_sweep_raw, _pc_picks, _pc_diag = self._per_contest_sweep(
+                        slots=_pc_slots,
+                        shortlist=_pc_shortlist,
+                        cand_scores=_pc_scores,
+                        e_dupes=_pc_dupes,
+                        field_pool=_pc_pool,
+                        gpp_cfg=gpp_cfg,
+                        modes=_modes,
+                        multi_arm=_multi_arm,
+                        cash_anchor_fraction=_cash_anchor_fraction,
+                        det_sweep_risks=(_DET_SWEEP_RISKS if "det" in _modes else []),
+                        ev_override=_pc_ev_override,
+                        disjoint=_pc_disjoint,
+                    )
+                    del _pc_scores, _pc_raw, _pc_pool
+                    gc.collect()
+                    logger.info(
+                        "[TIMING] Per-contest selection: %.3fs  RSS=%.0f MB",
+                        time.perf_counter() - _t_pc, _proc_rss_mb(),
+                    )
+                    self._cb("gpp_per_contest_done", {
+                        "n_contests": len(_pc_slots),
+                        "n_entries": _pc_need,
+                        "n_arms": len(_portfolio_sweep_raw),
+                        "shortlist": len(_pc_shortlist),
+                        "elapsed_s": round(time.perf_counter() - _t_pc, 1),
+                    })
+                    # Every arm has been built per contest already; the
+                    # single-ladder arm blocks below must not run again.
+                    _arm_modes = set()
+
                 # Round-10 selector modes. kelly/coverage build the sweep
                 # themselves and skip the det path's M×M correlation matmul;
                 # det (default) keeps today's behavior exactly. "all" runs
@@ -1937,8 +2289,8 @@ class PipelineRunner:
                 # generation + scoring dominate; selection is seconds), with
                 # kelly labeled risk+10 (11-15) and coverage labeled 23 so
                 # the sweep keys and dump's selected_risks stay distinct.
-                _det_sweep_risks = _DET_SWEEP_RISKS if "det" in _modes else []
-                if "kelly" in _modes:
+                _det_sweep_risks = _DET_SWEEP_RISKS if "det" in _arm_modes else []
+                if "kelly" in _arm_modes:
                     from src.optimization.gpp_portfolio import KellyPortfolioSelector
                     _entry_fee = float(getattr(scorer, "_entry_fee", 4.0))
                     # Risk → bankroll: B = fee × size × mult (pre-registered
@@ -1977,7 +2329,7 @@ class PipelineRunner:
                             ),
                         )))
                         del _k_sel
-                if "coverage" in _modes:
+                if "coverage" in _arm_modes:
                     if (
                         _fresh_beat_bits is None
                         or len(_fresh_beat_bits) != len(candidates)
@@ -2022,7 +2374,7 @@ class PipelineRunner:
                         )))
                         del _c_sel
 
-                if "emax" in _modes:
+                if "emax" in _arm_modes:
                     from src.optimization.gpp_portfolio import EMaxPortfolioSelector
                     # Risk is a no-op for E[max] (only the portfolio's BEST
                     # entry per world enters the objective, so there is no
@@ -2055,7 +2407,7 @@ class PipelineRunner:
                     )))
                     del _e_sel
 
-                if "dr" in _modes and _dr_field_sorted is not None:
+                if "dr" in _arm_modes and _dr_field_sorted is not None:
                     from src.optimization.mrp.delta_reward import ContestDeltaState
                     _dr_risk = 41.0 if _multi_arm else 3.0
                     # MEMORY, and why dR gets a shortlist when no other arm does.
@@ -2184,11 +2536,18 @@ class PipelineRunner:
                 # Reorder all sweep portfolios by entry-fee-weighted diversity now,
                 # so the ordering is final from the outset and never needs to be
                 # repeated when a risk level is activated or the sweep is displayed.
-                _sweep_fees = PipelineRunner._extract_sorted_fees(all_file_entries)
-                _portfolio_sweep_raw = [
-                    (r, PipelineRunner._reorder_by_diversity(p, _sweep_fees))
-                    for r, p in _portfolio_sweep_raw
-                ]
+                # Skipped on the per-contest path: this exists to line lineup
+                # strength up with entry FEE across a fee-heterogeneous slate,
+                # and within a contest every entry carries the same fee while
+                # across contests each slice was already chosen for its own
+                # ladder. Reordering there would only scramble the
+                # contest -> lineup pairing it cannot improve.
+                if not _pc_slots:
+                    _sweep_fees = PipelineRunner._extract_sorted_fees(all_file_entries)
+                    _portfolio_sweep_raw = [
+                        (r, PipelineRunner._reorder_by_diversity(p, _sweep_fees))
+                        for r, p in _portfolio_sweep_raw
+                    ]
 
                 # Default active = risk=1 (first entry).
                 gpp_result = _portfolio_sweep_raw[0][1] if _portfolio_sweep_raw else []
@@ -2443,6 +2802,13 @@ class PipelineRunner:
         self._raw_portfolio = portfolio
         self._portfolio_has_dollar_ev = _portfolio_has_dollar_ev
         self._discarded_lineups: set[frozenset] = set()
+        # Set only when per-contest selection ran; every downstream assignment
+        # site branches on it, so the single-ladder path is untouched.
+        self._pc_entry_order = (
+            PipelineRunner._per_contest_entry_order(_pc_slots) if _pc_slots else None
+        )
+        self._pc_slots = _pc_slots
+        self._pc_contest_diag = _pc_diag
         self._all_file_entries = all_file_entries
         self._entry_handlers = entry_handlers
         self._slate_df = slate_df
@@ -2470,13 +2836,20 @@ class PipelineRunner:
         # --- Generate upload files (skipped when stopped) ----------------
         entry_map: dict = {}
         if not was_stopped and all_file_entries:
-            assignments = entry_handlers["assign"](all_file_entries, portfolio)
+            if self._pc_entry_order:
+                assignments = self._assign_positional(self._pc_entry_order, portfolio)
+            else:
+                assignments = entry_handlers["assign"](all_file_entries, portfolio)
             paths_written = entry_handlers["write"](
                 all_file_entries, assignments, slate_df, output_dir
             )
             self._cb("upload_files", {"n_files": len(paths_written), "paths": paths_written})
 
-            entry_map = self._build_lineup_entry_map(all_file_entries, portfolio)
+            entry_map = (
+                self._build_per_contest_entry_map(self._pc_entry_order, portfolio)
+                if self._pc_entry_order
+                else self._build_lineup_entry_map(all_file_entries, portfolio)
+            )
             for lr in result:
                 info = entry_map.get(lr["lineup_index"])
                 if info:
@@ -2484,6 +2857,28 @@ class PipelineRunner:
             meta_path = os.path.join(output_dir, f"portfolio_entries_{platform.value}.json")
             with open(meta_path, "w") as f:
                 json.dump({str(k): v for k, v in entry_map.items()}, f)
+
+        # Built after the entry map is merged into `result`, since the
+        # per-contest rows read each lineup's serialized ownership/EV.
+        _pc_summary = (
+            self._per_contest_summary(result, self._pc_entry_order, _pc_diag)
+            if self._pc_entry_order else []
+        )
+        if _pc_summary:
+            _own = [c["mean_ownership"] for c in _pc_summary
+                    if c["mean_ownership"] is not None]
+            logger.info(
+                "Per-contest portfolio (%d contests, %d lineups); mean ownership "
+                "spread %.1f pts across contests%s",
+                len(_pc_summary), len(result),
+                (max(_own) - min(_own)) if len(_own) > 1 else 0.0,
+                "".join(
+                    f"\n    {c['fill_rank']}. {c['contest_name'][:38]:<38} "
+                    f"{c['n_lineups']:>4} lineups  own {c['mean_ownership']}  "
+                    f"EV ${c['mean_ev']}  field {c['field_size']:,}"
+                    for c in _pc_summary
+                ),
+            )
 
         # --- Notify (after entry augmentation so SSE payload is complete) -
         _optimal_result = (
@@ -2522,6 +2917,7 @@ class PipelineRunner:
                 "n_lineups": len(result),
                 "optimal_lineups": _optimal_result,
                 "portfolio_sweep": _stopped_sweep_payload,
+                "contests": _pc_summary,
             })
         else:
             _sweep_payload = [
@@ -2561,6 +2957,7 @@ class PipelineRunner:
                 "n_lineups": len(result),
                 "optimal_lineups": _optimal_result,
                 "portfolio_sweep": _sweep_payload,
+                "contests": _pc_summary,
             })
 
         return result
@@ -2594,7 +2991,7 @@ class PipelineRunner:
         gpp_cfg = cfg.get("gpp", {})
         _ev_type = str(gpp_cfg.get("external_pool_ev_type", "roi")).strip().lower()
         if _ev_type not in ("roi", "prj_own", "p_win", "proj_top", "self_play",
-                            "topn_coverage", "marginal_reward"):
+                            "topn_coverage", "marginal_reward", "per_contest"):
             logger.warning(
                 "External pool: unknown external_pool_ev_type %r — falling back to 'roi'.",
                 _ev_type,
@@ -2729,7 +3126,13 @@ class PipelineRunner:
         # along with it (~2GB+ wasted at a real slate's auto-sized ~68,000
         # sims with an ~8,000-lineup candidate pool). Every other ev_type
         # still computes these unconditionally, same as before.
-        if _ev_type == "topn_coverage":
+        if _ev_type in ("topn_coverage", "per_contest"):
+            # per_contest, like topn_coverage, consumes none of these: it scores
+            # the pool per contest against each contest's own ladder and never
+            # touches the pool-wide correlation matrix or the field-blind score
+            # percentiles. Measured 08/27 on a 4,219-lineup pool, computing them
+            # anyway cost 4.2s for a 71 MB corr matrix plus ~2.7s of percentiles
+            # that were then thrown away.
             lineup_scores = corr = sim_p95_scores = sim_p99_scores = None
         else:
             lineup_scores = ep.compute_lineup_scores(pool.lineups, sim_results)
@@ -3239,6 +3642,275 @@ class PipelineRunner:
                 stop_check=self._stop_check, progress_cb=_topn_progress,
             )
             allocations = {1.0: _topn_alloc}
+        elif _ev_type == "per_contest":
+            # --- per_contest: run the IMPORTED pool through the same
+            # per-contest selection the generated-pool path uses, so the
+            # Kelly / dR / E[max] / coverage arms become available to a
+            # SaberSim pool. Everything they need already exists here: the
+            # pool is the candidate list, `compute_lineup_scores` is exactly
+            # the (M, n_sims) matrix, entries files are mandatory in this
+            # mode, and ContestSimulator builds the opponent field the same
+            # way topn_coverage does.
+            #
+            # It differs from `marginal_reward` in SHAPE, not objective: MRP
+            # runs one global greedy over (lineup, contest) pairs, this fills
+            # each contest's slice in descending-top-prize order. Both price
+            # self-competition; which shape is better is an open, measurable
+            # question, so they are siblings rather than a replacement.
+            from src.optimization.multi_contest import (
+                SharedFieldPool, describe_slots, resolve_contest_slots,
+            )
+            from src.optimization.contest import ContestSimulator
+            from src.api.models import GppConfig as _GppCfg
+
+            _rng_seed = int(gpp_cfg.get("rng_seed") or 42)
+            _pc_slots = resolve_contest_slots(all_file_entries)
+            if not _pc_slots:
+                raise ValueError(
+                    "external_pool_ev_type='per_contest' found no contests in "
+                    "the entries files."
+                )
+            if any(int(sl.field_size) <= 0 for sl in _pc_slots):
+                raise ValueError(
+                    "external_pool_ev_type='per_contest': "
+                    + ", ".join(repr(sl.contest_name) for sl in _pc_slots
+                                if int(sl.field_size) <= 0)
+                    + " resolved to a payout table with no entry count."
+                )
+            logger.info("Contests read from the entries file(s):\n%s",
+                        describe_slots(_pc_slots))
+            _pc_approx = [sl for sl in _pc_slots if sl.is_approximate]
+            if _pc_approx:
+                _fb_payload = {
+                    "n_missing": len(_pc_approx), "n_contests": len(_pc_slots),
+                    "contests": [{
+                        "contest_id": sl.contest_id, "contest_name": sl.contest_name,
+                        "k": sl.n_entries, "implied_field_size": sl.field_size,
+                        "table_name": str(sl.structure.get("name", "?")),
+                        "table_entries": int(sl.structure.get("total_entries", 0)),
+                        "table_entry_fee": float(sl.structure.get("entry_fee", 0.0)),
+                        "table_prize_pool": float(sl.prize_pool),
+                        "entry_fee": float(sl.entry_fee), "exact": False,
+                    } for sl in _pc_approx],
+                    "description": (
+                        f"{len(_pc_approx)} of {len(_pc_slots)} contests have no "
+                        "registered payout table; the nearest captured table "
+                        "will be used for them."
+                    ),
+                }
+                logger.warning("Payout fallback: %s", _fb_payload["description"])
+                self._cb("gpp_payout_fallback", _fb_payload)
+                if self._await_confirmation is None:
+                    raise RuntimeError(_fb_payload["description"])
+                if not self._await_confirmation("gpp_payout_fallback", _fb_payload):
+                    self._cb("stopped", {"reason": "payout fallback declined"})
+                    return []
+
+            _pc_need = sum(sl.n_entries for sl in _pc_slots)
+            _pc_field_max = max(int(sl.field_size) for sl in _pc_slots)
+            _pc_k = max(int(gpp_cfg.get("per_contest_field_samples", 1)), 1)
+            _own_vec = players_df["ownership"].astype(float).to_numpy()
+            _pc_cs = ContestSimulator()
+            _pc_col_map = {int(p): i for i, p in enumerate(sim_results.player_ids)}
+
+            # --- FIELD POOLS, BUILT BEFORE THE SHORTLIST. ------------------
+            # They used to be built after it, which was fine while the pool
+            # was fixed. The line-2 frontier below needs a simulated field to
+            # estimate Sigma_delta from, and its lineups have to exist before
+            # anything is ranked or cut, so the field moves ahead of both --
+            # the same reordering `allocate_marginal_reward` made, and for the
+            # same reason. Generating one field pool and reading it twice is
+            # also the cheap way round: this is the ~30-60s step of the branch.
+            _pc_raw = []
+            for _k in range(_pc_k):
+                _pc_raw.append(ep.build_topn_field_pool(
+                    players_df, _own_vec, _pc_field_max,
+                    # Disjoint from every other field draw in this run.
+                    _rng_seed + 200_003 + _k,
+                    progress_cb=lambda done, total: self._cb(
+                        "gpp_contest_field_progress",
+                        {"n_done": done, "n_total": total,
+                         "n_field": _pc_field_max, "n_k": _pc_k},
+                    ),
+                    stop_check=self._stop_check,
+                ))
+
+            # --- LINE-2 FRONTIER AUGMENTATION. -----------------------------
+            # External-pool mode imports a pool; it does not have to be the
+            # ONLY pool. A SaberSim export is a few thousand lineups built to
+            # somebody else's objective, and the per-contest selectors can only
+            # ever pick what is in front of them -- filling 110 slots out of
+            # 4,219 is a 2.6% cut where the generated path cuts 0.4%, so the
+            # menu, not the objective, is doing most of the deciding. The
+            # frontier adds candidates along the mean-variance frontier the
+            # imported pool measured as NOT spanning, and merges them in; the
+            # user's own lineups are never removed to make room.
+            #
+            # Same generator and the same `marginal_reward:` knobs MRP reads,
+            # deliberately: `frontier_enabled: true` in config should mean the
+            # same thing whichever of the two sibling per-contest shapes is
+            # running, rather than silently doing nothing here.
+            _pc_frontier_diag: dict = {}
+            _pc_n_frontier = 0
+            _mr_cfg_pc = cfg.get("marginal_reward", {}) or {}
+            if bool(_mr_cfg_pc.get("frontier_enabled", False)):
+                pool, _pc_n_frontier, _pc_frontier_diag = self._frontier_augment_pool(
+                    pool, players_df, sim_results, _pc_slots, _mr_cfg_pc,
+                    _pc_raw[0], _pc_cs, _pc_col_map, seed=_rng_seed,
+                )
+
+            _pc_cap = max(int(gpp_cfg.get("per_contest_shortlist", 8_000)), _pc_need)
+            _pc_lineups = list(pool.lineups)
+            if len(_pc_lineups) < _pc_need:
+                raise ValueError(
+                    f"external pool holds {len(_pc_lineups)} lineups but the "
+                    f"entries files need {_pc_need}."
+                )
+            # Same stratified cut as the generated path, and for the same
+            # reason: one ladder's ranking biases WHICH lineups survive.
+            _pc_rank_sims = int(gpp_cfg.get("per_contest_rank_sims", 2_500))
+            if len(_pc_lineups) <= _pc_cap / (1.0 - _PC_RANK_MIN_CUT):
+                # An imported pool arrives already 9/10-overlap deduped and with
+                # no funnel upstream, so it routinely lands just over the cap —
+                # exactly the case where a ranking pass costs full price for a
+                # few percent of trim. Frontier augmentation normally takes the
+                # pool well clear of this, and the frontier's lineups are NOT
+                # 9/10-deduped (see _frontier_augment): if this branch ever
+                # fires on an augmented pool, it is skipping the ranking pass on
+                # a pool that is only half-deduped.
+                if len(_pc_lineups) > _pc_cap:
+                    logger.info(
+                        "Shortlist: taking all %d pool lineups (cap %d) — a "
+                        "%.0f%% cut is not worth a ranking pass.",
+                        len(_pc_lineups), _pc_cap,
+                        100.0 * (1 - _pc_cap / len(_pc_lineups)),
+                    )
+                _pc_sel = np.arange(len(_pc_lineups))
+            elif _pc_rank_sims > 0:
+                # Rank the whole pool against every contest's own ladder and
+                # union the results — same rule the generated path uses, and
+                # for the same reason: one ladder's ranking biases WHICH
+                # lineups survive, not just how many.
+                if _pc_lineups and _pc_cap < 0.5 * len(_pc_lineups):
+                    # Loud, because the shortlist is a memory/time guard and
+                    # not a quality device: every lineup it drops is one the
+                    # arms never get offered. Discarding more than half the
+                    # pool usually means the cap was left sized for an
+                    # unaugmented import while the frontier widened the menu.
+                    logger.warning(
+                        "Shortlist: per_contest_shortlist=%d keeps only %.0f%% "
+                        "of a %d-lineup pool. Raise it (each +1,000 costs "
+                        "~0.3GB peak and ~45s of selection at n_sims=%d), or "
+                        "lower marginal_reward.frontier_target_lineups.",
+                        _pc_cap, 100.0 * _pc_cap / len(_pc_lineups),
+                        len(_pc_lineups), sim_results.results_matrix.shape[0],
+                    )
+                _S_full = sim_results.results_matrix.shape[0]
+                _n_rank = int(min(_pc_rank_sims, _S_full))
+                _w_idx = np.sort(np.random.default_rng(_rng_seed).choice(
+                    _S_full, size=_n_rank, replace=False,
+                ))
+                _sim_rank = np.ascontiguousarray(
+                    sim_results.results_matrix.astype(np.float32)[_w_idx]
+                )
+                _rank_res = type("_R", (), {
+                    "results_matrix": _sim_rank,
+                    "player_ids": sim_results.player_ids,
+                })()
+                _scores_rank = ep.compute_lineup_scores(_pc_lineups, _rank_res)
+                # Disjoint from the selection field pool below, so the
+                # shortlist is not ranked on the field it will be priced
+                # against (see _RANK_FIELD_SEED_OFFSET).
+                _rank_raw = [ep.build_topn_field_pool(
+                    players_df, _own_vec, _pc_field_max, _rng_seed + 300_007,
+                    stop_check=self._stop_check,
+                )]
+
+                def _rank_sort_fn(raw, _m=_sim_rank, _cm=_pc_col_map):
+                    return np.ascontiguousarray(np.sort(
+                        _pc_cs.score_field(raw, _m, _cm), axis=1,
+                    ))
+
+                _pc_sel, _ = self._union_shortlist_by_contest(
+                    _pc_slots, _scores_rank, _rank_raw, _rank_sort_fn,
+                    _pc_cap, seed=_rng_seed,
+                    cand_chunk=max(int(gpp_cfg.get("per_contest_cand_chunk", 2_000)), 1),
+                )
+                del _scores_rank, _sim_rank, _rank_raw, _rank_res
+                gc.collect()
+            else:
+                _pc_ev_all = ep.compute_lineup_scores(
+                    _pc_lineups, sim_results,
+                ).mean(axis=1).astype(np.float64)
+                _own_map = dict(zip(
+                    players_df["player_id"].astype(int),
+                    players_df["ownership"].astype(float),
+                ))
+                _own_sum = np.array([
+                    sum(float(_own_map.get(int(pid), 0.0)) for pid in lu.player_ids)
+                    for lu in _pc_lineups
+                ], dtype=np.float64)
+                _pc_sel = PipelineRunner._stratified_shortlist(
+                    _pc_ev_all, _own_sum, _pc_cap,
+                    int(gpp_cfg.get("per_contest_shortlist_strata", 10)),
+                )
+            _pc_shortlist = [_pc_lineups[i] for i in _pc_sel]
+            # Full-resolution scores, shortlist only.
+            _pc_scores = ep.compute_lineup_scores(_pc_shortlist, sim_results)
+            gc.collect()
+
+            _pc_sim_matrix = sim_results.results_matrix.astype(np.float32)
+
+            def _pc_sort_fn(raw):
+                return np.ascontiguousarray(np.sort(
+                    _pc_cs.score_field(raw, _pc_sim_matrix, _pc_col_map), axis=1,
+                ))
+
+            _pc_pool_fields = SharedFieldPool(_pc_raw, _pc_sort_fn, seed=_rng_seed)
+            _pc_modes = {
+                m.strip() for m in str(gpp_cfg.get(
+                    "selector_mode", _GppCfg.model_fields["selector_mode"].default,
+                )).lower().split(",") if m.strip()
+            }
+            if "all" in _pc_modes:
+                _pc_modes = {"det", "kelly", "coverage", "emax", "dr"}
+            _pc_modes = _pc_modes & {"det", "kelly", "coverage", "emax", "dr"}
+            if not _pc_modes:
+                _pc_modes = {"kelly"}
+            _pc_sweep, _pc_picks, _pc_diag = self._per_contest_sweep(
+                slots=_pc_slots, shortlist=_pc_shortlist, cand_scores=_pc_scores,
+                e_dupes=None, field_pool=_pc_pool_fields, gpp_cfg=gpp_cfg,
+                modes=_pc_modes, multi_arm=len(_pc_modes) > 1,
+                cash_anchor_fraction=float(gpp_cfg.get("cash_anchor_fraction", 0.25)),
+                det_sweep_risks=([1.0, 2.0, 3.0, 4.0, 5.0] if "det" in _pc_modes else []),
+            )
+            del _pc_scores, _pc_raw, _pc_pool_fields
+            gc.collect()
+            # entry_plan is [(Path, EntryRecord)] parallel to the portfolio —
+            # the shape ExternalAllocation already promises, and exactly what
+            # the per-contest flatten order produces.
+            _pc_plan = [
+                (fp, rec)
+                for (fp, rec, _slot) in PipelineRunner._per_contest_entry_order(_pc_slots)
+            ]
+            # Every arm gets the FULL plan, not one sliced to its own length:
+            # the risk-invariance assertion downstream compares plans across
+            # arms, and an arm truncated at a short contest would otherwise
+            # look like a diverged plan and abort the run. Consumers zip plan
+            # against portfolio, so a longer plan is harmless.
+            allocations = {
+                lbl: ep.ExternalAllocation(
+                    portfolio=port, entry_plan=_pc_plan, unfilled=_pc_plan[len(port):],
+                )
+                for lbl, port in _pc_sweep
+            }
+            self._cb("gpp_per_contest_done", {
+                "n_contests": len(_pc_slots), "n_entries": _pc_need,
+                "n_arms": len(_pc_sweep), "shortlist": len(_pc_shortlist),
+                "n_pool": len(_pc_lineups), "n_frontier": _pc_n_frontier,
+                "frontier": _pc_frontier_diag or None,
+                "elapsed_s": 0.0,
+            })
         elif _ev_type == "marginal_reward":
             # --- MRP: one global greedy over (candidate, contest) pairs by
             # marginal expected dollars, with our own entries inside the order
@@ -3327,30 +3999,10 @@ class PipelineRunner:
                 elif stage == "mrp_pick":
                     self._cb("mrp_pick_progress",
                              {"done": info["done"], "total": info["total"]})
-                elif stage == "mrp_frontier_start":
-                    self._cb("mrp_frontier_start", {
-                        "n_lambda_search": info.get("n_lambda_search"),
-                        "target_lineups": info.get("target_lineups"),
-                        "n_sample": info.get("n_sample"),
-                        "n_pairs": info.get("n_pairs"),
-                    })
-                elif stage == "mrp_frontier":
-                    self._cb("mrp_frontier_progress", {
-                        "done": info["done"], "total": info["total"],
-                        "n_lineups": info.get("n_lineups", 0),
-                    })
-                elif stage == "mrp_frontier_done":
-                    self._cb("mrp_frontier_done", {
-                        k: info.get(k) for k in (
-                            "n_generated", "n_kept", "n_dropped_duplicate",
-                            "lambda_min", "lambda_max", "n_lambdas_represented",
-                            "n_cov_pairs", "n_players_kept", "n_players_before",
-                            "n_pitchers_kept", "n_teams", "skipped",
-                            "sigma_dG_contests", "sigma_dG_min_corr",
-                            "n_lambda_star", "lambda_star_at_edge",
-                            "lambda_search_lo", "lambda_search_hi",
-                        )
-                    })
+                elif self._frontier_progress(info):
+                    # Frontier stages are shared with the per-contest branch;
+                    # see PipelineRunner._frontier_progress.
+                    pass
                 elif stage == "mrp_floor":
                     # Re-report the ceiling floor with the count MRP actually
                     # applied. The pool-wide `external_proj_score_floor` event
@@ -3609,8 +4261,11 @@ class PipelineRunner:
 
         if self._all_file_entries:
             self.write_upload_files()
+            _pc_order = getattr(self, "_pc_entry_order", None)
             if getattr(self, "_external_mode", False):
                 entry_map = self._build_external_entry_map()
+            elif _pc_order:
+                entry_map = self._build_per_contest_entry_map(_pc_order, portfolio)
             else:
                 entry_map = self._build_lineup_entry_map(self._all_file_entries, portfolio)
             for lr in result:
@@ -3645,8 +4300,11 @@ class PipelineRunner:
             raise RuntimeError("No pipeline run artifacts available.")
         if not self._all_file_entries:
             return []
+        _pc_order = getattr(self, "_pc_entry_order", None)
         if getattr(self, "_external_mode", False):
             assignments = self._external_assignments(self._raw_portfolio)
+        elif _pc_order:
+            assignments = self._assign_positional(_pc_order, self._raw_portfolio)
         else:
             assignments = self._entry_handlers["assign"](self._all_file_entries, self._raw_portfolio)
         return self._entry_handlers["write"](
@@ -3741,8 +4399,22 @@ class PipelineRunner:
         new_lineup = self._gpp_candidates[new_ci]
         full_score = float(self._gpp_robust_payout[new_ci].mean())
         _has_ev = getattr(self, "_portfolio_has_dollar_ev", False)
-        _fees_re = PipelineRunner._extract_sorted_fees(self._all_file_entries)
-        self._raw_portfolio = PipelineRunner._reorder_by_diversity(remaining + [(new_lineup, full_score)], _fees_re)
+        if getattr(self, "_pc_entry_order", None):
+            # Per-contest: position i is bound to entry i, so the replacement
+            # takes the deleted lineup's SLOT rather than being appended and the
+            # whole portfolio reordered. CAVEAT, stated because it is invisible
+            # otherwise: the replacement is ranked on `_gpp_robust_payout`, the
+            # reference ladder the funnel used, not on the ladder of the contest
+            # this entry actually belongs to -- that contest's field is long
+            # freed by now. It is a like-for-like swap, not a re-selection.
+            self._raw_portfolio = (
+                remaining[:idx] + [(new_lineup, full_score)] + remaining[idx:]
+            )
+        else:
+            _fees_re = PipelineRunner._extract_sorted_fees(self._all_file_entries)
+            self._raw_portfolio = PipelineRunner._reorder_by_diversity(
+                remaining + [(new_lineup, full_score)], _fees_re,
+            )
         result = self._serialize_portfolio(
             self._raw_portfolio, self._players_df, mean_ev_from_score=_has_ev,
             ownership_by_id=getattr(self, "_ownership_pct", None),
@@ -3761,7 +4433,12 @@ class PipelineRunner:
         if self._all_file_entries:
             self.write_upload_files()
 
-            entry_map = self._build_lineup_entry_map(self._all_file_entries, self._raw_portfolio)
+            _pc_order = getattr(self, "_pc_entry_order", None)
+            entry_map = (
+                self._build_per_contest_entry_map(_pc_order, self._raw_portfolio)
+                if _pc_order
+                else self._build_lineup_entry_map(self._all_file_entries, self._raw_portfolio)
+            )
             for lr in result:
                 info = entry_map.get(lr["lineup_index"])
                 if info:
@@ -4454,6 +5131,751 @@ class PipelineRunner:
                 "players": players,
             })
         return result
+
+    # ------------------------------------------------------------------
+    # Per-contest selection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _funnel_reference(slots: list):
+        """The contest whose ladder and field size anchor the FUNNEL.
+
+        Selection is per contest; the funnel still needs one field size and one
+        ladder to score the whole pool against. The rule is most MONEY at risk
+        (entries x fee), because that is where being wrong costs most, and
+        because it lands near the $4 / ~5,000-entry reference that every
+        downstream threshold (`ev_floor`, `tail_ev_min_gross`) was calibrated
+        against. "Largest field" would anchor a typical entries file on a $1
+        contest, where a $0.20 `ev_floor` is a 20% ROI hurdle that guts the pool.
+
+        This choice still biases what survives, which is why the shortlist is
+        stratified rather than cut top-N on this ladder — see
+        `_stratified_shortlist`.
+        """
+        return max(slots, key=lambda sl: (
+            sl.dollars_at_risk, sl.prize_pool, sl.field_size,
+        ))
+
+    def _frontier_progress(self, info: dict) -> bool:
+        """Re-emit the line-2 generator's own progress dicts as SSE events.
+
+        Returns True when `info` was a frontier stage. Shared by the MRP branch
+        and the per-contest branch so the two cannot drift into reporting the
+        same generator under different event names — the UI keys off these.
+        """
+        stage = info.get("stage")
+        if stage == "mrp_frontier_start":
+            self._cb("mrp_frontier_start", {
+                "n_lambda_search": info.get("n_lambda_search"),
+                "target_lineups": info.get("target_lineups"),
+                "n_sample": info.get("n_sample"),
+                "n_pairs": info.get("n_pairs"),
+            })
+        elif stage == "mrp_frontier":
+            self._cb("mrp_frontier_progress", {
+                "done": info["done"], "total": info["total"],
+                "n_lineups": info.get("n_lineups", 0),
+            })
+        elif stage == "mrp_frontier_done":
+            self._cb("mrp_frontier_done", {
+                k: info.get(k) for k in (
+                    "n_generated", "n_kept", "n_dropped_duplicate", "n_real",
+                    "lambda_min", "lambda_max", "n_lambdas_represented",
+                    "n_cov_pairs", "n_players_kept", "n_players_before",
+                    "n_pitchers_kept", "n_teams", "skipped",
+                    "sigma_dG_contests", "sigma_dG_min_corr",
+                    "n_lambda_star", "lambda_star_at_edge",
+                    "lambda_search_lo", "lambda_search_hi",
+                )
+            })
+        else:
+            return False
+        return True
+
+    def _frontier_augment_pool(
+        self,
+        pool,
+        players_df,
+        sim_results,
+        slots: list,
+        mr_cfg: dict,
+        field_raw,
+        contest_sim,
+        col_map: dict,
+        seed: int,
+    ):
+        """Merge line-2 frontier lineups into an imported pool. -> (pool, n, diag).
+
+        The per-contest external path's entry point to the SAME generator MRP
+        uses, driven from `multi_contest.ContestSlot`s rather than MRP's
+        `ContestGroup`s. The slots carry their ladders already resolved on the
+        advertised prize pool, which is the resolution to trust, so they are
+        passed through rather than re-looked-up by name (see
+        `runner.FrontierContest`).
+
+        Fails SOFT for the same reason it does inside MRP: this is an
+        off-by-default generator, and a slate that cannot supply what it needs
+        should leave the imported pool alone rather than take down a run that
+        would otherwise produce a portfolio. It is logged at WARNING either
+        way, because a silent no-op here is precisely the failure that made
+        `frontier_enabled: true` sit in config doing nothing.
+        """
+        from src.optimization.mrp.runner import (
+            MRPConfig, _frontier_augment, _world_slice,
+            frontier_contests_from_slots,
+        )
+
+        t0 = time.time()
+        cfg_f = MRPConfig(
+            max_sims_per_contest=int(mr_cfg.get("max_sims_per_contest", 12_500)),
+            frontier_enabled=True,
+            frontier_n_lambdas=int(mr_cfg.get("frontier_n_lambdas", 12)),
+            frontier_target_lineups=int(mr_cfg.get("frontier_target_lineups", 4000)),
+            frontier_min_per_team=int(mr_cfg.get("frontier_min_per_team", 4)),
+            frontier_sample_n=int(mr_cfg.get("frontier_sample_n", 30_000)),
+            frontier_n_anchors=int(mr_cfg.get("frontier_n_anchors", 2)),
+            frontier_n_generations=int(mr_cfg.get("frontier_n_generations", 2)),
+            frontier_mutants_per_parent=int(
+                mr_cfg.get("frontier_mutants_per_parent", 4)),
+            frontier_salary_floor=float(
+                mr_cfg.get("frontier_salary_floor", 47_500.0)),
+            frontier_solver_timeout_s=float(
+                mr_cfg.get("frontier_solver_timeout_s", 10.0)),
+            frontier_mutant_workers=int(mr_cfg.get("frontier_mutant_workers", 0)),
+            seed=seed,
+        )
+        n_before = len(pool.lineups)
+        # NO `mrp_frontier_start` here. `_frontier_augment` emits its own once
+        # the covariance pairs are counted, and emitting a second one up front
+        # just to fill the gap put two rows in the event log -- the first
+        # necessarily claiming "0 covariance pairs", because at this point they
+        # have not been built yet. One honest row beats an early misleading one.
+        #
+        # Reduced world resolution, as MRP uses: Sigma_delta and the tier
+        # order statistics are bulk statistics, and the (S x F) field-score
+        # array is the memory peak of this stage — at F=17,835 the full 25,000
+        # worlds would be 1.8GB for a generation-side estimate.
+        keep = _world_slice(
+            sim_results.results_matrix.shape[0], cfg_f.max_sims_per_contest)
+        sim_small = sim_results.results_matrix.astype(np.float32)[keep]
+        field_scores = contest_sim.score_field(field_raw, sim_small, col_map)
+        try:
+            pool, n_frontier, diag, _ = _frontier_augment(
+                pool, players_df, sim_results, sim_small, field_scores,
+                frontier_contests_from_slots(slots), cfg_f, None,
+                np.random.default_rng(seed),
+                progress_cb=self._frontier_progress,
+                stop_check=self._stop_check,
+            )
+        finally:
+            del sim_small, field_scores
+            gc.collect()
+        diag = dict(diag or {})
+        diag["elapsed_s"] = round(time.time() - t0, 1)
+        if diag.get("skipped") or not n_frontier:
+            logger.warning(
+                "Frontier augmentation added nothing to the imported pool "
+                "(%s); selection runs on the %d imported lineups alone.",
+                diag.get("skipped", "generator kept 0 lineups"), n_before,
+            )
+        else:
+            logger.info(
+                "Frontier augmentation: pool %d -> %d (+%d generated, %d "
+                "duplicates dropped) in %.1fs.",
+                n_before, len(pool.lineups), n_frontier,
+                diag.get("n_dropped_duplicate", 0), diag["elapsed_s"],
+            )
+        diag["n_pool_before"] = n_before
+        diag["n_pool_after"] = len(pool.lineups)
+        return pool, int(n_frontier), diag
+
+    def _union_shortlist_by_contest(
+        self,
+        slots: list,
+        cand_scores_rank: np.ndarray,
+        raw_fields: list,
+        sort_fn,
+        cap: int,
+        seed: int = 42,
+        e_dupes: Optional[np.ndarray] = None,
+        dupe_min_gross: float = 15.0,
+        cand_chunk: int = 2_000,
+    ) -> tuple:
+        """(shortlist indices, [per-contest mean EV]) — every contest's own top.
+
+        Ranks the WHOLE pool against every contest's own ladder and field size,
+        then unions each contest's top candidates round-robin (see
+        `multi_contest.union_shortlist`). This is what removes the reference
+        ladder from the shortlist entirely, rather than proxying its bias with
+        an ownership stratification that has to assume ownership is the axis
+        contests disagree on.
+
+        RANKED AT REDUCED SIM RESOLUTION. `cand_scores_rank` is (M, S_rank) on
+        a sampled subset of worlds, and the fields are scored on the same
+        subset. Choosing which ~4,000 of 15,000 candidates to put on a menu is
+        a coarse question; it does not need the full 25,000 worlds that pricing
+        the final selection does. Measured at production scale, ranking the
+        full pool against all six ladders costs ~10s at S_rank=2,500 against
+        ~98s at full resolution. The cost is a noisier cut line, which matters
+        least here precisely because a union takes deep lists from each contest
+        rather than a tight threshold from one.
+        """
+        from src.optimization.multi_contest import (
+            SharedFieldPool, contest_ev_means, union_shortlist,
+        )
+        pool = SharedFieldPool(raw_fields, sort_fn, seed=seed)
+        evs: list = []
+        for i, slot in enumerate(slots, 1):
+            t0 = time.perf_counter()
+            evs.append(contest_ev_means(
+                cand_scores_rank, pool.fields(slot.field_size),
+                slot.payout_arr, slot.entry_fee,
+                e_dupes=e_dupes, dupe_min_gross_payout=dupe_min_gross,
+                cand_chunk=cand_chunk,
+            ))
+            logger.info(
+                "  rank %d/%d %s (field %d): %.1fs  EV $%.2f-$%.2f",
+                i, len(slots), slot.contest_name[:30], slot.field_size,
+                time.perf_counter() - t0, float(evs[-1].min()), float(evs[-1].max()),
+            )
+        sel = union_shortlist(evs, cap)
+        # Overlap is the interesting diagnostic: contests that agree produce a
+        # small union and deep shared coverage, contests that disagree produce
+        # a wide one. A union near cap/n_contests x n_contests means they are
+        # asking for almost disjoint material.
+        _tops = [set(np.argsort(-e)[:cap // max(len(slots), 1)].tolist()) for e in evs]
+        _pair = (
+            100.0 * len(_tops[0] & _tops[-1]) / max(len(_tops[0]), 1)
+            if len(_tops) > 1 else 100.0
+        )
+        logger.info(
+            "Shortlist: %d of %d by union over %d contests "
+            "(first/last contest top-lists overlap %.0f%%)",
+            len(sel), cand_scores_rank.shape[0], len(slots), _pair,
+        )
+        return sel, evs
+
+    @staticmethod
+    def _stratified_shortlist(
+        ev: np.ndarray, own_sum: np.ndarray, cap: int, strata: int,
+    ) -> np.ndarray:
+        """Shortlist indices spanning the ownership axis, best-by-EV per band.
+
+        WHY NOT TOP-N BY EV. That ranks every candidate on the funnel
+        reference's ladder alone, which is a COMPOSITION bias rather than a
+        threshold: the same pool produces portfolios ~19 ownership points apart
+        between a small and a large field, so one ladder's ranking thins
+        whichever quadrant that contest does not want, and the contests that
+        differ most from the reference are the ones starved of material. Once
+        selection is per contest, the shortlist's only remaining job is to not
+        discard what some contest wants.
+
+        Bands are equal-population by ownership RANK, so the split does not
+        depend on the shape of the ownership distribution. Each band gets the
+        same quota, filled by EV; a band too thin to fill its quota donates the
+        remainder to the best of what is left, so the cap is always reached.
+
+        `strata <= 1` restores the plain top-N cut.
+        """
+        n = len(ev)
+        cap = int(min(cap, n))
+        if cap >= n:
+            return np.arange(n)
+        if strata <= 1:
+            out = np.argsort(-ev, kind="stable")[:cap]
+            out.sort()
+            return out
+        bands = np.array_split(np.argsort(own_sum, kind="stable"), strata)
+        quota = cap // strata
+        taken = [
+            b[np.argsort(-ev[b], kind="stable")[:min(quota, len(b))]]
+            for b in bands if len(b)
+        ]
+        sel = np.unique(np.concatenate(taken)) if taken else np.array([], dtype=np.int64)
+        short = cap - len(sel)
+        if short > 0:
+            rest = np.setdiff1d(np.arange(n), sel)
+            if len(rest):
+                sel = np.unique(np.concatenate([
+                    sel, rest[np.argsort(-ev[rest], kind="stable")[:short]],
+                ]))
+        return sel
+
+
+    def _per_contest_sweep(
+        self,
+        slots: list,
+        shortlist: list,
+        cand_scores: np.ndarray,
+        e_dupes: Optional[np.ndarray],
+        field_pool,
+        gpp_cfg: dict,
+        modes: set,
+        multi_arm: bool,
+        cash_anchor_fraction: float,
+        det_sweep_risks: list,
+        ev_override: Optional[np.ndarray] = None,
+        disjoint: Optional[bool] = None,
+    ) -> tuple[list, dict, dict]:
+        """Run every selection arm against every contest's OWN ladder.
+
+        Returns (sweep, picks_by_arm, per_contest_diag) where `sweep` is the
+        usual [(arm_label, [(Lineup, ev), ...])] the rest of the pipeline
+        consumes and `picks_by_arm` maps each arm label to
+        {contest_id: [shortlist index, ...]}.
+
+        Every arm flattens its portfolio in the SAME order -- contests in fill
+        order, entries within a contest in file order -- so lineup i of any
+        arm belongs to the same entry, which is what lets one entry map serve
+        the whole sweep exactly as it does on the single-ladder path.
+
+        THE EV FLOOR IS OFF HERE, deliberately. `gpp.ev_floor` is a dollar
+        threshold calibrated against the reference ladder; these contests span
+        $1 to $25 fees and $1.5K to $175K pools, so one dollar figure is either
+        trivially cleared or culls the entire pool depending on the contest.
+        The funnel upstream already gated on it twice (mined and fresh), which
+        is where a fee-denominated floor belongs -- by selection time the
+        question is only which of the survivors fits THIS contest.
+        """
+        from src.optimization.gpp_portfolio import (
+            CoveragePortfolioSelector, DeterminantPortfolioSelector,
+            EMaxPortfolioSelector, KellyPortfolioSelector,
+        )
+        from src.optimization.multi_contest import (
+            contest_beat_bits, contest_payout_matrix, describe_slots,
+            select_per_contest_multi_arm,
+        )
+
+        logger.info("Per-contest selection over %d contests:\n%s",
+                    len(slots), describe_slots(slots))
+        M = len(shortlist)
+        # PROGRESS WEIGHTING. Per-contest cost is dominated by two terms that
+        # scale differently: sorting the field is O(F log F) per sim world, and
+        # the payout kernel is O(M log F) per world. At a 17,835-entry contest
+        # the sort dominates; at a 792-entry one the kernel does. `F + M` is a
+        # deliberately rough proxy that blends them -- it only has to be roughly
+        # PROPORTIONAL to real cost, because the UI calibrates the constant from
+        # measured elapsed time. Contests are filled in top-prize order, not
+        # size order, so a flat "contests done / total" bar would jump unevenly.
+        _work = [int(sl.field_size) + M for sl in slots]
+        _work_total = sum(_work)
+        _work_done = 0
+        # By identity, not `slots.index(slot)`: ContestSlot is a dataclass whose
+        # generated __eq__ compares a numpy payout array, so a linear scan only
+        # avoids "truth value of an array is ambiguous" because tuple comparison
+        # happens to short-circuit on contest_id first. That is a field-ordering
+        # accident, not a guarantee.
+        _slot_pos = {id(sl): k for k, sl in enumerate(slots)}
+        cand_chunk = max(int(gpp_cfg.get("per_contest_cand_chunk", 2_000)), 1)
+        dupe_min_gross = float(gpp_cfg.get("dupe_min_gross_payout", 15.0))
+        e_dupes_arg = e_dupes if bool(gpp_cfg.get("dupe_penalty", False)) else None
+        # dR re-ranks incumbents against the field itself, and coverage needs
+        # per-world beat-p99.9 bits derived from it, so those two arms force the
+        # sorted field to be materialized rather than streamed.
+        need_field = bool({"dr", "coverage"} & modes)
+
+        # Per-contest mean EV, kept per contest so a flattened portfolio can
+        # report each lineup's EV IN THE CONTEST IT WILL BE ENTERED IN. Arms
+        # share it (it is a property of the contest, not the objective); it is
+        # (M,) float64 per contest, ~32 KB, so retaining it costs nothing while
+        # the (M, S) matrix it came from is freed with the rest of the context.
+        ev_by_contest: dict = {}
+
+        def _prepare(fields, slot):
+            t0 = time.perf_counter()
+            _i = _slot_pos[id(slot)]
+            self._cb("gpp_contest_select", {
+                "contest_index": _i + 1,
+                "contests_total": len(slots),
+                "contest_name": slot.contest_name,
+                "n_entries": slot.n_entries,
+                "field_size": slot.field_size,
+                "entry_fee": slot.entry_fee,
+                "top_prize": slot.top_prize,
+                "table_name": str(slot.structure.get("name", "?")),
+                "is_approximate": bool(slot.is_approximate),
+                "shortlist": M,
+                "n_arms": len(arm_fns),
+                "work_done": _work_done,
+                "work_total": _work_total,
+            })
+            field_list = list(fields) if need_field else fields
+            payout = contest_payout_matrix(
+                cand_scores, field_list, slot.payout_arr, slot.entry_fee,
+                e_dupes=e_dupes_arg, dupe_min_gross_payout=dupe_min_gross,
+                cand_chunk=cand_chunk,
+            )
+            ctx = {
+                "payout": payout,
+                "ev": payout.mean(axis=1).astype(np.float64),
+                "bits": (
+                    contest_beat_bits(cand_scores, field_list)
+                    if "coverage" in modes else None
+                ),
+                "fields": field_list if "dr" in modes else None,
+            }
+            ev_by_contest[slot.contest_id] = ctx["ev"]
+            logger.info(
+                "  contest %s: payout matrix (%d x %d) in %.2fs  RSS=%.0f MB",
+                slot.contest_name[:32], payout.shape[0], payout.shape[1],
+                time.perf_counter() - t0, _proc_rss_mb(),
+            )
+            return ctx
+
+        def _sub(ctx, avail):
+            return ctx["payout"][avail], [shortlist[int(j)] for j in avail]
+
+        def _to_idx(result, sub_cands, avail):
+            """Selector results are the very Lineup objects we passed in."""
+            pos = {id(lu): i for i, lu in enumerate(sub_cands)}
+            return [int(avail[pos[id(lu)]]) for lu, _ in result]
+
+        kelly_mults = {1.0: 1.25, 2.0: 1.5, 3.0: 2.0, 4.0: 4.0, 5.0: 8.0}
+        kelly_scale = max(float(gpp_cfg.get("kelly_bankroll_mult", 1.0)), 1e-6)
+
+        def _kelly_arm(risk):
+            def fn(ctx, avail, k, slot):
+                pay, cands = _sub(ctx, avail)
+                # Bankroll is denominated in THIS contest's fee, not a single
+                # slate-wide one: B must exceed the worst case (fee x k) or the
+                # all-lose world sends log() to a domain error.
+                B = slot.entry_fee * k * kelly_mults[risk] * kelly_scale
+                sel = KellyPortfolioSelector(
+                    pay, cands, portfolio_size=k, bankroll=B,
+                    ev_floor=float("-inf"),
+                    cash_anchor_fraction=cash_anchor_fraction,
+                )
+                return _to_idx(sel.select(stop_check=self._stop_check), cands, avail)
+            return fn
+
+        def _emax_arm(ctx, avail, k, slot):
+            pay, cands = _sub(ctx, avail)
+            # PASS GROSS: `baseline` is the value of holding nothing, which is 0
+            # only on a gross ladder. Per-contest payouts are net of that
+            # contest's fee, so add that contest's fee back -- not a global one.
+            sel = EMaxPortfolioSelector(
+                pay + np.float32(slot.entry_fee), cands, portfolio_size=k,
+                ev_floor=float("-inf"), baseline=0.0,
+            )
+            return _to_idx(sel.select(stop_check=self._stop_check), cands, avail)
+
+        def _coverage_arm(ctx, avail, k, slot):
+            pay, cands = _sub(ctx, avail)
+            sel = CoveragePortfolioSelector(
+                pay, cands, portfolio_size=k,
+                beat999_bits=ctx["bits"][avail],
+                tie_break=ctx["ev"][avail],
+                ev_floor=float("-inf"),
+                cash_anchor_fraction=cash_anchor_fraction,
+            )
+            return _to_idx(sel.select(stop_check=self._stop_check), cands, avail)
+
+        def _det_arm(risk):
+            def fn(ctx, avail, k, slot):
+                pay, cands = _sub(ctx, avail)
+                sel = DeterminantPortfolioSelector(
+                    robust_payout=pay, candidates=cands, portfolio_size=k,
+                    risk=risk,
+                    evw_base=float(gpp_cfg.get("evw_base", 0.10)),
+                    evw_max=float(gpp_cfg.get("evw_max", 0.40)),
+                    ev_floor=float("-inf"),
+                    ev_override=(
+                        ev_override[avail] if ev_override is not None else None
+                    ),
+                    cash_anchor_fraction=cash_anchor_fraction,
+                )
+                return _to_idx(sel.select(), cands, avail)
+            return fn
+
+        def _dr_arm(ctx, avail, k, slot):
+            # dR runs against the FIRST field sample only. Its state is four
+            # (N, S) rank/tie arrays built from one field; averaging the
+            # objective over samples would mean one such state per sample, and
+            # the memory is the reason the shortlist exists. Identical to every
+            # other arm at the default per_contest_field_samples=1.
+            from src.optimization.mrp.delta_reward import ContestDeltaState
+            _t0 = time.perf_counter()
+            scores = np.ascontiguousarray(cand_scores[avail])
+            st = ContestDeltaState(
+                scores, ctx["fields"][0], slot.payout_arr.astype(np.float64),
+                chunk=512,
+            )
+            # dR's rank precompute is the same order of work as the payout
+            # kernel and it used to log nothing at all, which made it invisible:
+            # measured 08/27, it was 142s of a 342s run (41%) with not one line
+            # in the log to say so.
+            _t_state = time.perf_counter() - _t0
+            taken = np.zeros(len(avail), dtype=bool)
+            picks: list[int] = []
+            for _ in range(k):
+                if self._stop_check is not None and self._stop_check():
+                    break
+                g = np.asarray(st.marginal_gains(), dtype=np.float64).copy()
+                # Defined for committed picks too; without the mask the greedy
+                # can re-select an incumbent, which is maximal self-competition.
+                g[taken] = -np.inf
+                j = int(np.argmax(g))
+                if not np.isfinite(g[j]):
+                    break
+                taken[j] = True
+                st.commit(j)
+                picks.append(int(avail[j]))
+            logger.info(
+                "  dR %s: %d picks from %d candidates (field %d) — "
+                "state %.1fs, greedy %.1fs",
+                slot.contest_name[:30], len(picks), len(avail), slot.field_size,
+                _t_state, time.perf_counter() - _t0 - _t_state,
+            )
+            del st, scores
+            gc.collect()
+            return picks
+
+        arm_fns: dict = {}
+        if "kelly" in modes:
+            off = 10.0 if multi_arm else 0.0
+            for r in (1.0, 2.0, 3.0, 4.0, 5.0):
+                arm_fns[r + off] = _kelly_arm(r)
+        if "coverage" in modes:
+            arm_fns[23.0 if multi_arm else 3.0] = _coverage_arm
+        if "emax" in modes:
+            arm_fns[31.0 if multi_arm else 3.0] = _emax_arm
+        if "dr" in modes:
+            arm_fns[41.0 if multi_arm else 3.0] = _dr_arm
+        for r in det_sweep_risks:
+            arm_fns[r] = _det_arm(r)
+
+        def _contest_done(index, slot):
+            nonlocal _work_done
+            _work_done += _work[index - 1]
+            self._cb("gpp_contest_done", {
+                "contest_index": index,
+                "contests_total": len(slots),
+                "contest_name": slot.contest_name,
+                "work_done": _work_done,
+                "work_total": _work_total,
+            })
+
+        self._cb("gpp_per_contest_start", {
+            "n_contests": len(slots),
+            "n_entries": sum(sl.n_entries for sl in slots),
+            "shortlist": M,
+            "n_arms": len(arm_fns),
+            "work_total": _work_total,
+        })
+        # PER-CONTEST CANDIDATE CAP. The shortlist is global, so a 2-entry
+        # contest was handed the same 8,202 candidates as a 60-entry one and
+        # paid the same (M x S) dR state build for them: measured 08/27, three
+        # 2-entry contests burned 96s of state to choose six lineups, 22% of the
+        # whole selection stage.
+        #
+        # WHY IT IS SAFE WHERE IT BITES, and only there. dR's first pick is
+        # exactly argmax of this contest's mean EV, and every later pick is that
+        # minus a demotion term that only exists BECAUSE of the earlier picks --
+        # so at k=2 there is one demotion pair in the entire problem and the
+        # objective is within a hair of "take the two best by EV". Kelly's first
+        # ceil(cash_anchor_fraction * k) picks are on mean EV outright. Narrowing
+        # to the top `per_entry * k` by this contest's own EV therefore removes
+        # material the objective was never going to reach at small k.
+        #
+        # It is NOT free at large k, which is the whole reason the rate is per
+        # entry: with 60 slots to fill, dR's demotion term is doing real work
+        # and the contrarian tail it draws from is exactly what an EV ranking
+        # cuts first (measured Spearman(mean EV, ownership) = +0.356). At the
+        # default 400/entry the cap is a no-op for every contest with more than
+        # ~20 entries on a pool this size, and that is intended: this is a knob
+        # for the contests where the objective has nothing to price, not a
+        # general-purpose trim. Unlike the parallel dR state build, this DOES
+        # change which lineups are picked -- it is a speed/quality trade.
+        _pc_per_entry = int(gpp_cfg.get("per_contest_cand_per_entry", 400))
+
+        def _narrow(ctx, avail, k, slot):
+            if _pc_per_entry <= 0:
+                return avail
+            cap = max(_PC_CAND_CAP_FLOOR, _pc_per_entry * int(k))
+            if len(avail) <= cap:
+                return avail
+            ev = np.asarray(ctx["ev"])[avail]
+            keep = np.argpartition(-ev, cap - 1)[:cap]
+            # Sorted so the candidate axis keeps shortlist order: every arm
+            # returns positions into `avail`, and _to_idx maps them back by
+            # identity, but a stable order keeps diagnostics readable.
+            narrowed = np.sort(avail[keep])
+            logger.info(
+                "  %s: %d entries — narrowing %d candidates to top %d by this "
+                "contest's EV (%d/entry)",
+                slot.contest_name[:32], k, len(avail), cap, _pc_per_entry,
+            )
+            return narrowed
+
+        picks_by_arm, diag = select_per_contest_multi_arm(
+            slots, M,
+            make_field=field_pool.fields,
+            prepare_fn=_prepare,
+            arm_fns=arm_fns,
+            narrow_fn=_narrow,
+            contest_done=_contest_done,
+            exclude_used=(
+                bool(gpp_cfg.get("per_contest_disjoint", True))
+                if disjoint is None else bool(disjoint)
+            ),
+            progress=lambda msg: logger.info("  %s", msg),
+        )
+
+        # Flatten each arm into the shared entry order. Note there is NO
+        # diversity reorder here: _reorder_by_diversity exists to line lineup
+        # strength up with entry FEE across a fee-heterogeneous slate, and
+        # within one contest every entry carries the same fee, while across
+        # contests each slice was already chosen for its own contest. Applying
+        # it would only scramble the contest -> lineup pairing it cannot improve.
+        #
+        # ALIGNMENT IS POSITIONAL, so a contest that comes up short truncates
+        # the arm there. Position i of the flattened portfolio is entry i of
+        # `_per_contest_entry_order`; if contest 2 returns fewer picks than it
+        # has entries (a user stop mid-selection, or dR exhausting the pool),
+        # appending contest 3 next would slide its lineups onto contest 2's
+        # unfilled entries and every row after that point would name the wrong
+        # contest -- silently, since the count still looks plausible. Stopping
+        # at the shortfall keeps every position that IS filled correct, which
+        # is the same rule `_build_lineup_entry_map` applies to a short
+        # portfolio.
+        sweep: list = []
+        for arm_label, per_contest in picks_by_arm.items():
+            flat: list = []
+            for slot in slots:
+                ev = ev_by_contest[slot.contest_id]
+                picks = per_contest.get(slot.contest_id, [])
+                for j in picks:
+                    flat.append((shortlist[j], float(ev[j])))
+                if len(picks) < slot.n_entries:
+                    logger.warning(
+                        "Arm %s filled %d of %d entries for %s; truncating this "
+                        "arm there so the remaining contests' entries stay "
+                        "unassigned rather than mislabelled.",
+                        arm_label, len(picks), slot.n_entries, slot.contest_name,
+                    )
+                    break
+            sweep.append((arm_label, flat))
+        sweep.sort(key=lambda t: t[0])
+        return sweep, picks_by_arm, diag
+
+    @staticmethod
+    def _per_contest_entry_order(slots: list) -> list[tuple]:
+        """[(file_path, EntryRecord, slot)] in portfolio position order.
+
+        Contests in fill order, entries within a contest in file order -- the
+        exact order `_per_contest_sweep` flattens each arm's picks into, so
+        position i of any arm's portfolio belongs to entry i here.
+        """
+        return [
+            (file_path, rec, slot)
+            for slot in slots
+            for (file_path, rec) in slot.entries
+        ]
+
+    @staticmethod
+    def _assign_positional(entry_order: list, portfolio: list) -> dict:
+        """{file_path: [(EntryRecord, Lineup), ...]} by position, no re-sorting.
+
+        `assign_lineups_to_entries` ranks ONE portfolio by strength and hands
+        the strongest lineup to the easiest contest. That is right when a single
+        portfolio is spread across contests; once each contest has selected its
+        own slice against its own ladder there is nothing left to rank across
+        contests, and applying both rules would have them silently fight.
+        """
+        result: dict = {}
+        for (file_path, rec, _slot), (lineup, _score) in zip(entry_order, portfolio):
+            result.setdefault(file_path, []).append((rec, lineup))
+        return result
+
+    @staticmethod
+    def _per_contest_summary(result: list, entry_order: list, diag: dict) -> list[dict]:
+        """One row per contest, so the summary is not a blended average.
+
+        A portfolio spanning a 792-entry Pickoff (mean ownership 115.8) and a
+        17,835-entry mini-MAX (89.0) averages to ~94 -- a number that describes
+        neither contest, hides the ~45-point spread that is the entire point of
+        selecting per contest, and reads as mediocre middle-ground rather than
+        as correct per-contest targeting. Any aggregate over this list is
+        blended by construction and must be labelled as such.
+        """
+        if not entry_order:
+            return []
+        groups: dict = {}
+        order: list = []
+        for i, (_fp, _rec, slot) in enumerate(entry_order):
+            if id(slot) not in groups:
+                groups[id(slot)] = (slot, [])
+                order.append(id(slot))
+            if i < len(result):
+                groups[id(slot)][1].append(result[i])
+
+        def _mean(vals):
+            return sum(vals) / len(vals) if vals else None
+
+        out: list[dict] = []
+        for rank, key in enumerate(order, 1):
+            slot, rows = groups[key]
+            owns = [r["lineup_ownership"] for r in rows
+                    if r.get("lineup_ownership") is not None]
+            evs = [r["mean_ev"] for r in rows if r.get("mean_ev") is not None]
+            sals = [r["lineup_salary"] for r in rows if r.get("lineup_salary")]
+            _mo, _me, _ms = _mean(owns), _mean(evs), _mean(sals)
+            out.append({
+                "contest_id": slot.contest_id,
+                "contest_name": slot.contest_name,
+                "fill_rank": rank,
+                "n_lineups": len(rows),
+                "n_entries": int(slot.n_entries),
+                "entry_fee": float(slot.entry_fee),
+                "field_size": int(slot.field_size),
+                "top_prize": float(slot.top_prize),
+                "prize_pool": float(slot.prize_pool),
+                "table_name": str(slot.structure.get("name", "?")),
+                "is_approximate": bool(slot.is_approximate),
+                "lineup_indices": [r["lineup_index"] for r in rows],
+                "mean_ownership": round(_mo, 1) if _mo is not None else None,
+                "mean_ev": round(_me, 4) if _me is not None else None,
+                "total_ev": round(sum(evs), 2) if evs else None,
+                "mean_salary": round(_ms) if _ms is not None else None,
+                "dollars_at_risk": round(slot.entry_fee * len(rows), 2),
+                "pool_consumed_pct": diag.get(slot.contest_id, {}).get(
+                    "pool_consumed_pct"
+                ),
+            })
+        return out
+
+    @staticmethod
+    def _build_per_contest_entry_map(entry_order: list, portfolio: list) -> dict:
+        """{lineup_index: {upload_tag, entry_fee, contest_name, entry_sort_order}}.
+
+        `entry_sort_order` is the contest's FILL RANK rather than a prize
+        pool/fee ratio, so PortfolioTable's existing ascending sort groups the
+        portfolio by contest -- which is the only grouping that means anything
+        once each slice was chosen for its own ladder.
+        """
+        ranks = {}
+        for _fp, _rec, slot in entry_order:
+            ranks.setdefault(id(slot), len(ranks))
+        entry_map: dict[int, dict] = {}
+        for i, (file_path, rec, slot) in enumerate(entry_order):
+            if i >= len(portfolio):
+                break
+            entry_map[i + 1] = {
+                "upload_tag": _extract_upload_tag(file_path.name),
+                "entry_fee": rec.entry_fee_raw,
+                "contest_name": _shorten_contest_name(rec.contest_name),
+                "entry_sort_order": ranks[id(slot)],
+                # Contest identity rides on the entry map because that map is
+                # merged into every lineup row -- live, across the whole sweep,
+                # and again on restore from disk. Carrying it here means the UI
+                # can group and label per contest with no new plumbing, and the
+                # grouping survives a server restart for free.
+                "contest_field_size": int(slot.field_size),
+                "contest_top_prize": float(slot.top_prize),
+                "contest_table": str(slot.structure.get("name", "?")),
+                "contest_approximate": bool(slot.is_approximate),
+            }
+        return entry_map
 
     @staticmethod
     def _build_lineup_entry_map(

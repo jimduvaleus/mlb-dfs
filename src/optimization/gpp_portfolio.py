@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 # with the first-stage seeds field_rng_seed + 0..K-1.
 _FRESH_FIELD_SEED_OFFSET = 100_003
 
+# Per-contest selection draws its own field pool, disjoint from BOTH the
+# mining seeds (field_seed + k) and the fresh re-score seeds
+# (field_seed + _FRESH_FIELD_SEED_OFFSET + k). Reusing the fresh fields here
+# would re-run the winner's-curse the fresh pass exists to control: the
+# candidates that reach selection are exactly the ones that scored well on
+# those draws.
+_SELECT_FIELD_SEED_OFFSET = 200_003
+
+# The shortlist RANKING pass draws its own field again, disjoint from the
+# selection pool above. Ranking the pool on a field and then pricing the
+# survivors on that same field is the winner's curse the fresh re-score
+# exists to control: a candidate that got lucky against one field's
+# particular composition would be both admitted to the shortlist and
+# rewarded at selection, by the same accident.
+_RANK_FIELD_SEED_OFFSET = 300_007
+
 # DeterminantPortfolioSelector: fraction of the diversity weight (1-EVw)
 # carved out for the hedge bonus (see DEw/HedgeW split in __init__). Kept
 # well under 1 so a maxed-out hedge bonus (HedgeN capped at 1.0) can never
@@ -833,6 +849,59 @@ class ContestScorer:
         col_lineups = self._build_col_lineups(candidates)
         dupe_scale = self._compute_dupe_scale(candidates)
         return self._score_col_lineups(col_lineups, dupe_scale, progress_cb, stop_check)
+
+    def build_raw_field_pool(
+        self,
+        n_lineups: int,
+        n_samples: int,
+        progress_cb: Optional[Callable[[int, int], None]] = None,
+        stop_check: Optional[Callable[[], bool]] = None,
+        seed_offset: int = _SELECT_FIELD_SEED_OFFSET,
+    ) -> list[np.ndarray]:
+        """Raw (N, 10) opponent-field lineup arrays on a selection-only seed range.
+
+        Returns the UNSCORED lineups, which is the point: at (N=17,835, 10)
+        int64 a raw field is ~1.4 MB and can be held for the whole selection
+        phase, while its scored, per-world-sorted form is (n_sims x N) float32
+        -- ~1.8 GB at 25k sims. Per-contest selection needs many differently
+        sized fields, so it keeps the cheap thing and rebuilds the expensive
+        one per contest via `sorted_field_from_raw`.
+
+        Historical field mode has no raw lineup arrays (it samples score
+        distributions directly), so it is not supported here.
+        """
+        if self._field_source == "historical":
+            raise RuntimeError(
+                "build_raw_field_pool() needs generated field lineups; "
+                "field_source='historical' produces score distributions only."
+            )
+        seed0 = self._field_seed + int(seed_offset)
+        n_total = n_samples * n_lineups
+        out: list[np.ndarray] = []
+        for k in range(n_samples):
+            offset = k * n_lineups
+            def _cb(n_done: int, _n: int, _offset: int = offset) -> None:
+                if progress_cb is not None:
+                    progress_cb(_offset + n_done, n_total)
+            _t = time.perf_counter()
+            raw = self._cs.generate_field(
+                self._field_players_df, self._field_ownership_vec,
+                n_lineups=n_lineups, rng_seed=seed0 + k,
+                progress_cb=_cb if progress_cb is not None else None,
+                stop_check=stop_check,
+            )
+            logger.info(
+                "  [TIMING] selection field %d/%d: %.3fs (%d lineups)",
+                k + 1, n_samples, time.perf_counter() - _t, raw.shape[0],
+            )
+            out.append(raw)
+            if progress_cb is not None:
+                progress_cb(offset + len(raw), n_total)
+        return out
+
+    def sorted_field_from_raw(self, raw: np.ndarray) -> np.ndarray:
+        """Public wrapper: score raw field lineups and sort per sim world."""
+        return self._build_field_sorted(raw)
 
     def _score_col_lineups(
         self,
