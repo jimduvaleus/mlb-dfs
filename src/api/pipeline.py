@@ -1169,9 +1169,85 @@ class PipelineRunner:
                     field_ownership_vector = apply_ownership_calibration(
                         field_ownership_vector, sim_players_df["position"].values, _calibrator
                     )
-            from src.optimization.payout import load_payout_structure, payout_table_to_array
-            _gpp_structure = load_payout_structure("dk_classic_gpp_5001")
+            from src.optimization.payout import (
+                load_payout_structure, payout_table_to_array,
+                nearest_payout_structure, structure_for_contest,
+            )
+            # CONTEST AWARENESS LIVES OR DIES HERE. The payout ladder and field
+            # size are the only contest-specific inputs the selectors see, and
+            # the objectives respond to them strongly: measured 08/26 on one
+            # slate, the same pool produced portfolios ~19 ownership points
+            # chalkier for a 235-entry contest than for an 11,437-entry one,
+            # unprompted, purely because the ladder said uniqueness was not
+            # worth paying for. Pinning a single 5,001-entry reference curve
+            # throws all of that away and silently prices every contest as if
+            # it were a mid-size $4 GPP.
+            _contest_name = str(gpp_cfg.get("contest_structure", "") or "").strip()
+            _contest_entries = int(gpp_cfg.get("contest_field_size", 0) or 0)
+            _gpp_approx = False
+            if _contest_name:
+                _gpp_structure, _gpp_approx = nearest_payout_structure(
+                    _contest_name, n_entries=(_contest_entries or None),
+                )
+                _exact = structure_for_contest(
+                    _contest_name, n_entries=(_contest_entries or None),
+                ) is not None
+                _gpp_approx = bool(_gpp_approx or not _exact)
+            else:
+                _gpp_structure = load_payout_structure("dk_classic_gpp_5001")
             _gpp_payout_arr = payout_table_to_array(_gpp_structure).astype(np.float32)
+            # The field must be the size the ladder is denominated in, or rank
+            # -> payout is off by the ratio between them.
+            n_field = int(_gpp_structure.get("total_entries", n_field) or n_field)
+            logger.info(
+                "GPP payout structure: %s (%s entries, $%s fee, $%s pool)%s",
+                _gpp_structure.get("name", "?"),
+                f"{n_field:,}", _gpp_structure.get("entry_fee", "?"),
+                f"{float(_gpp_payout_arr.sum()):,.0f}",
+                "  [APPROXIMATE]" if _gpp_approx else "",
+            )
+            if _gpp_approx:
+                # Same hard gate the marginal-reward path uses, and for the same
+                # reason: dR, Kelly and E[max] are all denominated in DOLLARS,
+                # so a borrowed curve does not merely reorder candidates, it
+                # misprices the objective outright.
+                _fb_row = {
+                    "contest_id": _contest_name,
+                    "contest_name": _contest_name,
+                    "k": portfolio_size,
+                    "implied_field_size": n_field,
+                    "table_name": str(_gpp_structure.get("name", "?")),
+                    "table_entries": int(_gpp_structure.get("total_entries", 0)),
+                    "table_entry_fee": float(_gpp_structure.get("entry_fee", 0.0)),
+                    "table_prize_pool": float(_gpp_payout_arr.sum()),
+                    "entry_fee": float(_gpp_structure.get("entry_fee", 0.0)),
+                    "exact": False,
+                }
+                _fb_payload = {
+                    "n_missing": 1, "n_contests": 1, "contests": [_fb_row],
+                    "description": (
+                        f"{_contest_name} (~{n_field:,} entries) has no "
+                        f"registered payout table; falling back to "
+                        f"{_gpp_structure.get('name', '?')} "
+                        f"({int(_gpp_structure.get('total_entries', 0)):,} entries, "
+                        f"${float(_gpp_structure.get('entry_fee', 0)):.2f} entry, "
+                        f"${float(_gpp_payout_arr.sum()):,.0f} prize pool)."
+                    ),
+                }
+                logger.warning("GPP payout fallback: %s", _fb_payload["description"])
+                self._cb("gpp_payout_fallback", _fb_payload)
+                if self._await_confirmation is None:
+                    raise RuntimeError(
+                        "GPP: no registered payout table for "
+                        f"{_contest_name!r}, and this run has no way to ask. "
+                        "Register it in data/payout_structures/ (see "
+                        "PROSPECTIVE_PROTOCOL.md), set gpp.contest_structure to "
+                        "a registered name, or run from the UI to confirm.\n\n"
+                        f"{_fb_payload['description']}"
+                    )
+                if not self._await_confirmation("gpp_payout_fallback", _fb_payload):
+                    self._cb("stopped", {"reason": "payout fallback declined"})
+                    return []
             _cand_excluded_pids = (
                 set(sim_players_df["player_id"].tolist())
                 - set(cand_players_df["player_id"].tolist())
@@ -1546,7 +1622,32 @@ class PipelineRunner:
             _fresh_p_beat99: Optional[np.ndarray] = None
             # Round-10 selector-mode state (kelly/coverage need fresh-pass
             # artifacts the det path never consumed).
-            _selector_mode = str(gpp_cfg.get("selector_mode", "det")).lower()
+            from src.api.models import GppConfig  # noqa: E402  (default parity)
+            _selector_mode = str(
+                gpp_cfg.get("selector_mode", GppConfig.model_fields["selector_mode"].default)
+            ).lower()
+            # Comma list of arms, so a run can take the ones it will actually
+            # play. "all" is shorthand for every arm; a bare single name keeps
+            # its historical labelling. Determinant is the usual thing to omit:
+            # it is both the most expensive arm (the only one needing the M x M
+            # correlation matrix) and, measured across four contests, 9-13
+            # points of portfolio ROI behind Kelly/dR/coverage.
+            _ALL_ARMS = ("det", "kelly", "coverage", "emax", "dr")
+            _modes = {m.strip() for m in _selector_mode.split(",") if m.strip()}
+            if "all" in _modes:
+                _modes = set(_ALL_ARMS)
+            _unknown = _modes - set(_ALL_ARMS)
+            if _unknown:
+                raise ValueError(
+                    f"gpp.selector_mode has unknown arm(s) {sorted(_unknown)}; "
+                    f"valid: {sorted(_ALL_ARMS)} (comma-separated) or 'all'"
+                )
+            if not _modes:
+                _modes = {"det"}
+            # Sweep keys double as arm identifiers whenever more than one arm
+            # runs, so they must not collide; a single-arm run keeps its base
+            # labels so existing saved sweeps still resolve.
+            _multi_arm = len(_modes) > 1
             _fresh_p_beat999: Optional[np.ndarray] = None
             _fresh_e_dupes: Optional[np.ndarray] = None
             _fresh_beat_bits: Optional[np.ndarray] = None
@@ -1654,7 +1755,7 @@ class PipelineRunner:
                 # Coverage selector consumes per-world beat-p999 bits from
                 # this pass only; keep the flag off for every other mode so
                 # the mined-stage memory profile is unchanged.
-                scorer.retain_beat999_worlds = _selector_mode in ("coverage", "all")
+                scorer.retain_beat999_worlds = "coverage" in _modes
                 robust_payout = scorer.rescore_fresh_fields(
                     candidates, n_samples=final_k,
                     stop_check=self._stop_check,
@@ -1754,6 +1855,25 @@ class PipelineRunner:
                 # Phase 3: Det-EV portfolio selection
                 # Scorer is no longer needed; drop its large field arrays (~600-1200 MB)
                 # before the sweep allocates the M×M correlation matrix.
+                # dR is the one selector that needs the FIELD, not just the
+                # per-candidate payouts: its demotion term re-ranks incumbents
+                # against the field in each world. Everything else consumes
+                # robust_payout, so the field is dropped here (~600-1200 MB)
+                # before the det sweep allocates the M×M correlation matrix.
+                # The two are mutually exclusive in practice — dR never builds
+                # the correlation matrix — so this is a swap, not an addition.
+                _dr_field_sorted = None
+                _dr_sim_matrix = None
+                if "dr" in _modes:
+                    _fsl = getattr(scorer, "_field_sorted_list", None)
+                    if _fsl:
+                        _dr_field_sorted = np.ascontiguousarray(_fsl[0])
+                        _dr_sim_matrix = scorer._sim_matrix
+                    else:
+                        logger.warning(
+                            "selector_mode=%s requested dR but the scorer kept no "
+                            "sorted field — dR arm skipped.", _selector_mode,
+                        )
                 for _attr in ("_field_sorted_list", "last_raw_field_list"):
                     try:
                         setattr(scorer, _attr, None)
@@ -1817,8 +1937,8 @@ class PipelineRunner:
                 # generation + scoring dominate; selection is seconds), with
                 # kelly labeled risk+10 (11-15) and coverage labeled 23 so
                 # the sweep keys and dump's selected_risks stay distinct.
-                _det_sweep_risks = _DET_SWEEP_RISKS
-                if _selector_mode in ("kelly", "all"):
+                _det_sweep_risks = _DET_SWEEP_RISKS if "det" in _modes else []
+                if "kelly" in _modes:
                     from src.optimization.gpp_portfolio import KellyPortfolioSelector
                     _entry_fee = float(getattr(scorer, "_entry_fee", 4.0))
                     # Risk → bankroll: B = fee × size × mult (pre-registered
@@ -1826,9 +1946,7 @@ class PipelineRunner:
                     # hits log(<=0)). kelly_bankroll_mult is a global scale.
                     _kelly_mults = {1.0: 1.25, 2.0: 1.5, 3.0: 2.0, 4.0: 4.0, 5.0: 8.0}
                     _kelly_scale = max(float(gpp_cfg.get("kelly_bankroll_mult", 1.0)), 1e-6)
-                    _kelly_lbl_off = 10.0 if _selector_mode == "all" else 0.0
-                    if _selector_mode == "kelly":
-                        _det_sweep_risks = []
+                    _kelly_lbl_off = 10.0 if _multi_arm else 0.0
                     for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
                         if self._stop_check is not None and self._stop_check():
                             break
@@ -1859,7 +1977,7 @@ class PipelineRunner:
                             ),
                         )))
                         del _k_sel
-                if _selector_mode in ("coverage", "all"):
+                if "coverage" in _modes:
                     if (
                         _fresh_beat_bits is None
                         or len(_fresh_beat_bits) != len(candidates)
@@ -1878,12 +1996,10 @@ class PipelineRunner:
                                 _tb = _tb / (1.0 + np.maximum(
                                     np.asarray(_fresh_e_dupes, dtype=np.float64), 0.0,
                                 ))
-                        if _selector_mode == "coverage":
-                            _det_sweep_risks = []
                         # Risk is a no-op for coverage: single tier, labeled
                         # 23 in "all" mode to stay distinct from det 1-5 and
                         # kelly 11-15.
-                        _cov_risk = 23.0 if _selector_mode == "all" else 3.0
+                        _cov_risk = 23.0 if _multi_arm else 3.0
                         self._cb("gpp_det_risk_start", {
                             "risk": _cov_risk, "risk_index": 1, "total_risks": 1,
                         })
@@ -1905,6 +2021,112 @@ class PipelineRunner:
                             ),
                         )))
                         del _c_sel
+
+                if "emax" in _modes:
+                    from src.optimization.gpp_portfolio import EMaxPortfolioSelector
+                    # Risk is a no-op for E[max] (only the portfolio's BEST
+                    # entry per world enters the objective, so there is no
+                    # EV/diversity blend to sweep). Labeled 31 in "all" mode to
+                    # stay distinct from det 1-5, kelly 11-15, coverage 23.
+                    _emax_risk = 31.0 if _multi_arm else 3.0
+                    self._cb("gpp_det_risk_start", {
+                        "risk": _emax_risk, "risk_index": 1, "total_risks": 1,
+                    })
+                    # PASS GROSS, NOT NET: `baseline` is the value of holding
+                    # nothing, which is 0 only for a gross ladder. robust_payout
+                    # is net of the entry fee, so the all-lose world sits at
+                    # -fee and "max" would mean "least-bad loss"; add the fee
+                    # back for this objective alone.
+                    _emax_fee = float(getattr(scorer, "_entry_fee", 4.0))
+                    _e_sel = EMaxPortfolioSelector(
+                        robust_payout=robust_payout + _emax_fee,
+                        candidates=candidates,
+                        portfolio_size=portfolio_size,
+                        ev_floor=float("-inf"),
+                        baseline=0.0,
+                    )
+                    _portfolio_sweep_raw.append((_emax_risk, _e_sel.select(
+                        stop_check=self._stop_check,
+                        progress_cb=lambda data: self._cb(
+                            "gpp_det_select_progress",
+                            {**data, "risk": _emax_risk, "risk_index": 1,
+                             "total_risks": 1},
+                        ),
+                    )))
+                    del _e_sel
+
+                if "dr" in _modes and _dr_field_sorted is not None:
+                    from src.optimization.mrp.delta_reward import ContestDeltaState
+                    _dr_risk = 41.0 if _multi_arm else 3.0
+                    # MEMORY, and why dR gets a shortlist when no other arm does.
+                    # Every other selector consumes robust_payout, which already
+                    # exists. dR additionally needs (M, S) candidate scores plus
+                    # ContestDeltaState's four (M, S) rank/tie arrays — at a
+                    # production pool (M~11k, S=25k) that is ~2.5 GB ON TOP of
+                    # robust_payout's ~1.1 GB and the field's ~0.5 GB. Capping M
+                    # keeps the peak bounded; the cut is by mean payout, so it
+                    # discards only candidates the objective would rank last
+                    # anyway. This mirrors the standalone builder, which gates to
+                    # a few thousand before dR for the same reason.
+                    _dr_cap = int(gpp_cfg.get("dr_shortlist", 4_000))
+                    _dr_ev_all = robust_payout.mean(axis=1)
+                    if len(candidates) > _dr_cap:
+                        _dr_sel = np.argsort(-_dr_ev_all)[:_dr_cap]
+                        _dr_sel.sort()
+                    else:
+                        _dr_sel = np.arange(len(candidates))
+                    _dr_cands = [candidates[i] for i in _dr_sel]
+                    logger.info(
+                        "dR arm: %d of %d candidates (cap %d), field %s",
+                        len(_dr_cands), len(candidates), _dr_cap,
+                        _dr_field_sorted.shape,
+                    )
+                    self._cb("gpp_det_risk_start", {
+                        "risk": _dr_risk, "risk_index": 1, "total_risks": 1,
+                    })
+                    # (N, S) candidate scores on the SAME worlds the field was
+                    # sorted on — built through the scorer's own column
+                    # representation so no third view of the sim matrix exists.
+                    _dr_col = scorer._build_col_lineups(_dr_cands)     # (N, 10)
+                    _dr_S = _dr_sim_matrix.shape[0]
+                    _dr_scores = np.empty((len(_dr_cands), _dr_S), dtype=np.float32)
+                    for _c0 in range(0, len(_dr_cands), 250):
+                        _c1 = min(_c0 + 250, len(_dr_cands))
+                        _dr_scores[_c0:_c1] = _dr_sim_matrix[
+                            :, _dr_col[_c0:_c1]].sum(axis=2).T
+                    _st = ContestDeltaState(
+                        _dr_scores, _dr_field_sorted,
+                        _gpp_payout_arr.astype(np.float64), chunk=512,
+                    )
+                    del _dr_field_sorted
+                    gc.collect()
+                    _dr_taken = np.zeros(len(_dr_cands), dtype=bool)
+                    _dr_picks: list = []
+                    for _k in range(portfolio_size):
+                        if self._stop_check is not None and self._stop_check():
+                            break
+                        _g = np.asarray(_st.marginal_gains(), dtype=np.float64).copy()
+                        # marginal_gains is defined over committed picks too;
+                        # without the mask the greedy can re-select an incumbent,
+                        # which is the one thing this objective exists to prevent.
+                        _g[_dr_taken] = -np.inf
+                        _j = int(np.argmax(_g))
+                        if not np.isfinite(_g[_j]):
+                            break
+                        _dr_taken[_j] = True
+                        _st.commit(_j)
+                        _dr_picks.append(_j)
+                        if (_k + 1) % 10 == 0:
+                            self._cb("gpp_det_select_progress", {
+                                "step": _k + 1, "portfolio_size": portfolio_size,
+                                "risk": _dr_risk, "risk_index": 1, "total_risks": 1,
+                            })
+                    _portfolio_sweep_raw.append((_dr_risk, [
+                        (_dr_cands[i], float(_dr_ev_all[_dr_sel[i]]))
+                        for i in _dr_picks
+                    ]))
+                    del _st, _dr_scores, _dr_col
+                    gc.collect()
 
                 # Floor cull + correlation matrix are identical for every risk
                 # (risk only changes the EVw/DEw blend) — compute once and

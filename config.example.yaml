@@ -78,7 +78,19 @@ gpp:
   selector_score: mean_ev
   cash_anchor_fraction: 0.25
   # Round-10 selector objective: det (default) | kelly | coverage
-  selector_mode: det
+  # Comma list of selection arms, or 'all'. Determinant is the usual omission:
+  # most expensive (only arm needing the M x M correlation matrix) and 9-13
+  # points of portfolio ROI behind Kelly/dR/coverage across four contests.
+  # Kelly and E[max] add nothing upstream; coverage adds ~69 MB of packed world
+  # bits during the fresh re-score; dR retains the sorted field (~0.6-1.2 GB).
+  selector_mode: kelly,dr
+  # Contest identity for the GPP objectives. Empty = the legacy fixed
+  # dk_classic_gpp_5001 reference curve. A DK contest name (e.g. "Bat Flip") or
+  # a registered structure resolves the REAL ladder and field size, which is
+  # what makes the objectives contest-aware.
+  contest_structure: ''
+  contest_field_size: 0      # 0 = take it from the resolved structure
+  dr_shortlist: 4000         # memory cap on the dR arm; see pipeline.py
   kelly_bankroll_mult: 1.0
   final_rescore_top: 20000
   evw_base: 0.10

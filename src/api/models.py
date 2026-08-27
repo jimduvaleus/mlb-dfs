@@ -121,7 +121,23 @@ class GppConfig(BaseModel):
     # robust_payout; risk tier → bankroll B = fee × size × {1.25,1.5,2,4,8},
     # kelly_bankroll_mult scales the table) | "coverage" (greedy max-coverage
     # on fresh per-world beat-p999 bits; single risk tier).
-    selector_mode: str = "det"
+    # Comma list of arms ("kelly,dr"), a single arm, or "all". Upstream cost is
+    # NOT symmetric: kelly/emax consume only robust_payout; coverage flips
+    # retain_beat999_worlds on for the fresh re-score (~69 MB of packed world
+    # bits, and it silently yields nothing if compute_tail_metrics is off); dR
+    # keeps the sorted field the pipeline otherwise frees (~0.6-1.2 GB).
+    selector_mode: str = "kelly,dr"
+    # "" keeps the legacy fixed dk_classic_gpp_5001 curve. A DK contest name or
+    # registered structure name resolves the REAL ladder and field size, which
+    # is the only contest-specific input the dR/Kelly/E[max] objectives see —
+    # and they respond strongly to it (measured 08/26: ~19 points chalkier at
+    # 235 entries than at 11,437, unprompted). An unregistered name falls back
+    # to the nearest-size table and gates the run on confirmation.
+    contest_structure: str = ""
+    contest_field_size: int = 0
+    # dR needs (M, S) candidate scores plus four (M, S) rank/tie arrays on top
+    # of robust_payout; capping M keeps the peak bounded on a laptop.
+    dr_shortlist: int = 4000
     kelly_bankroll_mult: float = 1.0
     # Safety cap on the fresh-rescore slice. The slice itself is defined by
     # ev_floor (rescore everything at/above it, then drop what falls below on
