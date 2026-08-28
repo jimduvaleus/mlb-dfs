@@ -58,6 +58,13 @@ class ContestSlot:
     is_approximate: bool
     first_seen: int                      # original file/row order, for stability
     entries: list = _field(default_factory=list)   # [(file_path, EntryRecord)]
+    # Prize pool advertised in the contest NAME, in dollars ("MLB $8K Chin
+    # Music" -> 8000.0) -- the quantity `_resolve` matches size variants on,
+    # and the only statement of what the contest actually pays that does not
+    # come from a table. None when the name carried no "$<n>[K|M]" token. Kept
+    # distinct from `prize_pool` (the RESOLVED table's sum) precisely so a
+    # borrowed ladder can be told apart from the contest it was borrowed for.
+    advertised_pool: Optional[float] = None
 
     @property
     def top_prize(self) -> float:
@@ -172,6 +179,7 @@ def resolve_contest_slots(
             field_size=int(struct.get("total_entries", 0) or 0),
             is_approximate=bool(approx),
             first_seen=g["first_seen"], entries=g["entries"],
+            advertised_pool=pool_dollars,
         ))
 
     slots.sort(key=lambda s: s.sort_key())

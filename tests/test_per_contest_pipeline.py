@@ -509,7 +509,10 @@ def test_real_entries_files_resolve_with_no_user_input():
         pytest.skip("sample entries files not present")
     files = [(p, parse_entry_file(p)) for p in paths]
     slots = resolve_contest_slots(files)
-    assert len(slots) == 6
+    # No exact count: these are the live entries files and get overwritten with
+    # each slate's real download, so the contest count moves (6 on 08/25, 7 on
+    # 08/28). What must hold is that whatever they contain resolves cleanly.
+    assert len(slots) >= 5
     assert not any(s.is_approximate for s in slots)   # no fallback dialog
     assert all(s.field_size > 0 for s in slots)
     # Fill order is descending top prize.

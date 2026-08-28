@@ -1117,6 +1117,10 @@ export interface PayoutFallbackContest {
   contest_name: string
   k: number
   implied_field_size: number
+  /** Prize pool advertised in the contest name, in dollars. This is what the
+   *  resolver matches size variants on, so it is the figure to compare against
+   *  `table_prize_pool` when judging a fallback. Absent on the MRP path. */
+  contest_prize_pool?: number | null
   table_name: string
   table_entries: number
   table_entry_fee: number

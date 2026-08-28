@@ -34,14 +34,26 @@ export function PayoutFallbackDialog({ contests, nContests, onProceed, onCancel 
                  style={{ padding: '8px 0', borderTop: '1px solid var(--color-border)' }}>
               <div style={{ fontWeight: 600 }}>{c.contest_name}</div>
               <div style={{ fontSize: '0.85em', color: 'var(--color-text-muted)' }}>
-                {c.k} {c.k === 1 ? 'entry' : 'entries'} · ~{c.implied_field_size.toLocaleString()} field
-                · ${c.entry_fee.toFixed(2)} entry
+                {c.k} {c.k === 1 ? 'entry' : 'entries'}
+                {c.contest_prize_pool
+                  ? ` · $${c.contest_prize_pool.toLocaleString()} pool`
+                  : ''}
+                {c.implied_field_size > 0
+                  ? ` · ~${c.implied_field_size.toLocaleString()} field`
+                  : ''}
+                {' '}· ${c.entry_fee.toFixed(2)} entry
               </div>
               <div style={{ fontSize: '0.9em', marginTop: 4 }}>
                 → will use <strong>{c.table_name}</strong>{' '}
                 <span style={{ color: 'var(--color-text-muted)' }}>
                   ({c.table_entries.toLocaleString()} entries · ${c.table_entry_fee.toFixed(2)} entry
-                  · ${c.table_prize_pool.toLocaleString()} prize pool)
+                  · ${c.table_prize_pool.toLocaleString()} prize pool
+                  {c.contest_prize_pool
+                    ? `, ${(
+                        (c.table_prize_pool - c.contest_prize_pool)
+                        / c.contest_prize_pool * 100
+                      ).toFixed(1)}% vs this contest`
+                    : ''})
                 </span>
               </div>
             </div>

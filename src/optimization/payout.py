@@ -89,7 +89,7 @@ CONTEST_STRUCTURES = {
     "mini-max": ["dk_mini_max", "dk_mini_max_14268", "dk_mini_max_23781"],
     "knuckleball": ["dk_knuckleball"],
     "pickoff": ["dk_pickoff", "dk_pickoff_396", "dk_pickoff_792"],
-    "chin music": ["dk_chin_music", "dk_chin_music_1189", "dk_chin_music_1783", "dk_chin_music_2378"],
+    "chin music": ["dk_chin_music", "dk_chin_music_1189", "dk_chin_music_1783", "dk_chin_music_1902", "dk_chin_music_2378"],
     "relay throw": ["dk_relay_throw", "dk_relay_throw_9803"],
     "five-tool player": ["dk_five_tool"],
 }

@@ -1326,11 +1326,27 @@ class PipelineRunner:
             _approx_slots = [sl for sl in _pc_slots if sl.is_approximate]
             if _approx_slots or (_gpp_approx and not _pc_slots):
                 if _approx_slots:
+                    # The contest's OWN implied field, rake-adjusted the same
+                    # way external_pool.implied_field_size does it -- NOT
+                    # `sl.field_size`, which is the borrowed table's entry
+                    # count and made every fallback row read as a size match
+                    # against the very table it was being warned about.
+                    from src.api.external_pool import _DK_RAKE
+
+                    def _own_implied(sl) -> int:
+                        pool, fee = sl.advertised_pool, sl.entry_fee
+                        if not pool or not fee:
+                            return 0
+                        return int(round(pool / (fee * (1.0 - _DK_RAKE))))
+
                     _fb_rows = [{
                         "contest_id": sl.contest_id,
                         "contest_name": sl.contest_name,
                         "k": sl.n_entries,
-                        "implied_field_size": sl.field_size,
+                        "implied_field_size": _own_implied(sl),
+                        "contest_prize_pool": (
+                            float(sl.advertised_pool) if sl.advertised_pool else None
+                        ),
                         "table_name": str(sl.structure.get("name", "?")),
                         "table_entries": int(sl.structure.get("total_entries", 0)),
                         "table_entry_fee": float(sl.structure.get("entry_fee", 0.0)),
@@ -1344,8 +1360,12 @@ class PipelineRunner:
                         "entries file have no registered payout table; the "
                         "nearest captured table will be used for them: "
                         + ", ".join(
-                            f"{r['contest_name']} (~{r['implied_field_size']:,}) "
-                            f"-> {r['table_name']}" for r in _fb_rows
+                            f"{r['contest_name']} "
+                            + (f"(${r['contest_prize_pool']:,.0f} pool) "
+                               if r['contest_prize_pool'] else "")
+                            + f"-> {r['table_name']} "
+                              f"(${r['table_prize_pool']:,.0f} pool)"
+                            for r in _fb_rows
                         )
                     )
                 else:
@@ -1354,6 +1374,7 @@ class PipelineRunner:
                         "contest_name": _contest_name,
                         "k": portfolio_size,
                         "implied_field_size": n_field,
+                        "contest_prize_pool": None,
                         "table_name": str(_gpp_structure.get("name", "?")),
                         "table_entries": int(_gpp_structure.get("total_entries", 0)),
                         "table_entry_fee": float(_gpp_structure.get("entry_fee", 0.0)),
