@@ -152,13 +152,15 @@ class GppConfig(BaseModel):
     # Also consumed by external_pool_ev_type="per_contest", which runs the
     # imported SaberSim pool through the same per-contest selection.
     #
-    # SIZED AGAINST THE AUGMENTED POOL, not the imported one. A SaberSim export
-    # runs ~4,200 lineups and frontier_target_lineups defaults to 4,000, so an
-    # augmented pool lands near 8,200 and a 4,000 cap threw away more than half
-    # the menu the frontier had just been run to widen. At 8,000 the pool goes
-    # through essentially whole -- and because 8,200 <= 8,000 / (1 -
-    # _PC_RANK_MIN_CUT), the "not worth a ranking pass" shortcut fires and the
-    # union-rank stage is skipped outright.
+    # SIZED AGAINST THE AUGMENTED POOL, not the imported one. The arithmetic has
+    # been through two regimes and lands on the same number both times. It was
+    # an ~4,200-lineup SaberSim export plus a 4,000 frontier, so a 4,000 cap
+    # threw away more than half the menu the frontier had just run to widen. The
+    # export then dropped to ~500 per slate (2026-08-28) and the frontier target
+    # went to 8,000 to compensate, so the pool is ~8,500 and the cap still binds
+    # only lightly. Either way 8,200-8,500 <= 8,000 / (1 - _PC_RANK_MIN_CUT), so
+    # the "not worth a ranking pass" shortcut fires and the union-rank stage is
+    # skipped outright.
     #
     # This is a COMPUTATIONAL guard, never a quality device: a smaller value can
     # only remove options the arms would otherwise have had. So it should be as
@@ -222,6 +224,13 @@ class GppConfig(BaseModel):
     #
     # Unlike the parallel dR state build, this CHANGES WHICH LINEUPS ARE PICKED.
     # It is a speed/quality trade, not a free one.
+    #
+    # OVERRIDDEN TO 0 when neither dR nor Determinant is among the selected
+    # arms. Those two are the only ones whose cost grows faster than linearly
+    # in M (four (M x S) rank arrays, and an M x M matmul); Kelly, coverage and
+    # E[max] read a payout matrix built at full M regardless. Capping a
+    # Kelly-only run measured ~9s saved of a 119s stage while four of seven
+    # contests chose from 46% of the menu.
     per_contest_cand_per_entry: int = 400
     per_contest_shortlist_strata: int = 10
     # Candidate-axis chunk for the per-contest payout kernel (memory only).
@@ -720,7 +729,27 @@ class MarginalRewardConfig(BaseModel):
     # TOTAL generated lineups to aim for -- not a per-team rate. Output is
     # n_lambda_star x n_teams x per_team, and n_lambda_star is emergent (line 4
     # decides it), so a fixed rate swung the pool 1,920-4,320 on one setting.
-    frontier_target_lineups: int = 4000
+    #
+    # RAISED 4,000 -> 8,000 on 2026-08-28, when the SaberSim export dropped from
+    # ~5,000 lineups per slate to ~500. The frontier was sized to be roughly half
+    # a pool; it is now ~94% of one, and a 4,421-lineup pool put a 120-entry
+    # portfolio at a 2.7% cut -- the same thinness that motivated wiring the
+    # generator in at all (110 of 4,219 = 2.6%).
+    #
+    # It is nearly free because wall clock is dominated by SAMPLING, which is
+    # fixed at frontier_sample_n. Measured on the 08/28 slate (24 teams,
+    # lambda* = 3), yield stays at 100% and cost barely moves:
+    #
+    #   target   sample_n   kept   distinct 9-cores   wall
+    #    4,000     30,000   3,960            39,431   52.4s
+    #    8,000     30,000   7,992            79,571   57.8s
+    #   12,000     90,000  12,000           118,955  124.3s
+    #
+    # Doubling the target buys exactly 2x the distinct cores for 5.4s. Raising
+    # frontier_sample_n alongside it is the part that is NOT free: 8,000 at
+    # 60,000 samples cost +32s and returned FEWER lineups (7,968) with fewer
+    # distinct cores -- it found a 4th operating point rather than more menu.
+    frontier_target_lineups: int = 8000
     # Floor on the derived per-team cap: the anti-monopoly guarantee has to
     # survive the division.
     frontier_min_per_team: int = 4

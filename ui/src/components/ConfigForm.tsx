@@ -157,7 +157,7 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
                 </FieldRow>
                 <FieldRow label="Target generated lineups (total)">
                   <input type="number" step={500} min={500} max={20000}
-                    value={draft.marginal_reward?.frontier_target_lineups ?? 4000}
+                    value={draft.marginal_reward?.frontier_target_lineups ?? 8000}
                     onChange={e => set('marginal_reward', 'frontier_target_lineups', Number(e.target.value))}
                     disabled={disabled} />
                 </FieldRow>
@@ -400,7 +400,11 @@ export function ConfigForm({ config, onSaved, disabled }: Props) {
               to price. At 400 this is a no-op above roughly 20 entries, which is
               deliberate: with many slots to fill that demotion term is doing real work
               on the contrarian tail an EV ranking cuts first. Unlike the other speed
-              knobs, this changes which lineups get picked.
+              knobs, this changes which lineups get picked. It is forced to 0
+              automatically unless dR or Determinant is among your selection arms —
+              they are the only two whose cost grows faster than linearly in the
+              candidate count, so for Kelly, coverage or E[max] the cap costs picks
+              and saves nothing.
             </p>
             <FieldRow label="Per-contest field samples">
               <input type="number" step={1} min={1}

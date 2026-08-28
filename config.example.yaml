@@ -107,6 +107,9 @@ gpp:
                                     # (floor 2,000). Stops a 2-entry contest paying for
                                     # an 8k-candidate dR state; no-op above ~20 entries.
                                     # 0 disables. Changes picks, not just speed.
+                                    # Auto-forced to 0 unless dR or Determinant is
+                                    # selected — no other arm's cost grows faster
+                                    # than linearly in M, so the cap is pure loss.
   per_contest_shortlist_strata: 10  # fallback only: ownership bands; 1 = plain top-N by EV
   per_contest_cand_chunk: 2000      # payout-kernel chunk (memory only)
   final_rescore_top: 20000
@@ -315,7 +318,7 @@ marginal_reward:
                                 # conventional read of small-field play, and
                                 # falls out of the payout maths rather than
                                 # being tuned to it.
-  frontier_target_lineups: 4000 # TOTAL generated lineups to aim for. NOT a
+  frontier_target_lineups: 8000 # TOTAL generated lineups to aim for. NOT a
                                 # per-team rate: output is
                                 # n_lambda_star x n_teams x per_team, and
                                 # n_lambda_star is EMERGENT -- whatever line 4

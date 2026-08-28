@@ -5776,6 +5776,29 @@ class PipelineRunner:
         # general-purpose trim. Unlike the parallel dR state build, this DOES
         # change which lineups are picked -- it is a speed/quality trade.
         _pc_per_entry = int(gpp_cfg.get("per_contest_cand_per_entry", 400))
+        # THE CAP ONLY PAYS FOR ITSELF WHEN AN ARM'S COST GROWS FASTER THAN
+        # LINEARLY IN M, and exactly two do. dR materialises four (M x S)
+        # rank/tie arrays per contest (measured 30-47s at M=8,200, 51% of the
+        # whole selection stage); Determinant runs an M x M correlation matmul.
+        # Kelly, coverage and E[max] all read the payout matrix that was built
+        # at FULL M regardless of this setting, and their per-pick work is
+        # under a second -- capping them bought ~9s of a 119s stage while four
+        # of seven contests chose from 46% of the menu.
+        #
+        # So it is switched off rather than left as a silent quality tax the
+        # user has to know to disable. Overriding beats defaulting here: the
+        # value is a config field the user may well have set months ago for a
+        # run that DID include dR, and it should not keep costing them picks
+        # after they switch arms.
+        if _pc_per_entry > 0 and not ({"dr", "det"} & set(modes)):
+            logger.info(
+                "Per-contest candidate cap (%d/entry) disabled: it exists for "
+                "the dR state build and the Determinant correlation matmul, "
+                "and neither arm is running (%s). Every contest selects from "
+                "the full shortlist.",
+                _pc_per_entry, ", ".join(sorted(modes)) or "none",
+            )
+            _pc_per_entry = 0
         # narrow_fn runs once per ARM, so a bare log line here prints six times
         # per contest (five Kelly risk tiers plus dR) and buries the stage
         # boundaries either side of it. The cap is a property of the contest,

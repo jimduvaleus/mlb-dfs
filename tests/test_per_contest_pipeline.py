@@ -775,6 +775,42 @@ def test_candidate_cap_is_off_by_default_in_these_fixtures(slots, shortlist, sco
         assert [lu.player_ids for lu, _ in pa] == [lu.player_ids for lu, _ in pb]
 
 
+def test_the_cap_switches_itself_off_when_no_arm_can_use_it(slots, shortlist, scorer, caplog):
+    """It pays for itself only where cost grows faster than linearly in M.
+
+    dR builds four (M x S) rank arrays per contest and Determinant runs an
+    M x M matmul; Kelly, coverage and E[max] read a payout matrix that was
+    constructed at full M whatever this setting says, then do sub-second
+    per-pick work. Measured 08/28: capping a Kelly-only run saved ~9s of a
+    119s stage while four of seven contests chose from 46% of the menu.
+
+    Overriding rather than defaulting is deliberate. The value is a config
+    field a user may have set for a run that DID include dR, and it should not
+    keep costing them picks after they switch arms.
+    """
+    import logging
+    cfg = {"per_contest_cand_per_entry": 400}
+    for modes, disabled in [({"kelly"}, True), ({"emax"}, True),
+                            ({"kelly", "coverage", "emax"}, True),
+                            ({"dr"}, False), ({"kelly", "dr"}, False)]:
+        with caplog.at_level(logging.INFO, logger="src.api.pipeline"):
+            caplog.clear()
+            _sweep(_runner(), slots, shortlist, scorer, modes, gpp_cfg=dict(cfg),
+                   det_sweep_risks=([1.0] if "det" in modes else []))
+        off = any("cap" in r.getMessage() and "disabled" in r.getMessage()
+                  for r in caplog.records)
+        assert off is disabled, f"modes={modes}: expected disabled={disabled}"
+
+
+def test_an_explicit_zero_needs_no_announcement(slots, shortlist, scorer, caplog):
+    """Already off is not the same event as switched off, and must stay quiet."""
+    import logging
+    with caplog.at_level(logging.INFO, logger="src.api.pipeline"):
+        _sweep(_runner(), slots, shortlist, scorer, {"kelly"},
+               gpp_cfg={"per_contest_cand_per_entry": 0})
+    assert not any("disabled" in r.getMessage() for r in caplog.records)
+
+
 def test_a_binding_cap_keeps_the_highest_ev_candidates(slots, shortlist, scorer):
     """When it does bite, it must cut from the BOTTOM of this contest's EV.
 
