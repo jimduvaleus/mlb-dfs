@@ -87,11 +87,12 @@ CONTEST_STRUCTURES = {
     "moonshot": ["dk_moonshot"],
     "bat flip": ["dk_bat_flip", "dk_bat_flip_11437"],
     "mini-max": ["dk_mini_max", "dk_mini_max_14268", "dk_mini_max_23781"],
-    "knuckleball": ["dk_knuckleball"],
+    "knuckleball": ["dk_knuckleball", "dk_knuckleball_14268"],
     "pickoff": ["dk_pickoff", "dk_pickoff_396", "dk_pickoff_792"],
     "chin music": ["dk_chin_music", "dk_chin_music_1189", "dk_chin_music_1783", "dk_chin_music_1902", "dk_chin_music_2378"],
     "relay throw": ["dk_relay_throw", "dk_relay_throw_9803"],
     "five-tool player": ["dk_five_tool"],
+    "extra inning": ["dk_extra_inning"],
 }
 
 
@@ -147,7 +148,7 @@ def nearest_payout_structure(
 ) -> tuple[dict, bool]:
     """Like `structure_for_contest`, but never returns None: falls back to
     the closest-*size* table across ALL registered contest types when
-    `contest_name` isn't one of the 14 known DK types (e.g. a live contest
+    `contest_name` isn't one of the 15 known DK types (e.g. a live contest
     name outside the archive this codebase's tables were captured from).
 
     Returns `(structure, is_approximate)` — `is_approximate` is True

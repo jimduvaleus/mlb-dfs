@@ -568,6 +568,7 @@ class TestRealPayoutStructures:
         ("Bat Flip", 9803, 18.0, 0.333),
         ("mini-MAX", 17835, 1.0, 0.100),
         ("Knuckleball", 47562, 5.0, 0.250),
+        ("Extra Inning", 17647, 10.0, 0.333),
     ])
     def test_real_tables_match_captured_values(self, contest, n, fee, first_share):
         from src.optimization.payout import structure_for_contest, payout_table_to_array
