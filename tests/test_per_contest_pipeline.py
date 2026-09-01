@@ -397,6 +397,78 @@ def test_a_short_contest_truncates_the_arm_instead_of_sliding_later_contests(
 # Progress events
 # --------------------------------------------------------------------------
 
+def test_a_stop_after_one_contest_keeps_that_contests_lineups(
+    slots, shortlist, scorer,
+):
+    """Stop must end the sweep, not run every remaining contest to completion.
+
+    The user-visible symptom this covers: per-contest selection is the
+    minutes-long stage of a run, and every contest after the Stop click was
+    being priced in full before anything noticed.
+    """
+    runner = _runner()
+    done = []
+    runner._cb = lambda stage, data: (
+        done.append(data["contest_name"]) if stage == "gpp_contest_done" else None
+    )
+    runner._stop_check = lambda: len(done) >= 1
+    sweep, picks, diag = _sweep(runner, slots, shortlist, scorer, {"kelly"})
+
+    assert len(done) == 1                       # the second contest never ran
+    assert list(diag) == [slots[0].contest_id]
+    for _label, portfolio in sweep:
+        # Truncated at the contest boundary, so every position that IS filled
+        # still belongs to the entry the flatten order names.
+        assert len(portfolio) == slots[0].n_entries
+    for arm_picks in picks.values():
+        assert list(arm_picks) == [slots[0].contest_id]
+
+
+def test_a_stop_before_any_contest_yields_an_empty_portfolio_not_an_error(
+    slots, shortlist, scorer,
+):
+    runner = _runner()
+    runner._stop_check = lambda: True
+    sweep, picks, diag = _sweep(runner, slots, shortlist, scorer, {"kelly"})
+    assert diag == {}
+    assert sweep and all(portfolio == [] for _, portfolio in sweep)
+    assert all(arm_picks == {} for arm_picks in picks.values())
+
+
+def test_every_arm_honours_a_stop_including_det(slots, shortlist, scorer):
+    """det ran its greedy to completion regardless -- it was the one arm whose
+    selector was never handed the stop check."""
+    runner = _runner()
+    prepared = []
+    runner._cb = lambda stage, data: (
+        prepared.append(data["contest_name"]) if stage == "gpp_contest_select" else None
+    )
+    runner._stop_check = lambda: len(prepared) >= 1
+    sweep, _picks, diag = _sweep(
+        runner, slots, shortlist, scorer, {"det", "kelly", "coverage", "emax", "dr"},
+        det_sweep_risks=[1.0, 3.0],
+    )
+    assert diag == {}
+    assert all(portfolio == [] for _, portfolio in sweep)
+
+
+def test_a_stop_before_selection_reports_a_terminal_stopped_event():
+    """The external per_contest branch bails out through this helper whenever a
+    stop lands in a pre-selection stage (field generation, frontier
+    augmentation, shortlisting), and the UI's `stopped` handler reads every one
+    of these keys."""
+    runner = _runner()
+    events = []
+    runner._cb = lambda stage, data: events.append((stage, data))
+    assert runner._stopped_before_portfolio("per_contest") == []
+    (stage, data), = events
+    assert stage == "stopped"
+    assert data["n_lineups"] == 0
+    assert data["portfolio"] == [] and data["portfolio_sweep"] == []
+    assert data["optimal_lineups"] == []
+    assert data["ev_type"] == "per_contest" and data["external"] is True
+
+
 def test_progress_events_are_one_per_contest_not_one_per_arm(slots, shortlist, scorer):
     """The panel should get a readable stage trail, not a flood: the expensive
     work is per contest, so that is the reporting granularity even though six

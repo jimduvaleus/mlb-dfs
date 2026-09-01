@@ -14,6 +14,7 @@ from src.optimization.gpp_portfolio import DUPE_REF_FIELD_SIZE
 from src.optimization.multi_contest import (
     SharedFieldPool,
     assign_per_contest,
+    contest_ev_means,
     contest_payout_matrix,
     describe_slots,
     resolve_contest_slots,
@@ -203,6 +204,92 @@ def test_multi_arm_pool_consumption_diagnostic_tracks_the_greediest_arm():
     assert last["pool_consumed_pct"] == pytest.approx(33.0)
     assert last["table_name"]
     assert last["entry_fee"] > 0
+
+
+# --------------------------------------------------------------------------
+# Stopping mid-selection
+# --------------------------------------------------------------------------
+
+def test_a_stop_ends_the_contest_loop_instead_of_building_the_rest():
+    slots = resolve_contest_slots(_entries(REAL_SPEC))
+    prepared = []
+    picks, diag = select_per_contest_multi_arm(
+        slots, 200,
+        make_field=lambda f: None,
+        prepare_fn=lambda field, slot: prepared.append(slot.contest_id),
+        arm_fns={"a": _take_first},
+        # Stop lands while the first contest is being filled.
+        stop_check=lambda: len(prepared) >= 1,
+    )
+    # The stop is seen right after prepare_fn returns, so contest 1 is not
+    # filled either -- its context was built from a run that was already over.
+    assert prepared == [slots[0].contest_id]
+    assert picks["a"] == {}
+    assert diag == {}
+
+
+def test_a_stop_between_contests_keeps_the_contests_already_filled():
+    slots = resolve_contest_slots(_entries(REAL_SPEC))
+    filled = []
+
+    def _arm(ctx, avail, k, slot):
+        filled.append(slot.contest_id)
+        return _take_first(ctx, avail, k, slot)
+
+    picks, diag = select_per_contest_multi_arm(
+        slots, 200,
+        make_field=lambda f: None,
+        prepare_fn=lambda field, slot: None,
+        arm_fns={"a": _arm},
+        stop_check=lambda: len(filled) >= 1,
+    )
+    assert list(picks["a"]) == [slots[0].contest_id]
+    assert len(picks["a"][slots[0].contest_id]) == slots[0].n_entries
+    assert list(diag) == [slots[0].contest_id]
+
+
+def test_a_stop_never_raises_the_shortlist_too_small_error():
+    """A stop must end the run, not surface as a pool-exhaustion failure."""
+    slots = resolve_contest_slots(_entries(REAL_SPEC))
+    picks, _ = select_per_contest_multi_arm(
+        slots, 5,                       # far too few for 33 entries
+        make_field=lambda f: None,
+        prepare_fn=lambda field, slot: None,
+        arm_fns={"a": _take_first},
+        stop_check=lambda: True,
+    )
+    assert picks == {"a": {}}
+
+
+def test_payout_matrix_abandons_the_kernel_on_a_stop():
+    cands = np.arange(40, dtype=np.float32).reshape(10, 4)
+    field = np.tile(np.arange(6, dtype=np.float32), (4, 1))
+    payout = np.array([100.0, 50.0, 10.0, 0.0, 0.0, 0.0])
+    full = contest_payout_matrix(
+        cands, [field], payout, entry_fee=1.0, cand_chunk=5,
+    )
+    calls = {"n": 0}
+
+    def _stop():
+        calls["n"] += 1
+        return calls["n"] > 1           # first chunk runs, second does not
+
+    partial = contest_payout_matrix(
+        cands, [field], payout, entry_fee=1.0, cand_chunk=5, stop_check=_stop,
+    )
+    assert np.allclose(partial[:5], full[:5])
+    assert np.all(partial[5:] == 0.0)   # part-built, for the caller to discard
+
+
+def test_ev_means_stopped_before_any_field_returns_without_raising():
+    cands = np.arange(40, dtype=np.float32).reshape(10, 4)
+    field = np.tile(np.arange(6, dtype=np.float32), (4, 1))
+    out = contest_ev_means(
+        cands, [field], np.array([100.0, 50.0, 10.0, 0.0, 0.0, 0.0]),
+        entry_fee=1.0, stop_check=lambda: True,
+    )
+    assert out.shape == (10,)
+    assert np.all(out == 0.0)
 
 
 # --------------------------------------------------------------------------

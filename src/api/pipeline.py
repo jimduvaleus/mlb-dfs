@@ -3777,6 +3777,18 @@ class PipelineRunner:
                     ),
                     stop_check=self._stop_check,
                 ))
+            if self._stop_check is not None and self._stop_check():
+                # Everything between here and selection -- frontier
+                # augmentation, the shortlist ranking pass, the full-resolution
+                # score matrix -- is minutes of work whose output a stopped run
+                # throws away. It would also be built on a field pool that
+                # generate_field cut short (it returns a partial pool on a stop
+                # rather than raising), so there is nothing to salvage by
+                # continuing.
+                logger.info(
+                    "Per-contest: stop requested during field generation — "
+                    "ending the run before selection.")
+                return self._stopped_before_portfolio(_ev_type)
 
             # --- LINE-2 FRONTIER AUGMENTATION. -----------------------------
             # External-pool mode imports a pool; it does not have to be the
@@ -3810,6 +3822,11 @@ class PipelineRunner:
                         frozenset(lu.player_ids)
                         for lu in pool.lineups[-_pc_n_frontier:]
                     }
+                if self._stop_check is not None and self._stop_check():
+                    logger.info(
+                        "Per-contest: stop requested during frontier "
+                        "augmentation — ending the run before selection.")
+                    return self._stopped_before_portfolio(_ev_type)
 
             _pc_cap = max(int(gpp_cfg.get("per_contest_shortlist", 8_000)), _pc_need)
             _pc_lineups = list(pool.lineups)
@@ -3906,6 +3923,11 @@ class PipelineRunner:
                     _pc_ev_all, _own_sum, _pc_cap,
                     int(gpp_cfg.get("per_contest_shortlist_strata", 10)),
                 )
+            if self._stop_check is not None and self._stop_check():
+                logger.info(
+                    "Per-contest: stop requested during shortlisting — ending "
+                    "the run before selection.")
+                return self._stopped_before_portfolio(_ev_type)
             _pc_shortlist = [_pc_lineups[i] for i in _pc_sel]
             # Full-resolution scores, shortlist only.
             _pc_scores = ep.compute_lineup_scores(_pc_shortlist, sim_results)
@@ -4251,6 +4273,25 @@ class PipelineRunner:
             "ev_type": _ev_type,
         })
         return result
+
+    def _stopped_before_portfolio(self, ev_type: str) -> list:
+        """Emit the terminal `stopped` event for a run cut off with nothing
+        selected yet, and return the empty result its caller returns.
+
+        The tail of `_run_external` already handles a stop that lands once a
+        portfolio exists (it skips the upload files and reports `stopped` with
+        whatever was filled). A stop during the stages BEFORE selection has no
+        portfolio to report, and every one of those stages hands back a
+        part-built artefact on a stop -- a field pool short of its requested
+        size, a shortlist ranked against some of the contests -- so continuing
+        would price the run against inputs the stop truncated. Ending here is
+        both faster and the only honest option.
+        """
+        self._cb("stopped", {
+            "portfolio": [], "n_lineups": 0, "optimal_lineups": [],
+            "portfolio_sweep": [], "external": True, "ev_type": ev_type,
+        })
+        return []
 
     def _external_assignments(self, portfolio: list) -> dict:
         """Direct per-contest assignment: lineup i fills the entry it was
@@ -5409,18 +5450,34 @@ class PipelineRunner:
         pool = SharedFieldPool(raw_fields, sort_fn, seed=seed)
         evs: list = []
         for i, slot in enumerate(slots, 1):
+            # A stop here abandons the ranking pass: whatever contests have
+            # been ranked still union into a usable menu (and if none have, the
+            # caller's own stop checkpoint ends the run before it is used), so
+            # there is nothing to gain from ranking the rest.
+            if self._stop_check is not None and self._stop_check():
+                logger.info(
+                    "Shortlist ranking: stop requested after %d of %d contests.",
+                    i - 1, len(slots),
+                )
+                break
             t0 = time.perf_counter()
             evs.append(contest_ev_means(
                 cand_scores_rank, pool.fields(slot.field_size),
                 slot.payout_arr, slot.entry_fee,
                 e_dupes=e_dupes, dupe_min_gross_payout=dupe_min_gross,
-                cand_chunk=cand_chunk,
+                cand_chunk=cand_chunk, stop_check=self._stop_check,
             ))
             logger.info(
                 "  rank %d/%d %s (field %d): %.1fs  EV $%.2f-$%.2f",
                 i, len(slots), slot.contest_name[:30], slot.field_size,
                 time.perf_counter() - t0, float(evs[-1].min()), float(evs[-1].max()),
             )
+        if not evs:
+            # Stopped before the first contest ranked. Hand back the head of the
+            # pool rather than raising: the caller ends the run at its next stop
+            # checkpoint, and a valid-shaped return keeps that path free of a
+            # spurious error.
+            return np.arange(min(cap, cand_scores_rank.shape[0])), evs
         sel = union_shortlist(evs, cap)
         # Overlap is the interesting diagnostic: contests that agree produce a
         # small union and deep shared coverage, contests that disagree produce
@@ -5585,7 +5642,7 @@ class PipelineRunner:
             payout = contest_payout_matrix(
                 cand_scores, field_list, slot.payout_arr, slot.entry_fee,
                 e_dupes=e_dupes_arg, dupe_min_gross_payout=dupe_min_gross,
-                cand_chunk=cand_chunk,
+                cand_chunk=cand_chunk, stop_check=self._stop_check,
             )
             ctx = {
                 "payout": payout,
@@ -5666,7 +5723,7 @@ class PipelineRunner:
                     ),
                     cash_anchor_fraction=cash_anchor_fraction,
                 )
-                return _to_idx(sel.select(), cands, avail)
+                return _to_idx(sel.select(stop_check=self._stop_check), cands, avail)
             return fn
 
         def _dr_arm(ctx, avail, k, slot):
@@ -5676,6 +5733,11 @@ class PipelineRunner:
             # the memory is the reason the shortlist exists. Identical to every
             # other arm at the default per_contest_field_samples=1.
             from src.optimization.mrp.delta_reward import ContestDeltaState
+            if self._stop_check is not None and self._stop_check():
+                # The rank precompute below is one uninterruptible numba kernel
+                # (measured 30-47s at M=8,200) — this is the last boundary at
+                # which a stop costs nothing.
+                return []
             _t0 = time.perf_counter()
             scores = np.ascontiguousarray(cand_scores[avail])
             st = ContestDeltaState(
@@ -5838,6 +5900,7 @@ class PipelineRunner:
                 if disjoint is None else bool(disjoint)
             ),
             progress=lambda msg: logger.info("  %s", msg),
+            stop_check=self._stop_check,
         )
 
         # Flatten each arm into the shared entry order. Note there is NO
@@ -5857,20 +5920,37 @@ class PipelineRunner:
         # at the shortfall keeps every position that IS filled correct, which
         # is the same rule `_build_lineup_entry_map` applies to a short
         # portfolio.
+        #
+        # A user stop is the expected way to get here, so it is reported as
+        # such rather than as the WARNING that a pool-exhaustion shortfall
+        # deserves — the run is about to end as `stopped` with whatever these
+        # arms did fill.
+        _sweep_stopped = self._stop_check is not None and self._stop_check()
         sweep: list = []
         for arm_label, per_contest in picks_by_arm.items():
             flat: list = []
             for slot in slots:
-                ev = ev_by_contest[slot.contest_id]
+                ev = ev_by_contest.get(slot.contest_id)
+                if ev is None:
+                    # The contest never ran at all -- a stop landed before its
+                    # field was built -- so there is nothing to flatten and
+                    # nothing after it can be positioned either.
+                    logger.info(
+                        "Arm %s: %s and every contest after it were not "
+                        "reached (run stopped); the arm ends here.",
+                        arm_label, slot.contest_name,
+                    )
+                    break
                 picks = per_contest.get(slot.contest_id, [])
                 for j in picks:
                     flat.append((shortlist[j], float(ev[j])))
                 if len(picks) < slot.n_entries:
-                    logger.warning(
-                        "Arm %s filled %d of %d entries for %s; truncating this "
-                        "arm there so the remaining contests' entries stay "
+                    (logger.info if _sweep_stopped else logger.warning)(
+                        "Arm %s filled %d of %d entries for %s%s; truncating "
+                        "this arm there so the remaining contests' entries stay "
                         "unassigned rather than mislabelled.",
                         arm_label, len(picks), slot.n_entries, slot.contest_name,
+                        " (run stopped)" if _sweep_stopped else "",
                     )
                     break
             sweep.append((arm_label, flat))

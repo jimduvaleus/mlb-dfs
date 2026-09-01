@@ -213,6 +213,7 @@ def select_per_contest_multi_arm(
     progress=None,
     contest_done=None,
     narrow_fn=None,
+    stop_check=None,
 ) -> tuple[dict, dict]:
     """Fill every contest for every selection arm, contests on the OUTER loop.
 
@@ -244,18 +245,44 @@ def select_per_contest_multi_arm(
     `contest_done(index, slot)` fires once per contest AFTER every arm has
     filled it -- the only point at which that contest's cost is fully realized,
     which is what a caller driving a progress bar needs.
+
+    `stop_check()` is polled at every boundary that precedes real work: before a
+    contest's field build, again once `prepare_fn` has returned (that call is
+    the minutes-long half of a contest and can only report a stop by finishing
+    early with a matrix nobody should read), and before each arm fills. A stop
+    RETURNS what is already filled rather than raising -- the caller flattens a
+    partial portfolio and the run reports `stopped`, which is the contract every
+    other stage honours. A contest that never ran contributes no picks at all,
+    so the positional flatten downstream truncates there instead of sliding a
+    later contest's lineups onto its entries.
     """
     say = progress or (lambda m: None)
+    stopped = stop_check if stop_check is not None else (lambda: False)
     used: dict = {arm: set() for arm in arm_fns}
     out: dict = {arm: {} for arm in arm_fns}
     diag: dict[str, dict] = {}
     M = int(n_candidates)
     for i, slot in enumerate(slots, 1):
+        if stopped():
+            say(f"stop requested — {i - 1} of {len(slots)} contests filled")
+            break
         say(f"[{i}/{len(slots)}] {slot.contest_name} — {slot.n_entries} entries, "
             f"field {slot.field_size:,}, top ${slot.top_prize:,.0f}, "
             f"{M:,} candidates shortlisted")
         ctx = prepare_fn(make_field(slot.field_size), slot)
+        if stopped():
+            # The field sort and the payout kernel are the expensive half of a
+            # contest, and a Stop clicked inside them is only observable once
+            # they return. Drop the context unread: whatever it holds was cut
+            # short, so pricing an arm against it would pick lineups off a
+            # half-built matrix.
+            del ctx
+            say(f"stop requested during contest {i}/{len(slots)} — "
+                f"{i - 1} contests filled")
+            break
         for arm, fn in arm_fns.items():
+            if stopped():
+                break
             u = used[arm]
             avail = (
                 np.array([j for j in range(M) if j not in u], dtype=np.int64)
@@ -445,6 +472,7 @@ def contest_payout_matrix(
     e_dupes: Optional[np.ndarray] = None,
     dupe_min_gross_payout: float = 15.0,
     cand_chunk: int = 2_000,
+    stop_check=None,
 ) -> np.ndarray:
     """(M, S) NET dollars per candidate per sim world against ONE contest.
 
@@ -457,6 +485,13 @@ def contest_payout_matrix(
     `fields` is an iterable of (n_sims, F) ascending-sorted fields, consumed
     lazily and averaged: peak memory is one sorted field plus the (M, S) output,
     never K of either. Chunked over candidates for the same reason.
+
+    `stop_check()` is polled per candidate chunk, and a stop returns the matrix
+    PART-BUILT: at production scale this loop is the minutes-long block a Stop
+    click most often lands in, and the only useful thing to do with it then is
+    abandon it. Callers must poll stop_check themselves on return and discard
+    the result -- returning early beats raising, which would turn a user Stop
+    into an error path in every caller.
     """
     from src.optimization.gpp_portfolio import (
         _build_dilutable_lookup, _build_payout_lookup, _payout_cumsum,
@@ -494,6 +529,8 @@ def contest_payout_matrix(
                 "sample of one contest must be subsampled to the same size"
             )
         for c0 in range(0, M, cand_chunk):
+            if stop_check is not None and stop_check():
+                return out
             c1 = min(c0 + cand_chunk, M)
             out[c0:c1] += _compute_payout_from_sorted_field(
                 np.ascontiguousarray(cand_scores[c0:c1]),
@@ -548,6 +585,7 @@ def contest_ev_means(
     e_dupes: Optional[np.ndarray] = None,
     dupe_min_gross_payout: float = 15.0,
     cand_chunk: int = 2_000,
+    stop_check=None,
 ) -> np.ndarray:
     """(M,) mean net dollars per candidate against ONE contest.
 
@@ -555,6 +593,10 @@ def contest_ev_means(
     selection: it accumulates per-candidate means chunk by chunk and never
     holds an (M, S) payout matrix. Used to rank the whole pool against every
     contest's own ladder, which is the input the shortlist union needs.
+
+    `stop_check` behaves exactly as in `contest_payout_matrix`: polled per
+    candidate chunk, and a stop returns a part-built ranking for the caller to
+    discard, never a raise.
     """
     from src.optimization.gpp_portfolio import (
         _build_dilutable_lookup, _build_payout_lookup, _payout_cumsum,
@@ -586,6 +628,8 @@ def contest_ev_means(
                 f"field width changed mid-contest ({width} -> {F})"
             )
         for c0 in range(0, M, cand_chunk):
+            if stop_check is not None and stop_check():
+                return out / n_k if n_k else out
             c1 = min(c0 + cand_chunk, M)
             out[c0:c1] += _compute_payout_from_sorted_field(
                 np.ascontiguousarray(cand_scores[c0:c1]),
