@@ -1,0 +1,84 @@
+{
+  "name": "DraftKings $5 Chin Music (951)",
+  "entry_fee": 5.0,
+  "total_entries": 951,
+  "total_payout_positions": 212,
+  "source": "real DK contest payout table, captured 2026-08-31",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 400.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 200.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 150.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 125.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 100.0
+    },
+    {
+      "start": 6,
+      "end": 6,
+      "amount": 80.0
+    },
+    {
+      "start": 7,
+      "end": 7,
+      "amount": 70.0
+    },
+    {
+      "start": 8,
+      "end": 8,
+      "amount": 60.0
+    },
+    {
+      "start": 9,
+      "end": 9,
+      "amount": 50.0
+    },
+    {
+      "start": 10,
+      "end": 11,
+      "amount": 40.0
+    },
+    {
+      "start": 12,
+      "end": 16,
+      "amount": 30.0
+    },
+    {
+      "start": 17,
+      "end": 27,
+      "amount": 25.0
+    },
+    {
+      "start": 28,
+      "end": 47,
+      "amount": 20.0
+    },
+    {
+      "start": 48,
+      "end": 89,
+      "amount": 15.0
+    },
+    {
+      "start": 90,
+      "end": 212,
+      "amount": 10.0
+    }
+  ]
+}
