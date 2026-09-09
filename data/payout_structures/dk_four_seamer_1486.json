@@ -1,0 +1,99 @@
+{
+  "name": "DraftKings $4 Four-Seamer (1.49k)",
+  "entry_fee": 4.0,
+  "total_entries": 1486,
+  "total_payout_positions": 382,
+  "source": "real DK contest payout table, captured 2026-09-09",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 500.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 300.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 200.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 150.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 100.0
+    },
+    {
+      "start": 6,
+      "end": 6,
+      "amount": 75.0
+    },
+    {
+      "start": 7,
+      "end": 8,
+      "amount": 60.0
+    },
+    {
+      "start": 9,
+      "end": 10,
+      "amount": 50.0
+    },
+    {
+      "start": 11,
+      "end": 12,
+      "amount": 45.0
+    },
+    {
+      "start": 13,
+      "end": 17,
+      "amount": 40.0
+    },
+    {
+      "start": 18,
+      "end": 22,
+      "amount": 35.0
+    },
+    {
+      "start": 23,
+      "end": 27,
+      "amount": 30.0
+    },
+    {
+      "start": 28,
+      "end": 32,
+      "amount": 25.0
+    },
+    {
+      "start": 33,
+      "end": 42,
+      "amount": 20.0
+    },
+    {
+      "start": 43,
+      "end": 57,
+      "amount": 15.0
+    },
+    {
+      "start": 58,
+      "end": 102,
+      "amount": 10.0
+    },
+    {
+      "start": 103,
+      "end": 182,
+      "amount": 8.0
+    },
+    {
+      "start": 183,
+      "end": 382,
+      "amount": 6.0
+    }
+  ]
+}

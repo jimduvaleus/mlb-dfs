@@ -1,0 +1,109 @@
+{
+  "name": "DraftKings $1 mini-MAX (9.5k)",
+  "entry_fee": 1.0,
+  "total_entries": 9512,
+  "total_payout_positions": 1905,
+  "source": "real DK contest payout table, captured 2026-09-09",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 1000.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 500.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 300.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 150.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 100.0
+    },
+    {
+      "start": 6,
+      "end": 6,
+      "amount": 75.0
+    },
+    {
+      "start": 7,
+      "end": 8,
+      "amount": 60.0
+    },
+    {
+      "start": 9,
+      "end": 10,
+      "amount": 50.0
+    },
+    {
+      "start": 11,
+      "end": 14,
+      "amount": 40.0
+    },
+    {
+      "start": 15,
+      "end": 19,
+      "amount": 30.0
+    },
+    {
+      "start": 20,
+      "end": 25,
+      "amount": 25.0
+    },
+    {
+      "start": 26,
+      "end": 35,
+      "amount": 20.0
+    },
+    {
+      "start": 36,
+      "end": 45,
+      "amount": 15.0
+    },
+    {
+      "start": 46,
+      "end": 60,
+      "amount": 10.0
+    },
+    {
+      "start": 61,
+      "end": 75,
+      "amount": 8.0
+    },
+    {
+      "start": 76,
+      "end": 100,
+      "amount": 6.0
+    },
+    {
+      "start": 101,
+      "end": 165,
+      "amount": 5.0
+    },
+    {
+      "start": 166,
+      "end": 315,
+      "amount": 4.0
+    },
+    {
+      "start": 316,
+      "end": 635,
+      "amount": 3.0
+    },
+    {
+      "start": 636,
+      "end": 1905,
+      "amount": 2.0
+    }
+  ]
+}
