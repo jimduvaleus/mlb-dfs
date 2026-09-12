@@ -1,0 +1,94 @@
+{
+  "name": "DraftKings $15 Relay Throw [$20K to 1st] (6.3k)",
+  "entry_fee": 15.0,
+  "total_entries": 6274,
+  "total_payout_positions": 1414,
+  "source": "real DK contest payout table, captured 2026-09-12",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 20000.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 7500.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 3000.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 2000.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 1500.0
+    },
+    {
+      "start": 6,
+      "end": 6,
+      "amount": 1000.0
+    },
+    {
+      "start": 7,
+      "end": 7,
+      "amount": 500.0
+    },
+    {
+      "start": 8,
+      "end": 8,
+      "amount": 300.0
+    },
+    {
+      "start": 9,
+      "end": 10,
+      "amount": 200.0
+    },
+    {
+      "start": 11,
+      "end": 15,
+      "amount": 150.0
+    },
+    {
+      "start": 16,
+      "end": 25,
+      "amount": 100.0
+    },
+    {
+      "start": 26,
+      "end": 45,
+      "amount": 70.0
+    },
+    {
+      "start": 46,
+      "end": 75,
+      "amount": 60.0
+    },
+    {
+      "start": 76,
+      "end": 150,
+      "amount": 50.0
+    },
+    {
+      "start": 151,
+      "end": 275,
+      "amount": 40.0
+    },
+    {
+      "start": 276,
+      "end": 600,
+      "amount": 30.0
+    },
+    {
+      "start": 601,
+      "end": 1414,
+      "amount": 25.0
+    }
+  ]
+}
