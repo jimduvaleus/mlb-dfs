@@ -84,7 +84,7 @@ CONTEST_STRUCTURES = {
     "four-seamer": ["dk_four_seamer", "dk_four_seamer_1486", "dk_four_seamer_2972", "dk_four_seamer_3567", "dk_four_seamer_5945"],
     "rally cap": ["dk_rally_cap", "dk_rally_cap_8823", "dk_rally_cap_10294", "dk_rally_cap_11029", "dk_rally_cap_11764", "dk_rally_cap_29411"],
     "solo shot": ["dk_solo_shot", "dk_solo_shot_2378", "dk_solo_shot_4756", "dk_solo_shot_7134", "dk_solo_shot_8917"],
-    "moonshot": ["dk_moonshot", "dk_moonshot_4756"],
+    "moonshot": ["dk_moonshot", "dk_moonshot_1189", "dk_moonshot_4756"],
     "bat flip": ["dk_bat_flip", "dk_bat_flip_6535", "dk_bat_flip_8169", "dk_bat_flip_11437"],
     "mini-max": ["dk_mini_max", "dk_mini_max_9512", "dk_mini_max_11890", "dk_mini_max_14268", "dk_mini_max_23781"],
     "knuckleball": ["dk_knuckleball", "dk_knuckleball_14268"],
