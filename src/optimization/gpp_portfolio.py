@@ -1585,6 +1585,70 @@ class DeterminantPortfolioSelector:
         return result
 
 
+# --- Kelly bankroll tables -------------------------------------------------
+# Two ways to denominate B in E_w[log(B + portfolio_payout_w)], selected by
+# whether gpp.kelly_bankroll is set.
+#
+# STAKE-RELATIVE (kelly_bankroll <= 0, the round-10 original): B is a multiple
+# of the money at risk, fee x size. Pre-registered table; every mult must stay
+# > 1 or the all-entries-lose world drives the denominator to <= 0 and log
+# hits a domain error.
+_KELLY_STAKE_MULTS = {1.0: 1.25, 2.0: 1.5, 3.0: 2.0, 4.0: 4.0, 5.0: 8.0}
+#
+# ABSOLUTE (kelly_bankroll > 0): B is a multiple of the REAL bankroll, which is
+# what the objective actually means -- log utility is defined against total
+# wealth, not against today's stake. The stake-relative table cannot express
+# that, because one global scale cannot map contest-proportional stakes onto a
+# constant bankroll: on a real 8-contest entries file the per-contest stake
+# spans $3 to $76, so any scalar that puts the big contests near a $10k
+# bankroll leaves the small ones 25x too cautious. Tiers are a risk-aversion
+# sweep AROUND the truth rather than a ladder of stake multiples: tier 3 is
+# the bankroll itself (full Kelly), 1-2 are more risk-averse than it justifies,
+# 4-5 flatten log toward the risk-neutral mean-EV limit.
+#
+# NOTE the direction, which is the opposite of the Det sweep's `risk`: a HIGHER
+# Kelly tier is LESS risk-averse. B only shapes WHICH lineups are picked here
+# (the stake is fixed by the entries file, not by Kelly), so a bigger B is not
+# a bigger bet -- it is a flatter utility that pays full weight to top prizes.
+_KELLY_BANKROLL_MULTS = {1.0: 0.5, 2.0: 0.75, 3.0: 1.0, 4.0: 2.0, 5.0: 4.0}
+
+# Absolute-mode B is not automatically safe the way the stake-relative table
+# is: nothing stops a bankroll smaller than the stake. Clamp to this multiple
+# of the stake and warn rather than letting log() take a domain error.
+_KELLY_MIN_STAKE_MULT = 1.25
+
+
+def kelly_bankroll_for(
+    risk: float, entry_fee: float, n_entries: int, gpp_cfg: dict | None = None,
+) -> float:
+    """Bankroll B for one Kelly risk tier.
+
+    `entry_fee` x `n_entries` is the stake THIS Kelly problem risks -- on the
+    per-contest path that is one contest's fee and its own entry count, not a
+    slate-wide total, since each contest is solved as its own Kelly problem.
+
+    Shared by both call sites in `pipeline.py` (single-ladder and per-contest)
+    so the tiers cannot drift apart between them.
+    """
+    cfg = gpp_cfg or {}
+    scale = max(float(cfg.get("kelly_bankroll_mult", 1.0)), 1e-6)
+    bankroll = float(cfg.get("kelly_bankroll", 0.0) or 0.0)
+    stake = float(entry_fee) * int(n_entries)
+    if bankroll > 0.0:
+        b = bankroll * _KELLY_BANKROLL_MULTS[risk] * scale
+        floor = stake * _KELLY_MIN_STAKE_MULT
+        if b < floor:
+            logger.warning(
+                "kelly_bankroll=$%.0f gives B=$%.2f at risk %.0f, below the "
+                "$%.2f stake; clamping to $%.2f. Set a bankroll above the "
+                "money you actually put at risk.",
+                bankroll, b, risk, stake, floor,
+            )
+            return floor
+        return b
+    return stake * _KELLY_STAKE_MULTS[risk] * scale
+
+
 @njit(parallel=True, cache=True)
 def _kelly_gains_all(payout: np.ndarray, denom: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Marginal expected-log-growth of each candidate against the current

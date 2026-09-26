@@ -118,9 +118,9 @@ class GppConfig(BaseModel):
     cash_anchor_fraction: float = 0.25
     # Round-10 selector objective (plans/variants_round10.yaml):
     # "det" (default) | "kelly" (greedy expected-log-growth on the fresh
-    # robust_payout; risk tier → bankroll B = fee × size × {1.25,1.5,2,4,8},
-    # kelly_bankroll_mult scales the table) | "coverage" (greedy max-coverage
-    # on fresh per-world beat-p999 bits; single risk tier).
+    # robust_payout; risk tier → bankroll B per kelly_bankroll below, with
+    # kelly_bankroll_mult scaling either table) | "coverage" (greedy
+    # max-coverage on fresh per-world beat-p999 bits; single risk tier).
     # Comma list of arms ("kelly,dr"), a single arm, or "all". Upstream cost is
     # NOT symmetric: kelly/emax consume only robust_payout; coverage flips
     # retain_beat999_worlds on for the fresh re-score (~69 MB of packed world
@@ -139,6 +139,13 @@ class GppConfig(BaseModel):
     # of robust_payout; capping M keeps the peak bounded on a laptop.
     dr_shortlist: int = 4000
     kelly_bankroll_mult: float = 1.0
+    # Real bankroll in dollars for the Kelly arm. > 0 denominates B in the
+    # bankroll (tiers {0.5, 0.75, 1.0, 2.0, 4.0} x it, tier 3 = full Kelly);
+    # 0 keeps the round-10 stake-relative table (fee x size x {1.25..8}).
+    # Absolute is the correct reading -- log utility is defined against total
+    # wealth -- and is the only one expressible per contest, since one global
+    # scale cannot map stakes spanning $3-$76 onto a constant bankroll.
+    kelly_bankroll: float = 0.0
     # PER-CONTEST SELECTION. Active whenever the slate has entry files: each
     # contest in them selects its own slice against its OWN ladder and field
     # size, in descending-top-prize fill order, instead of one portfolio being

@@ -92,6 +92,13 @@ gpp:
   contest_field_size: 0      # 0 = take it from the resolved structure
   dr_shortlist: 4000         # memory cap on the dR arm; see pipeline.py
   kelly_bankroll_mult: 1.0
+  # Real bankroll in dollars. > 0 denominates the Kelly arm's B in the bankroll
+  # (risk tiers 1-5 = {0.5, 0.75, 1.0, 2.0, 4.0} x it; tier 3 is full Kelly, and
+  # a HIGHER tier is LESS risk-averse -- opposite to the Det sweep's risk).
+  # 0 keeps the round-10 stake-relative table (fee x size x {1.25,1.5,2,4,8}),
+  # which on the per-contest path denominates B in each CONTEST's stake: no
+  # global scale maps stakes spanning $3-$76 onto one constant bankroll.
+  kelly_bankroll: 10000.0
   # Per-contest selection. Active whenever the slate has *Entries.csv files:
   # each contest picks its own slice against its own ladder, in descending
   # top-prize order. contest_structure above still sets the reference ladder

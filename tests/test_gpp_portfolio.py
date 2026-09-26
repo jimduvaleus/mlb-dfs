@@ -586,9 +586,9 @@ class TestRealPayoutStructures:
         assert structure_for_contest("Four-Seamer", 4458)["total_entries"] == 4458
         assert structure_for_contest("Four-Seamer", 5945)["total_entries"] == 5945
         # nearest-match by hint: an absurdly small hint lands on the SMALLEST
-        # registered variant (mini-MAX has 9,512 / 14,268 / 17,835 / 23,781) --
+        # registered variant (mini-MAX has 5,945 / 9,512 / 11,890 / 14,268 / 17,835 / 23,781) --
         # bump this when a smaller variant is registered.
-        assert structure_for_contest("mini-MAX", 99)["total_entries"] == 9512
+        assert structure_for_contest("mini-MAX", 99)["total_entries"] == 5945
         assert structure_for_contest("Four-Seamer") is not None
 
     def test_unknown_contest_returns_none(self):

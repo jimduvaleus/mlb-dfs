@@ -2328,18 +2328,21 @@ class PipelineRunner:
                 # the sweep keys and dump's selected_risks stay distinct.
                 _det_sweep_risks = _DET_SWEEP_RISKS if "det" in _arm_modes else []
                 if "kelly" in _arm_modes:
-                    from src.optimization.gpp_portfolio import KellyPortfolioSelector
+                    from src.optimization.gpp_portfolio import (
+                        KellyPortfolioSelector, kelly_bankroll_for,
+                    )
                     _entry_fee = float(getattr(scorer, "_entry_fee", 4.0))
-                    # Risk → bankroll: B = fee × size × mult (pre-registered
-                    # round-10 table; mult must stay > 1 or the all-lose world
-                    # hits log(<=0)). kelly_bankroll_mult is a global scale.
-                    _kelly_mults = {1.0: 1.25, 2.0: 1.5, 3.0: 2.0, 4.0: 4.0, 5.0: 8.0}
-                    _kelly_scale = max(float(gpp_cfg.get("kelly_bankroll_mult", 1.0)), 1e-6)
+                    # Risk → bankroll, from the shared table in
+                    # gpp_portfolio.kelly_bankroll_for: gpp.kelly_bankroll set
+                    # denominates B in the real bankroll, unset falls back to
+                    # the round-10 stake-relative multiples of fee × size.
                     _kelly_lbl_off = _ARM_LABEL_KELLY
                     for _risk_idx, _sweep_risk in enumerate(_DET_SWEEP_RISKS):
                         if self._stop_check is not None and self._stop_check():
                             break
-                        _B = _entry_fee * portfolio_size * _kelly_mults[_sweep_risk] * _kelly_scale
+                        _B = kelly_bankroll_for(
+                            _sweep_risk, _entry_fee, portfolio_size, gpp_cfg,
+                        )
                         logger.info(
                             "Kelly risk %d/%d (risk=%.0f, B=$%.0f)",
                             _risk_idx + 1, len(_DET_SWEEP_RISKS), _sweep_risk, _B,
@@ -3955,7 +3958,13 @@ class PipelineRunner:
                 slots=_pc_slots, shortlist=_pc_shortlist, cand_scores=_pc_scores,
                 e_dupes=None, field_pool=_pc_pool_fields, gpp_cfg=gpp_cfg,
                 modes=_pc_modes,
-                cash_anchor_fraction=float(gpp_cfg.get("cash_anchor_fraction", 0.25)),
+                # External pool: the anchor knob is the external one. This is
+                # the external path, so gpp.cash_anchor_fraction would silently
+                # override an operator's external_pool_cash_anchor_fraction --
+                # the generated-pool per-contest route reads the plain key.
+                cash_anchor_fraction=float(
+                    gpp_cfg.get("external_pool_cash_anchor_fraction", 0.25)
+                ),
                 det_sweep_risks=([1.0, 2.0, 3.0, 4.0, 5.0] if "det" in _pc_modes else []),
             )
             del _pc_scores, _pc_raw, _pc_pool_fields
@@ -5578,7 +5587,7 @@ class PipelineRunner:
         """
         from src.optimization.gpp_portfolio import (
             CoveragePortfolioSelector, DeterminantPortfolioSelector,
-            EMaxPortfolioSelector, KellyPortfolioSelector,
+            EMaxPortfolioSelector, KellyPortfolioSelector, kelly_bankroll_for,
         )
         from src.optimization.multi_contest import (
             contest_beat_bits, contest_payout_matrix, describe_slots,
@@ -5669,16 +5678,16 @@ class PipelineRunner:
             pos = {id(lu): i for i, lu in enumerate(sub_cands)}
             return [int(avail[pos[id(lu)]]) for lu, _ in result]
 
-        kelly_mults = {1.0: 1.25, 2.0: 1.5, 3.0: 2.0, 4.0: 4.0, 5.0: 8.0}
-        kelly_scale = max(float(gpp_cfg.get("kelly_bankroll_mult", 1.0)), 1e-6)
-
         def _kelly_arm(risk):
             def fn(ctx, avail, k, slot):
                 pay, cands = _sub(ctx, avail)
-                # Bankroll is denominated in THIS contest's fee, not a single
-                # slate-wide one: B must exceed the worst case (fee x k) or the
-                # all-lose world sends log() to a domain error.
-                B = slot.entry_fee * k * kelly_mults[risk] * kelly_scale
+                # With gpp.kelly_bankroll unset B is denominated in THIS
+                # contest's stake, not a slate-wide one, and must exceed the
+                # worst case (fee x k) or the all-lose world sends log() to a
+                # domain error. With it set B is the real bankroll instead --
+                # the same constant for every contest, which is the point: no
+                # global scale on a per-contest stake can express that.
+                B = kelly_bankroll_for(risk, slot.entry_fee, k, gpp_cfg)
                 sel = KellyPortfolioSelector(
                     pay, cands, portfolio_size=k, bankroll=B,
                     ev_floor=float("-inf"),

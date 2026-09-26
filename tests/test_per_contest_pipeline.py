@@ -143,7 +143,7 @@ def _sweep(runner, slots, shortlist, scorer, modes, k=1, **kw):
     return runner._per_contest_sweep(
         slots=slots, shortlist=shortlist, cand_scores=scores, e_dupes=None,
         field_pool=pool, gpp_cfg=kw.pop("gpp_cfg", {}), modes=modes,
-        cash_anchor_fraction=0.25,
+        cash_anchor_fraction=kw.pop("cash_anchor_fraction", 0.25),
         det_sweep_risks=kw.pop("det_sweep_risks", []), **kw,
     )
 
@@ -959,3 +959,76 @@ def test_the_cap_is_applied_after_the_used_set_not_before(slots, shortlist, scor
     for (cid, n_avail), slot in zip(order_seen, slots):
         assert n_avail == M - used, "narrow_fn must see the used-set exclusion"
         used += slot.n_entries
+
+
+# --------------------------------------------------------------------------
+# Kelly bankroll denomination
+# --------------------------------------------------------------------------
+
+def test_kelly_bankroll_is_constant_across_contests_when_absolute():
+    """The whole point of gpp.kelly_bankroll: B stops tracking contest size.
+
+    Stake-relative B makes a $3 single-entry contest solve its Kelly problem
+    against a $4 bankroll while a $76 one uses $95 -- and no global
+    kelly_bankroll_mult can pull both onto the one bankroll that is actually
+    true, because the stakes differ 25x. Absolute mode is what expresses it.
+    """
+    from src.optimization.gpp_portfolio import kelly_bankroll_for
+
+    stakes = [(1.0, 60), (4.0, 19), (3.0, 1), (25.0, 1)]   # real 08/25 file
+    cfg = {"kelly_bankroll": 10_000.0}
+    for risk, want in [(1.0, 5_000.0), (3.0, 10_000.0), (5.0, 40_000.0)]:
+        got = {kelly_bankroll_for(risk, fee, k, cfg) for fee, k in stakes}
+        assert got == {want}, f"risk {risk} varied by contest: {got}"
+
+    # Tier 3 is full Kelly, and tiers ascend into the risk-neutral limit --
+    # the opposite direction to the Det sweep's `risk`.
+    Bs = [kelly_bankroll_for(r, 4.0, 19, cfg) for r in (1., 2., 3., 4., 5.)]
+    assert Bs == sorted(Bs) and Bs[2] == 10_000.0
+
+
+def test_kelly_bankroll_unset_keeps_the_round10_stake_table():
+    from src.optimization.gpp_portfolio import kelly_bankroll_for
+
+    for risk, mult in [(1.0, 1.25), (2.0, 1.5), (3.0, 2.0), (4.0, 4.0), (5.0, 8.0)]:
+        assert kelly_bankroll_for(risk, 4.0, 150, {}) == 4.0 * 150 * mult
+        assert kelly_bankroll_for(risk, 4.0, 150, {"kelly_bankroll": 0.0}) == \
+            4.0 * 150 * mult
+    # kelly_bankroll_mult still scales both tables.
+    assert kelly_bankroll_for(3.0, 4.0, 150, {"kelly_bankroll_mult": 70.0}) == \
+        4.0 * 150 * 2.0 * 70.0
+    assert kelly_bankroll_for(3.0, 4.0, 150, {
+        "kelly_bankroll": 10_000.0, "kelly_bankroll_mult": 2.0}) == 20_000.0
+
+
+def test_kelly_bankroll_below_the_stake_is_clamped_not_a_domain_error():
+    """log(B + payout) needs B > the all-entries-lose loss. The stake-relative
+    table guarantees that structurally (every mult > 1); an absolute bankroll
+    does not, so the helper has to enforce it."""
+    from src.optimization.gpp_portfolio import kelly_bankroll_for
+
+    B = kelly_bankroll_for(1.0, 25.0, 100, {"kelly_bankroll": 1_000.0})
+    assert B > 25.0 * 100, "B must exceed the stake it can lose"
+
+
+def test_kelly_runs_every_pick_when_the_anchor_is_off(slots, shortlist, scorer):
+    """ceil(0.25 * k) == 1 at k == 1, so a 25% anchor consumes a single-entry
+    contest whole and the Kelly loop never executes -- every arm collapses to
+    argmax mean EV there. At 0.0 the objective owns every pick."""
+    single = _entries([("MLB $1.5K Pickoff [Single Entry]", "c-pick", 3.0, 1_500.0, 1)])
+    one_slot = resolve_contest_slots(single)
+    assert [s.n_entries for s in one_slot] == [1]
+
+    anchored, kelly = (
+        _sweep(_runner(), one_slot, shortlist, scorer, {"kelly"},
+               cash_anchor_fraction=f)[0]
+        for f in (0.25, 0.0)
+    )
+    def _lineups(sweep):
+        return {tuple(sorted(lu.player_ids)) for _, pf in sweep for lu, _ in pf}
+
+    # Anchored: one anchor pick fills the slice, so the five tiers cannot
+    # disagree -- the bankroll is never read at all.
+    assert len(_lineups(anchored)) == 1
+    # Unanchored: every pick is the Kelly objective's.
+    assert len(_lineups(kelly)) >= 1
