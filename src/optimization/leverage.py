@@ -13,7 +13,7 @@ p_opt[j] = mean_over_worlds(percentile_within_pool(j) ** exponent) is then
 literally "probability lineup j is optimal," and its player-level aggregate
 O[p] (a p_opt-weighted share of pool composition) is a field-size-conditioned
 "optimal ownership" -- diffed against the pool's own projected ownership
-(players_df["ownership"], SaberSim's "Adj Own"/"My Own" column) to get
+(players_df["ownership"], SaberSim's "My Own" column) to get
 leverage = optimal - projected.
 
 Validated (Phase A, scripts/analyze_optimal_ownership.py, 2026-08-07):

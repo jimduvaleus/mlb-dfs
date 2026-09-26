@@ -593,14 +593,14 @@ class PipelineRunner:
         # ownership (and the dupe model's Σlog-own input) doesn't flatten.
         from src.models.projection_calibration import restore_fitted_mean_scale
         # SaberSim source: ownership is pulled straight from the export's
-        # "Adj Own" column (see _build_players_df) rather than computed —
+        # "My Own" column (see _build_players_df) rather than computed —
         # skip the heuristic model and its isotonic calibration entirely.
         _use_provided_ownership = "ownership" in cand_players_df.columns
         if _use_provided_ownership:
             ownership_vector = cand_players_df["ownership"].fillna(0.0).to_numpy(dtype=np.float64)
             _calibrator = None
             logger.info(
-                "Using SaberSim-provided ownership (Adj Own) — %d players",
+                "Using SaberSim-provided ownership (My Own) — %d players",
                 len(ownership_vector),
             )
         else:
@@ -630,7 +630,7 @@ class PipelineRunner:
         # player_id -> ownership in percentage points, for the portfolio
         # readout. Both internal branches above produce a fraction (the
         # heuristic model normalizes each position to its slot count, so the
-        # slate sums to 10; the SaberSim path divides "Adj Own" by 100), so
+        # slate sums to 10; the SaberSim path divides "My Own" by 100), so
         # both scale up by 100 here — see _serialize_portfolio.
         self._ownership_pct = {
             int(pid): float(o) * 100.0
@@ -5192,7 +5192,7 @@ class PipelineRunner:
         """`ownership_by_id` maps player_id -> projected ownership in
         *percentage points*. The two pipelines carry ownership on different
         scales — the internal one as a fraction summing to 10 across the
-        slate (compute_heuristic_ownership, and the SaberSim "Adj Own"/100
+        slate (compute_heuristic_ownership, and the SaberSim "My Own"/100
         path), external mode as raw "My Own" percentage points — so callers
         normalize rather than having this guess from magnitudes.
 

@@ -561,7 +561,7 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
     as a first-class ``projections_source`` (as opposed to full external-pool
     bypass mode, see ``parse_player_projections``/``build_external_players_df``
     above). Columns: player_id, name, mean, std_dev, lineup_slot,
-    slot_confirmed, ownership (fraction, from "Adj Own").
+    slot_confirmed, ownership (fraction, from "My Own").
 
     Unlike hitters, a pitcher row's Status column is ignored entirely — the
     file lists the whole rotation/bullpen, and Status on those rows isn't a
@@ -627,7 +627,7 @@ def parse_sabersim_projections(path: Path, platform: str = "draftkings") -> pd.D
         "lineup_slot": lineup_slot,
         "slot_confirmed": slot_confirmed,
         "status_confirmed": confirmed,
-        "ownership": pd.to_numeric(df.get("Adj Own"), errors="coerce") / 100.0,
+        "ownership": pd.to_numeric(df.get("My Own"), errors="coerce") / 100.0,
     })
     keep = keep_pitcher | (~is_pitcher & lineup_slot.notna())
     out = out[keep].dropna(subset=["player_id", "mean", "std_dev"]).copy()
@@ -1563,7 +1563,7 @@ def compute_prj_own_ev(
     instead of entry_fee), so the effective ownership-penalty coefficient
     is now somewhat stronger than the two anchors above intended. Left
     uncorrected for now since ownership itself is externally sourced
-    (SaberSim's Adj Own), not our own projection -- revisit own_scale if/
+    (SaberSim's My Own), not our own projection -- revisit own_scale if/
     when prj_own's behavior is recalibrated.
 
     `field_size=0` (unparseable prize pool) reduces this to plain projected
@@ -2951,7 +2951,7 @@ def compute_pool_e_dupes(
     Thin adapter: builds the four id->attribute maps
     `gpp_portfolio.expected_dupes` needs out of an external-pool `players_df`
     and delegates. `players_df["ownership"]` is in PERCENTAGE POINTS for this
-    pool (parse_player_projections doesn't divide "My Own"/"Adj Own" by 100 --
+    pool (parse_player_projections doesn't divide "My Own" by 100 --
     see the note in pipeline.py's external branch), while the fitted model
     takes ownership as a FRACTION, so it's divided by 100 here. Getting that
     wrong is silent: percentages would push every `log(own)` positive and

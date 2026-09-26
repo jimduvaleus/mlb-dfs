@@ -1846,7 +1846,7 @@ def projections_players():
                 pass
 
         # SaberSim source: ownership is pulled straight from the export's
-        # "Adj Own" column rather than computed by the heuristic model.
+        # "My Own" column rather than computed by the heuristic model.
         if "ownership" in merged.columns:
             ow_pct = [
                 round(float(v) * 100, 1)

@@ -9,7 +9,7 @@ a per-candidate "probability of being optimal" (p_opt) with no field
 simulation and no per-world optimizer call. Aggregating p_opt through the
 same player-indicator matrix compute_lineup_scores already builds gives a
 smooth, field-size-conditioned "optimal ownership" O[p] -- diffed against
-the pool's own projected ownership (SaberSim's "Adj Own"/"My Own" column,
+the pool's own projected ownership (SaberSim's "My Own" column,
 players_df["ownership"]) to get leverage = O - projected.
 
 Two checks, no portfolio construction:

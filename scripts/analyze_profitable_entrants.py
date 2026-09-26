@@ -272,7 +272,7 @@ def join_sabersim(entries_df: pd.DataFrame, field_players_df: pd.DataFrame,
     raw = raw.dropna(subset=["DFS ID"]).drop_duplicates(subset=["DFS ID"], keep="first")
     id_to_proj = pd.to_numeric(raw["dk_points"], errors="coerce").set_axis(
         raw["DFS ID"].astype(int)).to_dict()
-    id_to_own = pd.to_numeric(raw["Adj Own"], errors="coerce").set_axis(
+    id_to_own = pd.to_numeric(raw["My Own"], errors="coerce").set_axis(
         raw["DFS ID"].astype(int)).to_dict()
     field_own = field_players_df.set_index("player")["pct_drafted"].to_dict()
 

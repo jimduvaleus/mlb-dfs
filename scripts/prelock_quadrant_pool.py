@@ -11,7 +11,7 @@ Everything used to SELECT is pre-lock:
   ceiling  -- lineup p99.9 from SimulationEngine (projections + copula; the sim
               never sees the contest). NOT the SaberSim per-player p99 column,
               which ignores correlation and was measured dead (rho +0.010).
-  ownership-- SaberSim's projected `Adj Own`, summed over the roster.
+  ownership-- SaberSim's projected `My Own`, summed over the roster.
 Only the GRADING uses post-contest data (the real field's lineups + ladder).
 
 Each candidate is graded as a marginal 3,336th entry: ranked against the 3,335
