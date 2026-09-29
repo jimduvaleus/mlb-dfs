@@ -592,7 +592,13 @@ def test_real_entries_files_resolve_with_no_user_input():
         (s.top_prize for s in slots), reverse=True,
     )
     ref = PipelineRunner._funnel_reference(slots)
-    assert ref.entry_fee == 4.0 and ref.field_size == 5945
+    assert ref is max(slots, key=lambda s: s.dollars_at_risk)
+    # No literal field size either: the same contest runs at several sizes
+    # ($20K/5,945 Four-Seamer on 08/25, $5K/1,486 on 09/29). What must hold is
+    # that the size variant matches the advertised pool, not one ~4x off.
+    from src.api.external_pool import _DK_RAKE
+    implied = ref.advertised_pool / (ref.entry_fee * (1 - _DK_RAKE))
+    assert abs(ref.field_size - implied) / implied < 0.10
 
 
 # --------------------------------------------------------------------------

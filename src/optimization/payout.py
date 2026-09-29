@@ -93,6 +93,7 @@ CONTEST_STRUCTURES = {
     "relay throw": ["dk_relay_throw", "dk_relay_throw_6274", "dk_relay_throw_9803"],
     "five-tool player": ["dk_five_tool"],
     "extra inning": ["dk_extra_inning"],
+    "postseason opener": ["dk_postseason_opener_11764"],
 }
 
 

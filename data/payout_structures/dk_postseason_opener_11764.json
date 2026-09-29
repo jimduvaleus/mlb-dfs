@@ -1,0 +1,114 @@
+{
+  "name": "DraftKings $20 Postseason Opener ($200K)",
+  "entry_fee": 20.0,
+  "total_entries": 11764,
+  "total_payout_positions": 2766,
+  "source": "real DK contest payout table, captured 2026-09-29",
+  "payouts": [
+    {
+      "start": 1,
+      "end": 1,
+      "amount": 50000.0
+    },
+    {
+      "start": 2,
+      "end": 2,
+      "amount": 20000.0
+    },
+    {
+      "start": 3,
+      "end": 3,
+      "amount": 10000.0
+    },
+    {
+      "start": 4,
+      "end": 4,
+      "amount": 7000.0
+    },
+    {
+      "start": 5,
+      "end": 5,
+      "amount": 4000.0
+    },
+    {
+      "start": 6,
+      "end": 7,
+      "amount": 2000.0
+    },
+    {
+      "start": 8,
+      "end": 9,
+      "amount": 1000.0
+    },
+    {
+      "start": 10,
+      "end": 11,
+      "amount": 750.0
+    },
+    {
+      "start": 12,
+      "end": 13,
+      "amount": 500.0
+    },
+    {
+      "start": 14,
+      "end": 15,
+      "amount": 400.0
+    },
+    {
+      "start": 16,
+      "end": 18,
+      "amount": 300.0
+    },
+    {
+      "start": 19,
+      "end": 21,
+      "amount": 200.0
+    },
+    {
+      "start": 22,
+      "end": 26,
+      "amount": 150.0
+    },
+    {
+      "start": 27,
+      "end": 36,
+      "amount": 100.0
+    },
+    {
+      "start": 37,
+      "end": 56,
+      "amount": 75.0
+    },
+    {
+      "start": 57,
+      "end": 96,
+      "amount": 60.0
+    },
+    {
+      "start": 97,
+      "end": 171,
+      "amount": 50.0
+    },
+    {
+      "start": 172,
+      "end": 371,
+      "amount": 45.0
+    },
+    {
+      "start": 372,
+      "end": 766,
+      "amount": 40.0
+    },
+    {
+      "start": 767,
+      "end": 1566,
+      "amount": 35.0
+    },
+    {
+      "start": 1567,
+      "end": 2766,
+      "amount": 30.0
+    }
+  ]
+}
